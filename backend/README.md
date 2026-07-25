@@ -38,12 +38,37 @@ cd backend
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+```
 
-# start Postgres (from repo root)
+Then get PostgreSQL running — pick whichever of these two you actually have available. Both end up satisfying the same `.env.example` values (`trading`/`trading`/`trading_workspace` on `localhost:5432`), so the rest of the steps below are identical either way.
+
+**Option A — Docker (if installed):**
+```bash
 cd .. && docker compose up -d postgres
+```
 
+**Option B — local PostgreSQL install, no Docker:**
+```bash
+sudo service postgresql start   # if not already running
+
+sudo -u postgres psql <<'SQL'
+CREATE ROLE trading WITH LOGIN PASSWORD 'trading';
+CREATE DATABASE trading_workspace OWNER trading;
+\c trading_workspace
+GRANT ALL ON SCHEMA public TO trading;
+SQL
+```
+The `GRANT ALL ON SCHEMA public` step matters on Postgres 15+ — by default `CREATE` on the `public` schema is locked down even for the database's nominal owner, so skipping this makes Alembic's `CREATE TABLE` fail with a permissions error.
+
+Then, either way:
+
+```bash
 # apply migrations
 cd backend && alembic upgrade head
+
+# verify (should show `symbols` and a partitioned `candles`)
+PGPASSWORD=trading psql -h localhost -U trading -d trading_workspace -c '\dt'
+PGPASSWORD=trading psql -h localhost -U trading -d trading_workspace -c '\d+ candles'
 
 # run the API
 uvicorn app.main:app --reload
@@ -51,16 +76,17 @@ uvicorn app.main:app --reload
 
 ## Verifying the Phase 2 round-trip
 
-1. Open a WebSocket client (e.g. `wscat -c ws://localhost:8000/ws`) and subscribe:
-   ```json
-   {"action": "subscribe", "channel": "dev.ping"}
-   ```
-2. In another terminal: `curl -X POST http://localhost:8000/dev/dummy-event -H 'Content-Type: application/json' -d '{"message":"hello"}'`
-3. The WebSocket client should receive the event on the `dev.ping` channel — proving
-   HTTP route → Event Bus (normal lane) → WebSocket Gateway → client.
-4. Same idea for the critical lane: `curl -X POST http://localhost:8000/dev/critical-event`,
-   subscribed to channel `orders.status`.
-5. `GET /health` reports current market session and both lanes' queue depths.
+```bash
+python scripts/verify_roundtrip.py
+```
+
+Run this in a second terminal while `uvicorn app.main:app --reload` is running in the first. It checks `/health`, then proves the full round trip — HTTP → Event Bus → WebSocket Gateway → client — on **both** dispatch lanes:
+- normal lane: `POST /dev/dummy-event` → received on the `dev.ping` WS channel
+- critical lane: `POST /dev/critical-event` → received on the `orders.status` WS channel
+
+Exits non-zero with a clear message if anything's wrong (most commonly: uvicorn isn't running, or something's already bound to port 8000 — see the note below). Uses Python's `websockets` + `httpx` directly, so there's no separate CLI tool (`wscat`, etc.) to install — everything it needs is already in `requirements.txt`.
+
+**If you get `[Errno 98] Address already in use`:** that's not a bug — it means a previous `uvicorn` is still running in another terminal. Either use that one (it's fine), or stop it first (`Ctrl+C` in its terminal, or `lsof -i :8000` to find and kill it) before starting a new one.
 
 ## Running tests
 
