@@ -58,16 +58,25 @@ def upgrade() -> None:
     # partition covering "now" will reject inserts, so at least one seed
     # partition is required for the table to be usable at all, not just a
     # nice-to-have.
+    #
+    # Boundaries use an explicit +00 (UTC) offset, not bare dates. Postgres
+    # interprets a bare date literal like '2026-07-01' using the DB
+    # session's local TimeZone setting at the moment the migration runs —
+    # which means the exact same migration produces a different physical
+    # partition boundary depending on who/where runs it (verified: running
+    # this with a session TimeZone of Asia/Dhaka produced a 2026-06-30T18:00Z
+    # boundary, six hours off from the intended UTC midnight). Pinning +00
+    # here makes the boundary deterministic everywhere.
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS candles_y2026m07 PARTITION OF candles
-            FOR VALUES FROM ('2026-07-01') TO ('2026-08-01')
+            FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00')
         """
     )
     op.execute(
         """
         CREATE TABLE IF NOT EXISTS candles_y2026m08 PARTITION OF candles
-            FOR VALUES FROM ('2026-08-01') TO ('2026-09-01')
+            FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')
         """
     )
 
