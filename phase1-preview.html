@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Trading Workspace — Phase 1 Preview</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/4.1.3/lightweight-charts.standalone.production.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #0B0E14;
+    --panel: #131720;
+    --border: #1E2530;
+    --text: #E6EDF3;
+    --muted: #7D8590;
+    --bull: #3FB950;
+    --bear: #F85149;
+    --signal: #E3B341;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); font-family: 'IBM Plex Sans', system-ui, sans-serif; }
+  #app { display: flex; flex-direction: column; height: 100%; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    border-bottom: 1px solid var(--border); padding: 8px 16px; flex-shrink: 0;
+  }
+  header .title { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: var(--text); }
+  header .badge {
+    background: var(--panel); color: var(--muted); font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-left: 10px;
+  }
+  header .symbol { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); }
+  main { display: flex; flex: 1; min-height: 0; }
+  #chart-wrap { position: relative; flex: 1; min-width: 0; border-right: 1px solid var(--border); }
+  #chart { width: 100%; height: 100%; }
+  .rect-box { position: absolute; left: 0; right: 64px; pointer-events: none; border-top: 1px dashed rgba(227,179,65,0.3); border-bottom: 1px dashed rgba(227,179,65,0.3); }
+  .rect-box span { position: absolute; left: 8px; top: 2px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: rgba(227,179,65,0.8); }
+  aside { width: 300px; flex-shrink: 0; background: var(--panel); border-left: 1px solid var(--border); padding: 12px; overflow-y: auto; }
+  aside .eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  aside .symbol-lg { font-family: 'IBM Plex Mono', monospace; font-size: 18px; font-weight: 600; color: var(--text); margin-bottom: 12px; }
+  .final-conf { border: 1px solid rgba(227,179,65,0.3); background: rgba(227,179,65,0.05); border-radius: 6px; padding: 10px; margin-bottom: 12px; }
+  .final-conf .eyebrow { color: var(--signal); }
+  .final-conf .val { font-family: 'IBM Plex Mono', monospace; font-size: 26px; font-weight: 600; color: var(--signal); }
+  .opp { border: 1px solid var(--border); background: rgba(11,14,20,0.6); border-radius: 6px; padding: 10px; margin-bottom: 8px; }
+  .opp .row { display: flex; justify-content: space-between; align-items: center; }
+  .opp .strategy { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 500; color: var(--text); }
+  .opp .conf { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; }
+  .opp .reason { font-size: 11px; color: var(--muted); margin: 4px 0 8px; line-height: 1.4; }
+  .opp .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; }
+  .opp .grid .lbl { color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div style="display:flex; align-items:center;">
+      <span class="title">Trading Workspace</span>
+      <span class="badge">Phase 1 — static mock data</span>
+    </div>
+    <span class="symbol" id="symbol-label"></span>
+  </header>
+  <main>
+    <div id="chart-wrap"><div id="chart"></div></div>
+    <aside id="ai-panel"></aside>
+  </main>
+</div>
+
+<script>
+const SYMBOL = "NVDA";
+document.getElementById('symbol-label').textContent = SYMBOL;
+
+// ---- deterministic mock candles (same generator logic as the real Phase 1 code) ----
+function seededRandom(seed) {
+  let s = seed;
+  return () => { s = (s * 9301 + 49297) % 233280; return s / 233280; };
+}
+function generateMockCandles(count = 180) {
+  const rand = seededRandom(42);
+  const candles = [];
+  let price = 225.0;
+  const startTime = Math.floor(Date.now() / 1000) - count * 60;
+  for (let i = 0; i < count; i++) {
+    const drift = (rand() - 0.48) * 0.8;
+    const open = price;
+    const close = Math.max(1, open + drift);
+    const high = Math.max(open, close) + rand() * 0.4;
+    const low = Math.min(open, close) - rand() * 0.4;
+    const volume = Math.round(5000 + rand() * 20000);
+    candles.push({ time: startTime + i * 60, open: +open.toFixed(2), high: +high.toFixed(2), low: +low.toFixed(2), close: +close.toFixed(2), volume });
+    price = close;
+  }
+  return candles;
+}
+
+const candles = generateMockCandles();
+const closes = candles.map(c => c.close);
+const hi = Math.max(...closes), lo = Math.min(...closes);
+const markerIdx = Math.floor(candles.length * 0.7);
+
+// ---- chart ----
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+  layout: { background: { type: 'solid', color: '#131720' }, textColor: '#7D8590', fontFamily: "IBM Plex Mono, monospace" },
+  grid: { vertLines: { color: '#1E2530' }, horzLines: { color: '#1E2530' } },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  rightPriceScale: { borderColor: '#1E2530' },
+  timeScale: { borderColor: '#1E2530', timeVisible: true },
+});
+
+const candleSeries = chart.addCandlestickSeries({
+  upColor: '#3FB950', downColor: '#F85149', borderVisible: false,
+  wickUpColor: '#3FB950', wickDownColor: '#F85149',
+});
+const volumeSeries = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'volume' });
+chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+candleSeries.setData(candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close })));
+volumeSeries.setData(candles.map(c => ({ time: c.time, value: c.volume, color: c.close >= c.open ? 'rgba(63,185,80,0.5)' : 'rgba(248,81,73,0.5)' })));
+
+// overlays: PDH/PDL lines — distinct info-blue, not the same gray as axis text/grid
+candleSeries.createPriceLine({ price: +(hi * 1.01).toFixed(2), color: '#58A6FF', lineWidth: 2, lineStyle: 2, axisLabelVisible: true, title: 'PDH' });
+candleSeries.createPriceLine({ price: +(lo * 0.99).toFixed(2), color: '#58A6FF', lineWidth: 2, lineStyle: 2, axisLabelVisible: true, title: 'PDL' });
+
+// overlay: BUY marker
+candleSeries.setMarkers([{
+  time: candles[markerIdx].time, position: 'belowBar', color: '#E3B341', shape: 'arrowUp', text: 'BUY 87%',
+}]);
+
+// overlay: support rectangle (DOM overlay synced to price scale)
+const rectTop = lo + (hi - lo) * 0.15, rectBottom = lo;
+const rectBox = document.createElement('div');
+rectBox.className = 'rect-box';
+rectBox.innerHTML = '<span>Support Zone</span>';
+rectBox.style.background = 'rgba(63,185,80,0.16)';
+rectBox.style.borderTopColor = 'rgba(63,185,80,0.4)';
+rectBox.style.borderBottomColor = 'rgba(63,185,80,0.4)';
+document.getElementById('chart-wrap').appendChild(rectBox);
+
+function positionRect() {
+  const topPx = candleSeries.priceToCoordinate(rectTop);
+  const bottomPx = candleSeries.priceToCoordinate(rectBottom);
+  if (topPx == null || bottomPx == null) return;
+  rectBox.style.top = Math.min(topPx, bottomPx) + 'px';
+  rectBox.style.height = Math.abs(bottomPx - topPx) + 'px';
+}
+chart.timeScale().fitContent();
+chart.timeScale().subscribeVisibleLogicalRangeChange(positionRect);
+setTimeout(positionRect, 0);
+
+new ResizeObserver(() => {
+  chart.applyOptions({ width: document.getElementById('chart').clientWidth, height: document.getElementById('chart').clientHeight });
+  positionRect();
+}).observe(document.getElementById('chart-wrap'));
+
+// ---- AI panel (mirrors AIAnalysisPanel.tsx) ----
+const opportunities = [
+  { strategy: 'ORB', direction: 'BUY', confidence: 87, reason: 'Volume expansion with VWAP confirmation', entry: 225.10, stop: 223.40, target: 229.60 },
+  { strategy: 'Momentum', direction: 'BUY', confidence: 74, reason: 'Higher lows with expanding relative volume', entry: 225.40, stop: 223.90, target: 228.20 },
+  { strategy: 'Pullback', direction: 'SELL', confidence: 22, reason: 'Weak — trend context contradicts short setup', entry: 224.60, stop: 226.00, target: 221.80 },
+].sort((a, b) => b.confidence - a.confidence);
+
+function confColor(c) { return c >= 70 ? '#3FB950' : c >= 45 ? '#E3B341' : '#7D8590'; }
+
+const panel = document.getElementById('ai-panel');
+const top = opportunities[0];
+panel.innerHTML = `
+  <div class="eyebrow">AI Opportunity Score</div>
+  <div class="symbol-lg">${SYMBOL}</div>
+  <div class="final-conf">
+    <div class="eyebrow">Final Confidence</div>
+    <div class="val">${top.confidence}%</div>
+  </div>
+  ${opportunities.map(o => `
+    <div class="opp">
+      <div class="row">
+        <span class="strategy">${o.strategy}</span>
+        <span class="conf" style="color:${confColor(o.confidence)}">${o.confidence}%</span>
+      </div>
+      <div class="reason">${o.reason}</div>
+      <div class="grid">
+        <div><div class="lbl">Entry</div><div style="color:${o.direction === 'BUY' ? '#3FB950' : '#F85149'}">${o.entry.toFixed(2)}</div></div>
+        <div><div class="lbl">Stop</div><div style="color:#F85149">${o.stop.toFixed(2)}</div></div>
+        <div><div class="lbl">Target</div><div style="color:#3FB950">${o.target.toFixed(2)}</div></div>
+      </div>
+    </div>
+  `).join('')}
+`;
+</script>
+</body>
+</html>

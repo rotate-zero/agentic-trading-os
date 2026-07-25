@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Trading Workspace — Milestone Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #0B0E14; --panel: #131720; --border: #1E2530;
+    --text: #E6EDF3; --muted: #7D8590;
+    --bull: #3FB950; --bear: #F85149; --signal: #E3B341;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+    font-family: 'IBM Plex Sans', system-ui, sans-serif; padding: 24px 16px 64px;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-family: 'IBM Plex Mono', monospace; font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .progress-bar { height: 6px; background: var(--panel); border-radius: 999px; overflow: hidden; margin-bottom: 28px; }
+  .progress-fill { height: 100%; background: var(--signal); transition: width 0.3s ease; }
+  .phase { border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; overflow: hidden; }
+  .phase-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; background: var(--panel); cursor: pointer; }
+  .phase-header .left { display: flex; align-items: center; gap: 10px; }
+  .phase-num { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px; }
+  .phase-title { font-weight: 500; font-size: 14px; }
+  .phase-frac { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); }
+  .phase-frac.done { color: var(--bull); }
+  .phase-body { padding: 4px 14px 12px; }
+  .exit { font-size: 11px; color: var(--muted); padding: 8px 0 10px; border-bottom: 1px dashed var(--border); margin-bottom: 8px; line-height: 1.5; }
+  .exit b { color: var(--text); font-weight: 500; }
+  label.item { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; font-size: 13px; cursor: pointer; }
+  label.item input { margin-top: 3px; accent-color: var(--signal); }
+  label.item span.checked { text-decoration: line-through; color: var(--muted); }
+  .reset { display: inline-block; margin-top: 20px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; cursor: pointer; }
+  .reset:hover { color: var(--bear); border-color: var(--bear); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trading Workspace — Build Progress</h1>
+  <div class="sub">Checked state persists locally to this artifact. Phases mirror <code>system-design.md</code> §7.</div>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+  <div id="phases"></div>
+  <button class="reset" id="reset-btn">Reset all progress</button>
+</div>
+
+<script>
+const PHASES = [
+  {
+    id: "p1", title: "Chart Shell — static mock data",
+    exit: "Chart renders candles + one of each overlay type + AI panel shows mock opportunities.",
+    items: [
+      "Vite + React + Tailwind shell rendering hardcoded candles",
+      "Volume pane + multi-timeframe + zoom/pan/crosshair",
+      "Overlay renderer (horizontal_line, marker, rectangle) from static ChartObject JSON",
+      "AI Analysis Panel fed by static Opportunity JSON",
+    ],
+  },
+  {
+    id: "p2", title: "Backend comes alive",
+    exit: "A dummy event round-trips through the Event Bus to the chart over WebSocket.",
+    items: [
+      "FastAPI skeleton + Alembic wired to PostgreSQL",
+      "Event Bus + Market Clock scaffolding",
+      "WebSocket gateway re-publishing Event Bus events",
+      "Swap frontend mock data for the same shapes, pushed live",
+    ],
+  },
+  {
+    id: "p3", title: "First real data — Alpaca adapter",
+    exit: "Live ticks for one symbol flow adapter → engine → chart.",
+    items: [
+      "BrokerAdapter interface finalized",
+      "AlpacaAdapter implementation (paper account)",
+      "Live ticks reach the chart in real time",
+    ],
+  },
+  {
+    id: "p4", title: "Market Data Engine + Feature Engine at scale",
+    exit: "100-symbol universe streaming with a FeatureSet published per symbol, no dropped ticks.",
+    items: [
+      "Multi-symbol subscribe / normalize / cache / persist",
+      "Feature Engine computing EMA / VWAP / ATR / PDH-PDL / rel. volume / gap % once per symbol",
+      "Scanner running off Feature Engine output (100 → N candidates)",
+    ],
+  },
+  {
+    id: "p5", title: "Trading Intelligence pipeline",
+    exit: "Opportunities appear on the chart with confidence/entry/stop/target; Governor can reject a plan against Portfolio State.",
+    items: [
+      "Strategy Scheduler + first Strategy (ORB)",
+      "Opportunity Engine (ranks, doesn't decide)",
+      "Decision Engine (arbitrates using Portfolio State)",
+      "Trade Planning Engine (entry/stop/target/size/R)",
+      "Governor (approved/rejected implemented; richer actions typed but unused)",
+      "Portfolio State Engine live",
+    ],
+  },
+  {
+    id: "p6", title: "Execution",
+    exit: "Approved plan produces a paper order end-to-end; Position Monitor flags a weakening position.",
+    items: [
+      "Execution Engine (dry-run mode)",
+      "Order lifecycle tracking (pending → filled/partial/rejected)",
+      "Position Monitor (still valid? weakening? partial? exit?)",
+    ],
+  },
+];
+
+const STORAGE_KEY = "milestone-progress";
+
+async function loadState() {
+  try {
+    const result = await window.storage.get(STORAGE_KEY);
+    return result ? JSON.parse(result.value) : {};
+  } catch {
+    return {};
+  }
+}
+async function saveState(state) {
+  try {
+    await window.storage.set(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    console.error("Failed to save progress", e);
+  }
+}
+
+function itemKey(phaseId, idx) { return phaseId + ":" + idx; }
+
+async function render() {
+  const state = await loadState();
+  const container = document.getElementById("phases");
+  container.innerHTML = "";
+
+  let totalItems = 0, totalDone = 0;
+
+  PHASES.forEach((phase, pIdx) => {
+    const doneCount = phase.items.filter((_, i) => state[itemKey(phase.id, i)]).length;
+    totalItems += phase.items.length;
+    totalDone += doneCount;
+
+    const phaseEl = document.createElement("div");
+    phaseEl.className = "phase";
+    phaseEl.innerHTML = `
+      <div class="phase-header">
+        <div class="left">
+          <span class="phase-num">P${pIdx + 1}</span>
+          <span class="phase-title">${phase.title}</span>
+        </div>
+        <span class="phase-frac ${doneCount === phase.items.length ? "done" : ""}">${doneCount}/${phase.items.length}</span>
+      </div>
+      <div class="phase-body">
+        <div class="exit"><b>Exit criteria:</b> ${phase.exit}</div>
+        ${phase.items.map((label, i) => {
+          const key = itemKey(phase.id, i);
+          const checked = !!state[key];
+          return `<label class="item">
+            <input type="checkbox" data-key="${key}" ${checked ? "checked" : ""} />
+            <span class="${checked ? "checked" : ""}">${label}</span>
+          </label>`;
+        }).join("")}
+      </div>
+    `;
+    container.appendChild(phaseEl);
+  });
+
+  document.getElementById("progress-fill").style.width = Math.round((totalDone / totalItems) * 100) + "%";
+
+  container.querySelectorAll("input[type=checkbox]").forEach((box) => {
+    box.addEventListener("change", async () => {
+      const st = await loadState();
+      st[box.dataset.key] = box.checked;
+      await saveState(st);
+      render();
+    });
+  });
+}
+
+document.getElementById("reset-btn").addEventListener("click", async () => {
+  await saveState({});
+  render();
+});
+
+render();
+</script>
+</body>
+</html>
