@@ -25,7 +25,7 @@ from datetime import datetime
 
 from ib_async import IB, Stock
 
-from app.broker_adapters.base import BrokerAdapter, Candle, OrderAck, OrderRequest, Position, Tick
+from app.broker_adapters.base import BrokerAdapter, Candle, OrderAck, OrderRequest, Position, SymbolNotFoundError, Tick
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ class IBKRAdapter(BrokerAdapter):
         self._tick_callbacks: list[Callable[[Tick], None]] = []
 
         self._ib.pendingTickersEvent += self._on_pending_tickers
+        self._ib.disconnectedEvent += self._on_disconnected
 
     # --- BrokerAdapter interface --------------------------------------
 
@@ -103,12 +104,27 @@ class IBKRAdapter(BrokerAdapter):
             self._ib.disconnect()
         logger.info("IBKRAdapter disconnected")
 
+    async def _qualify(self, contract: Stock) -> Stock:
+        """
+        qualifyContractsAsync() never raises for an unresolvable symbol —
+        verified by reading its source: on failure it just logs a warning
+        and returns None in that result slot, leaving the input contract
+        object unmodified (no conId). Ignoring that return value (which
+        the first version of this adapter did) means subscribing to a
+        bad symbol would silently "succeed" and then fail opaquely later,
+        deep inside ib_async's error-event plumbing. Checking explicitly
+        here turns that into a clean, catchable error at the point of use.
+        """
+        (result,) = await self._ib.qualifyContractsAsync(contract)
+        if result is None:
+            raise SymbolNotFoundError(contract.symbol)
+        return result
+
     async def subscribe(self, symbols: list[str]) -> None:
         for symbol in symbols:
             if symbol in self._contracts:
                 continue
-            contract = Stock(symbol, "SMART", "USD")
-            await self._ib.qualifyContractsAsync(contract)
+            contract = await self._qualify(Stock(symbol, "SMART", "USD"))
             self._ib.reqMktData(contract, "", False, False)
             self._contracts[symbol] = contract
             logger.info("IBKRAdapter subscribed to %s", symbol)
@@ -123,8 +139,9 @@ class IBKRAdapter(BrokerAdapter):
     async def get_historical(
         self, symbol: str, timeframe: str, start: datetime, end: datetime
     ) -> list[Candle]:
-        contract = self._contracts.get(symbol) or Stock(symbol, "SMART", "USD")
-        await self._ib.qualifyContractsAsync(contract)
+        contract = self._contracts.get(symbol)
+        if contract is None:
+            contract = await self._qualify(Stock(symbol, "SMART", "USD"))
 
         bars = await self._ib.reqHistoricalDataAsync(
             contract,
@@ -166,8 +183,6 @@ class IBKRAdapter(BrokerAdapter):
     def on_tick(self, callback: Callable[[Tick], None]) -> None:
         self._tick_callbacks.append(callback)
 
-    # --- adapter-specific extension (not part of the BrokerAdapter ABC) --
-
     def is_connected(self) -> bool:
         return self._ib.isConnected()
 
@@ -189,3 +204,22 @@ class IBKRAdapter(BrokerAdapter):
             )
             for callback in self._tick_callbacks:
                 callback(tick)
+
+    def _on_disconnected(self) -> None:
+        """
+        Observability only, deliberately not reconnect logic. Auto-reconnect
+        with backoff is explicitly Market Data Engine's job in Phase 4
+        (system-design.md §4.2's ConnectionManager) — building it here would
+        pull Phase 4 scope forward into an adapter that's supposed to stay a
+        thin, replaceable wrapper around the broker SDK. For now: log loudly,
+        so a dropped connection doesn't silently go quiet. is_connected()
+        already reflects reality afterward without any extra state to
+        maintain here, since it always asks self._ib directly rather than
+        caching a status flag.
+        """
+        logger.warning(
+            "IBKRAdapter lost its connection to %s:%s. No auto-reconnect yet — "
+            "that's Phase 4's Market Data Engine (ConnectionManager), not this "
+            "adapter. Call POST /broker/connect again to restore it.",
+            self._host, self._port,
+        )

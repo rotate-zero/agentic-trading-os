@@ -15,28 +15,26 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
+from app.broker_adapters.base import SymbolNotFoundError
 from app.broker_adapters.ibkr_adapter import IBKRAdapter
 from app.event_bus.bus import get_event_bus
+from app.services import broker_registry
 from app.services.ibkr_ingest import IBKRIngestBridge
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/broker", tags=["broker"])
 
-_adapter: IBKRAdapter | None = None
-_bridge: IBKRIngestBridge | None = None
-
 
 @router.post("/connect")
 async def connect() -> dict:
-    global _adapter, _bridge
-    if _adapter is not None and _adapter.is_connected():
+    existing = broker_registry.get_active_adapter()
+    if existing is not None and existing.is_connected():
         return {"status": "already_connected"}
 
-    _adapter = IBKRAdapter()
+    adapter = IBKRAdapter()
     try:
-        await _adapter.connect()
+        await adapter.connect()
     except Exception as exc:  # noqa: BLE001 — surfaced to the caller as a clear HTTP error
-        _adapter = None
         logger.exception("IBKR connect failed")
         raise HTTPException(
             status_code=502,
@@ -46,36 +44,42 @@ async def connect() -> dict:
             ),
         ) from exc
 
-    _bridge = IBKRIngestBridge(_adapter, get_event_bus())
+    bridge = IBKRIngestBridge(adapter, get_event_bus())
+    broker_registry.set_active(adapter, bridge)
     return {"status": "connected"}
 
 
 @router.post("/subscribe")
 async def subscribe(symbol: str) -> dict:
-    if _adapter is None or not _adapter.is_connected():
+    adapter = broker_registry.get_active_adapter()
+    if adapter is None or not adapter.is_connected():
         raise HTTPException(status_code=400, detail="Not connected — call POST /broker/connect first")
-    await _adapter.subscribe([symbol])
+    try:
+        await adapter.subscribe([symbol])
+    except SymbolNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "subscribed", "symbol": symbol}
 
 
 @router.post("/unsubscribe")
 async def unsubscribe(symbol: str) -> dict:
-    if _adapter is None:
+    adapter = broker_registry.get_active_adapter()
+    if adapter is None:
         raise HTTPException(status_code=400, detail="Not connected")
-    await _adapter.unsubscribe([symbol])
+    await adapter.unsubscribe([symbol])
     return {"status": "unsubscribed", "symbol": symbol}
 
 
 @router.get("/status")
 async def status() -> dict:
-    return {"connected": _adapter is not None and _adapter.is_connected()}
+    adapter = broker_registry.get_active_adapter()
+    return {"connected": adapter is not None and adapter.is_connected()}
 
 
 @router.post("/disconnect")
 async def disconnect() -> dict:
-    global _adapter, _bridge
-    if _adapter is not None:
-        await _adapter.disconnect()
-    _adapter = None
-    _bridge = None
+    adapter = broker_registry.get_active_adapter()
+    if adapter is not None:
+        await adapter.disconnect()
+    broker_registry.clear_active()
     return {"status": "disconnected"}

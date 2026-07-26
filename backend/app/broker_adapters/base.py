@@ -28,7 +28,29 @@ from pydantic import BaseModel
 
 from app.schemas.events.market_data import CandleClosed as Candle
 
-__all__ = ["BrokerAdapter", "Candle", "Tick", "OrderRequest", "OrderAck", "Position"]
+__all__ = [
+    "BrokerAdapter",
+    "Candle",
+    "Tick",
+    "OrderRequest",
+    "OrderAck",
+    "Position",
+    "SymbolNotFoundError",
+]
+
+
+class SymbolNotFoundError(Exception):
+    """
+    Raised when a broker can't resolve a symbol to a tradeable contract.
+    Lives here (not in ibkr_adapter.py) since it's a cross-adapter concern
+    — any future adapter should raise this same type, so callers only
+    need one import regardless of which concrete adapter is active.
+    """
+
+    def __init__(self, symbol: str, broker: str = "IBKR") -> None:
+        self.symbol = symbol
+        self.broker = broker
+        super().__init__(f"{broker} could not resolve symbol {symbol!r} to a tradeable contract")
 
 
 class Tick(BaseModel):
@@ -74,6 +96,9 @@ class BrokerAdapter(ABC):
 
     @abstractmethod
     async def disconnect(self) -> None: ...
+
+    @abstractmethod
+    def is_connected(self) -> bool: ...
 
     @abstractmethod
     async def subscribe(self, symbols: list[str]) -> None: ...

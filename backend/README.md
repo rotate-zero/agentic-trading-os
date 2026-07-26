@@ -25,13 +25,21 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - **`IBKRAdapter`** (`app/broker_adapters/`) — implements the full `BrokerAdapter`
   interface using `ib_async`. Streams live ticks (`on_tick`) and fetches historical
   bars (`get_historical`). `place_order`/`cancel_order` raise `NotImplementedError`
-  on purpose — see the docstring on `BrokerAdapter` for why.
+  on purpose — see the docstring on `BrokerAdapter` for why. Symbol qualification
+  failures raise a clean `SymbolNotFoundError` instead of silently proceeding with an
+  unresolved contract (found and fixed by reading `qualifyContractsAsync`'s actual
+  source — it never raises on a bad symbol itself). Unexpected disconnects are logged
+  loudly; auto-reconnect is explicitly left to Phase 4's Market Data Engine, not built
+  here — see the docstring on `_on_disconnected`.
 - **`IBKRIngestBridge`** (`app/services/ibkr_ingest.py`) — Phase-3-minimal bridge:
   publishes every tick as `PriceUpdated`, buckets ticks into 1-minute `CandleClosed`
   events. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
   wholesale, not extended.
 - `POST /broker/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`, `GET /broker/status`
   for manual connection control (no auto-connect on app startup — see below)
+- `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever
+  adapter is currently connected (`app/services/broker_registry.py`). Same response
+  shape planned for the paused frontend mock-swap, so it's a drop-in later.
 
 **Deliberately not implemented yet** (belongs to a later phase, per
 [`phase-roadmap.md`](../docs/roadmap/phase-roadmap.md)):
@@ -47,11 +55,20 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - ✅ `ib_async` API signatures — verified by installing the library and introspecting
   real method signatures, not trusting memory
 - ✅ Tick→candle bucketing logic — unit tested (`tests/test_ibkr_ingest.py`)
+- ✅ Symbol-qualification failure path — unit tested by simulating
+  `qualifyContractsAsync`'s real "return None" failure signal, both in the adapter
+  directly and through the `/broker/subscribe` and `/market/candles` routes
+- ✅ Disconnect handler — unit tested by firing the same `eventkit` event ib_async
+  fires internally on a real drop
 - ✅ The connect path genuinely attempts a real socket connection and fails cleanly
   (verified: got a real `ConnectionRefusedError` against `127.0.0.1:4002` with no
-  Gateway running, surfaced as a clean HTTP 502, not a crash)
+  Gateway running, surfaced as a clean HTTP 502, not a crash) — re-verified against a
+  live `uvicorn` process after these changes, alongside `/market/candles`' clean
+  400 when nothing's connected
 - ❌ An actual live connection to a running Gateway with a real IBKR account — this
   sandbox has no path to that. Has to happen on your machine.
+- ❌ Auto-reconnect after a disconnect — not built. Deliberately deferred to Phase 4's
+  Market Data Engine (`ConnectionManager`), not pulled forward into this adapter.
 
 ## IBKR connection setup
 
