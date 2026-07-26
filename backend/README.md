@@ -172,7 +172,29 @@ cd backend
 pytest
 ```
 
-`tests/test_event_bus.py` and `tests/test_debounce_scheduler.py` don't need a database —
-they test the in-process bus and scheduler logic directly, including a test that
-specifically proves a slow normal-lane subscriber can't delay a critical-lane event
-(confirmed decision #9).
+No extra setup needed — every test file below runs with just `pip install -r requirements.txt`, no database and no live IBKR connection required. `pytest` alone picks up all of them.
+
+| File | What it verifies |
+|---|---|
+| `test_event_bus.py` | Event Bus pub/sub, including a test that specifically proves a slow normal-lane subscriber can't delay a critical-lane event (confirmed decision #9) |
+| `test_debounce_scheduler.py` | The shared min/max-interval update-policy utility (confirmed decision #10) |
+| `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance, the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
+| `test_ibkr_ingest.py` | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently |
+| `test_market_routes.py` | `GET /market/candles` and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
+| `conftest.py` | Not a test file — an autouse fixture resetting the app's module-level singletons (Event Bus, connection manager, Gateway, broker registry) between tests. Needed because those singletons are cached for the process lifetime, but `pytest-asyncio` gives each test its own event loop; without this reset, a second `TestClient(app)` in a later test reuses queues bound to an already-dead loop |
+
+**What these tests deliberately don't cover:** an actual live IBKR connection. `test_ibkr_adapter.py`'s interface-compliance test constructs a real `IBKRAdapter` but never calls `connect()` — that requires a running IB Gateway and a real account, which only exists on your machine, not here. See "IBKR connection setup" above for that verification path, and the smoke checks below.
+
+### Manually exercising `/market/candles`
+
+Once connected (`POST /broker/connect` then `POST /broker/subscribe?symbol=NVDA` from the section above):
+
+```bash
+curl "http://localhost:8000/market/candles?symbol=NVDA&count=50&timeframe=1m"
+```
+
+Returns `{"symbol": "NVDA", "candles": [...]}` — the same shape planned for the paused
+frontend mock-swap. Before connecting, this same call should return a clean `400`
+("Not connected"), not a crash or a 500 — that's the behavior `test_market_routes.py`
+checks automatically; this is just how to see it happen for real.
+
