@@ -6,10 +6,17 @@ import {
   CANDLE_LIMIT_MIN,
   CANDLE_LIMIT_STEP,
   DEFAULT_CHART_BG,
+  DEFAULT_GRID_COLOR,
+  DEFAULT_TIMER_COLOR,
   LINK_CONNECTOR_IDS,
   TIMEFRAMES,
+  VOLUME_AVG_BAR_MAX,
+  VOLUME_AVG_BAR_MIN,
+  VOLUME_AVG_BAR_STEP,
   type CandleLimit,
   type SubWindowConfig,
+  type VolumeAvgIndicatorConfig,
+  type VolumeAvgLineConfig,
 } from "../../types/workspace";
 import { MOCK_TICKERS } from "../../mocks/tickers";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -86,7 +93,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "indicators" | "connector" | "candles" | "background";
+type MenuLevel = "root" | "timeframe" | "indicators" | "connector" | "candles" | "background" | "timer" | "volumeAvg";
 
 function RootRow({
   label,
@@ -125,15 +132,138 @@ function BackRow({ label, onClick }: { label: string; onClick: () => void }) {
   );
 }
 
+// Shared swatch + hex-field control — same format used for chart background,
+// grid color, and the timer color, per the "same format" request. Keeps its
+// own draft state so a partially-typed invalid hex doesn't get lost or
+// clobbered by the last-committed value while the user is still typing.
+function ColorField({
+  label,
+  value,
+  onChange,
+}: {
+  label?: string;
+  value: string;
+  onChange: (hex: string) => void;
+}) {
+  const [hexDraft, setHexDraft] = useState(value);
+  useEffect(() => setHexDraft(value), [value]);
+
+  return (
+    <div className="flex items-center gap-2 px-2 py-1">
+      {label && <span className="w-16 shrink-0 font-mono text-[10px] text-text-muted">{label}</span>}
+      <input
+        type="color"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="h-7 w-7 shrink-0 cursor-pointer rounded border border-base-border bg-transparent p-0"
+        title="Pick a color"
+      />
+      <input
+        value={hexDraft}
+        onChange={(e) => {
+          setHexDraft(e.target.value);
+          if (isValidHex(e.target.value)) onChange(e.target.value);
+        }}
+        placeholder={value}
+        className={`w-24 rounded border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary outline-none focus:border-signal ${
+          isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
+        }`}
+      />
+    </div>
+  );
+}
+
+// One row per volume-average line: checkbox to enable, an optional bar-count
+// stepper (only for the 3 trailing-average lines, not "Day Avg"), and its own
+// compact color swatch + hex field.
+function VolumeAvgLineRow({
+  subWindowId,
+  volumeAvg,
+  line,
+  updateSubWindow,
+}: {
+  subWindowId: string;
+  volumeAvg: VolumeAvgIndicatorConfig;
+  line: VolumeAvgLineConfig;
+  updateSubWindow: (id: string, patch: Partial<SubWindowConfig>) => void;
+}) {
+  const [hexDraft, setHexDraft] = useState(line.color);
+  useEffect(() => setHexDraft(line.color), [line.color]);
+
+  const patchLine = (linePatch: Partial<VolumeAvgLineConfig>) => {
+    updateSubWindow(subWindowId, {
+      volumeAvg: {
+        ...volumeAvg,
+        lines: volumeAvg.lines.map((l) => (l.id === line.id ? { ...l, ...linePatch } : l)),
+      },
+    });
+  };
+
+  const stepBarCount = (direction: 1 | -1) => {
+    const next = line.barCount + direction * VOLUME_AVG_BAR_STEP;
+    patchLine({ barCount: Math.min(VOLUME_AVG_BAR_MAX, Math.max(VOLUME_AVG_BAR_MIN, next)) });
+  };
+
+  return (
+    <div className="mb-2 rounded border border-base-border/60 px-2 py-1.5">
+      <div className="flex items-center gap-1.5">
+        <input
+          type="checkbox"
+          checked={line.enabled}
+          onChange={(e) => patchLine({ enabled: e.target.checked })}
+          className="h-3 w-3 shrink-0 accent-signal"
+        />
+        <span className="flex-1 truncate font-mono text-[11px] text-text-primary">{line.label}</span>
+        {line.adjustable && (
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              onClick={() => stepBarCount(-1)}
+              disabled={line.barCount <= VOLUME_AVG_BAR_MIN}
+              className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+            >
+              &minus;
+            </button>
+            <span className="w-5 text-center font-mono text-[10px] text-text-primary">{line.barCount}</span>
+            <button
+              onClick={() => stepBarCount(1)}
+              disabled={line.barCount >= VOLUME_AVG_BAR_MAX}
+              className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+            >
+              +
+            </button>
+          </div>
+        )}
+      </div>
+      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+        <input
+          type="color"
+          value={line.color}
+          onChange={(e) => patchLine({ color: e.target.value })}
+          className="h-5 w-5 shrink-0 cursor-pointer rounded border border-base-border bg-transparent p-0"
+          title="Pick a color"
+        />
+        <input
+          value={hexDraft}
+          onChange={(e) => {
+            setHexDraft(e.target.value);
+            if (isValidHex(e.target.value)) patchLine({ color: e.target.value });
+          }}
+          placeholder={line.color}
+          className={`w-20 rounded border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary outline-none focus:border-signal ${
+            isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConfig; displaySymbol: string }) {
   const { updateSubWindow } = useWorkspace();
   const [open, setOpen] = useState(false);
   const [level, setLevel] = useState<MenuLevel>("root");
-  const [hexDraft, setHexDraft] = useState(config.backgroundColor);
 
-  // Keep the text field in sync if the color changes from elsewhere (e.g. the
-  // native swatch picker, or loading a saved layout with a different color).
-  useEffect(() => setHexDraft(config.backgroundColor), [config.backgroundColor]);
+  const activeVolumeAvgLines = config.volumeAvg.lines.filter((l) => l.enabled).length;
 
   const closeMenu = () => {
     setOpen(false);
@@ -183,7 +313,11 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
       </div>
 
       {open && (
-        <div className="absolute right-0 top-full z-20 w-56 rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl">
+        <div
+          className={`absolute right-0 top-full z-20 rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
+            level === "volumeAvg" ? "w-72" : "w-56"
+          }`}
+        >
           {level === "root" && (
             <div className="flex flex-col">
               <RootRow label="Timeframe" hint={config.timeframe} onClick={() => setLevel("timeframe")} />
@@ -203,6 +337,17 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                 hint={config.backgroundColor}
                 swatch={config.backgroundColor}
                 onClick={() => setLevel("background")}
+              />
+              <RootRow
+                label="Timer"
+                hint={config.timer.enabled ? "On" : "Off"}
+                swatch={config.timer.enabled ? config.timer.color : undefined}
+                onClick={() => setLevel("timer")}
+              />
+              <RootRow
+                label="Volume Avg"
+                hint={config.volumeAvg.enabled ? `${activeVolumeAvgLines} line${activeVolumeAvgLines === 1 ? "" : "s"}` : "Off"}
+                onClick={() => setLevel("volumeAvg")}
               />
             </div>
           )}
@@ -318,32 +463,74 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
           {level === "background" && (
             <div>
               <BackRow label="Background" onClick={() => setLevel("root")} />
-              <div className="flex items-center gap-2 px-2 py-1">
-                <input
-                  type="color"
-                  value={config.backgroundColor}
-                  onChange={(e) => updateSubWindow(config.id, { backgroundColor: e.target.value })}
-                  className="h-7 w-7 shrink-0 cursor-pointer rounded border border-base-border bg-transparent p-0"
-                  title="Pick a color"
-                />
-                <input
-                  value={hexDraft}
-                  onChange={(e) => {
-                    setHexDraft(e.target.value);
-                    if (isValidHex(e.target.value)) updateSubWindow(config.id, { backgroundColor: e.target.value });
-                  }}
-                  placeholder="#131720"
-                  className={`w-24 rounded border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary outline-none focus:border-signal ${
-                    isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
-                  }`}
-                />
+              <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                Chart background
               </div>
+              <ColorField
+                value={config.backgroundColor}
+                onChange={(hex) => updateSubWindow(config.id, { backgroundColor: hex })}
+              />
+              <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                Grid lines
+              </div>
+              <ColorField value={config.gridColor} onChange={(hex) => updateSubWindow(config.id, { gridColor: hex })} />
               <button
-                onClick={() => updateSubWindow(config.id, { backgroundColor: DEFAULT_CHART_BG })}
+                onClick={() => updateSubWindow(config.id, { backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR })}
                 className="mt-1 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
               >
                 Reset to default
               </button>
+            </div>
+          )}
+
+          {level === "timer" && (
+            <div>
+              <BackRow label="Timer" onClick={() => setLevel("root")} />
+              <button
+                onClick={() => updateSubWindow(config.id, { timer: { ...config.timer, enabled: !config.timer.enabled } })}
+                className={`mb-2 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.timer.enabled ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                Show timer
+                {config.timer.enabled && <span>&#10003;</span>}
+              </button>
+              <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                Sweep color
+              </div>
+              <ColorField value={config.timer.color} onChange={(hex) => updateSubWindow(config.id, { timer: { ...config.timer, color: hex } })} />
+              <button
+                onClick={() => updateSubWindow(config.id, { timer: { ...config.timer, color: DEFAULT_TIMER_COLOR } })}
+                className="mt-1 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+              >
+                Reset color to default
+              </button>
+            </div>
+          )}
+
+          {level === "volumeAvg" && (
+            <div>
+              <BackRow label="Volume Avg" onClick={() => setLevel("root")} />
+              <button
+                onClick={() => updateSubWindow(config.id, { volumeAvg: { ...config.volumeAvg, enabled: !config.volumeAvg.enabled } })}
+                className={`mb-2 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.volumeAvg.enabled ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                Show on volume pane
+                {config.volumeAvg.enabled && <span>&#10003;</span>}
+              </button>
+              <div className="max-h-72 overflow-y-auto pr-0.5">
+                {config.volumeAvg.lines.map((line) => (
+                  <VolumeAvgLineRow
+                    key={line.id}
+                    subWindowId={config.id}
+                    volumeAvg={config.volumeAvg}
+                    line={line}
+                    updateSubWindow={updateSubWindow}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </div>

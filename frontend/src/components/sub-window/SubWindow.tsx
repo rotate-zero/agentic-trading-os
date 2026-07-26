@@ -34,6 +34,10 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           indicators={indicators}
           candleLimit={config.candleLimit}
           backgroundColor={config.backgroundColor}
+          gridColor={config.gridColor}
+          timeframe={config.timeframe}
+          timer={config.timer}
+          volumeAvg={config.volumeAvg}
         />
       </div>
     </div>

@@ -279,7 +279,7 @@ Scanner promotes a symbol using Feature Engine's already-computed activity metri
 | Charting | TradingView Lightweight Charts | render-only, no TradingView embed |
 | State management (frontend) | Zustand | lighter than Redux for a single-user workspace |
 | Migrations | Alembic | schema versioning from Phase 2 onward |
-| Broker SDKs | `ib_insync` (IBKR), `alpaca-py` (Alpaca) | wrapped behind adapters, never imported outside them |
+| Broker SDKs | `ib_async` (IBKR) — see `../decisions/confirmed-decisions.md` #13; `ib_insync` is unmaintained | wrapped behind adapters, never imported outside them |
 
 **Confirmed:** in-process cache, no Redis, for v1. Revisit only when/if agents move to separate processes — Redis pub/sub is the natural upgrade at that point, not before.
 
@@ -337,8 +337,7 @@ trading-workspace/
 │   │   │       └── channels.py           # topic definitions
 │   │   ├── broker_adapters/
 │   │   │   ├── base.py                   # BrokerAdapter ABC
-│   │   │   ├── ibkr_adapter.py
-│   │   │   └── alpaca_adapter.py
+│   │   │   └── ibkr_adapter.py       # Alpaca deferred, not stubbed — see ../decisions/confirmed-decisions.md #1
 │   │   ├── market_data_engine/
 │   │   │   ├── engine.py
 │   │   │   ├── normalizer.py

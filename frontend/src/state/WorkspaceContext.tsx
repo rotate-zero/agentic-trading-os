@@ -1,8 +1,11 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   DEFAULT_CHART_BG,
+  DEFAULT_GRID_COLOR,
   DEFAULT_SYMBOL,
   LINK_CONNECTOR_IDS,
+  createDefaultTimerConfig,
+  createDefaultVolumeAvgConfig,
   type ConnectorId,
   type GridLayout,
   type MainWindowState,
@@ -67,10 +70,10 @@ const SAVED_LAYOUTS_KEY = "trading-workspace:saved-layouts";
 // cross-talk. Grid changes after this use the generic fallback below.
 function makeInitialSubWindows(): SubWindowConfig[] {
   return [
-    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: ["EMA9"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", indicators: ["SMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", indicators: ["EMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
+    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: ["EMA9"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", indicators: ["SMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", indicators: ["EMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
   ];
 }
 
@@ -80,10 +83,10 @@ function makeInitialSubWindows(): SubWindowConfig[] {
 // without the person needing to configure anything to see the feature.
 function makeSecondaryMainWindowSubWindows(id: string): SubWindowConfig[] {
   return [
-    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", indicators: ["EMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
-    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG },
+    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", indicators: ["EMA20"], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
   ];
 }
 
@@ -102,6 +105,9 @@ function makeDefaultSubWindows(rows: number, cols: number, prior: SubWindowConfi
         indicators: i === 0 ? ["EMA9"] : [],
         candleLimit: "all",
         backgroundColor: DEFAULT_CHART_BG,
+        gridColor: DEFAULT_GRID_COLOR,
+        timer: createDefaultTimerConfig(),
+        volumeAvg: createDefaultVolumeAvgConfig(),
       });
     }
   }
@@ -140,13 +146,30 @@ interface StoredSession {
   connectorSymbols: ConnectorSymbolMap;
 }
 
+// Back-fills fields that didn't exist on SubWindowConfig before this change
+// (gridColor, timer, volumeAvg) — anything persisted to localStorage by an
+// earlier version of the app won't have them, so reading them without this
+// would throw at render time (e.g. `config.timer.enabled` on `undefined`).
+function normalizeSubWindow(sw: SubWindowConfig): SubWindowConfig {
+  return {
+    ...sw,
+    gridColor: sw.gridColor ?? DEFAULT_GRID_COLOR,
+    timer: sw.timer ?? createDefaultTimerConfig(),
+    volumeAvg: sw.volumeAvg ?? createDefaultVolumeAvgConfig(),
+  };
+}
+
+function normalizeMainWindow(w: MainWindowState): MainWindowState {
+  return { ...w, subWindows: w.subWindows.map(normalizeSubWindow) };
+}
+
 function loadSession(): StoredSession | null {
   try {
     const raw = localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!parsed?.mainWindows?.length || !parsed?.activeMainWindowId || !parsed?.connectorSymbols) return null;
-    return parsed as StoredSession;
+    return { ...parsed, mainWindows: (parsed.mainWindows as MainWindowState[]).map(normalizeMainWindow) } as StoredSession;
   } catch {
     return null; // corrupt/missing storage just falls back to defaults
   }
@@ -156,7 +179,8 @@ function loadSavedLayouts(): SavedLayout[] {
   try {
     const raw = localStorage.getItem(SAVED_LAYOUTS_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return (parsed as SavedLayout[]).map((l) => ({ ...l, subWindows: l.subWindows.map(normalizeSubWindow) }));
   } catch {
     return [];
   }
@@ -318,6 +342,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       const withFreshIds = (parsed as SavedLayout[]).map((l, i) => ({
         ...l,
         id: `layout-${Date.now()}-${i}`,
+        subWindows: l.subWindows.map(normalizeSubWindow),
       }));
       setSavedLayouts((prev) => [...prev, ...withFreshIds]);
     } catch {

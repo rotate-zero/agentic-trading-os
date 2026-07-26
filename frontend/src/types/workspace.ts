@@ -37,6 +37,67 @@ export const MAX_GRID_DIM = 8;
 
 export const DEFAULT_CHART_BG = "#131720";
 
+// Grid line color lives alongside background color in the same "Background"
+// submenu, same format (native swatch + hex field). Default matches the
+// theme's previous hardcoded grid line color, so existing layouts render
+// identically until someone opts to change it.
+export const DEFAULT_GRID_COLOR = "#1E2530";
+
+// Round "radar" progress badge, top-right corner of each sub-window's chart —
+// sweeps clockwise 0-100% over the current timeframe bar. No live Market
+// Clock exists until Phase 2 (`core/market_clock.py`), so progress is
+// approximated from wall-clock time modulo the timeframe's duration (see
+// `utils/timerProgress.ts`) rather than a real bar-open timestamp.
+export interface TimerConfig {
+  enabled: boolean;
+  color: string; // hex — the round sweep itself; the surrounding badge frame
+  // (black border, fixed grey background) is intentionally NOT customizable,
+  // since its whole job is to stay legible no matter what backgroundColor is.
+}
+export const DEFAULT_TIMER_COLOR = "#3FB950"; // bull green, round sweep shape
+
+export function createDefaultTimerConfig(): TimerConfig {
+  return { enabled: true, color: DEFAULT_TIMER_COLOR };
+}
+
+// Up to 4 horizontal average-volume lines drawn on the volume pane. Line 1
+// ("day") is fixed to represent the whole session at the selected timeframe —
+// mock data has no day/session boundary yet (that's Phase 2/3's Market Clock),
+// so it's approximated as the average across every bar currently loaded, see
+// `utils/volumeAverages.ts`. Lines 2-4 are trailing N-bar averages (default
+// 3/6/9) with an adjustable bar count.
+export type VolumeAvgLineId = "day" | "n1" | "n2" | "n3";
+
+export interface VolumeAvgLineConfig {
+  id: VolumeAvgLineId;
+  label: string;
+  enabled: boolean;
+  color: string; // hex
+  barCount: number; // ignored when adjustable is false
+  adjustable: boolean;
+}
+
+export interface VolumeAvgIndicatorConfig {
+  enabled: boolean; // master on/off for the whole indicator
+  lines: VolumeAvgLineConfig[]; // always exactly 4, in fixed order (day, n1, n2, n3)
+}
+
+export const VOLUME_AVG_BAR_MIN = 2;
+export const VOLUME_AVG_BAR_MAX = 50;
+export const VOLUME_AVG_BAR_STEP = 1;
+
+export function createDefaultVolumeAvgConfig(): VolumeAvgIndicatorConfig {
+  return {
+    enabled: false, // opt-in, same convention as the Indicators list starting empty
+    lines: [
+      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", barCount: 0, adjustable: false },
+      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", barCount: 3, adjustable: true },
+      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", barCount: 6, adjustable: true },
+      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", barCount: 9, adjustable: true },
+    ],
+  };
+}
+
 export interface SubWindowConfig {
   id: string;
   connector: ConnectorId;
@@ -45,6 +106,9 @@ export interface SubWindowConfig {
   indicators: IndicatorType[];
   candleLimit: CandleLimit;
   backgroundColor: string; // hex, e.g. "#131720"
+  gridColor: string; // hex, e.g. "#1E2530"
+  timer: TimerConfig;
+  volumeAvg: VolumeAvgIndicatorConfig;
 }
 
 export const DEFAULT_SYMBOL = "NVDA";

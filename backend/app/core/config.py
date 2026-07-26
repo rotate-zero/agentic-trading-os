@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # --- Market Clock ---
     market_timezone: str = "America/New_York"
 
+    # --- IBKR (Phase 3) ---
+    # Default port 4002 = IB Gateway PAPER trading. 4001 = Gateway live,
+    # 7497 = TWS paper, 7496 = TWS live. Paper is the default on purpose —
+    # switching to a live port is an explicit, deliberate choice, not an
+    # accident of leaving a default in place.
+    ibkr_host: str = "127.0.0.1"
+    ibkr_port: int = 4002
+    ibkr_client_id: int = 1
+
     # --- CORS (frontend dev server) ---
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 

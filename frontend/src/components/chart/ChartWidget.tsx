@@ -9,7 +9,10 @@ import {
 } from "lightweight-charts";
 import type { Candle, ChartObject } from "../../types/market";
 import type { IndicatorPoint } from "../../utils/indicators";
-import type { CandleLimit } from "../../types/workspace";
+import type { CandleLimit, Timeframe, TimerConfig, VolumeAvgIndicatorConfig } from "../../types/workspace";
+import { DEFAULT_GRID_COLOR } from "../../types/workspace";
+import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
+import { TimerBadge } from "./TimerBadge";
 
 export interface IndicatorSeries {
   key: string;
@@ -33,6 +36,10 @@ interface ChartWidgetProps {
   indicators?: IndicatorSeries[];
   candleLimit?: CandleLimit;
   backgroundColor?: string;
+  gridColor?: string;
+  timeframe?: Timeframe;
+  timer?: TimerConfig;
+  volumeAvg?: VolumeAvgIndicatorConfig;
 }
 
 const BULL = "#3FB950";
@@ -46,6 +53,10 @@ export function ChartWidget({
   indicators = [],
   candleLimit = "all",
   backgroundColor = "#131720",
+  gridColor = DEFAULT_GRID_COLOR,
+  timeframe,
+  timer,
+  volumeAvg,
 }: ChartWidgetProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -68,8 +79,8 @@ export function ChartWidget({
         fontFamily: "IBM Plex Mono, ui-monospace, monospace",
       },
       grid: {
-        vertLines: { color: "#1E2530" },
-        horzLines: { color: "#1E2530" },
+        vertLines: { color: DEFAULT_GRID_COLOR },
+        horzLines: { color: DEFAULT_GRID_COLOR },
       },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: "#1E2530" },
@@ -106,14 +117,18 @@ export function ChartWidget({
     };
   }, []);
 
-  // Background color — applied live via applyOptions rather than folded into
-  // chart creation, so changing it (or loading a saved layout with a
-  // different color) never tears down the chart and loses zoom/pan state.
+  // Background + grid line color — applied live via applyOptions rather than
+  // folded into chart creation, so changing either (or loading a saved layout
+  // with different colors) never tears down the chart and loses zoom/pan state.
   useEffect(() => {
     chartRef.current?.applyOptions({
       layout: { background: { type: ColorType.Solid, color: backgroundColor } },
+      grid: {
+        vertLines: { color: gridColor },
+        horzLines: { color: gridColor },
+      },
     });
-  }, [backgroundColor]);
+  }, [backgroundColor, gridColor]);
 
   // Candle/volume data updates — runs whenever candles change for any reason
   // (symbol switch, timeframe switch, or eventually a live WebSocket push).
@@ -220,6 +235,36 @@ export function ChartWidget({
     };
   }, [overlays]);
 
+  // Volume average lines — up to 4 horizontal price lines drawn on the volume
+  // pane's own price scale (via createPriceLine, same mechanism the
+  // horizontal_line overlay above uses on the candle series). Dotted (vs. the
+  // overlay lines' dashed) purely so the two families are visually distinct.
+  // Re-drawn whenever candles or the line configs change; cleanup removes the
+  // previous set first so toggling a line off (or changing its bar count)
+  // never leaves a stale line behind.
+  useEffect(() => {
+    const series = volumeSeriesRef.current;
+    if (!series || !volumeAvg?.enabled) return;
+
+    const priceLines = volumeAvg.lines
+      .filter((line) => line.enabled)
+      .map((line) => {
+        const value = line.adjustable ? trailingAverageVolume(candles, line.barCount) : dayAverageVolume(candles);
+        return series.createPriceLine({
+          price: value,
+          color: line.color,
+          lineWidth: 1,
+          lineStyle: 1, // dotted
+          axisLabelVisible: true,
+          title: line.label,
+        });
+      });
+
+    return () => {
+      priceLines.forEach((line) => series.removePriceLine(line));
+    };
+  }, [candles, volumeAvg]);
+
   // Indicator line series — created/updated/removed as the sub-window's indicator
   // selection changes. Keyed so toggling one indicator doesn't touch the others.
   useEffect(() => {
@@ -255,6 +300,7 @@ export function ChartWidget({
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
+      {timeframe && timer && <TimerBadge timeframe={timeframe} timer={timer} />}
       {rectBoxes.map((box, i) => (
         <div
           key={i}
