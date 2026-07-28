@@ -97,3 +97,63 @@
 **Why deferred:** already reasoned through in `../architecture/system-design.md` §6 — no need for the operational overhead of a second service while this remains a single-operator modular monolith.
 
 **Trigger to revisit:** agents or other modules actually need to run as separate processes (e.g. for compute isolation or independent scaling).
+
+---
+
+## 9. FundamentalsProvider (Quarterly-Tier Context)
+
+**What it is:** a Context provider surfacing company fundamentals — revenue, profitability, debt, cash, leadership/quality signals — as slow-refresh context, using the same `ContextProvider` interface as `GapProvider` or `VolatilityRegimeProvider` (`../architecture/trading-intelligence-architecture.md` §5), just triggered on filings/earnings events instead of a seconds-scale timer.
+
+**Why deferred:** not because fundamentals don't matter for this system's future — they're explicitly kept out of "don't build at all" territory (see `confirmed-decisions.md` #21) — but because a confirmed structured-data source isn't settled yet. `ib_async` may partially cover this; needs a real spike, not an assumption, before committing to a schema.
+
+**Trigger to revisit:** a confirmed fundamentals data source, or the point at which swing/position-holding-period trading becomes an actual near-term goal rather than an open door to keep available. In the meantime, fundamentals still inform which symbols enter the 100-name scanning universe — that's a one-time screen, not a live provider, and needs no architecture change to keep doing today.
+
+**Where it would plug in:** `trading_intelligence/context_engine/providers/fundamentals_provider.py`, triggered by an `EarningsReleased`/filing event rather than the `DebounceScheduler`'s seconds-scale rhythm.
+
+---
+
+## 10. Expectation / Surprise Provider
+
+**What it is:** markets move on the delta between expected and actual, not the raw number — same-magnitude EPS beats send stocks in opposite directions depending on what was priced in beforehand. This would extend `CalendarProvider`'s scheduled events (earnings, Fed decisions, CPI) with a consensus/expected value, and compute the surprise once the real value lands.
+
+**Why deferred:** needs a consensus-estimate data source (earnings estimates, economic forecast consensus) this system has no confirmed access to yet — same class of gap as Fundamentals (#9), not a design problem.
+
+**Trigger to revisit:** a confirmed consensus-estimate data source. Worth prioritizing highly once that's settled — of everything parked in this document, this is one of the more clearly load-bearing concepts, not a nice-to-have.
+
+**Where it would plug in:** extends `CalendarProvider`'s event schema with an optional expected-value field; a companion provider (or the same one) computes and publishes the delta once the actual value posts.
+
+---
+
+## 11. Fundamentals-Informed Sizing / Confidence
+
+**What it is:** letting fundamental quality — not just technical setup — influence position size, confidence, or holding duration. Two symbols with identical technical setups don't have to get identical treatment.
+
+**Why deferred:** a two-step idea, and only the first step (visibility, via #9) is safe to build now. Wiring fundamentals into Decision Engine's arbitration or Trade Planning's Kelly sizing means inventing a real number for "how much does low fundamental quality shrink size" — exactly the kind of number that shouldn't be guessed before it can be checked, per the same reasoning already applied to Uncertainty Propagation (#3).
+
+**Trigger to revisit:** `FundamentalsProvider` (#9) is live, and Performance Intelligence exists with enough history to check whether fundamentals-adjusted sizing actually improves outcomes versus technical-only sizing.
+
+**Where it would plug in:** new optional fields on the Opportunity/Decision schema (`../architecture/system-design.md` §10), consumed by `governor/position_sizing.py`.
+
+---
+
+## 12. Macro / Global Slow-Tier Provider
+
+**What it is:** a Context provider for macro conditions that drift over days-to-weeks — currency, commodity prices, broad rate levels, geopolitical events — as opposed to the scheduled macro *events* (Fed day, CPI print) `CalendarProvider` already covers.
+
+**Why deferred:** lowest priority of the slow-tier providers parked here. The scheduled-event slice that actually matters intraday is already covered; unscheduled macro drift matters far more for swing/position holding periods than for a scanner-driven intraday system, and the "keep the door open" reasoning (`confirmed-decisions.md` #21) applies with less force here than to Fundamentals or Expectation, which have a more direct line to individual per-symbol decisions.
+
+**Trigger to revisit:** same trigger as Fundamentals (#9) — swing/position trading becomes an active goal — but revisit it after #9 and #10, not alongside them.
+
+**Where it would plug in:** `trading_intelligence/context_engine/providers/macro_provider.py`, same slow-refresh pattern as Fundamentals.
+
+---
+
+## 13. Causal Psychology Inference / Market Participant Taxonomy
+
+**What it is:** going beyond Participation's observable buy/sell imbalance (`../architecture/trading-intelligence-architecture.md` §4, shipped) to explain *why* — panic vs. genuine excitement vs. short covering vs. options-hedging flow — and, relatedly, a real breakdown of who's trading (retail, institutions, HFTs, options dealers) rather than an inferred aggregate.
+
+**Why deferred:** distinguishing these causes needs data this system has no confirmed source for — short interest, options gamma exposure/dealer positioning, order-flow-level participant classification. Labeling a volume spike "panic" using only price/volume data that's equally consistent with short covering would be a confidently wrong label, not a useful one — worse than leaving it unlabeled. Same calibration discipline already applied to Uncertainty Propagation (#3): don't dress up a guess as inference.
+
+**Trigger to revisit:** confirmed access to options-flow or short-interest data (via IBKR or a dedicated feed). Once that exists, this becomes a genuine inference layer built on real signal rather than a relabeling of Participation.
+
+**Where it would plug in:** a new Context provider, or, if the inference turns out complex enough to need its own reasoning loop, a discrete module reading Participation plus the new data source — evaluate which it needs at that time rather than assuming now.

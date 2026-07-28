@@ -1,5 +1,5 @@
 # Personal AI Trading Workspace — System Design Document
-**Version:** 2.2 (Pre-Implementation)
+**Version:** 2.3 (Pre-Implementation)
 **Status:** Phase 2 kickoff — Event Bus dispatch lanes and shared update-policy utility added
 **Owner:** Saqib
 **Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) — how the system thinks (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) — concepts raised and deliberately deferred, with reasoning intact, so they aren't lost or re-argued from scratch. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) — the running settled-decisions log. [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) — phased delivery plan and exit criteria. This doc explains how the system is built. Read all of them; they're deliberately kept separate. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
@@ -141,7 +141,7 @@ The WebSocket Gateway (§4.12) is just one more subscriber — it re-publishes a
 Every event listed above has a formal, versioned payload schema — see §10 for the full contract and versioning rules. That section is what Phase 2 actually implements; the list here is just the vocabulary.
 
 ### 4.5 Feature Engine
-Computes every technical indicator exactly once per symbol per update: EMA(s), VWAP, ATR, previous day high/low, relative volume, gap %, opening range, average volume, trend slope. Publishes a `FeatureSet` object via `FeaturesUpdated`.
+Computes every technical indicator exactly once per symbol per update: EMA(s), VWAP, ATR, previous day high/low, relative volume, gap %, opening range, average volume, trend slope, signed-volume / uptick-downtick imbalance (feeds Market State's Participation dimension — see `trading-intelligence-architecture.md` §4). Publishes a `FeatureSet` object via `FeaturesUpdated`.
 
 This exists specifically to prevent the failure mode where Momentum, Breakout, and VWAP strategies each compute their own EMA and quietly disagree. **Nothing downstream — not the Scanner, not the Market State Engine, not any Strategy — computes an indicator itself. They all consume the same `FeatureSet`.**
 
@@ -345,7 +345,7 @@ trading-workspace/
 │   │   │   └── historical_writer.py
 │   │   ├── feature_engine/
 │   │   │   ├── engine.py
-│   │   │   └── indicators.py             # EMA, VWAP, ATR, PDH/PDL, rel. volume, gap %, ...
+│   │   │   └── indicators.py             # EMA, VWAP, ATR, PDH/PDL, rel. volume, gap %, signed-volume imbalance, ...
 │   │   ├── scanner/
 │   │   │   ├── scanner.py
 │   │   │   └── schedule.py               # ScanCadenceSchedule, keyed to Market Clock sessions
@@ -359,7 +359,9 @@ trading-workspace/
 │   │   │   │       ├── calendar_provider.py
 │   │   │   │       ├── gap_provider.py
 │   │   │   │       ├── levels_provider.py
-│   │   │   │       └── volatility_regime_provider.py
+│   │   │   │       ├── volatility_regime_provider.py
+│   │   │   │       ├── sector_correlation_provider.py
+│   │   │   │       └── news_flag_provider.py
 │   │   │   ├── strategy_engine/
 │   │   │   │   ├── base_strategy.py
 │   │   │   │   ├── orb_strategy.py

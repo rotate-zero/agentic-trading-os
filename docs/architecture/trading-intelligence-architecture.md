@@ -1,5 +1,5 @@
 # Trading Intelligence Architecture
-**Version:** 1.2
+**Version:** 1.3
 **Companion documents:** [`system-design.md`](./system-design.md) — that doc explains *how the system is built* (modules, interfaces, deployment, folder structure). This doc explains *how the system thinks* (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) holds concepts raised and deliberately deferred, with the reasoning intact, so they don't need to be re-argued from scratch later. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) is the running settled-decisions log. Keep these separate; a change to trading logic shouldn't require touching WebSocket plumbing, and an idea that isn't ready yet shouldn't clutter a document meant to describe what's actually built. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
 
 ---
@@ -120,7 +120,9 @@ Changed at: 09:52:14
 
 This is what lets strategies reason about *change*, not just position — "momentum has been weakening for 12 minutes" is a fundamentally different (and more useful) signal than "momentum = 65." A snapshot can't tell you that; a state object with memory can.
 
-**State dimensions tracked (each with the duration/strength/confidence/previous shape above):** Trend, Volatility regime, Volume regime, VWAP relationship, Session type, Market breadth.
+**State dimensions tracked (each with the duration/strength/confidence/previous shape above):** Trend, Volatility regime, Volume regime, VWAP relationship, Session type, Market breadth, Participation.
+
+**Participation is the observable half of market psychology, not the causal half.** §7's agent-design table already asks "who is in control — buyers or sellers?" as an example question; this is where it gets a real answer. Feature Engine computes a raw, tick-derived signed-volume / uptick-downtick imbalance — an observable, no different in kind from relative volume or gap % — and Market State Engine turns that into a Participation dimension with the same duration/strength/confidence/previous shape as everything else, so "buyers have been in control for 8 minutes and strengthening" is a first-class read. What Participation deliberately does *not* claim is *why*: the same volume imbalance can mean panic, excitement, short covering, or options-hedging flow, and telling those apart needs data (options gamma exposure, short interest) this system has no confirmed source for yet. That causal-inference layer is real, and it's kept visible rather than dropped — see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 — but faking it from data that can't support the distinction would produce a confidently wrong label, not a useful one.
 
 **Implementation note, flagged deliberately because it's easy to get wrong:** this makes the Market State Engine *stateful* — it holds a rolling window per symbol, not just the latest computed value. That raises a real question for Phase 5: on a backend restart mid-session, does the engine rebuild "bullish for 23 minutes" from `market_state_history` / `market_events` (see `system-design.md` §4.13), or does it wake up with duration reset to zero? **Decision: rebuild from persisted history on startup.** The whole point of storing `market_state_history` and `market_events` is to make state survive a restart — an engine that forgets duration every time the process bounces defeats the feature. This should be a concrete Phase 5 task, not an afterthought.
 
@@ -142,7 +144,9 @@ class ContextProvider(ABC):
     async def evaluate(self, market_state: MarketState) -> dict: ...
 ```
 
-v1 providers: `CalendarProvider` (session timing, Fed days, holidays — via Market Clock), `GapProvider` (gap status vs. prior close), `LevelsProvider` (proximity to PDH/PDL/VWAP/round numbers), `VolatilityRegimeProvider` (realized vol vs. recent history). Context Engine calls each registered provider and merges their output into one `ContextChanged` event (see `system-design.md` §10 for the payload contract). Adding a new context dimension later — News, OPEX, breadth — means writing one new provider, not touching the aggregator or anything downstream.
+v1 providers: `CalendarProvider` (session timing, Fed days, holidays — via Market Clock), `GapProvider` (gap status vs. prior close), `LevelsProvider` (proximity to PDH/PDL/VWAP/round numbers), `VolatilityRegimeProvider` (realized vol vs. recent history), `SectorCorrelationProvider` (is this symbol moving with or against its sector ETF right now — a breakout against a falling sector is a different trade than one moving with it), `NewsFlagProvider` (has a headline hit for this symbol in the last N minutes — a boolean/count, deliberately not sentiment scoring; see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 for why NLP sentiment stays deferred). Context Engine calls each registered provider and merges their output into one `ContextChanged` event (see `system-design.md` §10 for the payload contract). Adding a new context dimension later — OPEX, breadth, fundamentals — means writing one new provider, not touching the aggregator or anything downstream.
+
+**Providers refresh at whatever cadence their underlying reality actually changes at — this was always true of the interface, now made explicit because it matters for what comes next.** `VolatilityRegimeProvider` re-evaluates on the same `DebounceScheduler` rhythm as Market State (§4, seconds-scale). `CalendarProvider` changes on session/day boundaries. Nothing about the `ContextProvider` interface assumes tick-speed refresh — a provider whose underlying reality only changes quarterly (earnings, balance-sheet data) is exactly as valid a provider as one that changes every 10 seconds; it just triggers on a different event (`EarningsReleased` instead of a volatility threshold crossing) and sits idle otherwise. This is what keeps a path open to slower-moving context — fundamentals, macro — without it costing anything today: same abstraction, sparser trigger, no new module. See [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #9–#12 for the specific slow-tier providers this unlocks once their data sources are settled.
 
 ---
 
@@ -168,7 +172,7 @@ Don't design a module around "an EMA strategy." Design it around a question it a
 | Module | Question |
 |---|---|
 | Trend (part of Market State Engine) | What is the dominant trend? |
-| Participation | Who is in control — buyers or sellers? |
+| Participation (part of Market State Engine, §4) | Who is in control — buyers or sellers? |
 | Liquidity | Where is liquidity likely sitting? |
 | Breakout (a Strategy) | Is this breakout likely to continue? |
 | Risk (the Governor) | Can we afford this trade? |
@@ -319,7 +323,7 @@ Single-writer-per-domain stays fully intact — `WorldView` has no state of its 
 
 ## 16. Explicitly Deferred (Not Forgotten)
 
-Deferred ideas — this round's and earlier rounds' — now live in one place: [**`../decisions/future-ideas.md`**](../decisions/future-ideas.md). That includes Replay Engine, Simulation Mode, Knowledge Engine, Attention Engine, uncertainty propagation, and the full write-everywhere World Model. Centralizing them there (rather than re-explaining reasoning in whichever doc happened to be open when the idea came up) is what keeps this doc and `system-design.md` from drifting — the same reasoning that justified splitting into two documents in the first place applies to a third.
+Deferred ideas — this round's and earlier rounds' — now live in one place: [**`../decisions/future-ideas.md`**](../decisions/future-ideas.md). That includes Replay Engine, Simulation Mode, Knowledge Engine, Attention Engine, uncertainty propagation, the full write-everywhere World Model, and — added this round — a quarterly-tier `FundamentalsProvider`, an Expectation/Surprise provider, fundamentals-informed sizing, a macro slow-tier provider, and causal psychology / market-participant inference (options flow, short interest). Centralizing them there (rather than re-explaining reasoning in whichever doc happened to be open when the idea came up) is what keeps this doc and `system-design.md` from drifting — the same reasoning that justified splitting into two documents in the first place applies to a third.
 
 One piece of reasoning worth keeping visible here rather than only in the future-ideas doc, because it's load-bearing for Phase 3: `system-design.md`'s `BrokerAdapter` interface already means the Market Data Engine doesn't care whether its source is live or replayed. Replay, whenever it's built, becomes a new implementation of that interface — not a redesign of anything upstream. That's why deferring it now costs nothing later.
 
@@ -332,7 +336,10 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Trading-intelligence concept | Code location (`system-design.md`) |
 |---|---|
 | Market State (with memory) | `trading_intelligence/market_state_engine.py` → `market_state_history` table |
+| Participation (Market State dimension) | `feature_engine/indicators.py` (signed volume / tick imbalance) → `trading_intelligence/market_state_engine.py` |
 | Context (composed providers) | `trading_intelligence/context_engine/` (`engine.py` + `providers/`) (derived, not persisted) |
+| Sector/correlation context | `trading_intelligence/context_engine/providers/sector_correlation_provider.py` |
+| News-flag context | `trading_intelligence/context_engine/providers/news_flag_provider.py` |
 | Strategy Engine | `trading_intelligence/strategy_engine/` → `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `trading_intelligence/opportunity_engine.py` → `ai_decisions` |
 | Decision Engine | `trading_intelligence/decision_engine.py` → `ai_decisions` |
