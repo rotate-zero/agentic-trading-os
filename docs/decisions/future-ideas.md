@@ -157,3 +157,15 @@
 **Trigger to revisit:** confirmed access to options-flow or short-interest data (via IBKR or a dedicated feed). Once that exists, this becomes a genuine inference layer built on real signal rather than a relabeling of Participation.
 
 **Where it would plug in:** a new Context provider, or, if the inference turns out complex enough to need its own reasoning loop, a discrete module reading Participation plus the new data source — evaluate which it needs at that time rather than assuming now.
+
+---
+
+## 14. Position Monitor / Trade Management Integration for Manually-Initiated Positions
+
+**What it is:** once a manually-initiated trade (`../architecture/trading-intelligence-architecture.md` §18) is filled, letting Position Monitor actively manage it — move stops, flag weakening, suggest partial exits — the same way it already does for AI-originated positions; and extending the Trade Management widget with manual-specific controls (e.g. hotkey-driven `MOVE_STOP` / close-fraction commands) for positions the human is actively watching.
+
+**Why deferred:** explicitly scoped out of the first manual-trading iteration on purpose, not overlooked — see `trading-intelligence-architecture.md` §18.8. Building it now would mean designing Position Monitor's behavior for a position type (`origin="manual"`) before there's any real usage of manual entry to learn from. A manually-opened position today is recorded in `trades`/`positions` exactly like any other and simply isn't yet under any origin-aware management logic.
+
+**Trigger to revisit:** manual trade entry ships and real usage shows demand for in-position manual control — i.e. traders are actually taking manual entries often enough that "how does Position Monitor treat this" becomes a live question rather than a hypothetical one.
+
+**Where it would plug in:** `position_monitor/monitor.py` gains origin-aware branching (parallel to Trade Planning Engine's `TradeRequest.origin` branching, decision #22); Trade Management widget gains the deferred `MOVE_STOP`/close-fraction `InputCommand` types held back in decision #23.

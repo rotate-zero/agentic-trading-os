@@ -1,5 +1,5 @@
 # Trading Intelligence Architecture
-**Version:** 1.3
+**Version:** 1.5 — refined §18 (unified Trade Planning interface, generalized Input Layer vocabulary)
 **Companion documents:** [`system-design.md`](./system-design.md) — that doc explains *how the system is built* (modules, interfaces, deployment, folder structure). This doc explains *how the system thinks* (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) holds concepts raised and deliberately deferred, with the reasoning intact, so they don't need to be re-argued from scratch later. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) is the running settled-decisions log. Keep these separate; a change to trading logic shouldn't require touching WebSocket plumbing, and an idea that isn't ready yet shouldn't clutter a document meant to describe what's actually built. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
 
 ---
@@ -343,7 +343,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Strategy Engine | `trading_intelligence/strategy_engine/` → `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `trading_intelligence/opportunity_engine.py` → `ai_decisions` |
 | Decision Engine | `trading_intelligence/decision_engine.py` → `ai_decisions` |
-| Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft) |
+| Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft); single `plan(TradeRequest)` interface, see §18 |
 | Governor (widened decision schema) | `governor/governor.py`, `risk_rules.py`, `position_sizing.py` → `trades` (approved/rejected) |
 | Position Monitor | `position_monitor/monitor.py` → `positions` |
 | Performance Intelligence | `performance_intelligence/analyzer.py` → `strategy_performance` |
@@ -353,5 +353,130 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Feature Engine | `feature_engine/engine.py`, `indicators.py` → `feature_snapshots` |
 | World View (read-only facade) | `world_view/composite.py` — reads only, owns nothing |
 | Shared update-policy utility (DebounceScheduler) | `core/debounce_scheduler.py` — used by Market State Engine (§4) and Position Monitor (§13) |
+| Execution Mode (auto/manual) | `execution_engine/mode.py` (flag + `ExecutionModeChanged` event) → `portfolio_state` — see §18 |
+| Approval Queue | `execution_engine/approval_queue.py` → `trades` (`status=pending_confirmation`) — see §18 |
+| Input Layer / `InputCommand` | `input_layer/` (device adapters + shared schema) — frontend-owned; backend never sees which physical device fired — see §18 |
 
 If a trading-logic change doesn't map to a row in this table, it's a signal the code structure needs to catch up — not that the mapping should be skipped.
+
+---
+
+## 18. Manual Trading & Execution Modes
+
+Manual trading is not a second system running alongside the AI pipeline — it is a second *source* feeding the same pipeline, and a second *behavior* at the Governor→Execution boundary. Nothing in §3–§12 changes. This revision (v1.5) folds in three refinements: a single public Trade Planning interface, removal of a component that duplicated what the Input Layer already does, and a fully generalized command vocabulary.
+
+```
+Input Device → Input Layer → TradeRequest → Trade Planning Engine → TradePlan → Governor → Execution Engine → Broker
+                                                      ▲
+                                    Decision Engine ──┘ (auto path, unchanged)
+```
+
+### 18.1 One public Trade Planning interface
+
+Agreed, and it's a real improvement over v1.4's two methods (`plan()` / `plan_manual()`). Trade Planning Engine should not expose a different method per origin — that just means every future origin (a signals import, copy-trading, whatever comes next) needs its own new public method forever. One interface, one input type that describes its own origin:
+
+```python
+trade_planning_engine.plan(request: TradeRequest) -> TradePlan
+```
+
+The engine branches internally on `request.origin` (auto-path sizing uses the opportunity's edge estimate; manual-path sizing uses the corroboration check in §18.4) — but that's an implementation detail inside one function, not two public contracts. Decision Engine, Governor, and Execution Engine still require zero new logic; they only ever see the resulting `TradePlan`.
+
+### 18.2 `TradeRequest`
+
+```python
+class TradeRequest(BaseModel):
+    origin: Literal["auto", "manual"]
+    symbol: str
+    direction: Literal["long", "short"]
+    opportunity: OpportunitySelected | None = None  # required when origin == "auto"
+    manual_size: ManualSize | None = None           # optional when origin == "manual";
+                                                     # absent = size via corroborated Kelly (§18.4),
+                                                     # if any, otherwise rejected — no silent default
+    order_type: Literal["market", "limit"] = "market"
+    limit_price: float | None = None                # required when order_type == "limit"
+```
+
+### 18.3 `TradePlan` — unchanged from v1.4
+
+```python
+class TradePlan(BaseModel):
+    symbol: str
+    direction: Literal["long", "short"]
+    entry: float
+    stop: float
+    target: float | None = None
+    size: int
+    r_multiple: float | None = None
+    max_hold_seconds: int | None = None
+    scaling_plan: list[str] | None = None
+    trailing_stop_rule: str | None = None
+    origin: Literal["auto", "manual"]
+    corroboration: list[str] = []   # symbols/strategy names of any Opportunity
+                                     # Objects independently agreeing with this
+                                     # trade; empty is a valid, meaningful value
+```
+
+`origin` carries forward from `TradeRequest` into `TradePlan` unchanged, which is what lets Governor's reasons, the Approval Queue, and Performance Intelligence (§14) distinguish manual from AI-originated trades without special-casing — same "widen now, narrow implementation" pattern as `GovernorDecision` (confirmed decision #6).
+
+### 18.4 Success-rate evaluation — corroboration, not a fabricated score
+
+A manually proposed trade has no strategy backing it by definition, so there's no honest probability to attach to it out of nothing. When `plan()` receives `origin == "manual"`, it does one cheap, real thing instead: reads (never decides) current Opportunity Objects for the symbol from Opportunity Engine (§9). If an active strategy already independently sees the same setup, that strategy's real confidence is surfaced and recorded in `corroboration`. If nothing corroborates it, the plan says so explicitly rather than presenting a number. Sizing follows the same rule — fractional-Kelly sizing (§11) needs a real edge estimate; with no corroborating strategy, `manual_size` (the human's own dollar/percentage/share input) is required, not optional, and Kelly doesn't run.
+
+### 18.5 Execution Mode
+
+```python
+class ExecutionMode(str, Enum):
+    AUTO = "auto"
+    MANUAL = "manual"
+```
+
+One value, system-wide, at a time — owned by Portfolio State (account-level state, same as buying power or daily loss consumed) and broadcast as `ExecutionModeChanged` so Execution Engine and the frontend both react without polling (system-design.md principle 4). Deliberately an enum, not a bare bool, so a third mode (simulation, review-only — explicitly not designed now) is additive later, not breaking.
+
+**Execution Engine (system-design.md §4.9) is the only module that changes behavior**, and only where it currently "routes through `BrokerAdapter.place_order`":
+
+- `mode == auto` → unchanged. `OrderApproved` flows straight through to `place_order`.
+- `mode == manual` → the approved `TradePlan` is written to an **Approval Queue** instead (`status=pending_confirmation`) and a `PlanAwaitingConfirmation` event notifies the UI. A human action — `ManualConfirmOrder` or `ManualDiscardOrder` — actually calls `place_order`, or discards it.
+
+A discarded/ignored plan is logged with the same discipline as a Governor rejection (§12: *"a rejected plan is exactly as valuable a data point as an approved one"*).
+
+**Note for `system-design.md`:** §4.9 needs this same mode-check added — out of scope for this doc, flagged so it doesn't drift (confirmed decision #11's own rule).
+
+### 18.6 Input Layer
+
+Correct abstraction, same justification as v1.4: nothing above `BrokerAdapter` should know which broker is behind it (architectural principle 1); nothing above the Input Layer should know which physical device fired a command. Device adapters (Gamepad API, keyboard, Stream Deck webhook, voice-to-text) live in the frontend, all normalizing to one shape, sent over the existing WebSocket Gateway (system-design.md §4.12) — no new transport.
+
+```python
+class ManualSize(BaseModel):
+    mode: Literal["shares", "percentage", "dollars"]
+    value: float
+
+class InputCommand(BaseModel):
+    command: Literal["BUY", "SELL", "PROPOSE_LONG", "PROPOSE_SHORT", "CANCEL_PENDING"]
+    symbol: str | None = None        # None = currently focused chart symbol
+    order_type: Literal["market", "limit"] = "market"
+    limit_price: float | None = None
+    size: ManualSize | None = None   # None on PROPOSE_* — sizing is decided after review
+```
+
+**Vocabulary generalized as requested** — quantity is a `size` parameter (`mode` + `value`), not encoded in the command name, so a future sizing option never requires a new command. `symbol` stays a top-level field rather than a `params` entry, deliberately: it's addressing information every command needs, not an action-specific tuning knob like `size` or `order_type` — folding it into an untyped dict would make it optional-looking when it's actually load-bearing for every command except "use whatever's focused."
+
+**One naming ambiguity worth resolving explicitly.** `SELL` is back in this list, and it's genuinely ambiguous in trading vocabulary: it could mean "open a short position" (an entry, in scope) or "close/reduce an existing long" (an exit, explicitly out of scope per §18.8). v1.4 silently dropped `SELL` from the working vocabulary for this exact reason without saying so — that was an inconsistency, not a decision, and worth naming now rather than carrying forward quietly. Resolving it as **entry-only**: `SELL` here means *open a short position*, symmetric to `BUY` opening a long — both are immediate market/limit entries with a pre-decided `size`. Closing or reducing an existing position is reserved for a distinct future verb (e.g. `CLOSE`) once Position Monitor/Trade Management are in scope, so the two meanings never collide under one name. If that's not the intended reading, say so and it's a one-line fix.
+
+This iteration's vocabulary: `BUY`, `SELL` (opens short, per above), `PROPOSE_LONG`, `PROPOSE_SHORT`, `CANCEL_PENDING` (Approval Queue only — never live orders or positions).
+
+### 18.7 No dedicated `ManualPlanBuilder`
+
+Agreed — removing it. The only thing it would have done is translate an `InputCommand` into a `TradeRequest`, and that translation belongs to the Input Layer itself: it already owns "normalize whatever the device sent into one shape" (§18.6), and `TradeRequest` is just that shape's next stop. Adding a named backend component for a pure data reshape would be structure for its own sake — exactly the kind of thing this project's own discipline (confirmed decisions, `future-ideas.md`) exists to avoid building before it's earned. If the translation ever grows real logic — permissioning, rate-limiting a trigger-happy hotkey, multi-step confirmation state — that's a legitimate trigger condition for promoting it to a real component then, not now.
+
+### 18.8 Explicitly deferred: Position Monitor & Trade Management for manual positions
+
+This is a conscious design decision, not an omission. Position Monitor, Trade Management, and any post-entry manual workflow (stop moves, partial exits, reversal) are untouched by this iteration. Once a manual `TradePlan` is accepted and filled, it's recorded exactly where an auto-executed one is — the existing `trades` table (§17 bridge table) — `origin="manual"` is sufficient to distinguish it; no new logging infrastructure. A manually-opened position, once filled, is managed no differently than any other open position today, which is to say: not yet actively managed by Position Monitor logic that's aware of manual origin — that integration is future work.
+
+Worth logging as a `future-ideas.md` entry with an explicit trigger condition (e.g. "once manual entry has real usage data showing demand for in-position manual control") so it's recoverable later rather than needing to be re-argued from scratch — happy to draft that entry alongside this doc if useful.
+
+### 18.9 Changes made beyond what was requested
+
+- Unified `plan()`/`plan_manual()` into the single interface requested (§18.1), and removed `ManualPlanBuilder` as its own file/row in the bridge table (§18.7) — it was already redundant with the Input Layer once the single interface existed.
+- Named and resolved the `SELL` ambiguity explicitly (§18.6) rather than letting v1.4's silent omission of it stand unexplained.
+- Added `order_type`/`limit_price` to both `TradeRequest` and `InputCommand`, since "order type" was in the requested parameter list but hadn't been modeled anywhere yet.
+- Kept `symbol` as a top-level field rather than folding it into `params`/`size` — held this position rather than adopting the flatter version, with reasoning in §18.6, since it's addressing information rather than a sizing/type parameter.

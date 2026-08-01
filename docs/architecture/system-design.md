@@ -1,5 +1,5 @@
 # Personal AI Trading Workspace — System Design Document
-**Version:** 2.3 (Pre-Implementation)
+**Version:** 2.4 (Pre-Implementation) — Execution Engine documented as mode-aware (auto/manual), see §4.9 and companion doc §18
 **Status:** Phase 2 kickoff — Event Bus dispatch lanes and shared update-policy utility added
 **Owner:** Saqib
 **Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) — how the system thinks (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) — concepts raised and deliberately deferred, with reasoning intact, so they aren't lost or re-argued from scratch. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) — the running settled-decisions log. [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) — phased delivery plan and exit criteria. This doc explains how the system is built. Read all of them; they're deliberately kept separate. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
@@ -179,7 +179,7 @@ This section gives each module's software interface — what it consumes, what i
 | Strategy Engine | `MarketStateChanged`, `ContextChanged`, `FeaturesUpdated` | `OpportunityCreated` | `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `OpportunityCreated` (all strategies, per symbol) | ranked opportunity list | `ai_decisions` |
 | Decision Engine | ranked opportunities + Portfolio State | `OpportunitySelected` | `ai_decisions` |
-| Trade Planning Engine | `OpportunitySelected` | `TradePlanned` | `trades` (draft) |
+| Trade Planning Engine | `OpportunitySelected` (auto) or manual `TradeRequest` (hotkey/UI) | `TradePlanned` | `trades` (draft) |
 | Governor | `TradePlanned` + Portfolio State + Context | `OrderApproved` / `PlanRejected` | `trades` (approved/rejected) |
 | Position Monitor | `OrderFilled`, ongoing `MarketStateChanged` | `PositionAdjusted` / `PositionClosed` | `positions` |
 | Performance Intelligence | `PositionClosed`, `feature_snapshots`, `market_events` | strategy reweighting signal | `strategy_performance` |
@@ -215,6 +215,8 @@ class Strategy(ABC):
 ### 4.9 Execution Engine
 Only module allowed to place orders. Consumes `OrderApproved` (payload: `ApprovedOrder`), routes through `BrokerAdapter.place_order`, tracks order lifecycle (`pending → filled/partial/rejected`), and emits `OrderFilled` onto the Event Bus so the UI and Position Monitor both update without polling. Must support a **dry-run mode** by default — mirrors the pattern already used in the Polymarket bot.
 
+**Mode-aware since manual trading (`trading-intelligence-architecture.md` §18):** a system-wide `ExecutionMode` (`auto` | `manual`, owned by Portfolio State, broadcast via `ExecutionModeChanged`) gates the one place this module talks to the broker. In `auto` mode, `OrderApproved` flows straight to `place_order` as above, unchanged. In `manual` mode, an approved `TradePlan` is written to an **Approval Queue** (`trades`, `status=pending_confirmation`) instead of firing immediately; a `PlanAwaitingConfirmation` event notifies the UI, and only an explicit `ManualConfirmOrder` (or `ManualDiscardOrder`) actually calls `place_order`. This is the only module whose behavior changes between modes — Decision Engine, Trade Planning Engine, and Governor are identical either way.
+
 ### 4.10 Visualization Engine / Chart Overlay Protocol
 The backend is the only source of chart truth. It pushes typed **chart objects** over WebSocket; the frontend (TradingView Lightweight Charts as a renderer only) draws whatever it receives — it computes nothing.
 
@@ -227,7 +229,7 @@ The backend is the only source of chart truth. It pushes typed **chart objects**
 A discriminated-union Pydantic schema (`ChartObject`) validates all overlay types server-side before they're ever sent.
 
 ### 4.11 Trading Workspace UI
-Component-based, workspace is **data, not code** — a JSON layout describes which widgets are mounted where. Core widgets: Chart, Watchlist, AI Analysis Panel, Trade Management, Positions, Strategy Monitor, Market Scanner, Trade Journal. A `WidgetRegistry` maps widget type → React component, so new widget types don't require touching the layout engine.
+Component-based, workspace is **data, not code** — a JSON layout describes which widgets are mounted where. Core widgets: Chart, Watchlist, AI Analysis Panel, Trade Management (hosts the manual-mode Approval Queue — accept/ignore a Governor-approved plan, or a hotkey-proposed one, per `trading-intelligence-architecture.md` §18), Positions, Strategy Monitor, Market Scanner, Trade Journal. A `WidgetRegistry` maps widget type → React component, so new widget types don't require touching the layout engine.
 
 **Render-rate is a widget concern, not a transport concern.** The WebSocket Gateway and Event Bus push at full frequency — throttling never happens upstream, and the backend stays simple: push everything, always. Widgets that don't need sub-second fidelity (Watchlist rows, Positions summary, P&L) batch incoming updates and flush on a fixed render cadence (e.g. once per animation frame or ~250ms) inside the widget/store layer. Chart needs no such throttling — Lightweight Charts already coalesces to the browser's paint cycle. Execution/risk-relevant UI (order status, Governor rejections) never batches — full latency, always. This gives each widget control over its own responsiveness-vs-render-cost trade-off without adding any backend complexity.
 
@@ -238,12 +240,14 @@ Single multiplexed connection, topic-tagged envelopes — a thin re-publisher si
 { "channel": "market.tick", "symbol": "NVDA", "payload": {...} }
 { "channel": "opportunity.new", "symbol": "NVDA", "payload": {...} }
 { "channel": "orders.status", "order_id": "...", "payload": {...} }
+{ "channel": "input.command", "payload": {...} }               // InputCommand from any device — §18.6, companion doc
+{ "channel": "orders.approval_queue", "payload": {...} }       // manual-mode pending TradePlan, accept/ignore
 { "channel": "chart.overlay", "symbol": "NVDA", "payload": {...} }
 ```
 Frontend subscribes/unsubscribes to channels per symbol as widgets mount/unmount. This avoids one-socket-per-widget sprawl.
 
 ### 4.13 Database (PostgreSQL)
-Core tables: `symbols`, `candles` (natively partitioned by month, sub-partitioned by timeframe), `trades`, `orders`, `positions`, `ai_decisions`, `strategy_performance`, `workspace_layouts`, `watchlists`. Alembic manages migrations from day one so schema drift never becomes a manual-SQL problem.
+Core tables: `symbols`, `candles` (natively partitioned by month, sub-partitioned by timeframe), `trades` (gains an `origin: auto|manual` column and a `pending_confirmation` status once manual trading lands — `trading-intelligence-architecture.md` §18), `orders`, `positions`, `ai_decisions`, `strategy_performance`, `workspace_layouts`, `watchlists`. Alembic manages migrations from day one so schema drift never becomes a manual-SQL problem.
 
 New in this revision, added to support explainability and Market State's temporal memory (see companion doc):
 - **`feature_snapshots`** — the exact `FeatureSet` values at the moment a strategy produced an opportunity. Answers "why did the AI say this" by query, not by recomputation.
@@ -382,7 +386,9 @@ trading-workspace/
 │   │   │   └── risk_rules.py
 │   │   ├── execution_engine/
 │   │   │   ├── order_manager.py
-│   │   │   └── execution_router.py
+│   │   │   ├── execution_router.py
+│   │   │   ├── mode.py                    # ExecutionMode flag + ExecutionModeChanged event — §18
+│   │   │   └── approval_queue.py          # manual-mode holding queue for approved TradePlans — §18
 │   │   ├── position_monitor/
 │   │   │   └── monitor.py                # still valid? weakening? partial? exit?
 │   │   ├── performance_intelligence/
@@ -409,6 +415,7 @@ trading-workspace/
 │   │   │   ├── scanner/
 │   │   │   ├── journal/
 │   │   │   └── workspace/                # layout engine + widget registry
+│   │   ├── input/                        # Input Layer — device adapters (gamepad, keyboard, Stream Deck, voice) all normalize to one InputCommand — §18.6
 │   │   ├── hooks/
 │   │   ├── services/
 │   │   │   ├── websocket-client.ts
