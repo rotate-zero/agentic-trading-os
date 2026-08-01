@@ -168,4 +168,30 @@
 
 **Trigger to revisit:** manual trade entry ships and real usage shows demand for in-position manual control — i.e. traders are actually taking manual entries often enough that "how does Position Monitor treat this" becomes a live question rather than a hypothetical one.
 
-**Where it would plug in:** `position_monitor/monitor.py` gains origin-aware branching (parallel to Trade Planning Engine's `TradeRequest.origin` branching, decision #22); Trade Management widget gains the deferred `MOVE_STOP`/close-fraction `InputCommand` types held back in decision #23.
+**Where it would plug in:** `position_monitor/monitor.py` gains origin-aware branching (parallel to Trade Planning Engine's `TradeRequest.origin` branching, decision #22); Trade Management widget gains the deferred `MOVE_STOP`/close-fraction `InputCommand` types held back in decision #23. Also unblocks #16 (Emergency actions) — the two share the same prerequisite.
+
+---
+
+## 15. Auto-Focus / Attention-Directing Hotkey Target
+
+**What it is:** having the system itself shift hotkey focus toward whatever's most urgent right now — e.g. automatically focusing the tile where a high-confidence Opportunity just fired, or where a Position Monitor "weakening" flag just appeared — so a fast reflex action can follow immediately without a manual click first.
+
+**Why deferred:** directly conflicts with the safety rule established for hotkey targeting (`trading-intelligence-architecture.md` §18.6/§18.10, decision #24) — `TradeTarget` (renamed from `FocusedTile` in v1.7, decision #27) is only ever supposed to move on a deliberate user action, specifically so a bound hotkey never fires against a target that changed underneath the person without them choosing it. Doing this well needs a genuinely unmistakable UX (e.g. a distinct "suggested" state requiring its own explicit acceptance before it becomes the actual fire target) that doesn't exist yet and shouldn't be improvised under this feature's current scope.
+
+**Trigger to revisit:** a specific, opt-in UX pattern is designed that makes a system-suggested focus change unmistakable and separately confirmable from firing on it.
+
+**Where it would plug in:** `frontend/src/input/` would need a distinct input path (not reusing `TradeTarget` directly) so a system suggestion and a user's actual click never share the same state.
+
+---
+
+## 16. Emergency Actions — `PANIC`, `FLATTEN_SYMBOL`, `CANCEL_ALL_ORDERS`
+
+**What it is:** a small set of hotkey-bound actions for getting out fast — `PANIC` closes every open position immediately, `FLATTEN_SYMBOL` closes just the focused symbol's position, `CANCEL_ALL_ORDERS` pulls every resting order. Arguably some of the highest-value actions a manual trader can have.
+
+**Why deferred:** every one of them needs to read and act on an *existing* position — Position Monitor / Trade Management territory, already explicitly out of scope for this iteration (`trading-intelligence-architecture.md` §18.8, and entry #14 in this file). Building any of them now would mean quietly reopening a boundary that's been confirmed more than once, and would need real construction (an emergency exit path through Execution Engine) that doesn't exist yet.
+
+**Priority note:** unlike most entries in this file, this one shouldn't sit at the back of the queue once its trigger condition is met. When Position Monitor/Trade Management integration for manual positions (#14) starts, these should be near the front of that work, not an afterthought — the value-to-effort ratio on an emergency kill-switch is unusually high once the underlying position-management plumbing exists at all.
+
+**Trigger to revisit:** Position Monitor/Trade Management integration for manual-origin positions (#14) ships.
+
+**Where it would plug in:** a new `Emergency` category action, `SafetyLevel.DOUBLE_CONFIRM` (`trading-intelligence-architecture.md` §18.10) — the two safety levels reserved and unused today exist specifically so this doesn't need another schema migration when it's built. Routes through Execution Engine like any other exit, once Position Monitor can construct one for a manually-tracked position.

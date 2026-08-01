@@ -1,5 +1,5 @@
 # Trading Intelligence Architecture
-**Version:** 1.5 — refined §18 (unified Trade Planning interface, generalized Input Layer vocabulary)
+**Version:** 1.7 — generalized hotkey/action model (Action Categories, Safety Levels, Hotkey Context, action-to-multi-device bindings); `LONG`/`SHORT` intent actions replace `BUY`/`SELL`/`PROPOSE_LONG`/`PROPOSE_SHORT`; `FocusedTile` renamed `TradeTarget`
 **Companion documents:** [`system-design.md`](./system-design.md) — that doc explains *how the system is built* (modules, interfaces, deployment, folder structure). This doc explains *how the system thinks* (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) holds concepts raised and deliberately deferred, with the reasoning intact, so they don't need to be re-argued from scratch later. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) is the running settled-decisions log. Keep these separate; a change to trading logic shouldn't require touching WebSocket plumbing, and an idea that isn't ready yet shouldn't clutter a document meant to describe what's actually built. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
 
 ---
@@ -391,7 +391,9 @@ class TradeRequest(BaseModel):
     opportunity: OpportunitySelected | None = None  # required when origin == "auto"
     manual_size: ManualSize | None = None           # optional when origin == "manual";
                                                      # absent = size via corroborated Kelly (§18.4),
-                                                     # if any, otherwise rejected — no silent default
+                                                     # if any, otherwise rejected — no silent default.
+                                                     # presence/absence also drives Approval Queue
+                                                     # routing regardless of ExecutionMode — see §18.5
     order_type: Literal["market", "limit"] = "market"
     limit_price: float | None = None                # required when order_type == "limit"
 ```
@@ -439,11 +441,15 @@ One value, system-wide, at a time — owned by Portfolio State (account-level st
 
 A discarded/ignored plan is logged with the same discipline as a Governor rejection (§12: *"a rejected plan is exactly as valuable a data point as an approved one"*).
 
+**One exception, independent of mode.** If a manual `TradeRequest` has no `manual_size` (§18.2) — a proposed idea, not yet a committed size — it always lands in the Approval Queue for review, even when `ExecutionMode == auto`. Nobody, human or Kelly's algorithm, decided a size yet, so nothing should be able to fire it yet either — that's a property of the request, not of the mode. A sized manual request, and every auto-origin request, follows the mode rule above unchanged. This is what makes a single `LONG`/`SHORT` action work for both what used to be `BUY`/`SELL` and `PROPOSE_LONG`/`PROPOSE_SHORT` (§18.6) — the branch moved from "which command was pressed" to "was a size actually given."
+
 **Note for `system-design.md`:** §4.9 needs this same mode-check added — out of scope for this doc, flagged so it doesn't drift (confirmed decision #11's own rule).
 
 ### 18.6 Input Layer
 
 Correct abstraction, same justification as v1.4: nothing above `BrokerAdapter` should know which broker is behind it (architectural principle 1); nothing above the Input Layer should know which physical device fired a command. Device adapters (Gamepad API, keyboard, Stream Deck webhook, voice-to-text) live in the frontend, all normalizing to one shape, sent over the existing WebSocket Gateway (system-design.md §4.12) — no new transport.
+
+**Commands are trading intentions, not order verbs — `LONG`/`SHORT` replace `BUY`/`SELL`/`PROPOSE_LONG`/`PROPOSE_SHORT`.** v1.6 kept two commands per direction — a sized, committing one and an unsized, review-only one — and had to work around `SELL` being ambiguous between "open a short" and "close a long." Both problems trace to the same cause: the command was encoding an execution decision (fire now vs. review first) that belongs to Governor and `ExecutionMode`, not to the hotkey. One command per direction removes both at once — there's no second verb to keep in sync, and `SHORT` never needs a footnote explaining what it doesn't mean.
 
 ```python
 class ManualSize(BaseModel):
@@ -451,18 +457,26 @@ class ManualSize(BaseModel):
     value: float
 
 class InputCommand(BaseModel):
-    command: Literal["BUY", "SELL", "PROPOSE_LONG", "PROPOSE_SHORT", "CANCEL_PENDING"]
-    symbol: str | None = None        # None = currently focused chart symbol
+    action: Literal["LONG", "SHORT", "APPROVE", "DISCARD"]
+    symbol: str | None = None        # None = current TradeTarget (§18.10)
     order_type: Literal["market", "limit"] = "market"
     limit_price: float | None = None
-    size: ManualSize | None = None   # None on PROPOSE_* — sizing is decided after review
+    size: ManualSize | None = None   # present = commit now; absent = propose for review — §18.5
 ```
 
-**Vocabulary generalized as requested** — quantity is a `size` parameter (`mode` + `value`), not encoded in the command name, so a future sizing option never requires a new command. `symbol` stays a top-level field rather than a `params` entry, deliberately: it's addressing information every command needs, not an action-specific tuning knob like `size` or `order_type` — folding it into an untyped dict would make it optional-looking when it's actually load-bearing for every command except "use whatever's focused."
+`size`'s presence, not the action name, is what used to be the `BUY` vs. `PROPOSE_LONG` distinction — pressing `LONG` with a size preset behaves like the old `BUY`; pressing it with no size behaves like the old `PROPOSE_LONG`. One action, one meaning ("I want long exposure on this symbol"), two possible payloads, decided downstream by §18.5's rule rather than by two different buttons meaning two different things.
 
-**One naming ambiguity worth resolving explicitly.** `SELL` is back in this list, and it's genuinely ambiguous in trading vocabulary: it could mean "open a short position" (an entry, in scope) or "close/reduce an existing long" (an exit, explicitly out of scope per §18.8). v1.4 silently dropped `SELL` from the working vocabulary for this exact reason without saying so — that was an inconsistency, not a decision, and worth naming now rather than carrying forward quietly. Resolving it as **entry-only**: `SELL` here means *open a short position*, symmetric to `BUY` opening a long — both are immediate market/limit entries with a pre-decided `size`. Closing or reducing an existing position is reserved for a distinct future verb (e.g. `CLOSE`) once Position Monitor/Trade Management are in scope, so the two meanings never collide under one name. If that's not the intended reading, say so and it's a one-line fix.
+`CLOSE` and `REVERSE` — real, valuable future actions — are deliberately not in this enum yet. Both require reading and acting on an *existing* position, which is Position Monitor/Trade Management territory and explicitly out of scope this iteration (§18.8). They're reserved names, not built actions — see `future-ideas.md` #14 and #16.
 
-This iteration's vocabulary: `BUY`, `SELL` (opens short, per above), `PROPOSE_LONG`, `PROPOSE_SHORT`, `CANCEL_PENDING` (Approval Queue only — never live orders or positions).
+**Symbol targeting — `TradeTarget` (renamed from `FocusedTile`).** `symbol: None` resolving to "whatever's targeted" only works if that's one real, singular, always-known piece of state — and Phase 1's workspace (multiple tabbed Main Windows, each an 8×8 grid of sub-window tiles, each tile its own symbol) has no such concept yet. It needs to be added, not assumed. Renamed from v1.6's `FocusedTile` specifically because "focus" is an overloaded word in frontend work — it invites confusion with DOM/keyboard focus, which this concept explicitly is not tied to:
+
+- A `TradeTarget{subWindowId, symbol} | null`, tracked **per tab** — clicking a tile sets that tab's target, and nothing else does. Not a hover. Not keyboard tab-order. Not mouse position. Not a new Opportunity, a price alert, or an approaching stop firing in the background. A hotkey acting on a target that silently changed underneath you is exactly the failure mode this whole design exists to avoid.
+- A hotkey always resolves against the **active tab's** remembered target. Switch tabs, and `LONG`/`SHORT` immediately target whatever that tab's target is — there's no such thing as acting on a tile in a tab you aren't currently looking at.
+- No target yet set in the active tab → symbol-targeted actions are refused outright, with a clear on-screen state — never defaulted to an arbitrary tile.
+- A persistent highlighted border on the target tile is mandatory, always rendered. What a hotkey is about to act on is never something you have to remember or infer.
+- Persists with the rest of the workspace layout (Phase 1's existing localStorage mechanism, §4.11) — reloading restores it, and the highlight is what makes that visible rather than silent.
+
+This is a distinct concept from the **Approval Queue cursor**, formalized here as `QueueCursor` — the position within the pending-plans list that `APPROVE`/`DISCARD` act on. That's unrelated to any tile or tab; conflating the two would mean a chart click could accidentally change which trade you're about to confirm.
 
 ### 18.7 No dedicated `ManualPlanBuilder`
 
@@ -477,6 +491,99 @@ Worth logging as a `future-ideas.md` entry with an explicit trigger condition (e
 ### 18.9 Changes made beyond what was requested
 
 - Unified `plan()`/`plan_manual()` into the single interface requested (§18.1), and removed `ManualPlanBuilder` as its own file/row in the bridge table (§18.7) — it was already redundant with the Input Layer once the single interface existed.
-- Named and resolved the `SELL` ambiguity explicitly (§18.6) rather than letting v1.4's silent omission of it stand unexplained.
+- Named and resolved the `SELL` ambiguity explicitly (§18.6) rather than letting v1.4's silent omission of it stand unexplained. *(Superseded in v1.7 — `SELL` itself was later dropped in favor of `SHORT`; see §18.6.)*
 - Added `order_type`/`limit_price` to both `TradeRequest` and `InputCommand`, since "order type" was in the requested parameter list but hadn't been modeled anywhere yet.
 - Kept `symbol` as a top-level field rather than folding it into `params`/`size` — held this position rather than adopting the flatter version, with reasoning in §18.6, since it's addressing information rather than a sizing/type parameter.
+
+### 18.10 Hotkey Module, Actions & Bindings
+
+Kept as a self-contained module, per your instruction — the rest of the frontend (chart, grid, workspace) doesn't know a controller, or any other device, exists.
+
+**Action Categories.** Every dispatchable action belongs to exactly one category, and the category — not a case-by-case decision — determines where it's routed:
+
+| Category | Examples (this iteration) | Routed to |
+|---|---|---|
+| Trading | `LONG`, `SHORT` | Backend, via `TradeRequest` -> Trade Planning Engine (§18.1) |
+| Queue | `APPROVE`, `DISCARD` | Backend — `APPROVE` fires `ManualConfirmOrder`, `DISCARD` fires `ManualDiscardOrder` (§18.5), acting on `QueueCursor` |
+| Navigation | `NEXT_TILE`, `NEXT_QUEUE_ITEM` | Frontend only — never touches the backend |
+| UI | `SHOW_BINDING_LEGEND` | Frontend only |
+| Emergency | *(none built yet — see below)* | — |
+
+Navigation and UI actions never construct a `TradeRequest` or reach the WebSocket Gateway at all. This is what "the Input Layer knows nothing about trading logic" means concretely: not that trading-shaped actions don't exist, but that non-trading categories take a genuinely separate, simpler path chosen by category — the dispatcher never hardcodes "everything eventually becomes a trade."
+
+**Hotkey Context.** Before category routing happens at all, the Input Layer checks what the user is currently doing. If a text input has focus (renaming a tab, a search box) or a modal is open, only `Emergency`-category actions are eligible — everything else, Navigation included, is suppressed. This was a real gap in v1.6: without it, a keyboard-bound action (once a keyboard adapter exists) could fire while someone is typing into a search box, or a controller press could land while a confirmation dialog is on screen expecting a different answer. `HotkeyContext` (`chart` | `modal` | `text_input` | `settings`) is frontend-only state, read by the dispatcher, never sent to the backend.
+
+**Safety Levels.** Each action declares one, rather than a single hardcoded "arm-then-fire" rule bolted onto two specific commands:
+
+```python
+class SafetyLevel(int, Enum):
+    IMMEDIATE = 0        # single press
+    HOLD_AND_PRESS = 1   # arm input held, then action input pressed -- the hold is the confirmation
+    HOLD_TIMED = 2        # arm input held for a fixed duration (not used by any action yet)
+    DOUBLE_CONFIRM = 3    # two distinct presses required (not used by any action yet)
+```
+
+This iteration only populates levels 0–1 — `LONG`/`SHORT` with a `size` set (committing capital) and `APPROVE` are `HOLD_AND_PRESS`; an unsized `LONG`/`SHORT` (proposing, not committing — §18.5's review step is the safety net here, not the gesture), `DISCARD`, and every Navigation/UI action are `IMMEDIATE`. Levels 2–3 exist now specifically so the Emergency actions below have somewhere to land later without another enum migration.
+
+**Bind actions, not buttons.** A binding maps one action to one input on one device — the reverse of keying by button:
+
+```python
+class Binding(BaseModel):
+    action: str             # e.g. "LONG"
+    device: Literal["gamepad", "keyboard", "streamdeck", "voice"]
+    input: str               # device-specific: "RB+A", "Ctrl+L", "button_3"
+```
+
+Multiple devices can bind the same action simultaneously — gamepad *and* keyboard both mapped to `LONG` is a normal configuration, not a conflict, since bindings are keyed by `(action, device)`, not one global button table. `bindingMap.ts` stores a list of these, persisted with the rest of the workspace layout (§4.11).
+
+```
+frontend/src/input/
+├── deviceAdapters/
+│   ├── gamepadAdapter.ts    # polls Gamepad API (rAF loop), emits edge-triggered RawInputEvent -- button-down transitions only
+│   └── types.ts             # RawInputEvent -- device-agnostic; keyboard/Stream Deck/voice adapters land here later
+├── bindingMap.ts             # Binding[] -- user-configurable, persisted with workspace layout
+├── safetyLevels.ts           # Action -> SafetyLevel table
+├── hotkeyContext.ts          # tracks chart/modal/text_input/settings -- gates all dispatch
+├── commandDispatcher.ts      # RawInputEvent + bindingMap + HotkeyContext + TradeTarget/QueueCursor -> routes by Action Category
+└── useInputLayer.ts          # the module's only public export -- one hook, mounted once at the app shell
+```
+
+`useInputLayer.ts` is the entire public surface. `TradeTarget` and `QueueCursor` deliberately don't live in this module — they're core workspace state (written by tile clicks and queue-navigation UI), and the Input Layer only reads them. Same read-only relationship §15 already established for World View reading state it doesn't own.
+
+**Default bindings** (Xbox layout, gamepad device — fully remappable via `bindingMap.ts`; a starting proposal, not a locked-in decision):
+
+| Input | Action | Safety Level | Notes |
+|---|---|---|---|
+| Hold **RB** + tap **A** | `LONG` (sized) | 1 | Current size preset, current `TradeTarget` |
+| Hold **RB** + tap **X** | `SHORT` (sized) | 1 | Same sizing |
+| **D-pad Up** | `LONG` (unsized) | 0 | Always lands in the queue for review — §18.5 |
+| **D-pad Down** | `SHORT` (unsized) | 0 | Same |
+| **D-pad Left / Right** | Cycle size preset | 0 | 3 configurable tiers — local UI state, not a dispatched action |
+| Hold **LB** + tap **A** | `APPROVE` | 1 | Acts on top of Approval Queue |
+| Hold **LB** + tap **B** | `DISCARD` | 0 | Acts on top of Approval Queue |
+| **Y** | `NEXT_QUEUE_ITEM` | 0 | Navigation — moves `QueueCursor`, no trading effect |
+| **Start** | `SHOW_BINDING_LEGEND` | 0 | UI |
+
+**Feedback, not just input.** Haptic pulses on Safety Level 1 transitions — one pattern armed-and-ready, one for Governor-approved, one for Governor-rejected — give an eyes-off-chart channel for exactly the moments reflex speed matters. A Governor rejection reason surfaces at the point of the action that triggered it, not only in a log reviewed later.
+
+**Emergency actions — agreed valuable, deliberately not built here.** `PANIC` (close every open position), `FLATTEN_SYMBOL`, and `CANCEL_ALL_ORDERS` would be some of the highest-value actions a manual trader could have. But every one of them needs to read and act on *existing* positions — Position Monitor/Trade Management territory, already twice explicitly deferred this iteration (§18.8). Building any of them now would quietly reopen a boundary that's been confirmed more than once. Logged as `future-ideas.md` #16, flagged high priority for whenever Position Monitor integration starts — not a "maybe later," a "build this early in that phase."
+
+**Deliberately not solved here:** limit orders (no clean way for a controller to type a price — the natural source later is the chart crosshair, not typed entry) and a richer order payload (risk preset, time-in-force) — real, worth having, but nothing in a market-order-only iteration uses them yet. `InputCommand`'s `size`/`order_type` fields (§18.6) are where they'd extend, not a redesign.
+
+### 18.11 This revision — verdicts on the reviewed proposals
+
+| # | Suggestion | Verdict | Where |
+|---|---|---|---|
+| 1 | Unify `BUY`/`SELL`/`PROPOSE_*` into intent actions, let Governor + `ExecutionMode` decide | **Adopted, refined** — `size` presence, not mode, decides queueing; an unsized request queues in every mode, not only Manual, so an idea nobody sized never fires unreviewed | §18.5, §18.6 |
+| 2 | Drop `BUY`/`SELL` for `LONG`/`SHORT` | **Adopted** | §18.6 |
+| 3 | Formalize symbol targeting as one source of truth | **Adopted, renamed** `FocusedTile` -> `TradeTarget`; explicit non-triggers listed | §18.6 |
+| 4 | Hotkey Context (textbox/modal gating) | **Adopted** — real gap, not previously addressed | §18.10 |
+| 5 | Architecture shouldn't name Xbox buttons directly | **Already true in code** (`bindingMap` existed in v1.6); doc presentation now clearly separates Action (architecture) from default binding (config) | §18.10 |
+| 6 | Action Categories | **Adopted** | §18.10 |
+| 7 | Emergency actions (`PANIC`, flatten, cancel-all) | **Agreed valuable, not built** — all read/act on existing positions, already-deferred territory; logged as high-priority future work | `future-ideas.md` #16 |
+| 8 | Multi-step Safety Levels | **Adopted** — only levels 0–1 populated today; 2–3 reserved for Emergency actions | §18.10 |
+| 9 | Bind actions, not buttons; multiple devices per action | **Adopted** | §18.10 |
+| 10 | Richer order payload (risk preset, time-in-force) | **Noted as an extension point**, not added to the schema — nothing in a market-order-only iteration uses them | §18.10 |
+| 11 | Fully generic Input Layer, no trading knowledge | **Adopted** — Action Category routing means Navigation/UI actions never construct a `TradeRequest` | §18.10 |
+
+The one place the suggestion as literally written wasn't taken: unconditional "Governor + `ExecutionMode` decide" (point 1) would let an algorithmically-sized, never-reviewed idea fire with zero human look in Auto mode. Kept the review step; moved what triggers it from "which command was pressed" to "was a size actually given."

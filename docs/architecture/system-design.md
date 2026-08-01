@@ -1,5 +1,5 @@
 # Personal AI Trading Workspace — System Design Document
-**Version:** 2.4 (Pre-Implementation) — Execution Engine documented as mode-aware (auto/manual), see §4.9 and companion doc §18
+**Version:** 2.6 (Pre-Implementation) — §8 folder structure updated for the generalized hotkey/action model (`safetyLevels.ts`, `hotkeyContext.ts`, action-keyed bindings) and the `TradeTarget`/`QueueCursor` rename; see companion doc §18.10
 **Status:** Phase 2 kickoff — Event Bus dispatch lanes and shared update-policy utility added
 **Owner:** Saqib
 **Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) — how the system thinks (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) — concepts raised and deliberately deferred, with reasoning intact, so they aren't lost or re-argued from scratch. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) — the running settled-decisions log. [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) — phased delivery plan and exit criteria. This doc explains how the system is built. Read all of them; they're deliberately kept separate. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
@@ -415,12 +415,20 @@ trading-workspace/
 │   │   │   ├── scanner/
 │   │   │   ├── journal/
 │   │   │   └── workspace/                # layout engine + widget registry
-│   │   ├── input/                        # Input Layer — device adapters (gamepad, keyboard, Stream Deck, voice) all normalize to one InputCommand — §18.6
+│   │   ├── input/                        # Input Layer — self-contained module, see trading-intelligence-architecture.md §18.10
+│   │   │   ├── deviceAdapters/
+│   │   │   │   ├── gamepadAdapter.ts      # Gamepad API, rAF poll loop, edge-triggered RawInputEvent
+│   │   │   │   └── types.ts               # RawInputEvent — device-agnostic; keyboard/Stream Deck/voice adapters land here later
+│   │   │   ├── bindingMap.ts              # Binding[] (action -> device -> input), persisted with workspace layout — §18.10
+│   │   │   ├── safetyLevels.ts            # Action -> SafetyLevel (0-3) table — §18.10
+│   │   │   ├── hotkeyContext.ts           # chart/modal/text_input/settings — gates all dispatch — §18.10
+│   │   │   ├── commandDispatcher.ts       # RawInputEvent + bindingMap + HotkeyContext + TradeTarget/QueueCursor -> routes by Action Category
+│   │   │   └── useInputLayer.ts           # module's only public export — mounted once at the app shell
 │   │   ├── hooks/
 │   │   ├── services/
 │   │   │   ├── websocket-client.ts
 │   │   │   └── api-client.ts
-│   │   ├── store/                        # Zustand slices
+│   │   ├── store/                        # Zustand slices — workspace layout, TradeTarget (per-tab, written by tile clicks only — §18.6), QueueCursor
 │   │   ├── types/
 │   │   ├── pages/
 │   │   └── App.tsx
