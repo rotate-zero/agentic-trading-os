@@ -12,7 +12,7 @@ Each phase should be a mergeable, demoable slice — no phase depends on unfinis
 | 3 | One broker adapter — IBKR (Alpaca not available for a Bangladesh-resident account; see `../decisions/confirmed-decisions.md` #1) | Live ticks for 1 symbol flow adapter → engine → chart |
 | 4 | Full Market Data Engine + Feature Engine: multi-symbol subscribe, normalize, cache, persist, compute features once | 100-symbol universe streaming with a `FeatureSet` published per symbol, no dropped ticks |
 | 5 | Scanner + Strategy Engine + Opportunity/Decision/Planning Engines + Governor + Portfolio State Engine | Opportunities appear on chart with confidence, entry/stop/target; Governor can reject a plan against Portfolio State |
-| 6 | Execution Engine (dry-run first, then live) + Position Monitor + Execution Mode (auto/manual) & Approval Queue + Input Layer (`../decisions/confirmed-decisions.md` #22–23) | Approved plan produces a paper order end-to-end; Position Monitor flags an open position as "weakening"; a manual-mode plan holds in the Approval Queue until explicitly accepted |
+| 6 | Execution Engine (dry-run first, then live) + Position Monitor | Approved plan produces a paper order end-to-end; Position Monitor flags an open position as "weakening" |
 
 ## Status (living — update as phases complete)
 

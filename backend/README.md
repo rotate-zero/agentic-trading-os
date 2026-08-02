@@ -23,7 +23,7 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - Dev routes (`POST /dev/dummy-event`, `POST /dev/critical-event`) that prove events
   round-trip through the bus and out over WebSocket
 - **`IBKRAdapter`** (`app/broker_adapters/`) — implements the full `BrokerAdapter`
-  interface using `ib_async`. Streams live ticks (`on_tick`) and fetches historical
+  interface (which now extends `MarketDataProvider` — see below) using `ib_async`. Streams live ticks (`on_tick`) and fetches historical
   bars (`get_historical`). `place_order`/`cancel_order` raise `NotImplementedError`
   on purpose — see the docstring on `BrokerAdapter` for why. Symbol qualification
   failures raise a clean `SymbolNotFoundError` instead of silently proceeding with an
@@ -40,6 +40,13 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever
   adapter is currently connected (`app/services/broker_registry.py`). Same response
   shape planned for the paused frontend mock-swap, so it's a drop-in later.
+- **`MarketDataProvider` / `BrokerAdapter` split** (`app/broker_adapters/base.py`) —
+  `BrokerAdapter` now extends `MarketDataProvider`, so a future pure data-only vendor
+  (Polygon.io — API access obtained, see
+  `../docs/decisions/future-ideas.md` #17) can implement just the data-streaming subset
+  without pretending to support order placement. `IBKRAdapter` is unaffected
+  behaviorally — same interface, now assembled via inheritance. See
+  `../docs/decisions/confirmed-decisions.md` #28.
 
 **Deliberately not implemented yet** (belongs to a later phase, per
 [`phase-roadmap.md`](../docs/roadmap/phase-roadmap.md)):
@@ -110,6 +117,12 @@ pipeline changed; only the source feeding it did.
 
 ## Running locally
 
+**Python 3.10–3.13 recommended.** Python 3.14 works too, but only with `ib_async>=2.1`
+(already what `requirements.txt` pins) — earlier `ib_async` versions depend on a library
+that crashes on import under 3.14 (`RuntimeError: There is no current event loop`, a
+Python 3.14 behavior change, not a bug in this codebase — see confirmed decision #29
+if you hit this with an older lockfile or cached install).
+
 ```bash
 cd backend
 python -m venv .venv && source .venv/bin/activate
@@ -178,7 +191,7 @@ No extra setup needed — every test file below runs with just `pip install -r r
 |---|---|
 | `test_event_bus.py` | Event Bus pub/sub, including a test that specifically proves a slow normal-lane subscriber can't delay a critical-lane event (confirmed decision #9) |
 | `test_debounce_scheduler.py` | The shared min/max-interval update-policy utility (confirmed decision #10) |
-| `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance, the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
+| `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
 | `test_ibkr_ingest.py` | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently |
 | `test_market_routes.py` | `GET /market/candles` and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `conftest.py` | Not a test file — an autouse fixture resetting the app's module-level singletons (Event Bus, connection manager, Gateway, broker registry) between tests. Needed because those singletons are cached for the process lifetime, but `pytest-asyncio` gives each test its own event loop; without this reset, a second `TestClient(app)` in a later test reuses queues bound to an already-dead loop |
