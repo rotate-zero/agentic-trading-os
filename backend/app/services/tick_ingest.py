@@ -1,7 +1,14 @@
 """
-Phase-3-minimal bridge from a BrokerAdapter's raw tick stream onto the
-Event Bus — publishes PriceUpdated per tick, and buckets ticks into
+Phase-3-minimal bridge from any MarketDataProvider's raw tick stream onto
+the Event Bus — publishes PriceUpdated per tick, and buckets ticks into
 1-minute CandleClosed events.
+
+Renamed from IBKRIngestBridge (confirmed decision #31): its logic never
+actually depended on IBKR — it only ever called adapter.on_tick(), which
+is defined on MarketDataProvider, not BrokerAdapter specifically. Once a
+second provider (PolygonAdapter) needed the exact same bucketing, keeping
+the IBKR-specific name and type would have meant either duplicating this
+logic or lying about what the class actually does.
 
 This is explicitly NOT the real Market Data Engine (Phase 4,
 docs/architecture/system-design.md §4.2) — no multi-symbol StateCache, no
@@ -18,7 +25,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from app.broker_adapters.base import BrokerAdapter, Tick
+from app.broker_adapters.base import MarketDataProvider, Tick
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.schemas.events.envelope import EventType
@@ -53,17 +60,24 @@ class _MinuteBucket:
         )
 
 
-class IBKRIngestBridge:
-    """Registers itself as the adapter's tick callback on construction."""
+class TickIngestBridge:
+    """Registers itself as the provider's tick callback on construction.
+    Works identically regardless of whether ticks arrive from a genuine
+    push stream (IBKR, many ticks/minute) or from delayed REST polling
+    that only has one data point per minute (Polygon's free tier — see
+    PolygonAdapter's docstring). In the latter case each "bucket" just
+    ends up holding a single tick, which is correct, not a bug: bucketing
+    on real trade granularity when the underlying data doesn't have that
+    granularity would be fabricating precision that isn't there."""
 
-    def __init__(self, adapter: BrokerAdapter, bus: EventBus) -> None:
+    def __init__(self, provider: MarketDataProvider, bus: EventBus) -> None:
         self._bus = bus
         self._buckets: dict[str, _MinuteBucket] = {}
-        adapter.on_tick(self._on_tick)
+        provider.on_tick(self._on_tick)
 
     def _on_tick(self, tick: Tick) -> None:
-        # on_tick's callback is sync per the BrokerAdapter interface, but
-        # EventBus.publish() is async — hand off to the running loop.
+        # on_tick's callback is sync per the MarketDataProvider interface,
+        # but EventBus.publish() is async — hand off to the running loop.
         asyncio.create_task(self._handle_tick(tick))
 
     async def _handle_tick(self, tick: Tick) -> None:

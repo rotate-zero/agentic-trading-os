@@ -19,7 +19,7 @@ from app.broker_adapters.base import SymbolNotFoundError
 from app.broker_adapters.ibkr_adapter import IBKRAdapter
 from app.event_bus.bus import get_event_bus
 from app.services import broker_registry
-from app.services.ibkr_ingest import IBKRIngestBridge
+from app.services.tick_ingest import TickIngestBridge
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/broker", tags=["broker"])
@@ -44,7 +44,7 @@ async def connect() -> dict:
             ),
         ) from exc
 
-    bridge = IBKRIngestBridge(adapter, get_event_bus())
+    bridge = TickIngestBridge(adapter, get_event_bus())
     broker_registry.set_active(adapter, bridge)
     return {"status": "connected"}
 

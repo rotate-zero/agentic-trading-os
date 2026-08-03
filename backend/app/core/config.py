@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     ibkr_port: int = 4002
     ibkr_client_id: int = 1
 
+    # --- Polygon.io (Phase 3 — free/Basic tier: 15-min delayed, 5 REST calls/min) ---
+    # No WebSocket on this tier — PolygonAdapter polls instead. See
+    # docs/decisions/confirmed-decisions.md #30. Optional: the app boots
+    # fine with this unset, it just skips auto-connecting Polygon.
+    polygon_api_key: str | None = None
+    polygon_poll_interval_seconds: int = 60  # matches the underlying 1-min bar granularity — polling faster wastes budget for no new data
+    polygon_max_calls_per_minute: int = 5
+
     # --- CORS (frontend dev server) ---
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 

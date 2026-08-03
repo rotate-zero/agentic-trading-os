@@ -9,7 +9,7 @@ decision #14).
 
 Scope note: on_tick() gives raw per-tick price updates only. Building
 1-minute candles from that stream is deliberately NOT this adapter's job
-(confirmed decision #16) — see app/services/ibkr_ingest.py.
+(confirmed decision #16) — see app/services/tick_ingest.py.
 
 Verification note: every method here is built against real, introspected
 ib_async signatures (see the Phase 3 chat transcript / commit message),

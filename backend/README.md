@@ -1,4 +1,4 @@
-# Backend — Phase 2 Scaffold
+# Backend — Phase 2/3
 
 FastAPI skeleton, Event Bus (two dispatch lanes), Market Clock, `DebounceScheduler`,
 WebSocket Gateway, PostgreSQL + Alembic (plain Postgres, native monthly
@@ -31,9 +31,11 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   source — it never raises on a bad symbol itself). Unexpected disconnects are logged
   loudly; auto-reconnect is explicitly left to Phase 4's Market Data Engine, not built
   here — see the docstring on `_on_disconnected`.
-- **`IBKRIngestBridge`** (`app/services/ibkr_ingest.py`) — Phase-3-minimal bridge:
+- **`TickIngestBridge`** (`app/services/tick_ingest.py`, renamed from `IBKRIngestBridge` —
+  see `../docs/decisions/confirmed-decisions.md` #31) — Phase-3-minimal bridge:
   publishes every tick as `PriceUpdated`, buckets ticks into 1-minute `CandleClosed`
-  events. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
+  events. Works for any `MarketDataProvider`, not just IBKR — shared by both adapters
+  below. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
   wholesale, not extended.
 - `POST /broker/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`, `GET /broker/status`
   for manual connection control (no auto-connect on app startup — see below)
@@ -41,12 +43,21 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   adapter is currently connected (`app/services/broker_registry.py`). Same response
   shape planned for the paused frontend mock-swap, so it's a drop-in later.
 - **`MarketDataProvider` / `BrokerAdapter` split** (`app/broker_adapters/base.py`) —
-  `BrokerAdapter` now extends `MarketDataProvider`, so a future pure data-only vendor
-  (Polygon.io — API access obtained, see
-  `../docs/decisions/future-ideas.md` #17) can implement just the data-streaming subset
-  without pretending to support order placement. `IBKRAdapter` is unaffected
-  behaviorally — same interface, now assembled via inheritance. See
-  `../docs/decisions/confirmed-decisions.md` #28.
+  `BrokerAdapter` now extends `MarketDataProvider`, so a pure data-only vendor can
+  implement just the data-streaming subset without pretending to support order
+  placement. `IBKRAdapter` is unaffected behaviorally — same interface, now assembled
+  via inheritance. See `../docs/decisions/confirmed-decisions.md` #28.
+- **`PolygonAdapter`** (`app/broker_adapters/polygon_provider.py`) — implements
+  `MarketDataProvider` only (no execution, correctly). Built around the free/Basic
+  tier's real constraints (15-min delayed, 5 REST calls/min, **no WebSocket at this
+  tier at all**) rather than assuming a real-time feed — see
+  `../docs/decisions/confirmed-decisions.md` #30 for the full design reasoning.
+  `on_tick()` is backed by rate-limited REST polling
+  (`app/core/rate_limiter.py`), not a push stream. **Auto-connects on app startup**
+  if `POLYGON_API_KEY` is set (soft-fail if not — see "Polygon.io connection setup"
+  below), unlike IBKR's deliberately manual connect.
+- `POST /market-data/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`,
+  `GET /market-data/status` — same pattern as the `/broker/*` routes, for Polygon.
 
 **Deliberately not implemented yet** (belongs to a later phase, per
 [`phase-roadmap.md`](../docs/roadmap/phase-roadmap.md)):
@@ -114,6 +125,32 @@ Then subscribe to `market.tick` and `market.candle` on the `/ws` endpoint (same 
 Phase 2 dev routes) — real IBKR ticks now flow through the exact same Event Bus →
 WebSocket Gateway pipeline the dummy events proved out in Phase 2. Nothing about that
 pipeline changed; only the source feeding it did.
+
+## Polygon.io connection setup
+
+Much simpler than IBKR's — Polygon is just an API-key-authenticated cloud service, no
+desktop app, no 2FA handshake per session.
+
+1. Set `POLYGON_API_KEY` in `.env`. That's it — no other setup step.
+2. Start the backend. It auto-connects on startup (check the logs for
+   `Polygon auto-connected on startup`) — no manual `POST /connect` needed, unlike IBKR.
+3. **Read this before expecting live data:** the free/Basic tier gives **15-minute
+   delayed** data, 5 REST calls/minute, and **no WebSocket access at all**. This
+   adapter polls (`app/core/rate_limiter.py`-throttled) rather than streams — see
+   `../docs/decisions/confirmed-decisions.md` #30 for the full reasoning. Every tick's
+   timestamp reflects Polygon's actual (delayed) bar time, not "now," so what you see
+   on a chart fed by this will honestly lag real time by ~15 minutes. This is expected
+   behavior on this tier, not a bug.
+4. Subscribe to a symbol:
+   ```bash
+   curl -X POST "http://localhost:8000/market-data/subscribe?symbol=NVDA"
+   curl http://localhost:8000/market-data/status
+   ```
+   Then watch `market.tick`/`market.candle` on `/ws`, same as IBKR — same pipeline,
+   different (and much more rate-limited) source feeding it.
+5. No `POLYGON_API_KEY` set → the app boots fine anyway and just skips Polygon
+   entirely (check logs for `POLYGON_API_KEY not set — skipping Polygon auto-connect`).
+   An optional data source failing to configure must never block the whole app.
 
 ## Running locally
 
@@ -192,8 +229,10 @@ No extra setup needed — every test file below runs with just `pip install -r r
 | `test_event_bus.py` | Event Bus pub/sub, including a test that specifically proves a slow normal-lane subscriber can't delay a critical-lane event (confirmed decision #9) |
 | `test_debounce_scheduler.py` | The shared min/max-interval update-policy utility (confirmed decision #10) |
 | `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
-| `test_ibkr_ingest.py` | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently |
+| `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
 | `test_market_routes.py` | `GET /market/candles` and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
+| `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |
+| `test_polygon_provider.py` | `PolygonAdapter`'s pure logic, all via monkeypatched `get_aggs` (no real API key or network access): timeframe mapping, ABC compliance, `get_historical`'s bad-symbol handling (empty-list-not-exception, same trap as `qualifyContractsAsync`), and the polling dedup logic — a new bar fires `on_tick`, the same bar polled again doesn't, a client exception doesn't kill the loop |
 | `conftest.py` | Not a test file — an autouse fixture resetting the app's module-level singletons (Event Bus, connection manager, Gateway, broker registry) between tests. Needed because those singletons are cached for the process lifetime, but `pytest-asyncio` gives each test its own event loop; without this reset, a second `TestClient(app)` in a later test reuses queues bound to an already-dead loop |
 
 **What these tests deliberately don't cover:** an actual live IBKR connection. `test_ibkr_adapter.py`'s interface-compliance test constructs a real `IBKRAdapter` but never calls `connect()` — that requires a running IB Gateway and a real account, which only exists on your machine, not here. See "IBKR connection setup" above for that verification path, and the smoke checks below.

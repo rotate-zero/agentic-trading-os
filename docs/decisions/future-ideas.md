@@ -60,11 +60,11 @@
 
 **Why deferred:** explicitly out of scope for now, per project simplicity — not because it's architecturally hard.
 
-**Why it's cheap to defer:** the `BrokerAdapter` interface (`../architecture/system-design.md` §4.1) already means the Market Data Engine doesn't care whether its data source is live or replayed. When Replay is built, it's a new implementation of that interface (or a wrapper feeding the same `PriceUpdated`/`CandleClosed` events), not a redesign of anything upstream. The door was left open for free; nothing today needs to anticipate it further.
+**Why it's cheap to defer:** the `MarketDataProvider` interface (`../architecture/system-design.md` §4.1) already means the Market Data Engine doesn't care whether its data source is live or replayed. When Replay is built, it's a new implementation of that interface (or a wrapper feeding the same `PriceUpdated`/`CandleClosed` events), not a redesign of anything upstream. The door was left open for free; nothing today needs to anticipate it further.
 
 **Trigger to revisit:** whenever manual-trading-experience-driven review of specific historical sessions becomes valuable enough to justify the build — no architectural trigger required, this one's just a scheduling/priority call.
 
-**Where it would plug in:** `broker_adapters/replay_adapter.py`, implementing the same `BrokerAdapter` ABC. Would use the deferred `replay_sessions` table (reserved name, not created — `../architecture/system-design.md` §4.13).
+**Where it would plug in:** `broker_adapters/replay_provider.py`, implementing `MarketDataProvider` (not `BrokerAdapter` — replay has no execution to fake, same reasoning as `confirmed-decisions.md` #28). Would use the deferred `replay_sessions` table (reserved name, not created — `../architecture/system-design.md` §4.13).
 
 ---
 
@@ -195,3 +195,20 @@
 **Trigger to revisit:** Position Monitor/Trade Management integration for manual-origin positions (#14) ships.
 
 **Where it would plug in:** a new `Emergency` category action, `SafetyLevel.DOUBLE_CONFIRM` (`trading-intelligence-architecture.md` §18.10) — the two safety levels reserved and unused today exist specifically so this doesn't need another schema migration when it's built. Routes through Execution Engine like any other exit, once Position Monitor can construct one for a manually-tracked position.
+
+---
+
+## 17. Market Data Provider Selection (Polygon.io / Databento / others) — RESOLVED, kept for the comparison notes
+
+**Status:** `PolygonAdapter` is built (`confirmed-decisions.md` #30) — this entry has graduated from "deferred idea" to "done," but the vendor comparison below stays on record since it's still the relevant reasoning if a provider ever needs to change (rate-limit pain on the free tier, a paid-tier upgrade, Databento turning out to be a better fit, etc.).
+
+**Candidates checked, with findings (Polygon.io chosen and built; the rest are notes for later, not final rankings):**
+- **Polygon.io** — verified accessible from Bangladesh by reading its Terms of Service directly: the only geographic restriction is OFAC-embargoed countries and the SDN sanctions list, not a nationality/residency gate. Free/Basic tier confirmed via account: 15-minute delayed, 5 REST calls/minute, no WebSocket access at all. `PolygonAdapter` built around exactly those constraints — see `confirmed-decisions.md` #30 for the design.
+- **Databento** — attestation-based exchange licensing (self-serve, instant approval for non-professional/non-redistributing use), not nationality-gated. No explicit restriction found. Worth a look if Polygon's free-tier limits (especially the 5 calls/minute ceiling) become a real bottleneck.
+- **Alpaca Market Data** — likely not independent of the same account system that ruled out Alpaca brokerage (`confirmed-decisions.md` #1): account creation still asks for Country of Tax Residence, with Alpaca's own docs noting unlisted countries are paper-trading-only. Not pursued further without direct evidence otherwise.
+- **London Strategic Edge** — a real company, but under a year old (first funding round November 2025) and offering an unusually large amount of claimed real-time institutional-grade data entirely free. Real exchange data licensing is genuinely expensive — a company this young giving this much away free is a real yellow flag for anything feeding live trades. Possibly fine for exploratory backtesting once vetted further; not for production use yet.
+- **Twelve Data, Finnhub** — surfaced as currently-active alternatives (broad exchange coverage, and free WebSocket streaming, respectively) but not vetted as deeply as the four above.
+
+**Trigger to revisit:** the free tier's 5-calls/minute budget becomes a real constraint (e.g. wanting more than a handful of symbols polled at a reasonable cadence), or a paid Polygon tier / a different vendor entirely becomes worth the cost once real trading volume justifies it.
+
+**Where a replacement would plug in:** same place `PolygonAdapter` does — `app/broker_adapters/<vendor>_provider.py` implementing `MarketDataProvider`, registered through the existing `broker_registry` and `GET /market/candles` route. No route changes needed; that's the whole point of the interface (`confirmed-decisions.md` #28).
