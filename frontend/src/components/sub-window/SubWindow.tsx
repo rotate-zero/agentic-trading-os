@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { ChartWidget } from "../chart/ChartWidget";
 import { SubWindowMenu } from "./SubWindowMenu";
-import { generateMockCandles } from "../../mocks/candles";
+import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { generateMockOverlays } from "../../mocks/chartObjects";
 import { resampleCandles } from "../../utils/resample";
 import { computeIndicator } from "../../utils/indicators";
@@ -12,7 +12,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   const { resolvedSymbol } = useWorkspace();
   const symbol = resolvedSymbol(config);
 
-  const oneMinCandles = useMemo(() => generateMockCandles(symbol), [symbol]);
+  const oneMinCandles = useLiveCandles(symbol);
   const candles = useMemo(
     () => resampleCandles(oneMinCandles, config.timeframe),
     [oneMinCandles, config.timeframe]

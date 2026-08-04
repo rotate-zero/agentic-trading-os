@@ -1,15 +1,15 @@
 """
-Candle backfill over REST — a chart needs "the last N candles" on load;
-a WebSocket subscription alone only gives you what arrives from now on.
-Reads specifically from the HISTORICAL role in broker_registry, not
-whichever provider is currently streaming — those are independent roles
-now (confirmed decision #33), since Finnhub (streaming) can't serve this
-at all.
+Candle backfill and live-symbol subscription over a provider-agnostic
+route — the frontend shouldn't need to know whether Finnhub, Polygon, or
+(eventually) IBKR is the currently active source. GET /candles reads from
+the HISTORICAL role; POST /subscribe acts on the STREAMING role
+(confirmed decision #33) — same split reasoning as everywhere else this
+distinction shows up.
 
-Response shape is deliberately the same {"symbol", "candles": [...]}
-shape planned for the paused frontend mock-swap work, so useLiveCandles
-(when that resumes) is a drop-in regardless of which backend source is
-behind it.
+Response shape for /candles is deliberately the same {"symbol",
+"candles": [...]} shape the frontend mock-swap was designed around, so
+useLiveCandles is a drop-in regardless of which backend source is behind
+it.
 """
 from __future__ import annotations
 
@@ -70,3 +70,26 @@ async def get_candles(
         "symbol": symbol,
         "candles": [c.model_dump(mode="json") for c in candles[-count:]],
     }
+
+
+@router.post("/subscribe")
+async def subscribe(symbol: str = Query(...)) -> dict:
+    """
+    Subscribes on whichever provider currently holds the streaming role
+    — added specifically for the frontend swap, so a symbol switch in the
+    UI can call one route regardless of whether Finnhub, Polygon, or
+    (eventually) IBKR is actually connected. Provider-specific routes
+    (/finnhub/subscribe, /market-data/subscribe, /broker/subscribe) still
+    exist for manual/debug use; this is the one real consumers should use.
+    """
+    provider = broker_registry.get_streaming_provider()
+    if provider is None or not provider.is_connected():
+        raise HTTPException(
+            status_code=400,
+            detail="No streaming provider connected — nothing is currently live.",
+        )
+    try:
+        await provider.subscribe([symbol])
+    except SymbolNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "subscribed", "symbol": symbol}

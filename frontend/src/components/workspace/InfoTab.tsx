@@ -1,8 +1,9 @@
 import { useMemo, useRef, useState } from "react";
 import { LINK_CONNECTOR_IDS, type InfoConnectorMode } from "../../types/workspace";
 import { MOCK_TICKERS } from "../../mocks/tickers";
-import { generateMockCandles } from "../../mocks/candles";
 import { generateMockOpportunities } from "../../mocks/opportunities";
+import { useLatestPrices } from "../../hooks/useLatestPrices";
+import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -24,16 +25,14 @@ const MAX_WIDTH = 480;
 const COLLAPSED_WIDTH = 36;
 
 function GeneralContent() {
-  const rows = useMemo(
-    () =>
-      MOCK_TICKERS.map((t) => {
-        const candles = generateMockCandles(t.symbol, 2);
-        const last = candles[candles.length - 1]?.close ?? t.basePrice;
-        const changePct = ((last - t.basePrice) / t.basePrice) * 100;
-        return { ...t, last, changePct };
-      }),
-    []
-  );
+  const symbols = useMemo(() => MOCK_TICKERS.map((t) => t.symbol), []);
+  const prices = useLatestPrices(symbols);
+
+  const rows = MOCK_TICKERS.map((t) => {
+    const last = prices[t.symbol] ?? t.basePrice;
+    const changePct = ((last - t.basePrice) / t.basePrice) * 100;
+    return { ...t, last, changePct };
+  });
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
@@ -68,7 +67,7 @@ function GeneralContent() {
 }
 
 function ConnectorContent({ symbol }: { symbol: string }) {
-  const candles = useMemo(() => generateMockCandles(symbol), [symbol]);
+  const candles = useLiveCandles(symbol);
   const opportunities = useMemo(() => generateMockOpportunities(symbol, candles), [symbol, candles]);
   return <AIAnalysisPanel symbol={symbol} opportunities={opportunities} />;
 }

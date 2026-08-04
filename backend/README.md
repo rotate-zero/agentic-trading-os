@@ -41,8 +41,13 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   for manual connection control (no auto-connect on app startup — see below)
 - `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever
   provider currently holds the **historical role** (`app/services/broker_registry.py`
-  — see below). Same response shape planned for the paused frontend mock-swap, so
-  it's a drop-in later.
+  — see below). **This is what the frontend actually calls now** — the mock-swap
+  (`frontend/src/hooks/useLiveCandles.ts`) is done, not just planned.
+- `POST /market/subscribe?symbol=` — tells whichever provider holds the **streaming
+  role** to start streaming a symbol. Provider-agnostic on purpose: the frontend calls
+  this one route regardless of whether Finnhub, Polygon, or IBKR is actually
+  connected. Provider-specific subscribe routes (`/finnhub/subscribe`,
+  `/market-data/subscribe`, `/broker/subscribe`) still exist for manual/debug use.
 - **`MarketDataProvider` / `BrokerAdapter` split** (`app/broker_adapters/base.py`) —
   `BrokerAdapter` now extends `MarketDataProvider`, so a pure data-only vendor can
   implement just the data-streaming subset without pretending to support order
@@ -89,9 +94,6 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - Any table beyond `symbols`/`candles`
 - Order placement — no route exists for it; only the Governor (Phase 5/6) should ever
   be able to trigger a real order
-- Frontend mock-data swap — paused mid-implementation to prioritize the broker/data
-  adapters; the plan (candles.ts only, via a `useLiveCandles` hook) is unchanged and
-  now has real data sources to point at instead of the dev mock publisher
 
 **What's verified vs. not, for the IBKR pieces specifically:**
 - ✅ `ib_async` API signatures — verified by installing the library and introspecting
@@ -294,7 +296,7 @@ No extra setup needed — every test file below runs with just `pip install -r r
 | `test_debounce_scheduler.py` | The shared min/max-interval update-policy utility (confirmed decision #10) |
 | `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
-| `test_market_routes.py` | `GET /market/candles` and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
+| `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |
 | `test_polygon_provider.py` | `PolygonAdapter`'s pure logic, all via monkeypatched `get_aggs` (no real API key or network access): timeframe mapping, ABC compliance, `get_historical`'s bad-symbol handling (empty-list-not-exception, same trap as `qualifyContractsAsync`), and the polling dedup logic — a new bar fires `on_tick`, the same bar polled again doesn't, a client exception doesn't kill the loop |
 | `test_finnhub_provider.py` | `FinnhubAdapter`'s pure logic: missing-key handling, ABC compliance, `get_historical` correctly raising `HistoricalDataUnavailableError` (confirmed decision #32), and WS message parsing — ping/unknown types ignored, single and multi-trade messages parsed, malformed entries skipped without crashing the batch |
@@ -311,8 +313,36 @@ Once connected (`POST /broker/connect` then `POST /broker/subscribe?symbol=NVDA`
 curl "http://localhost:8000/market/candles?symbol=NVDA&count=50&timeframe=1m"
 ```
 
-Returns `{"symbol": "NVDA", "candles": [...]}` — the same shape planned for the paused
-frontend mock-swap. Before connecting, this same call should return a clean `400`
-("Not connected"), not a crash or a 500 — that's the behavior `test_market_routes.py`
-checks automatically; this is just how to see it happen for real.
+Returns `{"symbol": "NVDA", "candles": [...]}` — the same shape the frontend's
+`useLiveCandles` hook actually consumes now, not just a planned one. Before
+connecting, this same call should return a clean `400` ("Not connected"), not a
+crash or a 500 — that's the behavior `test_market_routes.py` checks automatically;
+this is just how to see it happen for real.
+
+## Frontend
+
+`frontend/` reads live data through this backend now (`useLiveCandles`,
+`useLatestPrices`, `services/websocket-client.ts`, `services/api-client.ts`) — no
+config needed if the backend's on `localhost:8000` and the frontend dev server's on
+`localhost:5173` (both are the defaults on each side, including CORS). Override via
+`frontend/.env`'s `VITE_API_BASE_URL`/`VITE_WS_BASE_URL` if not.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Verified before shipping: a full `tsc -b && vite build` succeeds, and the actual
+CORS headers + error-response JSON shape were checked against a real running
+backend (not assumed to match what the frontend's error handling expects).
+
+**One pre-existing, unrelated bug worth knowing about:** `GridPresetPicker.tsx`
+references a `GRID_PRESETS` export and `preset`/`setPreset` context fields that don't
+exist anywhere in the codebase — confirmed via `git diff` that this wasn't touched by
+any of the backend/data-provider work, and it's not imported by anything else either,
+so it's dead code rather than something actively broken at runtime. Only `tsc -b`'s
+full-project type-check catches it (`vite build` alone, and `npm run dev`, won't).
+Worth deciding whether to finish it or delete it — not touched here since it's out of
+scope for a data-source swap.
 

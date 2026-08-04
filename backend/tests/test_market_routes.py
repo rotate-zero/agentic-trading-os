@@ -78,3 +78,44 @@ def test_market_candles_rejects_unsupported_timeframe():
         assert r.status_code == 400
     finally:
         broker_registry.clear_all()
+
+
+def test_market_subscribe_requires_connection():
+    broker_registry.clear_all()
+    with TestClient(app) as client:
+        r = client.post("/market/subscribe", params={"symbol": "NVDA"})
+    assert r.status_code == 400
+    assert "connected" in r.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_market_subscribe_returns_400_for_unresolvable_symbol():
+    """Same fake, but via the generic provider-agnostic route rather than
+    /broker/subscribe specifically — this is the one the frontend
+    actually calls, and it needs to behave the same way."""
+    fake = _FakeConnectedAdapter()
+    await broker_registry.take_over_streaming(fake)
+    try:
+        with TestClient(app) as client:
+            r = client.post("/market/subscribe", params={"symbol": "NOTREAL"})
+        assert r.status_code == 400
+        assert "NOTREAL" in r.json()["detail"]
+    finally:
+        broker_registry.clear_all()
+
+
+@pytest.mark.asyncio
+async def test_market_subscribe_succeeds_for_valid_symbol():
+    class _AlwaysSucceeds(_FakeConnectedAdapter):
+        async def subscribe(self, symbols: list[str]) -> None:
+            pass  # no exception — a resolvable symbol
+
+    fake = _AlwaysSucceeds()
+    await broker_registry.take_over_streaming(fake)
+    try:
+        with TestClient(app) as client:
+            r = client.post("/market/subscribe", params={"symbol": "NVDA"})
+        assert r.status_code == 200
+        assert r.json() == {"status": "subscribed", "symbol": "NVDA"}
+    finally:
+        broker_registry.clear_all()
