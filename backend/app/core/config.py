@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     polygon_poll_interval_seconds: int = 60  # matches the underlying 1-min bar granularity — polling faster wastes budget for no new data
     polygon_max_calls_per_minute: int = 5
 
+    # --- Finnhub (Phase 3 — free tier: genuine real-time WebSocket streaming,
+    # but historical stock candles are paywalled: confirmed 403 on free keys,
+    # not assumed). See docs/decisions/confirmed-decisions.md #32.
+    finnhub_api_key: str | None = None
+    finnhub_max_calls_per_minute: int = 60
+
     # --- CORS (frontend dev server) ---
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 

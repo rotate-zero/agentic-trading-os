@@ -58,7 +58,29 @@ __all__ = [
     "OrderAck",
     "Position",
     "SymbolNotFoundError",
+    "HistoricalDataUnavailableError",
 ]
+
+
+class HistoricalDataUnavailableError(Exception):
+    """
+    Raised when a provider structurally cannot serve get_historical() —
+    not a transient failure, a capability gap. First needed for
+    FinnhubAdapter: Finnhub's free tier serves real-time WebSocket
+    streaming but returns a 403 on historical stock candles (moved behind
+    a paywall — confirmed via a real failed request, not assumed from
+    older docs). Distinct from SymbolNotFoundError, which means "this
+    symbol specifically doesn't resolve"; this means "this provider can
+    never answer this question, for any symbol." Same honesty principle
+    as BrokerAdapter.place_order() raising NotImplementedError for a
+    provider with no execution capability — don't pretend to support
+    something you structurally can't.
+    """
+
+    def __init__(self, provider: str, reason: str) -> None:
+        self.provider = provider
+        self.reason = reason
+        super().__init__(f"{provider} cannot serve historical data: {reason}")
 
 
 class SymbolNotFoundError(Exception):

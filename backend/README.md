@@ -34,14 +34,15 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - **`TickIngestBridge`** (`app/services/tick_ingest.py`, renamed from `IBKRIngestBridge` —
   see `../docs/decisions/confirmed-decisions.md` #31) — Phase-3-minimal bridge:
   publishes every tick as `PriceUpdated`, buckets ticks into 1-minute `CandleClosed`
-  events. Works for any `MarketDataProvider`, not just IBKR — shared by both adapters
-  below. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
+  events. Works for any `MarketDataProvider`, not just IBKR — shared by all three
+  adapters. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
   wholesale, not extended.
 - `POST /broker/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`, `GET /broker/status`
   for manual connection control (no auto-connect on app startup — see below)
 - `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever
-  adapter is currently connected (`app/services/broker_registry.py`). Same response
-  shape planned for the paused frontend mock-swap, so it's a drop-in later.
+  provider currently holds the **historical role** (`app/services/broker_registry.py`
+  — see below). Same response shape planned for the paused frontend mock-swap, so
+  it's a drop-in later.
 - **`MarketDataProvider` / `BrokerAdapter` split** (`app/broker_adapters/base.py`) —
   `BrokerAdapter` now extends `MarketDataProvider`, so a pure data-only vendor can
   implement just the data-streaming subset without pretending to support order
@@ -55,9 +56,32 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   `on_tick()` is backed by rate-limited REST polling
   (`app/core/rate_limiter.py`), not a push stream. **Auto-connects on app startup**
   if `POLYGON_API_KEY` is set (soft-fail if not — see "Polygon.io connection setup"
-  below), unlike IBKR's deliberately manual connect.
+  below). Serves the **historical** role always; also serves **streaming** as a
+  fallback if Finnhub isn't connected.
+- **`FinnhubAdapter`** (`app/broker_adapters/finnhub_provider.py`) — implements
+  `MarketDataProvider` only. Genuine real-time WebSocket streaming (built directly on
+  `websockets`, since `finnhub-python` ships no WS client at all — confirmed by
+  inspecting the package), but `get_historical()` raises the new
+  `HistoricalDataUnavailableError` — Finnhub's free tier paywalls historical stock
+  candles (confirmed 403, not assumed) — see
+  `../docs/decisions/confirmed-decisions.md` #32. Auto-connects on startup if
+  `FINNHUB_API_KEY` is set. Always takes the **streaming** role when connected —
+  never historical.
+- **Two-role `broker_registry`** (`streaming` / `historical`, not one shared slot —
+  see `../docs/decisions/confirmed-decisions.md` #33) — Finnhub and Polygon need to be
+  connected at once now, each doing the job it's actually good at.
+  `take_over_streaming()` safely hands off the streaming role without disconnecting a
+  provider still needed for historical. `IBKRAdapter`, once connected, takes over
+  both roles (it's capable of both) — that's always a deliberate manual action, so
+  it's allowed to override whatever auto-connected at startup.
 - `POST /market-data/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`,
-  `GET /market-data/status` — same pattern as the `/broker/*` routes, for Polygon.
+  `GET /market-data/status` (Polygon) and `POST /finnhub/connect`, `/subscribe`,
+  `/unsubscribe`, `/disconnect`, `GET /finnhub/status` (Finnhub) — same pattern as
+  `/broker/*`, one route file per provider. `main.py`'s auto-connect calls these same
+  modules' shared `connect_polygon()`/`connect_finnhub()` functions rather than
+  constructing adapters inline — an earlier version didn't, and auto-connect silently
+  desynced from these routes' own state (see `../docs/decisions/confirmed-decisions.md`
+  #34, found via an actual startup test, not caught by unit tests).
 
 **Deliberately not implemented yet** (belongs to a later phase, per
 [`phase-roadmap.md`](../docs/roadmap/phase-roadmap.md)):
@@ -65,14 +89,14 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - Any table beyond `symbols`/`candles`
 - Order placement — no route exists for it; only the Governor (Phase 5/6) should ever
   be able to trigger a real order
-- Frontend mock-data swap — paused mid-implementation to prioritize the IBKR adapter;
-  the plan (candles.ts only, via a `useLiveCandles` hook) is unchanged and now has a
-  real data source to point at instead of the dev mock publisher
+- Frontend mock-data swap — paused mid-implementation to prioritize the broker/data
+  adapters; the plan (candles.ts only, via a `useLiveCandles` hook) is unchanged and
+  now has real data sources to point at instead of the dev mock publisher
 
 **What's verified vs. not, for the IBKR pieces specifically:**
 - ✅ `ib_async` API signatures — verified by installing the library and introspecting
   real method signatures, not trusting memory
-- ✅ Tick→candle bucketing logic — unit tested (`tests/test_ibkr_ingest.py`)
+- ✅ Tick→candle bucketing logic — unit tested (`tests/test_tick_ingest.py`)
 - ✅ Symbol-qualification failure path — unit tested by simulating
   `qualifyContractsAsync`'s real "return None" failure signal, both in the adapter
   directly and through the `/broker/subscribe` and `/market/candles` routes
@@ -80,13 +104,25 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   fires internally on a real drop
 - ✅ The connect path genuinely attempts a real socket connection and fails cleanly
   (verified: got a real `ConnectionRefusedError` against `127.0.0.1:4002` with no
-  Gateway running, surfaced as a clean HTTP 502, not a crash) — re-verified against a
-  live `uvicorn` process after these changes, alongside `/market/candles`' clean
-  400 when nothing's connected
+  Gateway running, surfaced as a clean HTTP 502, not a crash)
 - ❌ An actual live connection to a running Gateway with a real IBKR account — this
   sandbox has no path to that. Has to happen on your machine.
 - ❌ Auto-reconnect after a disconnect — not built. Deliberately deferred to Phase 4's
   Market Data Engine (`ConnectionManager`), not pulled forward into this adapter.
+
+**What's verified vs. not, for Finnhub specifically:**
+- ✅ `finnhub-python` ships no WebSocket client — confirmed by inspecting the
+  installed package, not assumed
+- ✅ Free tier's historical-candle paywall — confirmed via a real GitHub issue from
+  someone hitting the actual 403, not from a tutorial that might predate the change
+- ✅ Full connect → subscribe → receive-trade → ignore-ping → unsubscribe → disconnect
+  flow — verified against a **real local WebSocket server** mimicking Finnhub's exact
+  protocol (this sandbox can't reach `wss://ws.finnhub.io` — not in its network
+  allowlist — so this is the strongest verification available short of a real key)
+- ✅ Message parsing edge cases — multiple trades in one message, malformed entries,
+  ping/unknown message types — all unit tested
+- ❌ Behavior against the real Finnhub servers with a real key — has to happen on your
+  machine
 
 ## IBKR connection setup
 
@@ -139,20 +175,48 @@ desktop app, no 2FA handshake per session.
    adapter polls (`app/core/rate_limiter.py`-throttled) rather than streams — see
    `../docs/decisions/confirmed-decisions.md` #30 for the full reasoning. Every tick's
    timestamp reflects Polygon's actual (delayed) bar time, not "now," so what you see
-   on a chart fed by this will honestly lag real time by ~15 minutes. This is expected
-   behavior on this tier, not a bug.
-4. Subscribe to a symbol:
+   on a chart fed by this will honestly lag real time by ~15 minutes if Polygon is your
+   only connected source. This is expected behavior on this tier, not a bug.
+4. Polygon always serves the **historical** role (`GET /market/candles`) regardless of
+   what else is connected. It also serves **streaming** as a fallback if Finnhub isn't
+   configured — check `GET /market-data/status`'s `role` field to see which.
+5. Subscribe to a symbol:
    ```bash
    curl -X POST "http://localhost:8000/market-data/subscribe?symbol=NVDA"
    curl http://localhost:8000/market-data/status
    ```
-   Then watch `market.tick`/`market.candle` on `/ws`, same as IBKR — same pipeline,
-   different (and much more rate-limited) source feeding it.
-5. No `POLYGON_API_KEY` set → the app boots fine anyway and just skips Polygon
+6. No `POLYGON_API_KEY` set → the app boots fine anyway and just skips Polygon
    entirely (check logs for `POLYGON_API_KEY not set — skipping Polygon auto-connect`).
    An optional data source failing to configure must never block the whole app.
 
+## Finnhub connection setup
+
+Same auto-connect pattern as Polygon — an API key, no desktop app.
+
+1. Set `FINNHUB_API_KEY` in `.env`.
+2. Start the backend. It auto-connects on startup (check logs for
+   `Finnhub auto-connected on startup`) and **takes the streaming role over Polygon**
+   if both are configured (Finnhub is genuinely real-time; Polygon's streaming is only
+   ever a delayed fallback). Polygon keeps serving historical either way — connecting
+   Finnhub never disconnects Polygon unless Polygon has no other job to do.
+3. **This one actually is real-time** — free-tier WebSocket streaming, not polling,
+   not delayed. What it can't do: historical candles for stocks — `GET /market/candles`
+   will 501 if Finnhub is somehow the only thing registered as historical (it never
+   registers as historical itself, so this shouldn't happen in practice; see
+   `../docs/decisions/confirmed-decisions.md` #32 for why).
+4. Subscribe to a symbol:
+   ```bash
+   curl -X POST "http://localhost:8000/finnhub/subscribe?symbol=NVDA"
+   curl http://localhost:8000/finnhub/status
+   ```
+   Then watch `market.tick`/`market.candle` on `/ws` — same pipeline as everything
+   else, genuinely live this time.
+5. No `FINNHUB_API_KEY` set → skips cleanly, same as Polygon. If both keys are set,
+   Polygon's auto-connect logs will say "historical only — Finnhub already streaming"
+   instead of claiming the streaming-fallback role.
+
 ## Running locally
+
 
 **Python 3.10–3.13 recommended.** Python 3.14 works too, but only with `ib_async>=2.1`
 (already what `requirements.txt` pins) — earlier `ib_async` versions depend on a library
@@ -233,6 +297,8 @@ No extra setup needed — every test file below runs with just `pip install -r r
 | `test_market_routes.py` | `GET /market/candles` and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |
 | `test_polygon_provider.py` | `PolygonAdapter`'s pure logic, all via monkeypatched `get_aggs` (no real API key or network access): timeframe mapping, ABC compliance, `get_historical`'s bad-symbol handling (empty-list-not-exception, same trap as `qualifyContractsAsync`), and the polling dedup logic — a new bar fires `on_tick`, the same bar polled again doesn't, a client exception doesn't kill the loop |
+| `test_finnhub_provider.py` | `FinnhubAdapter`'s pure logic: missing-key handling, ABC compliance, `get_historical` correctly raising `HistoricalDataUnavailableError` (confirmed decision #32), and WS message parsing — ping/unknown types ignored, single and multi-trade messages parsed, malformed entries skipped without crashing the batch |
+| `test_broker_registry.py` | The two-role registry's coordination logic (confirmed decision #33) directly, not just incidentally through route tests: `take_over_streaming()` disconnects the previous streaming provider by default, but does NOT disconnect one still needed for the historical role; a no-op takeover (same provider) doesn't self-disconnect; `get_all_active_providers()` deduplicates by identity |
 | `conftest.py` | Not a test file — an autouse fixture resetting the app's module-level singletons (Event Bus, connection manager, Gateway, broker registry) between tests. Needed because those singletons are cached for the process lifetime, but `pytest-asyncio` gives each test its own event loop; without this reset, a second `TestClient(app)` in a later test reuses queues bound to an already-dead loop |
 
 **What these tests deliberately don't cover:** an actual live IBKR connection. `test_ibkr_adapter.py`'s interface-compliance test constructs a real `IBKRAdapter` but never calls `connect()` — that requires a running IB Gateway and a real account, which only exists on your machine, not here. See "IBKR connection setup" above for that verification path, and the smoke checks below.

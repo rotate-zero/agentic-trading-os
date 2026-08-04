@@ -1,8 +1,10 @@
 """
 Candle backfill over REST — a chart needs "the last N candles" on load;
 a WebSocket subscription alone only gives you what arrives from now on.
-Reads from whichever adapter is currently connected via broker_registry
-(app/api/routes/broker.py owns connecting it).
+Reads specifically from the HISTORICAL role in broker_registry, not
+whichever provider is currently streaming — those are independent roles
+now (confirmed decision #33), since Finnhub (streaming) can't serve this
+at all.
 
 Response shape is deliberately the same {"symbol", "candles": [...]}
 shape planned for the paused frontend mock-swap work, so useLiveCandles
@@ -15,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.broker_adapters.base import SymbolNotFoundError
+from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
 from app.services import broker_registry
 
 router = APIRouter(prefix="/market", tags=["market"])
@@ -33,9 +35,16 @@ async def get_candles(
     count: int = Query(240, le=1000),
     timeframe: str = Query("1m"),
 ) -> dict:
-    adapter = broker_registry.get_active_adapter()
+    adapter = broker_registry.get_historical_provider()
     if adapter is None or not adapter.is_connected():
-        raise HTTPException(status_code=400, detail="Not connected — call POST /broker/connect first")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No historical provider connected — call POST /market-data/connect "
+                "(Polygon) or POST /broker/connect (IBKR, once available). Finnhub "
+                "cannot serve this (see GET /finnhub/status)."
+            ),
+        )
 
     if timeframe not in _MINUTES_PER_UNIT:
         raise HTTPException(
@@ -50,6 +59,12 @@ async def get_candles(
         candles = await adapter.get_historical(symbol, timeframe, start, end)
     except SymbolNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HistoricalDataUnavailableError as exc:
+        # Shouldn't normally happen — the historical role is only ever
+        # supposed to hold a provider that can actually do this — but
+        # handled explicitly rather than surfacing as a raw 500 if it
+        # somehow does (e.g. a future provider registered incorrectly).
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     return {
         "symbol": symbol,

@@ -22,6 +22,8 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _reset_app_singletons():
+    import app.api.routes.finnhub_data as finnhub_data_module
+    import app.api.routes.market_data as market_data_module
     import app.api.websocket.channels as channels_module
     import app.api.websocket.manager as manager_module
     import app.event_bus.bus as bus_module
@@ -31,7 +33,14 @@ def _reset_app_singletons():
         bus_module._event_bus = None
         manager_module._manager = None
         channels_module._gateway = None
-        broker_registry.clear_active()
+        broker_registry.clear_all()
+        # market_data.py and finnhub_data.py each keep their own local
+        # provider reference (see their module docstrings for why) —
+        # broker_registry.clear_all() doesn't reach these, so reset
+        # explicitly or a provider "connected" in one test leaks into
+        # the next.
+        market_data_module._provider = None
+        finnhub_data_module._provider = None
 
     _reset()
     yield

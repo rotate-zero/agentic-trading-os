@@ -1,41 +1,95 @@
 """
-Shared registry for whichever provider is currently connected — a full
-BrokerAdapter (IBKR) or, once one exists, a data-only MarketDataProvider
-(Polygon, Databento, ...). Exists so app/api/routes/broker.py
-(connect/disconnect) and app/api/routes/market.py (candle backfill) agree
-on the same instance, instead of each route file keeping its own
-module-level global that the other can't see.
+Shared registry for currently-connected market-data/broker providers.
 
-Typed against MarketDataProvider, not BrokerAdapter — GET /market/candles
-only ever needs is_connected()/get_historical(), both on the base
-interface, so it shouldn't require a full broker to be sitting behind it.
-A BrokerAdapter instance (like IBKRAdapter) satisfies this type fine,
-since BrokerAdapter extends MarketDataProvider (confirmed decision #28).
+Two independent named roles, not one slot (confirmed decision #33):
+  - streaming: whichever provider feeds the live tick pipeline
+    (TickIngestBridge -> Event Bus -> WebSocket Gateway). Finnhub when
+    connected (genuinely real-time); Polygon as a fallback (delayed) if
+    Finnhub isn't connected.
+  - historical: whichever provider serves GET /market/candles backfill.
+    Polygon, since Finnhub's free tier can't serve this at all
+    (confirmed decision #32).
 
-Deliberately a single global slot, not a dict — Phase 3 is "one
-provider, one symbol at a time" by design (system-design.md §7's Phase 3
-exit criterion). Multi-provider support isn't a Phase 3 concern.
+A single provider can fill both roles if it's capable of both —
+IBKRAdapter, once connected, takes over both, since it's a full
+BrokerAdapter with no reason not to. Finnhub only ever registers as
+streaming; get_historical() on it would just raise
+HistoricalDataUnavailableError.
+
+Replaces the original single-slot design (set_active/get_active_adapter/
+clear_active) now that the trigger for needing more than one slot has
+actually fired: Finnhub (streaming-only) and Polygon (historical-capable,
+streaming-capable-but-delayed) both need to be connected at once, each
+doing the job it's actually good at.
 """
 from __future__ import annotations
 
 from app.broker_adapters.base import MarketDataProvider
 from app.services.tick_ingest import TickIngestBridge
 
-_adapter: MarketDataProvider | None = None
-_bridge: TickIngestBridge | None = None
+_streaming_provider: MarketDataProvider | None = None
+_streaming_bridge: TickIngestBridge | None = None
+_historical_provider: MarketDataProvider | None = None
 
 
-def set_active(adapter: MarketDataProvider, bridge: TickIngestBridge | None = None) -> None:
-    global _adapter, _bridge
-    _adapter = adapter
-    _bridge = bridge
+async def take_over_streaming(
+    new_provider: MarketDataProvider, bridge: TickIngestBridge | None = None
+) -> None:
+    """
+    Makes new_provider the streaming provider, safely retiring whatever
+    was there before. If the previous streaming provider is a different
+    instance and ISN'T also the current historical provider, it gets
+    disconnected — otherwise it would keep silently pushing ticks onto
+    the Event Bus alongside the new provider, and nothing downstream
+    would know two sources were feeding it at once. If it's still needed
+    for the historical role, it's left connected; only its streaming
+    "ownership" changes.
+    """
+    global _streaming_provider, _streaming_bridge
+    old = _streaming_provider
+    if old is not None and old is not new_provider and _historical_provider is not old:
+        await old.disconnect()
+    _streaming_provider = new_provider
+    _streaming_bridge = bridge
 
 
-def clear_active() -> None:
-    global _adapter, _bridge
-    _adapter = None
-    _bridge = None
+def clear_streaming_provider() -> None:
+    global _streaming_provider, _streaming_bridge
+    _streaming_provider = None
+    _streaming_bridge = None
 
 
-def get_active_adapter() -> MarketDataProvider | None:
-    return _adapter
+def get_streaming_provider() -> MarketDataProvider | None:
+    return _streaming_provider
+
+
+def set_historical_provider(provider: MarketDataProvider) -> None:
+    global _historical_provider
+    _historical_provider = provider
+
+
+def clear_historical_provider() -> None:
+    global _historical_provider
+    _historical_provider = None
+
+
+def get_historical_provider() -> MarketDataProvider | None:
+    return _historical_provider
+
+
+def get_all_active_providers() -> list[MarketDataProvider]:
+    """For lifecycle management (main.py shutdown) — every distinct
+    connected provider, deduplicated by identity, since one instance can
+    fill both roles at once (e.g. IBKR) and must not be disconnected
+    twice."""
+    result: list[MarketDataProvider] = []
+    for provider in (_streaming_provider, _historical_provider):
+        if provider is not None and provider not in result:
+            result.append(provider)
+    return result
+
+
+def clear_all() -> None:
+    """Test-fixture convenience — resets both roles at once."""
+    clear_streaming_provider()
+    clear_historical_provider()
