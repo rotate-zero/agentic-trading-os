@@ -5,6 +5,13 @@ import type { Candle } from "../types/market";
 // zones) will push over the Event Bus from Phase 4/5 onward. Same shape either way.
 
 export function generateMockOverlays(candles: Candle[]): ChartObject[] {
+  // useLiveCandles (the real data source this now runs against) starts
+  // empty and fills in after an async backfill — the old
+  // generateMockCandles never had that state, since it returned a full
+  // synchronous array on every call, so this guard was never needed
+  // before. No candles yet means nothing to compute overlays from.
+  if (candles.length === 0) return [];
+
   const closes = candles.map((c) => c.close);
   const high = Math.max(...closes);
   const low = Math.min(...closes);
