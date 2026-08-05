@@ -119,3 +119,45 @@ async def test_market_subscribe_succeeds_for_valid_symbol():
         assert r.json() == {"status": "subscribed", "symbol": "NVDA"}
     finally:
         broker_registry.clear_all()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_exception_still_gets_cors_headers_and_clean_json():
+    """
+    The actual reported bug: a real, unanticipated exception from
+    get_historical() (my tests only ever mocked Polygon's client, never
+    hit a genuinely unexpected error type from the real API) fell through
+    every try/except in the route and, per a known FastAPI/Starlette
+    gotcha, bypassed CORSMiddleware entirely — the browser reported this
+    as a CORS policy violation with zero useful detail, when the real
+    problem was a plain unhandled exception. Proving the fix here means
+    actually checking the CORS header is present, not just that a JSON
+    body comes back — a naive fix could return clean JSON while still
+    missing the header and not actually solve the reported symptom.
+    """
+
+    class _ThrowsSomethingUnexpected(_FakeConnectedAdapter):
+        async def get_historical(self, symbol: str, timeframe: str, start, end):
+            raise RuntimeError("simulated unexpected error — e.g. a real Polygon API failure")
+
+    broker_registry.set_historical_provider(_ThrowsSomethingUnexpected())
+    try:
+        # raise_server_exceptions=False: TestClient's default (True) is a
+        # debug convenience that re-raises exceptions in the test process
+        # itself for easier debugging — bypassing any registered
+        # exception handler entirely. That's TestClient-specific test
+        # behavior, not how a real uvicorn server behaves (which always
+        # returns whatever the middleware stack produces, handler
+        # included). Disabling it here is what actually exercises the
+        # handler under test, matching production behavior.
+        with TestClient(app, raise_server_exceptions=False) as client:
+            r = client.get(
+                "/market/candles",
+                params={"symbol": "NVDA"},
+                headers={"Origin": "http://localhost:5173"},
+            )
+        assert r.status_code == 500
+        assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+        assert "simulated unexpected error" in r.json()["detail"]
+    finally:
+        broker_registry.clear_all()

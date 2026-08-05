@@ -12,6 +12,7 @@ from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
 from app.api.websocket.channels import get_gateway
 from app.core.config import get_settings
+from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
 from app.services import broker_registry
@@ -88,6 +89,16 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
+    # Order matters here — Starlette's add_middleware() prepends, so
+    # wrap-order is the REVERSE of call-order. Adding
+    # UnhandledExceptionMiddleware first, then CORSMiddleware, means
+    # CORSMiddleware ends up wrapping UnhandledExceptionMiddleware —
+    # required so a response built by UnhandledExceptionMiddleware
+    # actually passes back through CORSMiddleware's header injection.
+    # Reversing this order silently breaks it again (confirmed decision
+    # #37) — the two are not a plain "add these two middlewares"
+    # independent pair, this ordering is load-bearing.
+    app.add_middleware(UnhandledExceptionMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
