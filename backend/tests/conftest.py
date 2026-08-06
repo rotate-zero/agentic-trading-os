@@ -14,6 +14,19 @@ touched them) get reused across tests running on different loops,
 producing "Queue ... is bound to a different event loop" errors — not a
 bug in the app itself, just a mismatch between "singleton per process"
 and "fresh loop per test."
+
+Also blanks FINNHUB_API_KEY/POLYGON_API_KEY for the duration of every
+test, regardless of what's actually in a real .env file on whatever
+machine runs these tests — found via a real bug, not a hypothetical:
+once real API keys were configured locally for actual usage,
+`TestClient(app)`'s __enter__ started running main.py's REAL lifespan
+startup on every single test, which auto-connects real
+Finnhub/Polygon providers as a side effect and silently overwrites
+whatever fake registry state a test had carefully set up — confirmed
+via an actual captured traceback showing a genuine HTTPS request to
+api.polygon.io firing during a supposedly-isolated unit test. Six tests
+failed from this alone, none of them because of an actual bug in
+application code (see confirmed-decisions.md #38).
 """
 from __future__ import annotations
 
@@ -21,13 +34,24 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_app_singletons():
+def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.api.routes.finnhub_data as finnhub_data_module
     import app.api.routes.market_data as market_data_module
     import app.api.websocket.channels as channels_module
     import app.api.websocket.manager as manager_module
+    import app.core.config as config_module
     import app.event_bus.bus as bus_module
     from app.services import broker_registry
+
+    # Explicit empty string, not delenv: pydantic-settings' BaseSettings
+    # reads the .env FILE as a fallback source independent of the
+    # process's real os.environ — delenv only removes an OS-level
+    # override that likely was never set in the first place (a real key
+    # sitting in .env isn't a shell-exported OS env var). Only a SET
+    # (even to "") takes priority over the .env file's own value.
+    monkeypatch.setenv("FINNHUB_API_KEY", "")
+    monkeypatch.setenv("POLYGON_API_KEY", "")
+    config_module.get_settings.cache_clear()  # lru_cache — must clear or the blanked env is never actually read
 
     def _reset():
         bus_module._event_bus = None
@@ -45,3 +69,4 @@ def _reset_app_singletons():
     _reset()
     yield
     _reset()
+    config_module.get_settings.cache_clear()  # restore real settings for anything running after this fixture
