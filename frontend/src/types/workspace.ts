@@ -13,8 +13,83 @@ export type InfoConnectorMode = "general" | Exclude<ConnectorId, "none">;
 export type Timeframe = "1m" | "5m" | "15m" | "1h";
 export const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m", "1h"];
 
-export type IndicatorType = "EMA9" | "EMA20" | "SMA20" | "SMA50";
-export const AVAILABLE_INDICATORS: IndicatorType[] = ["EMA9", "EMA20", "SMA20", "SMA50"];
+// EMA9/EMA20 only — the two SMA presets that used to live here (SMA20,
+// SMA50) are superseded by PriceIndicatorInstance below and were removed
+// from this enum, not left as a second, conflicting way to add an SMA line.
+// EMA stays on the old fixed-preset model for now; migrating it to the same
+// instance-based shape as SMA is future work, not done here (out of scope —
+// see confirmed-decisions.md).
+export type IndicatorType = "EMA9" | "EMA20";
+export const AVAILABLE_INDICATORS: IndicatorType[] = ["EMA9", "EMA20"];
+
+// Price-pane indicators drawn directly on the candlestick series, as
+// instances rather than fixed presets — a chart can hold any number of SMAs
+// at once, each with its own period/color/thickness (the "9/20/50 on a 5m
+// chart, 50/100/200 on daily" requirement can't be expressed as a fixed
+// enum the way IndicatorType above is). This is UI-only chart-reading
+// convenience, computed client-side from whatever candles are already
+// loaded — same category as the pre-existing EMA9/EMA20 lines and the
+// volume-average lines above, NOT a Feature Engine output. It's never
+// published to the Event Bus and never consumed by Strategy/Decision
+// Engine, so it doesn't conflict with system-design.md §1's "no generic
+// indicator plugin marketplace" non-goal — that non-goal is about keeping
+// algorithmic-decision inputs flowing through the one canonical backend
+// Feature Engine, not about what a human is allowed to overlay on their own
+// chart for reading price action. See confirmed-decisions.md for the full
+// reasoning.
+//
+// Add the next kind (EMA, Bollinger Bands, VWAP band, ...) by extending this
+// union, adding one case to computePriceIndicator (utils/indicators.ts), and
+// reusing everything else (this config shape, the SMA submenu's list/add/
+// remove UI, ChartWidget's series wiring, persistence/normalization)
+// unchanged — that's the whole point of the instance shape below.
+export type PriceIndicatorType = "SMA";
+
+export interface PriceIndicatorInstance {
+  id: string; // stable per-instance id — NOT derived from type/period, since
+  // two instances of the same type can coexist (e.g. two SMAs) and an id
+  // tied to period would have to change (and orphan its chart series) the
+  // moment the user edits the period.
+  type: PriceIndicatorType;
+  enabled: boolean;
+  period: number; // bars considered
+  color: string; // hex
+  lineWidth: number; // px, PRICE_INDICATOR_LINE_WIDTH_MIN..MAX
+}
+
+export const PRICE_INDICATOR_PERIOD_MIN = 2;
+export const PRICE_INDICATOR_PERIOD_MAX = 500;
+export const PRICE_INDICATOR_PERIOD_STEP = 1;
+export const PRICE_INDICATOR_LINE_WIDTH_MIN = 1;
+export const PRICE_INDICATOR_LINE_WIDTH_MAX = 4;
+export const PRICE_INDICATOR_DEFAULT_PERIOD = 20;
+export const PRICE_INDICATOR_DEFAULT_LINE_WIDTH = 2;
+
+// Cycled through as new instances are added so three fresh SMAs don't all
+// land on the same color before the user picks their own — same rationale
+// as SubWindowMenu.tsx's CONNECTOR_COLORS.
+const PRICE_INDICATOR_COLOR_CYCLE = ["#58A6FF", "#E3B341", "#7EE787", "#F778BA", "#BC8CFF", "#FFA657"];
+
+export function createPriceIndicatorInstance(
+  type: PriceIndicatorType,
+  existingCount: number,
+  period: number = PRICE_INDICATOR_DEFAULT_PERIOD
+): PriceIndicatorInstance {
+  return {
+    id: `${type.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    type,
+    enabled: true,
+    period,
+    color: PRICE_INDICATOR_COLOR_CYCLE[existingCount % PRICE_INDICATOR_COLOR_CYCLE.length],
+    lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
+  };
+}
+
+// Derived, not stored — a label tied to a stale period the user just edited
+// would be a second source of truth for the same value.
+export function priceIndicatorLabel(instance: PriceIndicatorInstance): string {
+  return `${instance.type} ${instance.period}`;
+}
 
 // "Maintain a fixed number of candles, new ones replace old ones" — implemented
 // as a visible-range constraint (last N bars), not data deletion. Behaves like a
@@ -104,6 +179,7 @@ export interface SubWindowConfig {
   symbol: string; // only authoritative when connector === 'none'
   timeframe: Timeframe;
   indicators: IndicatorType[];
+  priceIndicators: PriceIndicatorInstance[]; // opt-in, starts empty — SMA today
   candleLimit: CandleLimit;
   backgroundColor: string; // hex, e.g. "#131720"
   gridColor: string; // hex, e.g. "#1E2530"

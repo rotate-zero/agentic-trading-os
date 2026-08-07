@@ -9,11 +9,19 @@ import {
   DEFAULT_GRID_COLOR,
   DEFAULT_TIMER_COLOR,
   LINK_CONNECTOR_IDS,
+  PRICE_INDICATOR_LINE_WIDTH_MAX,
+  PRICE_INDICATOR_LINE_WIDTH_MIN,
+  PRICE_INDICATOR_PERIOD_MAX,
+  PRICE_INDICATOR_PERIOD_MIN,
+  PRICE_INDICATOR_PERIOD_STEP,
   TIMEFRAMES,
   VOLUME_AVG_BAR_MAX,
   VOLUME_AVG_BAR_MIN,
   VOLUME_AVG_BAR_STEP,
+  createPriceIndicatorInstance,
+  priceIndicatorLabel,
   type CandleLimit,
+  type PriceIndicatorInstance,
   type SubWindowConfig,
   type VolumeAvgIndicatorConfig,
   type VolumeAvgLineConfig,
@@ -93,7 +101,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "indicators" | "connector" | "candles" | "background" | "timer" | "volumeAvg";
+type MenuLevel = "root" | "timeframe" | "indicators" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "sma";
 
 function RootRow({
   label,
@@ -258,12 +266,132 @@ function VolumeAvgLineRow({
   );
 }
 
+// One row per SMA instance — checkbox to enable, a period stepper (bars
+// considered), a line-width stepper (thickness), its own color swatch + hex
+// field, and a remove button. Modeled directly on VolumeAvgLineRow above;
+// the next indicator kind to get this treatment should follow the same
+// shape rather than inventing a new one.
+function SmaIndicatorRow({
+  subWindowId,
+  priceIndicators,
+  instance,
+  updateSubWindow,
+}: {
+  subWindowId: string;
+  priceIndicators: PriceIndicatorInstance[];
+  instance: PriceIndicatorInstance;
+  updateSubWindow: (id: string, patch: Partial<SubWindowConfig>) => void;
+}) {
+  const [hexDraft, setHexDraft] = useState(instance.color);
+  useEffect(() => setHexDraft(instance.color), [instance.color]);
+
+  const patchInstance = (patch: Partial<PriceIndicatorInstance>) => {
+    updateSubWindow(subWindowId, {
+      priceIndicators: priceIndicators.map((p) => (p.id === instance.id ? { ...p, ...patch } : p)),
+    });
+  };
+
+  const removeInstance = () => {
+    updateSubWindow(subWindowId, { priceIndicators: priceIndicators.filter((p) => p.id !== instance.id) });
+  };
+
+  const stepPeriod = (direction: 1 | -1) => {
+    const next = instance.period + direction * PRICE_INDICATOR_PERIOD_STEP;
+    patchInstance({ period: Math.min(PRICE_INDICATOR_PERIOD_MAX, Math.max(PRICE_INDICATOR_PERIOD_MIN, next)) });
+  };
+
+  const stepLineWidth = (direction: 1 | -1) => {
+    const next = instance.lineWidth + direction;
+    patchInstance({ lineWidth: Math.min(PRICE_INDICATOR_LINE_WIDTH_MAX, Math.max(PRICE_INDICATOR_LINE_WIDTH_MIN, next)) });
+  };
+
+  return (
+    <div className="mb-2 rounded border border-base-border/60 px-2 py-1.5">
+      <div className="flex items-center gap-1.5">
+        <input
+          type="checkbox"
+          checked={instance.enabled}
+          onChange={(e) => patchInstance({ enabled: e.target.checked })}
+          className="h-3 w-3 shrink-0 accent-signal"
+        />
+        <span className="flex-1 truncate font-mono text-[11px] text-text-primary">{priceIndicatorLabel(instance)}</span>
+        <button
+          onClick={removeInstance}
+          title="Remove"
+          className="shrink-0 rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear"
+        >
+          &times;
+        </button>
+      </div>
+      <div className="mt-1 flex items-center gap-3 pl-[18px]">
+        <div className="flex items-center gap-1">
+          <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Bars</span>
+          <button
+            onClick={() => stepPeriod(-1)}
+            disabled={instance.period <= PRICE_INDICATOR_PERIOD_MIN}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            &minus;
+          </button>
+          <span className="w-7 text-center font-mono text-[10px] text-text-primary">{instance.period}</span>
+          <button
+            onClick={() => stepPeriod(1)}
+            disabled={instance.period >= PRICE_INDICATOR_PERIOD_MAX}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            +
+          </button>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Width</span>
+          <button
+            onClick={() => stepLineWidth(-1)}
+            disabled={instance.lineWidth <= PRICE_INDICATOR_LINE_WIDTH_MIN}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            &minus;
+          </button>
+          <span className="w-4 text-center font-mono text-[10px] text-text-primary">{instance.lineWidth}</span>
+          <button
+            onClick={() => stepLineWidth(1)}
+            disabled={instance.lineWidth >= PRICE_INDICATOR_LINE_WIDTH_MAX}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            +
+          </button>
+        </div>
+      </div>
+      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+        <input
+          type="color"
+          value={instance.color}
+          onChange={(e) => patchInstance({ color: e.target.value })}
+          className="h-5 w-5 shrink-0 cursor-pointer rounded border border-base-border bg-transparent p-0"
+          title="Pick a color"
+        />
+        <input
+          value={hexDraft}
+          onChange={(e) => {
+            setHexDraft(e.target.value);
+            if (isValidHex(e.target.value)) patchInstance({ color: e.target.value });
+          }}
+          placeholder={instance.color}
+          className={`w-20 rounded border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary outline-none focus:border-signal ${
+            isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
 export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConfig; displaySymbol: string }) {
   const { updateSubWindow } = useWorkspace();
   const [open, setOpen] = useState(false);
   const [level, setLevel] = useState<MenuLevel>("root");
 
   const activeVolumeAvgLines = config.volumeAvg.lines.filter((l) => l.enabled).length;
+  const activeSmaCount = config.priceIndicators.filter((p) => p.enabled).length;
 
   const closeMenu = () => {
     setOpen(false);
@@ -274,6 +402,12 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
     const has = config.indicators.includes(ind);
     updateSubWindow(config.id, {
       indicators: has ? config.indicators.filter((i) => i !== ind) : [...config.indicators, ind],
+    });
+  };
+
+  const addSmaInstance = () => {
+    updateSubWindow(config.id, {
+      priceIndicators: [...config.priceIndicators, createPriceIndicatorInstance("SMA", config.priceIndicators.length)],
     });
   };
 
@@ -301,8 +435,10 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
         )}
         <span className="truncate font-mono text-xs font-semibold text-text-primary">{displaySymbol}</span>
         <span className="shrink-0 font-mono text-[10px] text-text-muted">{config.timeframe}</span>
-        {config.indicators.length > 0 && (
-          <span className="truncate font-mono text-[10px] text-text-muted">{config.indicators.join(", ")}</span>
+        {(config.indicators.length > 0 || activeSmaCount > 0) && (
+          <span className="truncate font-mono text-[10px] text-text-muted">
+            {[...config.indicators, ...config.priceIndicators.filter((p) => p.enabled).map(priceIndicatorLabel)].join(", ")}
+          </span>
         )}
         <button
           onClick={() => (open ? closeMenu() : setOpen(true))}
@@ -315,7 +451,7 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
       {open && (
         <div
           className={`absolute right-0 top-full z-20 rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
-            level === "volumeAvg" ? "w-72" : "w-56"
+            level === "volumeAvg" || level === "sma" ? "w-72" : "w-56"
           }`}
         >
           {level === "root" && (
@@ -325,6 +461,11 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                 label="Indicators"
                 hint={config.indicators.length ? `${config.indicators.length} active` : "None"}
                 onClick={() => setLevel("indicators")}
+              />
+              <RootRow
+                label="SMA"
+                hint={activeSmaCount > 0 ? `${activeSmaCount} active` : "None"}
+                onClick={() => setLevel("sma")}
               />
               <RootRow
                 label="Connector"
@@ -531,6 +672,32 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   />
                 ))}
               </div>
+            </div>
+          )}
+
+          {level === "sma" && (
+            <div>
+              <BackRow label="SMA" onClick={() => setLevel("root")} />
+              <div className="max-h-72 overflow-y-auto pr-0.5">
+                {config.priceIndicators.length === 0 && (
+                  <div className="px-2 py-1 font-mono text-[11px] text-text-muted">No SMAs added yet.</div>
+                )}
+                {config.priceIndicators.map((instance) => (
+                  <SmaIndicatorRow
+                    key={instance.id}
+                    subWindowId={config.id}
+                    priceIndicators={config.priceIndicators}
+                    instance={instance}
+                    updateSubWindow={updateSubWindow}
+                  />
+                ))}
+              </div>
+              <button
+                onClick={addSmaInstance}
+                className="mt-1 w-full rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal"
+              >
+                + Add SMA
+              </button>
             </div>
           )}
         </div>

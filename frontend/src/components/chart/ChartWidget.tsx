@@ -18,6 +18,7 @@ export interface IndicatorSeries {
   key: string;
   label: string;
   color: string;
+  lineWidth?: number; // px, 1-4 — defaults to 2 when omitted (legacy EMA9/EMA20 callers)
   data: IndicatorPoint[];
 }
 
@@ -281,16 +282,26 @@ export function ChartWidget({
     }
 
     for (const ind of indicators) {
+      // Lightweight Charts only accepts 1|2|3|4 for lineWidth — clamp rather
+      // than trust the caller, since PriceIndicatorInstance's lineWidth is
+      // user-typed-adjacent (a stepper, but still worth defending here too).
+      const lineWidth = Math.min(4, Math.max(1, Math.round(ind.lineWidth ?? 2))) as 1 | 2 | 3 | 4;
       let series = lineSeriesRef.current.get(ind.key);
       if (!series) {
         series = chart.addLineSeries({
           color: ind.color,
-          lineWidth: 2,
+          lineWidth,
           title: ind.label,
           priceLineVisible: false,
           lastValueVisible: true,
         });
         lineSeriesRef.current.set(ind.key, series);
+      } else {
+        // Color/thickness/label are live-editable per instance (the new SMA
+        // system) after the series already exists — applied on every render
+        // rather than only at creation, or a color pick / thickness step
+        // wouldn't show until the series was torn down and recreated.
+        series.applyOptions({ color: ind.color, lineWidth, title: ind.label });
       }
       series.setData(ind.data.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }
