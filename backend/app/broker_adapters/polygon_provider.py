@@ -35,13 +35,15 @@ granularity, not a bug to work around.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
 from polygon import RESTClient
+from polygon.exceptions import AuthError, BadResponse
 
-from app.broker_adapters.base import Candle, MarketDataProvider, SymbolNotFoundError, Tick
+from app.broker_adapters.base import Candle, HistoricalDataUnavailableError, MarketDataProvider, SymbolNotFoundError, Tick
 from app.core.config import get_settings
 from app.core.rate_limiter import RateLimiter
 
@@ -64,6 +66,24 @@ def _polygon_params_for(timeframe: str) -> tuple[int, str]:
             f"Unsupported timeframe for Polygon historical data: {timeframe!r} "
             f"(supported: {sorted(_TIMEFRAME_TO_POLYGON)})"
         ) from None
+
+
+def _is_plan_limitation(exc: BadResponse) -> bool:
+    """
+    polygon-api-client's BadResponse carries no structured fields at all
+    (verified by reading its source — it's a bare Exception subclass) —
+    the only signal available is the raw response body text it was
+    constructed with, a JSON string like
+    '{"status":"NOT_AUTHORIZED","message":"Your plan doesn't include
+    this data timeframe..."}'. Parsed rather than pattern-matched against
+    the message text, since the message wording is more likely to change
+    than the status field.
+    """
+    try:
+        body = json.loads(str(exc))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return body.get("status") == "NOT_AUTHORIZED"
 
 
 class PolygonAdapter(MarketDataProvider):
@@ -136,17 +156,47 @@ class PolygonAdapter(MarketDataProvider):
         multiplier, span = _polygon_params_for(timeframe)
 
         await self._rate_limiter.acquire()
-        aggs = await asyncio.to_thread(
-            self._client.get_aggs,
-            ticker=symbol,
-            multiplier=multiplier,
-            timespan=span,
-            from_=start,
-            to=end,
-            adjusted=True,
-            sort="asc",
-            limit=50000,
-        )
+        try:
+            aggs = await asyncio.to_thread(
+                self._client.get_aggs,
+                ticker=symbol,
+                multiplier=multiplier,
+                timespan=span,
+                from_=start,
+                to=end,
+                adjusted=True,
+                sort="asc",
+                limit=50000,
+            )
+        except AuthError as exc:
+            # A real auth failure (bad/expired key) — genuinely
+            # unexpected, not a known-and-handled case, so this
+            # propagates as-is to UnhandledExceptionMiddleware (confirmed
+            # decision #37) rather than being mis-categorized as a plan
+            # limitation. Different problem, different fix (check the key
+            # itself), shouldn't look the same to whoever's debugging it.
+            raise
+        except BadResponse as exc:
+            if _is_plan_limitation(exc):
+                # Found via a real account, not assumed: the free/Basic
+                # tier's minute-level aggregates specifically return
+                # NOT_AUTHORIZED — "15-minute delayed" (confirmed
+                # decision #30) turned out to describe a latency
+                # characteristic of data this plan doesn't actually grant
+                # access to at all, not a promise that minute bars are
+                # available-but-delayed. Distinct enough from the
+                # original research to be worth re-flagging here rather
+                # than silently patched over — see confirmed decision #39.
+                raise HistoricalDataUnavailableError(
+                    provider="Polygon",
+                    reason=(
+                        f"plan doesn't include {timeframe!r} timeframe data "
+                        f"({exc}). Try a coarser timeframe (e.g. '1d') if your "
+                        "plan supports it, or check what's actually included at "
+                        "https://polygon.io/pricing before assuming this is a bug."
+                    ),
+                ) from exc
+            raise  # some other BadResponse — genuinely unexpected, don't mask it
 
         if not aggs:
             # get_aggs returns an empty list for a bad/delisted ticker
@@ -203,6 +253,25 @@ class PolygonAdapter(MarketDataProvider):
                 sort="desc",
                 limit=5,
             )
+        except BadResponse as exc:
+            if _is_plan_limitation(exc):
+                # Same condition as get_historical() hitting
+                # HistoricalDataUnavailableError (confirmed decision
+                # #39) — but this is the polling path (used when Polygon
+                # is the streaming fallback, not the historical route),
+                # and it's a PERMANENT condition, not a transient one:
+                # logging a full traceback every 60s forever for
+                # something that will never resolve itself is just log
+                # spam. One clear line instead.
+                logger.warning(
+                    "PolygonAdapter poll for %s: plan doesn't include minute-level "
+                    "data (%s) — this will keep failing every cycle until the plan "
+                    "changes; not logging a full traceback for it repeatedly.",
+                    symbol, exc,
+                )
+            else:
+                logger.exception("PolygonAdapter poll failed for %s", symbol)
+            return
         except Exception:  # noqa: BLE001 — one bad poll must not kill the loop
             logger.exception("PolygonAdapter poll failed for %s", symbol)
             return

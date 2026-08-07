@@ -2,9 +2,10 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from polygon.exceptions import AuthError, BadResponse
 
-from app.broker_adapters.base import MarketDataProvider, SymbolNotFoundError
-from app.broker_adapters.polygon_provider import PolygonAdapter, _polygon_params_for
+from app.broker_adapters.base import HistoricalDataUnavailableError, MarketDataProvider, SymbolNotFoundError
+from app.broker_adapters.polygon_provider import PolygonAdapter, _is_plan_limitation, _polygon_params_for
 
 
 def _fake_agg(close: float, volume: int, ts_ms: int) -> SimpleNamespace:
@@ -126,3 +127,102 @@ async def test_poll_symbol_survives_client_exception():
 
     adapter._client.get_aggs = raise_error
     await adapter._poll_symbol("NVDA")  # should not raise
+
+
+# The exact real response body captured from a live account hitting
+# minute-level aggregates on the free/Basic tier — not a guessed shape.
+_REAL_NOT_AUTHORIZED_BODY = (
+    '{"status":"NOT_AUTHORIZED","request_id":"f73a9e39364524f66ccb08499ea385b3",'
+    '"message":"Your plan doesn\'t include this data timeframe. '
+    'Please upgrade your plan at https://polygon.io/pricing"}'
+)
+
+
+def test_is_plan_limitation_detects_the_real_not_authorized_response():
+    exc = BadResponse(_REAL_NOT_AUTHORIZED_BODY)
+    assert _is_plan_limitation(exc) is True
+
+
+def test_is_plan_limitation_false_for_other_bad_responses():
+    assert _is_plan_limitation(BadResponse('{"status":"ERROR","message":"something else"}')) is False
+
+
+def test_is_plan_limitation_false_for_unparseable_body():
+    # get_aggs's actual behavior on a genuinely malformed/non-JSON body —
+    # must not itself raise while trying to classify the original error.
+    assert _is_plan_limitation(BadResponse("not json at all")) is False
+
+
+@pytest.mark.asyncio
+async def test_get_historical_raises_historical_data_unavailable_for_plan_limitation():
+    """
+    The actual reported bug: querying timespan="minute" on the free/Basic
+    tier returns this exact NOT_AUTHORIZED response (confirmed against a
+    real account, not assumed) — it was propagating as a raw 500 with
+    Polygon's JSON error text before this fix categorized it properly.
+    """
+    adapter = PolygonAdapter(api_key="test-key-not-real")
+
+    def raise_bad_response(**kwargs):
+        raise BadResponse(_REAL_NOT_AUTHORIZED_BODY)
+
+    adapter._client.get_aggs = raise_bad_response
+
+    with pytest.raises(HistoricalDataUnavailableError) as exc_info:
+        await adapter.get_historical(
+            "AAPL", "1m", datetime.now(timezone.utc) - timedelta(hours=1), datetime.now(timezone.utc)
+        )
+    assert exc_info.value.provider == "Polygon"
+    assert "1m" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_get_historical_reraises_other_bad_responses_unmodified():
+    """A BadResponse that ISN'T the plan-limitation pattern must not be
+    silently swallowed or mis-categorized — it should reach
+    UnhandledExceptionMiddleware (confirmed decision #37) as a genuine
+    unexpected error, same as before this fix existed."""
+    adapter = PolygonAdapter(api_key="test-key-not-real")
+
+    def raise_other_bad_response(**kwargs):
+        raise BadResponse('{"status":"SOMETHING_ELSE","message":"a different problem"}')
+
+    adapter._client.get_aggs = raise_other_bad_response
+
+    with pytest.raises(BadResponse):
+        await adapter.get_historical(
+            "AAPL", "1m", datetime.now(timezone.utc) - timedelta(hours=1), datetime.now(timezone.utc)
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_historical_reraises_auth_error_unmodified():
+    """A real auth failure (bad/expired key) is a different problem with
+    a different fix than a plan limitation — must not look the same to
+    whoever's debugging it."""
+    adapter = PolygonAdapter(api_key="test-key-not-real")
+
+    def raise_auth_error(**kwargs):
+        raise AuthError("invalid API key")
+
+    adapter._client.get_aggs = raise_auth_error
+
+    with pytest.raises(AuthError):
+        await adapter.get_historical(
+            "AAPL", "1m", datetime.now(timezone.utc) - timedelta(hours=1), datetime.now(timezone.utc)
+        )
+
+
+@pytest.mark.asyncio
+async def test_poll_symbol_handles_plan_limitation_without_full_traceback_spam():
+    """Same NOT_AUTHORIZED condition, hit via the polling path (used when
+    Polygon is the streaming fallback) instead of get_historical() — must
+    not raise, and must not log a full traceback every cycle for a
+    permanent condition that will never resolve itself."""
+    adapter = PolygonAdapter(api_key="test-key-not-real")
+
+    def raise_bad_response(**kwargs):
+        raise BadResponse(_REAL_NOT_AUTHORIZED_BODY)
+
+    adapter._client.get_aggs = raise_bad_response
+    await adapter._poll_symbol("AAPL")  # should not raise
