@@ -3,24 +3,36 @@ import {
   createChart,
   ColorType,
   CrosshairMode,
+  LineStyle,
   type IChartApi,
   type ISeriesApi,
+  type LineWidth,
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { Candle, ChartObject } from "../../types/market";
 import type { IndicatorPoint } from "../../utils/indicators";
-import type { CandleLimit, Timeframe, TimerConfig, VolumeAvgIndicatorConfig } from "../../types/workspace";
+import type { CandleLimit, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig } from "../../types/workspace";
 import { DEFAULT_GRID_COLOR } from "../../types/workspace";
 import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
+import { computeHorizontalLevel } from "../../utils/indicators";
 import { TimerBadge } from "./TimerBadge";
 
 export interface IndicatorSeries {
   key: string;
   label: string;
   color: string;
-  lineWidth?: number; // px, 1-4 — defaults to 2 when omitted (legacy EMA9/EMA20 callers)
+  lineWidth?: number; // px — fractional allowed (e.g. 1.5), see the
+  // PRICE_INDICATOR_LINE_WIDTH_STEP comment in types/workspace.ts. Defaults
+  // to 2 when omitted (legacy callers).
+  showPriceLabel?: boolean; // last-value tag near the price axis; defaults to true
   data: IndicatorPoint[];
 }
+
+const LINE_STYLE_MAP: Record<LineStyleOption, LineStyle> = {
+  solid: LineStyle.Solid,
+  dashed: LineStyle.Dashed,
+  dotted: LineStyle.Dotted,
+};
 
 interface RectBox {
   label: string;
@@ -35,6 +47,7 @@ interface ChartWidgetProps {
   candles: Candle[];
   overlays: ChartObject[];
   indicators?: IndicatorSeries[];
+  horizontalLevels?: HorizontalLevelInstance[];
   candleLimit?: CandleLimit;
   backgroundColor?: string;
   gridColor?: string;
@@ -52,6 +65,7 @@ export function ChartWidget({
   candles,
   overlays,
   indicators = [],
+  horizontalLevels = [],
   candleLimit = "all",
   backgroundColor = "#131720",
   gridColor = DEFAULT_GRID_COLOR,
@@ -266,6 +280,38 @@ export function ChartWidget({
     };
   }, [candles, volumeAvg]);
 
+  // Horizontal level indicators (Previous Day Close/High/Low, Pre-Market
+  // High/Low, Camarilla Pivots, VPOC) — drawn on the candle series via
+  // createPriceLine, same mechanism as the backend `overlays` block above,
+  // but with per-instance color/width/style/label-visibility instead of a
+  // fixed style. Recreated on every candles/config change (not diffed via
+  // applyOptions like the indicator line series above) — price lines are
+  // cheap to recreate and this matches the existing overlays/volumeAvg
+  // precedent in this same file.
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+
+    const priceLines = horizontalLevels
+      .filter((level) => level.enabled)
+      .map((level) => computeHorizontalLevel(candles, level))
+      .filter((resolved): resolved is NonNullable<typeof resolved> => resolved !== undefined)
+      .map((resolved) =>
+        series.createPriceLine({
+          price: resolved.price,
+          color: resolved.color,
+          lineWidth: Math.min(4, Math.max(1, Math.round(resolved.lineWidth))) as LineWidth,
+          lineStyle: LINE_STYLE_MAP[resolved.lineStyle],
+          axisLabelVisible: resolved.showPriceLabel,
+          title: resolved.label,
+        })
+      );
+
+    return () => {
+      priceLines.forEach((line) => series.removePriceLine(line));
+    };
+  }, [candles, horizontalLevels]);
+
   // Indicator line series — created/updated/removed as the sub-window's indicator
   // selection changes. Keyed so toggling one indicator doesn't touch the others.
   useEffect(() => {
@@ -282,10 +328,16 @@ export function ChartWidget({
     }
 
     for (const ind of indicators) {
-      // Lightweight Charts only accepts 1|2|3|4 for lineWidth — clamp rather
-      // than trust the caller, since PriceIndicatorInstance's lineWidth is
-      // user-typed-adjacent (a stepper, but still worth defending here too).
-      const lineWidth = Math.min(4, Math.max(1, Math.round(ind.lineWidth ?? 2))) as 1 | 2 | 3 | 4;
+      // Lightweight Charts' TS type restricts lineWidth to 1|2|3|4, but the
+      // installed v4.2.3's Line-series renderer passes it straight into the
+      // canvas 2D context's lineWidth (a float property) with no
+      // rounding — verified by reading the shipped source, not assumed. So
+      // a fractional value like 1.5 genuinely renders as an intermediate
+      // thickness; this cast is deliberate, not a type-safety shortcut. See
+      // PRICE_INDICATOR_LINE_WIDTH_STEP in types/workspace.ts for the full
+      // explanation and the caveat about this being version-coupled.
+      const lineWidth = Math.min(4, Math.max(1, ind.lineWidth ?? 2)) as unknown as LineWidth;
+      const showPriceLabel = ind.showPriceLabel ?? true;
       let series = lineSeriesRef.current.get(ind.key);
       if (!series) {
         series = chart.addLineSeries({
@@ -293,15 +345,16 @@ export function ChartWidget({
           lineWidth,
           title: ind.label,
           priceLineVisible: false,
-          lastValueVisible: true,
+          lastValueVisible: showPriceLabel,
         });
         lineSeriesRef.current.set(ind.key, series);
       } else {
-        // Color/thickness/label are live-editable per instance (the new SMA
-        // system) after the series already exists — applied on every render
-        // rather than only at creation, or a color pick / thickness step
-        // wouldn't show until the series was torn down and recreated.
-        series.applyOptions({ color: ind.color, lineWidth, title: ind.label });
+        // Color/thickness/label/price-label-visibility are all live-editable
+        // per instance after the series already exists — applied on every
+        // render rather than only at creation, or a color pick / thickness
+        // step / checkbox toggle wouldn't show until the series was torn
+        // down and recreated.
+        series.applyOptions({ color: ind.color, lineWidth, title: ind.label, lastValueVisible: showPriceLabel });
       }
       series.setData(ind.data.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }

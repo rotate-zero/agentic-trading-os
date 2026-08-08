@@ -13,48 +13,48 @@ export type InfoConnectorMode = "general" | Exclude<ConnectorId, "none">;
 export type Timeframe = "1m" | "5m" | "15m" | "1h";
 export const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m", "1h"];
 
-// EMA9/EMA20 only — the two SMA presets that used to live here (SMA20,
-// SMA50) are superseded by PriceIndicatorInstance below and were removed
-// from this enum, not left as a second, conflicting way to add an SMA line.
-// EMA stays on the old fixed-preset model for now; migrating it to the same
-// instance-based shape as SMA is future work, not done here (out of scope —
-// see confirmed-decisions.md).
-export type IndicatorType = "EMA9" | "EMA20";
-export const AVAILABLE_INDICATORS: IndicatorType[] = ["EMA9", "EMA20"];
-
-// Price-pane indicators drawn directly on the candlestick series, as
-// instances rather than fixed presets — a chart can hold any number of SMAs
-// at once, each with its own period/color/thickness (the "9/20/50 on a 5m
-// chart, 50/100/200 on daily" requirement can't be expressed as a fixed
-// enum the way IndicatorType above is). This is UI-only chart-reading
-// convenience, computed client-side from whatever candles are already
-// loaded — same category as the pre-existing EMA9/EMA20 lines and the
-// volume-average lines above, NOT a Feature Engine output. It's never
-// published to the Event Bus and never consumed by Strategy/Decision
-// Engine, so it doesn't conflict with system-design.md §1's "no generic
-// indicator plugin marketplace" non-goal — that non-goal is about keeping
-// algorithmic-decision inputs flowing through the one canonical backend
-// Feature Engine, not about what a human is allowed to overlay on their own
-// chart for reading price action. See confirmed-decisions.md for the full
-// reasoning.
+// ---- Overlay indicators: continuous line series drawn over price (SMA, EMA, VWAP) ----
 //
-// Add the next kind (EMA, Bollinger Bands, VWAP band, ...) by extending this
-// union, adding one case to computePriceIndicator (utils/indicators.ts), and
-// reusing everything else (this config shape, the SMA submenu's list/add/
-// remove UI, ChartWidget's series wiring, persistence/normalization)
-// unchanged — that's the whole point of the instance shape below.
-export type PriceIndicatorType = "SMA";
+// Instance-based rather than fixed presets — a chart can hold any number of
+// SMAs/EMAs at once, each with its own period/color/thickness (the "9/20/50
+// on a 5m chart, 50/100/200 on daily" requirement can't be expressed as a
+// fixed enum). This is UI-only chart-reading convenience, computed
+// client-side from whatever candles are already loaded — NOT a Feature
+// Engine output. It's never published to the Event Bus and never consumed
+// by Strategy/Decision Engine, so it doesn't conflict with
+// system-design.md §1's "no generic indicator plugin marketplace" non-goal
+// — that non-goal is about keeping algorithmic-decision inputs flowing
+// through the one canonical backend Feature Engine, not about what a human
+// is allowed to overlay on their own chart for reading price action. See
+// confirmed-decisions.md for the full reasoning.
+//
+// The two fixed EMA9/EMA20 presets that used to live in a separate
+// IndicatorType enum are retired — EMA is now just another
+// OverlayIndicatorType here, on the same instance model as SMA, so there's
+// one system instead of two conflicting ones. Existing sessions with
+// EMA9/EMA20 selected are migrated to real instances (period 9 / 20, same
+// colors as before) by normalizeSubWindow in WorkspaceContext.tsx, not
+// silently dropped.
+//
+// Add the next kind (Bollinger Bands, a moving-average envelope, ...) by
+// extending this union, adding one case to computePriceIndicator
+// (utils/indicators.ts) that pulls from its own file under indicators/, and
+// reusing everything else (this config shape, the submenu's list/add/remove
+// UI, ChartWidget's series wiring, persistence/normalization) unchanged.
+export type OverlayIndicatorType = "SMA" | "EMA" | "VWAP";
+export const OVERLAY_TYPES_WITH_PERIOD: OverlayIndicatorType[] = ["SMA", "EMA"]; // VWAP is session-anchored, not bar-count-based
 
 export interface PriceIndicatorInstance {
   id: string; // stable per-instance id — NOT derived from type/period, since
   // two instances of the same type can coexist (e.g. two SMAs) and an id
   // tied to period would have to change (and orphan its chart series) the
   // moment the user edits the period.
-  type: PriceIndicatorType;
+  type: OverlayIndicatorType;
   enabled: boolean;
-  period: number; // bars considered
+  period?: number; // bars considered — SMA/EMA only; unused (undefined) for VWAP
   color: string; // hex
-  lineWidth: number; // px, PRICE_INDICATOR_LINE_WIDTH_MIN..MAX
+  lineWidth: number; // px — see PRICE_INDICATOR_LINE_WIDTH_STEP note below
+  showPriceLabel: boolean; // last-value tag near the price axis, e.g. "SMA 9 → 22.50"
 }
 
 export const PRICE_INDICATOR_PERIOD_MIN = 2;
@@ -62,6 +62,25 @@ export const PRICE_INDICATOR_PERIOD_MAX = 500;
 export const PRICE_INDICATOR_PERIOD_STEP = 1;
 export const PRICE_INDICATOR_LINE_WIDTH_MIN = 1;
 export const PRICE_INDICATOR_LINE_WIDTH_MAX = 4;
+// 0.5, not 1 — Lightweight Charts' overlay line-series renderer passes
+// lineWidth straight into the canvas 2D context's (float-valued) lineWidth
+// property with no rounding (verified by reading
+// node_modules/lightweight-charts/dist/lightweight-charts.production.mjs
+// for the installed v4.2.3: the Line-series renderer does
+// `context.lineWidth = configuredWidth * verticalPixelRatio` with no
+// Math.round/floor anywhere in that path — only the `LineWidth = 1|2|3|4`
+// TypeScript type restricts it, not the runtime). So 1.5 genuinely renders
+// as a real intermediate thickness, fixing "1 is almost okay, 2 is too
+// thick" by giving a step in between, rather than being a fake/rounded
+// value. ChartWidget.tsx casts past that TS union deliberately — see the
+// comment there. This is coupled to the exact installed version; a future
+// lightweight-charts upgrade could change the renderer and silently start
+// clamping again, so it's worth re-checking after any upgrade of that
+// dependency. Horizontal levels (createPriceLine, below) do NOT get this
+// treatment — that renderer explicitly floors to an integer physical pixel
+// count, so a fractional step wouldn't reliably produce a visible
+// difference there.
+export const PRICE_INDICATOR_LINE_WIDTH_STEP = 0.5;
 export const PRICE_INDICATOR_DEFAULT_PERIOD = 20;
 export const PRICE_INDICATOR_DEFAULT_LINE_WIDTH = 2;
 
@@ -71,7 +90,7 @@ export const PRICE_INDICATOR_DEFAULT_LINE_WIDTH = 2;
 const PRICE_INDICATOR_COLOR_CYCLE = ["#58A6FF", "#E3B341", "#7EE787", "#F778BA", "#BC8CFF", "#FFA657"];
 
 export function createPriceIndicatorInstance(
-  type: PriceIndicatorType,
+  type: OverlayIndicatorType,
   existingCount: number,
   period: number = PRICE_INDICATOR_DEFAULT_PERIOD
 ): PriceIndicatorInstance {
@@ -79,17 +98,130 @@ export function createPriceIndicatorInstance(
     id: `${type.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
     type,
     enabled: true,
-    period,
+    period: type === "VWAP" ? undefined : period,
     color: PRICE_INDICATOR_COLOR_CYCLE[existingCount % PRICE_INDICATOR_COLOR_CYCLE.length],
     lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
+    showPriceLabel: true,
   };
 }
 
 // Derived, not stored — a label tied to a stale period the user just edited
 // would be a second source of truth for the same value.
 export function priceIndicatorLabel(instance: PriceIndicatorInstance): string {
-  return `${instance.type} ${instance.period}`;
+  return instance.type === "VWAP" ? "VWAP" : `${instance.type} ${instance.period}`;
 }
+
+// ---- Horizontal level indicators (Previous Day Close/High/Low, Pre-Market
+// High/Low, Camarilla Pivots, VPOC) ----
+//
+// Single-price-level indicators, drawn as horizontal lines via
+// series.createPriceLine — a different rendering shape from the overlay
+// indicators above (which are {time,value}[] continuous series), so they
+// get their own instance model rather than being forced into
+// PriceIndicatorInstance's shape. Camarilla's nine named levels
+// (PP/R1-4/S1-4) are modeled as nine separate instances rather than one
+// nested list, so every horizontal level — Camarilla or not — is toggled,
+// colored, and styled through the exact same row UI and the exact same
+// HorizontalLevelInstance[] list; see SubWindowMenu.tsx's "Levels" submenu.
+export type HorizontalLevelType =
+  | "PDC"
+  | "PDH"
+  | "PDL"
+  | "PMH"
+  | "PML"
+  | "CAM_PP"
+  | "CAM_R1"
+  | "CAM_R2"
+  | "CAM_R3"
+  | "CAM_R4"
+  | "CAM_S1"
+  | "CAM_S2"
+  | "CAM_S3"
+  | "CAM_S4"
+  | "VPOC";
+
+export interface HorizontalLevelInstance {
+  id: string;
+  type: HorizontalLevelType;
+  enabled: boolean;
+  color: string; // hex
+  lineWidth: number; // px, integer HORIZONTAL_LEVEL_LINE_WIDTH_MIN..MAX — createPriceLine floors
+  // fractional widths to an integer physical-pixel count (unlike the overlay
+  // line series above), so there's no finer step here; see the
+  // PRICE_INDICATOR_LINE_WIDTH_STEP comment for the source-level detail.
+  lineStyle: LineStyleOption;
+  showPriceLabel: boolean; // the price-axis tag (createPriceLine's axisLabelVisible)
+}
+
+export type LineStyleOption = "solid" | "dashed" | "dotted";
+export const LINE_STYLE_OPTIONS: LineStyleOption[] = ["solid", "dashed", "dotted"];
+
+export const HORIZONTAL_LEVEL_LINE_WIDTH_MIN = 1;
+export const HORIZONTAL_LEVEL_LINE_WIDTH_MAX = 4;
+
+export const HORIZONTAL_LEVEL_LABELS: Record<HorizontalLevelType, string> = {
+  PDC: "Prev Day Close",
+  PDH: "Prev Day High",
+  PDL: "Prev Day Low",
+  PMH: "Premarket High",
+  PML: "Premarket Low",
+  CAM_PP: "Camarilla PP",
+  CAM_R1: "Camarilla R1",
+  CAM_R2: "Camarilla R2",
+  CAM_R3: "Camarilla R3",
+  CAM_R4: "Camarilla R4",
+  CAM_S1: "Camarilla S1",
+  CAM_S2: "Camarilla S2",
+  CAM_S3: "Camarilla S3",
+  CAM_S4: "Camarilla S4",
+  VPOC: "VPOC (Prev Day)",
+};
+
+const HORIZONTAL_LEVEL_DEFAULT_COLORS: Record<HorizontalLevelType, string> = {
+  PDC: "#7D8590",
+  PDH: "#3FB950",
+  PDL: "#F85149",
+  PMH: "#58A6FF",
+  PML: "#F778BA",
+  CAM_PP: "#E3B341",
+  CAM_R1: "#F8B4AB",
+  CAM_R2: "#F79A8E",
+  CAM_R3: "#F87A6B",
+  CAM_R4: "#F85149",
+  CAM_S1: "#A8E6B0",
+  CAM_S2: "#7EE787",
+  CAM_S3: "#4FD860",
+  CAM_S4: "#3FB950",
+  VPOC: "#BC8CFF",
+};
+
+// Groups drive the submenu's "Add" buttons — clicking one adds every
+// missing member of that group at once (e.g. "Add Camarilla" adds all nine
+// levels in one click) rather than requiring nine individual adds. Members
+// already present are skipped, so the button is safely clickable more than
+// once.
+export const HORIZONTAL_LEVEL_GROUPS: { label: string; types: HorizontalLevelType[] }[] = [
+  { label: "Previous Day (Close / High / Low)", types: ["PDC", "PDH", "PDL"] },
+  { label: "Pre-Market High / Low", types: ["PMH", "PML"] },
+  {
+    label: "Camarilla Pivots",
+    types: ["CAM_PP", "CAM_R4", "CAM_R3", "CAM_R2", "CAM_R1", "CAM_S1", "CAM_S2", "CAM_S3", "CAM_S4"],
+  },
+  { label: "VPOC (Previous Day)", types: ["VPOC"] },
+];
+
+export function createHorizontalLevelInstance(type: HorizontalLevelType): HorizontalLevelInstance {
+  return {
+    id: `${type.toLowerCase()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    type,
+    enabled: true,
+    color: HORIZONTAL_LEVEL_DEFAULT_COLORS[type],
+    lineWidth: 1,
+    lineStyle: "dashed",
+    showPriceLabel: true,
+  };
+}
+
 
 // "Maintain a fixed number of candles, new ones replace old ones" — implemented
 // as a visible-range constraint (last N bars), not data deletion. Behaves like a
@@ -178,8 +310,8 @@ export interface SubWindowConfig {
   connector: ConnectorId;
   symbol: string; // only authoritative when connector === 'none'
   timeframe: Timeframe;
-  indicators: IndicatorType[];
-  priceIndicators: PriceIndicatorInstance[]; // opt-in, starts empty — SMA today
+  priceIndicators: PriceIndicatorInstance[]; // opt-in, starts empty — SMA/EMA/VWAP
+  horizontalLevels: HorizontalLevelInstance[]; // opt-in, starts empty — PDH/PDL/Camarilla/VPOC/etc.
   candleLimit: CandleLimit;
   backgroundColor: string; // hex, e.g. "#131720"
   gridColor: string; // hex, e.g. "#1E2530"

@@ -1,65 +1,82 @@
+// Dispatcher layer: wires config instances (types/workspace.ts) to the
+// calculation functions living under frontend/src/indicators/. Each
+// indicator's actual math is in its own file there — this file only knows
+// how to route a config instance to the right function and shape the
+// result for ChartWidget; it does no calculation itself.
 import type { Candle } from "../types/market";
-import type { IndicatorType, PriceIndicatorInstance } from "../types/workspace";
-import { priceIndicatorLabel } from "../types/workspace";
+import type { HorizontalLevelInstance, PriceIndicatorInstance } from "../types/workspace";
+import { HORIZONTAL_LEVEL_LABELS, priceIndicatorLabel } from "../types/workspace";
+import { sma } from "../indicators/sma";
+import { ema } from "../indicators/ema";
+import { vwap } from "../indicators/vwap";
+import { computePreviousDayLevels } from "../indicators/previousDayLevels";
+import { computePremarketLevels } from "../indicators/premarketLevels";
+import { computeCamarillaPivots } from "../indicators/camarillaPivots";
+import { computeVPOC } from "../indicators/vpoc";
 
-export interface IndicatorPoint {
-  time: number;
-  value: number;
-}
+export type { IndicatorPoint } from "../indicators/types";
 
-export function sma(candles: Candle[], period: number): IndicatorPoint[] {
-  const out: IndicatorPoint[] = [];
-  for (let i = period - 1; i < candles.length; i++) {
-    let sum = 0;
-    for (let j = i - period + 1; j <= i; j++) sum += candles[j].close;
-    out.push({ time: candles[i].time, value: Number((sum / period).toFixed(2)) });
-  }
-  return out;
-}
-
-export function ema(candles: Candle[], period: number): IndicatorPoint[] {
-  const out: IndicatorPoint[] = [];
-  const k = 2 / (period + 1);
-  let prev: number | null = null;
-  candles.forEach((c, i) => {
-    if (i < period - 1) return;
-    if (prev === null) {
-      // seed with SMA of the first `period` closes
-      const seedSlice = candles.slice(0, period);
-      prev = seedSlice.reduce((s, x) => s + x.close, 0) / period;
-    } else {
-      prev = c.close * k + prev * (1 - k);
-    }
-    out.push({ time: c.time, value: Number(prev.toFixed(2)) });
-  });
-  return out;
-}
-
-const INDICATOR_COLORS: Record<IndicatorType, string> = {
-  EMA9: "#E3B341",
-  EMA20: "#F778BA",
-};
-
-export function computeIndicator(candles: Candle[], type: IndicatorType) {
-  const color = INDICATOR_COLORS[type];
-  switch (type) {
-    case "EMA9":
-      return { label: "EMA 9", color, data: ema(candles, 9) };
-    case "EMA20":
-      return { label: "EMA 20", color, data: ema(candles, 20) };
-  }
-}
-
-// Generic price-pane indicator instances (types/workspace.ts's
-// PriceIndicatorInstance) — SMA today, dispatched the same switch-based way
-// as computeIndicator above so a second kind is one new case, not a new
-// function shape. Unlike computeIndicator, color/lineWidth come from the
-// instance itself (user-editable per instance) rather than a fixed lookup
-// table, since that's the whole reason this model exists.
+// Overlay indicators (SMA/EMA/VWAP) — continuous {time,value}[] series drawn
+// as a line on the price pane. Dispatched by instance.type so a new kind is
+// one new case here plus its own file under indicators/.
 export function computePriceIndicator(candles: Candle[], instance: PriceIndicatorInstance) {
   const label = priceIndicatorLabel(instance);
+  const { color, lineWidth, showPriceLabel } = instance;
   switch (instance.type) {
     case "SMA":
-      return { label, color: instance.color, lineWidth: instance.lineWidth, data: sma(candles, instance.period) };
+      return { label, color, lineWidth, showPriceLabel, data: sma(candles, instance.period ?? 20) };
+    case "EMA":
+      return { label, color, lineWidth, showPriceLabel, data: ema(candles, instance.period ?? 20) };
+    case "VWAP":
+      return { label, color, lineWidth, showPriceLabel, data: vwap(candles) };
+  }
+}
+
+// Horizontal level indicators (Previous Day Close/High/Low, Pre-Market
+// High/Low, Camarilla Pivots, VPOC) — resolve to a single price number (or
+// undefined when there isn't enough history yet — see sessions.ts). Grouped
+// calculations (previousDayLevels, camarillaPivots) are computed once per
+// call rather than once per instance, since e.g. all three Camarilla
+// resistance levels share the same previous-session lookup; this dispatcher
+// doesn't try to cache across calls, but SubWindow.tsx's useMemo means it
+// only runs when candles or the level list actually change.
+export function computeHorizontalLevel(candles: Candle[], instance: HorizontalLevelInstance) {
+  const label = HORIZONTAL_LEVEL_LABELS[instance.type];
+  const price = resolveHorizontalLevelPrice(candles, instance.type);
+  if (price === undefined) return undefined;
+  return { label, price, color: instance.color, lineWidth: instance.lineWidth, lineStyle: instance.lineStyle, showPriceLabel: instance.showPriceLabel };
+}
+
+function resolveHorizontalLevelPrice(candles: Candle[], type: HorizontalLevelInstance["type"]): number | undefined {
+  switch (type) {
+    case "PDC":
+    case "PDH":
+    case "PDL": {
+      const levels = computePreviousDayLevels(candles);
+      if (!levels) return undefined;
+      return type === "PDC" ? levels.close : type === "PDH" ? levels.high : levels.low;
+    }
+    case "PMH":
+    case "PML": {
+      const levels = computePremarketLevels(candles);
+      if (!levels) return undefined;
+      return type === "PMH" ? levels.high : levels.low;
+    }
+    case "VPOC":
+      return computeVPOC(candles);
+    case "CAM_PP":
+    case "CAM_R1":
+    case "CAM_R2":
+    case "CAM_R3":
+    case "CAM_R4":
+    case "CAM_S1":
+    case "CAM_S2":
+    case "CAM_S3":
+    case "CAM_S4": {
+      const pivots = computeCamarillaPivots(candles);
+      if (!pivots) return undefined;
+      const key = type.slice(4).toLowerCase() as "pp" | "r1" | "r2" | "r3" | "r4" | "s1" | "s2" | "s3" | "s4";
+      return pivots[key];
+    }
   }
 }

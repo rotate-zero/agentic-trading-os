@@ -4,7 +4,7 @@ import { SubWindowMenu } from "./SubWindowMenu";
 import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { generateMockOverlays } from "../../mocks/chartObjects";
 import { resampleCandles } from "../../utils/resample";
-import { computeIndicator, computePriceIndicator } from "../../utils/indicators";
+import { computePriceIndicator } from "../../utils/indicators";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import type { SubWindowConfig } from "../../types/workspace";
 
@@ -19,26 +19,14 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   );
   const overlays = useMemo(() => generateMockOverlays(candles), [candles]);
 
-  // Legacy fixed-preset indicators (EMA9/EMA20) and the new instance-based
-  // price indicators (SMA today) are two separate config lists but merge
-  // into one flat series array for ChartWidget, which doesn't need to know
-  // the two systems exist. Keyed by IndicatorType string vs. instance.id
-  // respectively — both are unique within a sub-window, so no collision risk
-  // combining them into one Map inside ChartWidget.
-  const legacyIndicators = useMemo(
-    () => config.indicators.map((type) => ({ key: type, ...computeIndicator(candles, type) })),
-    [config.indicators, candles]
-  );
-  const priceIndicators = useMemo(
+  // Overlay indicators (SMA/EMA/VWAP instances) computed into flat series for
+  // ChartWidget. Keyed by instance.id, which is unique within a sub-window.
+  const indicators = useMemo(
     () =>
       config.priceIndicators
         .filter((inst) => inst.enabled)
         .map((inst) => ({ key: inst.id, ...computePriceIndicator(candles, inst) })),
     [config.priceIndicators, candles]
-  );
-  const indicators = useMemo(
-    () => [...legacyIndicators, ...priceIndicators],
-    [legacyIndicators, priceIndicators]
   );
 
   return (
@@ -50,6 +38,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           candles={candles}
           overlays={overlays}
           indicators={indicators}
+          horizontalLevels={config.horizontalLevels}
           candleLimit={config.candleLimit}
           backgroundColor={config.backgroundColor}
           gridColor={config.gridColor}

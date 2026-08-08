@@ -1,52 +1,78 @@
-# SMA indicator system — changed files
+# Indicators: SMA, EMA, VWAP, Previous Day Levels, Pre-Market Levels, Camarilla Pivots, VPOC
 
-Copy these into your repo root, overwriting the existing paths. Full reasoning
-is in `docs/decisions/confirmed-decisions.md` #40; `docs/architecture/system-design.md`
-§4.11 has the companion architecture note.
+Copy these into your repo root, overwriting the existing paths. This zip is
+the full current state of the indicator feature (both rounds combined) — you
+don't need last time's zip anymore. Full reasoning is in
+`docs/decisions/confirmed-decisions.md` #40 and #41; `docs/architecture/
+system-design.md` §4.11 has the companion architecture note.
 
-## Files
-- `frontend/src/types/workspace.ts` — new `PriceIndicatorInstance` model
-  (id/type/enabled/period/color/lineWidth), `SubWindowConfig.priceIndicators`.
-  Removed `SMA20`/`SMA50` from the old fixed `IndicatorType` (superseded).
-  `EMA9`/`EMA20` untouched.
-- `frontend/src/utils/indicators.ts` — new `computePriceIndicator()`, SMA case.
-- `frontend/src/components/chart/ChartWidget.tsx` — `lineWidth` support on
-  `IndicatorSeries`; fixed a real bug where an existing series never picked
-  up color/width changes after creation (only mattered once indicators
-  became live-editable).
-- `frontend/src/components/sub-window/SubWindow.tsx` — merges legacy EMA
-  series + new SMA instance series into one list for `ChartWidget`.
-- `frontend/src/components/sub-window/SubWindowMenu.tsx` — new "SMA" root
-  menu row + submenu: add/remove instances, per-instance period stepper,
-  line-width stepper, color picker + hex field (`SmaIndicatorRow`).
-- `frontend/src/state/WorkspaceContext.tsx` — default sub-window seeds
-  updated (`sw-1`, 5m timeframe, now ships with 9/20/50 SMA as a live demo
-  of the feature); `normalizeSubWindow` back-fills `priceIndicators: []` for
-  existing localStorage sessions and strips any persisted `SMA20`/`SMA50`.
-- `docs/architecture/system-design.md` — §1 non-goal footnote + new §4.11
-  paragraph distinguishing client-side chart overlays from Feature Engine
-  output; version bump.
-- `docs/decisions/confirmed-decisions.md` — decision #40, full reasoning.
+## New files — one calculation file per indicator (frontend/src/indicators/)
+- `types.ts` — shared `IndicatorPoint` type
+- `sessions.ts` — US-Eastern trading-day / pre-market / regular-session
+  classification (`Intl.DateTimeFormat`, DST-correct). Shared by everything
+  below except sma/ema.
+- `sma.ts`, `ema.ts` — moved here from the old `utils/indicators.ts`
+- `vwap.ts` — session VWAP, anchored to regular-session open (9:30 ET)
+- `previousDayLevels.ts` — Close/High/Low together (same previous-session lookup)
+- `premarketLevels.ts` — today's developing pre-market High/Low
+- `camarillaPivots.ts` — all 9 levels (PP, R1-4, S1-4), standard formula
+- `vpoc.ts` — previous day's Volume Point of Control (24-bucket approximation
+  by typical price — documented as such, since real volume profile needs
+  tick data this app doesn't have)
+
+## Modified files
+- `frontend/src/types/workspace.ts` — `OverlayIndicatorType` extended to
+  `SMA | EMA | VWAP` (EMA fully retired off the old fixed-preset system);
+  new `HorizontalLevelInstance` model for Previous Day/Pre-Market/Camarilla/
+  VPOC with `lineStyle` (solid/dashed/dotted) and `showPriceLabel`;
+  `PriceIndicatorInstance` also gained `showPriceLabel`; line-width step for
+  overlays changed to **0.5** (see thickness fix below).
+- `frontend/src/utils/indicators.ts` — now purely a dispatcher importing
+  from `indicators/*`, no calculation logic of its own.
+- `frontend/src/components/chart/ChartWidget.tsx` — new `horizontalLevels`
+  prop rendered via `createPriceLine`; fractional line-width support for
+  overlay series (see below); `showPriceLabel` wired to `lastValueVisible`/
+  `axisLabelVisible`.
+- `frontend/src/components/sub-window/SubWindow.tsx` — simplified now that
+  only the instance-based system exists.
+- `frontend/src/components/sub-window/SubWindowMenu.tsx` — "Indicators" root
+  row (SMA/EMA/VWAP, unified) and new "Levels" root row (Previous Day/
+  Pre-Market/Camarilla/VPOC, grouped add-buttons, per-instance line-style
+  selector and price-tag checkbox).
+- `frontend/src/state/WorkspaceContext.tsx` — real EMA9/EMA20 migration this
+  time (colors were known, unlike SMA20/SMA50 last round); defaults updated.
+- `docs/architecture/system-design.md`, `docs/decisions/confirmed-
+  decisions.md` — decision #41, version bump.
+
+## The thickness fix
+Read the actual shipped `lightweight-charts` v4.2.3 source
+(`lightweight-charts.production.mjs`) rather than guessing. Two renderers,
+two behaviors:
+- **Overlay line series** (`addLineSeries` — SMA/EMA/VWAP): passes
+  `lineWidth` straight into the canvas 2D context's `lineWidth` (a float
+  property) with **no rounding anywhere**. Only the TS type `1|2|3|4`
+  restricted it — not the runtime. So these now step by **0.5**, and 1.5
+  genuinely renders as real intermediate thickness. This should directly
+  fix "1 is almost okay, 2 is too thick."
+- **Horizontal levels** (`createPriceLine` — Previous Day/Camarilla/etc.):
+  the renderer does `Math.floor(width * pixelRatio)` — fractional values get
+  floored back to an integer, unreliably. These stay on integer 1-4 steps.
+
+This is coupled to the exact installed lightweight-charts version — worth
+re-checking after any future upgrade.
+
+## Honest gap — not a bug
+PDC/PDH/PDL, Camarilla, and VPOC all need **yesterday's** candles. Right now
+neither mock data (~4 hours) nor live data (no historical backfill yet, per
+decision #39) spans more than one day, so `getPreviousTradingDayCandles`
+returns `[]` and these five indicator groups won't show anything to add
+meaningfully yet. The math is correct and ready — it activates automatically
+once real multi-day history exists, no code change needed.
 
 ## Verified
-- `npx tsc -b` — no new errors (only the pre-existing, already-flagged
-  `GridPresetPicker.tsx` dead code from decision #35).
+- `npx tsc -b` — clean (only the pre-existing `GridPresetPicker.tsx` dead
+  code from decision #35 remains).
 - `npx vite build` — succeeds.
-- **Not verified**: no live browser click-through was done in this pass (no
-  browser available in the sandbox this was built in). The `applyOptions`
-  live-color/width fix and the SMA submenu's on-screen behavior are correct
-  by inspection and by the checks above, not by clicking through them —
-  worth doing before treating this as fully proven, same bar decisions
-  #32/#34/#36/#37/#38 met.
-
-## Deliberately not done
-- No `"1d"` / daily timeframe added to the frontend `Timeframe` union. The
-  backend already accepts `timeframe="1d"` on `/market/candles`, but
-  decision #39 leaves the free-tier daily-bar *source* unresolved, and
-  `useLiveCandles` currently only ever fetches/resamples from a rolling
-  1-minute buffer regardless of the sub-window's selected timeframe. Adding
-  `"1d"` today would render a cosmetic daily chart with at most one
-  incomplete bar — not real data. This SMA system is timeframe-agnostic and
-  needs zero changes once #39 resolves and real daily backfill is wired up.
-- EMA9/EMA20 left on the old fixed-preset model — migrating them to the new
-  instance shape is a natural follow-up, not done here (out of scope).
+- **Not verified**: still no live browser click-through in this sandbox —
+  two rounds of chart-indicator work now without one. Worth doing before a
+  third round builds more on top.

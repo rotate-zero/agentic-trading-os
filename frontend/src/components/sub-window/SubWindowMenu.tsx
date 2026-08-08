@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  AVAILABLE_INDICATORS,
   CANDLE_LIMIT_DEFAULT,
   CANDLE_LIMIT_MAX,
   CANDLE_LIMIT_MIN,
@@ -8,9 +7,16 @@ import {
   DEFAULT_CHART_BG,
   DEFAULT_GRID_COLOR,
   DEFAULT_TIMER_COLOR,
+  HORIZONTAL_LEVEL_GROUPS,
+  HORIZONTAL_LEVEL_LABELS,
+  HORIZONTAL_LEVEL_LINE_WIDTH_MAX,
+  HORIZONTAL_LEVEL_LINE_WIDTH_MIN,
+  LINE_STYLE_OPTIONS,
   LINK_CONNECTOR_IDS,
+  OVERLAY_TYPES_WITH_PERIOD,
   PRICE_INDICATOR_LINE_WIDTH_MAX,
   PRICE_INDICATOR_LINE_WIDTH_MIN,
+  PRICE_INDICATOR_LINE_WIDTH_STEP,
   PRICE_INDICATOR_PERIOD_MAX,
   PRICE_INDICATOR_PERIOD_MIN,
   PRICE_INDICATOR_PERIOD_STEP,
@@ -18,9 +24,14 @@ import {
   VOLUME_AVG_BAR_MAX,
   VOLUME_AVG_BAR_MIN,
   VOLUME_AVG_BAR_STEP,
+  createHorizontalLevelInstance,
   createPriceIndicatorInstance,
   priceIndicatorLabel,
   type CandleLimit,
+  type HorizontalLevelInstance,
+  type HorizontalLevelType,
+  type LineStyleOption,
+  type OverlayIndicatorType,
   type PriceIndicatorInstance,
   type SubWindowConfig,
   type VolumeAvgIndicatorConfig,
@@ -101,7 +112,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "indicators" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "sma";
+type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg";
 
 function RootRow({
   label,
@@ -266,12 +277,15 @@ function VolumeAvgLineRow({
   );
 }
 
-// One row per SMA instance — checkbox to enable, a period stepper (bars
-// considered), a line-width stepper (thickness), its own color swatch + hex
-// field, and a remove button. Modeled directly on VolumeAvgLineRow above;
-// the next indicator kind to get this treatment should follow the same
-// shape rather than inventing a new one.
-function SmaIndicatorRow({
+// One row per overlay instance (SMA/EMA/VWAP) — checkbox to enable, a period
+// stepper (bars considered, hidden for VWAP since it's session-anchored, not
+// bar-count-based), a fractional line-width stepper (thickness — 0.5 steps;
+// see PRICE_INDICATOR_LINE_WIDTH_STEP in types/workspace.ts for why that's
+// safe here specifically), a price-label visibility checkbox, its own color
+// swatch + hex field, and a remove button. Modeled directly on
+// VolumeAvgLineRow above; the next overlay kind should extend
+// OverlayIndicatorType rather than inventing a new row shape.
+function OverlayIndicatorRow({
   subWindowId,
   priceIndicators,
   instance,
@@ -285,6 +299,8 @@ function SmaIndicatorRow({
   const [hexDraft, setHexDraft] = useState(instance.color);
   useEffect(() => setHexDraft(instance.color), [instance.color]);
 
+  const hasPeriod = OVERLAY_TYPES_WITH_PERIOD.includes(instance.type);
+
   const patchInstance = (patch: Partial<PriceIndicatorInstance>) => {
     updateSubWindow(subWindowId, {
       priceIndicators: priceIndicators.map((p) => (p.id === instance.id ? { ...p, ...patch } : p)),
@@ -296,12 +312,13 @@ function SmaIndicatorRow({
   };
 
   const stepPeriod = (direction: 1 | -1) => {
-    const next = instance.period + direction * PRICE_INDICATOR_PERIOD_STEP;
+    const current = instance.period ?? PRICE_INDICATOR_PERIOD_MIN;
+    const next = current + direction * PRICE_INDICATOR_PERIOD_STEP;
     patchInstance({ period: Math.min(PRICE_INDICATOR_PERIOD_MAX, Math.max(PRICE_INDICATOR_PERIOD_MIN, next)) });
   };
 
   const stepLineWidth = (direction: 1 | -1) => {
-    const next = instance.lineWidth + direction;
+    const next = instance.lineWidth + direction * PRICE_INDICATOR_LINE_WIDTH_STEP;
     patchInstance({ lineWidth: Math.min(PRICE_INDICATOR_LINE_WIDTH_MAX, Math.max(PRICE_INDICATOR_LINE_WIDTH_MIN, next)) });
   };
 
@@ -324,24 +341,26 @@ function SmaIndicatorRow({
         </button>
       </div>
       <div className="mt-1 flex items-center gap-3 pl-[18px]">
-        <div className="flex items-center gap-1">
-          <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Bars</span>
-          <button
-            onClick={() => stepPeriod(-1)}
-            disabled={instance.period <= PRICE_INDICATOR_PERIOD_MIN}
-            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
-          >
-            &minus;
-          </button>
-          <span className="w-7 text-center font-mono text-[10px] text-text-primary">{instance.period}</span>
-          <button
-            onClick={() => stepPeriod(1)}
-            disabled={instance.period >= PRICE_INDICATOR_PERIOD_MAX}
-            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
-          >
-            +
-          </button>
-        </div>
+        {hasPeriod && (
+          <div className="flex items-center gap-1">
+            <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Bars</span>
+            <button
+              onClick={() => stepPeriod(-1)}
+              disabled={(instance.period ?? 0) <= PRICE_INDICATOR_PERIOD_MIN}
+              className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+            >
+              &minus;
+            </button>
+            <span className="w-7 text-center font-mono text-[10px] text-text-primary">{instance.period}</span>
+            <button
+              onClick={() => stepPeriod(1)}
+              disabled={(instance.period ?? 0) >= PRICE_INDICATOR_PERIOD_MAX}
+              className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+            >
+              +
+            </button>
+          </div>
+        )}
         <div className="flex items-center gap-1">
           <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Width</span>
           <button
@@ -351,7 +370,7 @@ function SmaIndicatorRow({
           >
             &minus;
           </button>
-          <span className="w-4 text-center font-mono text-[10px] text-text-primary">{instance.lineWidth}</span>
+          <span className="w-6 text-center font-mono text-[10px] text-text-primary">{instance.lineWidth}</span>
           <button
             onClick={() => stepLineWidth(1)}
             disabled={instance.lineWidth >= PRICE_INDICATOR_LINE_WIDTH_MAX}
@@ -361,6 +380,137 @@ function SmaIndicatorRow({
           </button>
         </div>
       </div>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={instance.showPriceLabel}
+          onChange={(e) => patchInstance({ showPriceLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show price tag
+      </label>
+      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+        <input
+          type="color"
+          value={instance.color}
+          onChange={(e) => patchInstance({ color: e.target.value })}
+          className="h-5 w-5 shrink-0 cursor-pointer rounded border border-base-border bg-transparent p-0"
+          title="Pick a color"
+        />
+        <input
+          value={hexDraft}
+          onChange={(e) => {
+            setHexDraft(e.target.value);
+            if (isValidHex(e.target.value)) patchInstance({ color: e.target.value });
+          }}
+          placeholder={instance.color}
+          className={`w-20 rounded border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary outline-none focus:border-signal ${
+            isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
+          }`}
+        />
+      </div>
+    </div>
+  );
+}
+
+// One row per horizontal level instance (Previous Day Close/High/Low,
+// Pre-Market High/Low, each individual Camarilla level, VPOC) — checkbox to
+// enable, an integer line-width stepper (createPriceLine floors fractional
+// widths, so no 0.5 step here — see types/workspace.ts), a 3-way line-style
+// selector (solid/dashed/dotted), a price-label visibility checkbox, color,
+// and remove.
+function HorizontalLevelRow({
+  subWindowId,
+  horizontalLevels,
+  instance,
+  updateSubWindow,
+}: {
+  subWindowId: string;
+  horizontalLevels: HorizontalLevelInstance[];
+  instance: HorizontalLevelInstance;
+  updateSubWindow: (id: string, patch: Partial<SubWindowConfig>) => void;
+}) {
+  const [hexDraft, setHexDraft] = useState(instance.color);
+  useEffect(() => setHexDraft(instance.color), [instance.color]);
+
+  const patchInstance = (patch: Partial<HorizontalLevelInstance>) => {
+    updateSubWindow(subWindowId, {
+      horizontalLevels: horizontalLevels.map((l) => (l.id === instance.id ? { ...l, ...patch } : l)),
+    });
+  };
+
+  const removeInstance = () => {
+    updateSubWindow(subWindowId, { horizontalLevels: horizontalLevels.filter((l) => l.id !== instance.id) });
+  };
+
+  const stepLineWidth = (direction: 1 | -1) => {
+    const next = instance.lineWidth + direction;
+    patchInstance({ lineWidth: Math.min(HORIZONTAL_LEVEL_LINE_WIDTH_MAX, Math.max(HORIZONTAL_LEVEL_LINE_WIDTH_MIN, next)) });
+  };
+
+  return (
+    <div className="mb-2 rounded border border-base-border/60 px-2 py-1.5">
+      <div className="flex items-center gap-1.5">
+        <input
+          type="checkbox"
+          checked={instance.enabled}
+          onChange={(e) => patchInstance({ enabled: e.target.checked })}
+          className="h-3 w-3 shrink-0 accent-signal"
+        />
+        <span className="flex-1 truncate font-mono text-[11px] text-text-primary">{HORIZONTAL_LEVEL_LABELS[instance.type]}</span>
+        <button
+          onClick={removeInstance}
+          title="Remove"
+          className="shrink-0 rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear"
+        >
+          &times;
+        </button>
+      </div>
+      <div className="mt-1 flex items-center gap-3 pl-[18px]">
+        <div className="flex items-center gap-1">
+          <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Width</span>
+          <button
+            onClick={() => stepLineWidth(-1)}
+            disabled={instance.lineWidth <= HORIZONTAL_LEVEL_LINE_WIDTH_MIN}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            &minus;
+          </button>
+          <span className="w-4 text-center font-mono text-[10px] text-text-primary">{instance.lineWidth}</span>
+          <button
+            onClick={() => stepLineWidth(1)}
+            disabled={instance.lineWidth >= HORIZONTAL_LEVEL_LINE_WIDTH_MAX}
+            className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+          >
+            +
+          </button>
+        </div>
+        <div className="flex items-center gap-1">
+          {LINE_STYLE_OPTIONS.map((style) => (
+            <button
+              key={style}
+              onClick={() => patchInstance({ lineStyle: style })}
+              title={style}
+              className={`flex h-5 w-6 items-center justify-center rounded border font-mono text-[9px] uppercase ${
+                instance.lineStyle === style
+                  ? "border-signal bg-signal/20 text-signal"
+                  : "border-base-border text-text-muted hover:border-signal"
+              }`}
+            >
+              {style === "solid" ? "\u2015" : style === "dashed" ? "- -" : "\u00b7\u00b7\u00b7"}
+            </button>
+          ))}
+        </div>
+      </div>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={instance.showPriceLabel}
+          onChange={(e) => patchInstance({ showPriceLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show price tag
+      </label>
       <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
         <input
           type="color"
@@ -391,23 +541,28 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
   const [level, setLevel] = useState<MenuLevel>("root");
 
   const activeVolumeAvgLines = config.volumeAvg.lines.filter((l) => l.enabled).length;
-  const activeSmaCount = config.priceIndicators.filter((p) => p.enabled).length;
+  const activeOverlayCount = config.priceIndicators.filter((p) => p.enabled).length;
+  const activeLevelCount = config.horizontalLevels.filter((l) => l.enabled).length;
 
   const closeMenu = () => {
     setOpen(false);
     setLevel("root");
   };
 
-  const toggleIndicator = (ind: (typeof AVAILABLE_INDICATORS)[number]) => {
-    const has = config.indicators.includes(ind);
+  const addOverlayInstance = (type: OverlayIndicatorType) => {
     updateSubWindow(config.id, {
-      indicators: has ? config.indicators.filter((i) => i !== ind) : [...config.indicators, ind],
+      priceIndicators: [...config.priceIndicators, createPriceIndicatorInstance(type, config.priceIndicators.length)],
     });
   };
 
-  const addSmaInstance = () => {
+  // Adds whichever members of the group aren't already present — safe to
+  // click more than once (e.g. clicking "Camarilla" again after removing
+  // just R1 only re-adds R1, not all nine).
+  const addHorizontalLevelGroup = (types: HorizontalLevelType[]) => {
+    const missing = types.filter((t) => !config.horizontalLevels.some((l) => l.type === t));
+    if (missing.length === 0) return;
     updateSubWindow(config.id, {
-      priceIndicators: [...config.priceIndicators, createPriceIndicatorInstance("SMA", config.priceIndicators.length)],
+      horizontalLevels: [...config.horizontalLevels, ...missing.map(createHorizontalLevelInstance)],
     });
   };
 
@@ -435,9 +590,9 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
         )}
         <span className="truncate font-mono text-xs font-semibold text-text-primary">{displaySymbol}</span>
         <span className="shrink-0 font-mono text-[10px] text-text-muted">{config.timeframe}</span>
-        {(config.indicators.length > 0 || activeSmaCount > 0) && (
+        {activeOverlayCount > 0 && (
           <span className="truncate font-mono text-[10px] text-text-muted">
-            {[...config.indicators, ...config.priceIndicators.filter((p) => p.enabled).map(priceIndicatorLabel)].join(", ")}
+            {config.priceIndicators.filter((p) => p.enabled).map(priceIndicatorLabel).join(", ")}
           </span>
         )}
         <button
@@ -451,7 +606,7 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
       {open && (
         <div
           className={`absolute right-0 top-full z-20 rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
-            level === "volumeAvg" || level === "sma" ? "w-72" : "w-56"
+            level === "volumeAvg" || level === "overlay" || level === "levels" ? "w-72" : "w-56"
           }`}
         >
           {level === "root" && (
@@ -459,13 +614,13 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
               <RootRow label="Timeframe" hint={config.timeframe} onClick={() => setLevel("timeframe")} />
               <RootRow
                 label="Indicators"
-                hint={config.indicators.length ? `${config.indicators.length} active` : "None"}
-                onClick={() => setLevel("indicators")}
+                hint={activeOverlayCount > 0 ? `${activeOverlayCount} active` : "None"}
+                onClick={() => setLevel("overlay")}
               />
               <RootRow
-                label="SMA"
-                hint={activeSmaCount > 0 ? `${activeSmaCount} active` : "None"}
-                onClick={() => setLevel("sma")}
+                label="Levels"
+                hint={activeLevelCount > 0 ? `${activeLevelCount} active` : "None"}
+                onClick={() => setLevel("levels")}
               />
               <RootRow
                 label="Connector"
@@ -513,21 +668,79 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
             </div>
           )}
 
-          {level === "indicators" && (
+          {level === "overlay" && (
             <div>
               <BackRow label="Indicators" onClick={() => setLevel("root")} />
-              {AVAILABLE_INDICATORS.map((ind) => (
+              <div className="max-h-72 overflow-y-auto pr-0.5">
+                {config.priceIndicators.length === 0 && (
+                  <div className="px-2 py-1 font-mono text-[11px] text-text-muted">None added yet.</div>
+                )}
+                {config.priceIndicators.map((instance) => (
+                  <OverlayIndicatorRow
+                    key={instance.id}
+                    subWindowId={config.id}
+                    priceIndicators={config.priceIndicators}
+                    instance={instance}
+                    updateSubWindow={updateSubWindow}
+                  />
+                ))}
+              </div>
+              <div className="mt-1 grid grid-cols-3 gap-1">
                 <button
-                  key={ind}
-                  onClick={() => toggleIndicator(ind)}
-                  className={`flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
-                    config.indicators.includes(ind) ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
-                  }`}
+                  onClick={() => addOverlayInstance("SMA")}
+                  className="rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal"
                 >
-                  <span>{ind}</span>
-                  {config.indicators.includes(ind) && <span>&#10003;</span>}
+                  + SMA
                 </button>
-              ))}
+                <button
+                  onClick={() => addOverlayInstance("EMA")}
+                  className="rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal"
+                >
+                  + EMA
+                </button>
+                <button
+                  onClick={() => addOverlayInstance("VWAP")}
+                  className="rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal"
+                >
+                  + VWAP
+                </button>
+              </div>
+            </div>
+          )}
+
+          {level === "levels" && (
+            <div>
+              <BackRow label="Levels" onClick={() => setLevel("root")} />
+              <div className="max-h-72 overflow-y-auto pr-0.5">
+                {config.horizontalLevels.length === 0 && (
+                  <div className="px-2 py-1 font-mono text-[11px] text-text-muted">None added yet.</div>
+                )}
+                {config.horizontalLevels.map((instance) => (
+                  <HorizontalLevelRow
+                    key={instance.id}
+                    subWindowId={config.id}
+                    horizontalLevels={config.horizontalLevels}
+                    instance={instance}
+                    updateSubWindow={updateSubWindow}
+                  />
+                ))}
+              </div>
+              <div className="mt-1 flex flex-col gap-1">
+                {HORIZONTAL_LEVEL_GROUPS.map((group) => {
+                  const allPresent = group.types.every((t) => config.horizontalLevels.some((l) => l.type === t));
+                  return (
+                    <button
+                      key={group.label}
+                      onClick={() => addHorizontalLevelGroup(group.types)}
+                      disabled={allPresent}
+                      className="rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal disabled:cursor-default disabled:opacity-30 disabled:hover:border-base-border disabled:hover:text-text-muted"
+                    >
+                      {allPresent ? "\u2713 " : "+ "}
+                      {group.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -675,31 +888,6 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
             </div>
           )}
 
-          {level === "sma" && (
-            <div>
-              <BackRow label="SMA" onClick={() => setLevel("root")} />
-              <div className="max-h-72 overflow-y-auto pr-0.5">
-                {config.priceIndicators.length === 0 && (
-                  <div className="px-2 py-1 font-mono text-[11px] text-text-muted">No SMAs added yet.</div>
-                )}
-                {config.priceIndicators.map((instance) => (
-                  <SmaIndicatorRow
-                    key={instance.id}
-                    subWindowId={config.id}
-                    priceIndicators={config.priceIndicators}
-                    instance={instance}
-                    updateSubWindow={updateSubWindow}
-                  />
-                ))}
-              </div>
-              <button
-                onClick={addSmaInstance}
-                className="mt-1 w-full rounded border border-dashed border-base-border px-2 py-1 text-center font-mono text-[11px] text-text-muted hover:border-signal hover:text-signal"
-              >
-                + Add SMA
-              </button>
-            </div>
-          )}
         </div>
       )}
     </div>

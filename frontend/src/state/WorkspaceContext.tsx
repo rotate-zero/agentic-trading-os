@@ -4,12 +4,14 @@ import {
   DEFAULT_GRID_COLOR,
   DEFAULT_SYMBOL,
   LINK_CONNECTOR_IDS,
+  PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
   createDefaultTimerConfig,
   createDefaultVolumeAvgConfig,
   createPriceIndicatorInstance,
   type ConnectorId,
   type GridLayout,
   type MainWindowState,
+  type PriceIndicatorInstance,
   type SavedLayout,
   type SubWindowConfig,
 } from "../types/workspace";
@@ -71,14 +73,14 @@ const SAVED_LAYOUTS_KEY = "trading-workspace:saved-layouts";
 // cross-talk. Grid changes after this use the generic fallback below.
 function makeInitialSubWindows(): SubWindowConfig[] {
   return [
-    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: ["EMA9"], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
     // 9/20/50 SMA on the 5m window — the exact motivating example for the
-    // new instance-based SMA system, shown live instead of making the
-    // person configure it themselves to see it work (same rationale as the
-    // rest of this function's comment above).
-    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", indicators: [], priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", indicators: [], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", indicators: ["EMA20"], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    // instance-based SMA system, shown live instead of making the person
+    // configure it themselves to see it work (same rationale as the rest of
+    // this function's comment above).
+    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
   ];
 }
 
@@ -88,10 +90,10 @@ function makeInitialSubWindows(): SubWindowConfig[] {
 // without the person needing to configure anything to see the feature.
 function makeSecondaryMainWindowSubWindows(id: string): SubWindowConfig[] {
   return [
-    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", indicators: ["EMA20"], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", indicators: [], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", indicators: [], priceIndicators: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
   ];
 }
 
@@ -107,8 +109,8 @@ function makeDefaultSubWindows(rows: number, cols: number, prior: SubWindowConfi
         connector: "none",
         symbol: DEFAULT_SYMBOL,
         timeframe: "1m",
-        indicators: i === 0 ? ["EMA9"] : [],
-        priceIndicators: [],
+        priceIndicators: i === 0 ? [createPriceIndicatorInstance("EMA", 0, 9)] : [],
+        horizontalLevels: [],
         candleLimit: "all",
         backgroundColor: DEFAULT_CHART_BG,
         gridColor: DEFAULT_GRID_COLOR,
@@ -152,24 +154,51 @@ interface StoredSession {
   connectorSymbols: ConnectorSymbolMap;
 }
 
-// Back-fills fields that didn't exist on SubWindowConfig before this change
-// (gridColor, timer, volumeAvg, priceIndicators) — anything persisted to
-// localStorage by an earlier version of the app won't have them, so reading
-// them without this would throw at render time (e.g. `config.timer.enabled`
-// on `undefined`). Also drops any persisted "SMA20"/"SMA50" from the old
-// fixed indicators list — those two values were removed from IndicatorType
-// when the instance-based SMA system replaced them, so a stale session with
-// either would otherwise carry a value the type (and computeIndicator) no
-// longer recognizes. Nothing silently "becomes" a new-system SMA — the user
-// re-adds via the SMA submenu, since the old fixed SMA20/SMA50 didn't carry
-// enough information (no per-instance color/thickness) to round-trip.
-const RETIRED_INDICATOR_VALUES = new Set(["SMA20", "SMA50"]);
+// Back-fills fields that didn't exist on SubWindowConfig at various earlier
+// points (gridColor, timer, volumeAvg, priceIndicators, horizontalLevels,
+// and priceIndicators[].showPriceLabel) — anything persisted to localStorage
+// by an earlier version of the app won't have them, so reading them without
+// this would throw at render time (e.g. `config.timer.enabled` on
+// `undefined`).
+//
+// Also migrates the old fixed `indicators: IndicatorType[]` field (now
+// removed from SubWindowConfig entirely) into real PriceIndicatorInstance
+// entries: unlike SMA20/SMA50 (dropped, not migrated, in the previous pass
+// — see git history / confirmed-decisions.md #40 — because the old fixed
+// system carried no per-instance color/thickness for them to carry over),
+// EMA9 and EMA20 map cleanly onto the new EMA overlay type with a known
+// period and the exact same color the old fixed system used, so this is a
+// real, faithful migration rather than a drop. "SMA20"/"SMA50" (if somehow
+// still present from an even older session) are still dropped for the same
+// reason as before.
+const LEGACY_EMA_COLORS: Record<"EMA9" | "EMA20", string> = { EMA9: "#E3B341", EMA20: "#F778BA" };
 
-function normalizeSubWindow(sw: SubWindowConfig): SubWindowConfig {
+function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): SubWindowConfig {
+  const migratedFromLegacyIndicators: PriceIndicatorInstance[] = (sw.indicators ?? [])
+    .filter((i): i is "EMA9" | "EMA20" => i === "EMA9" || i === "EMA20")
+    .map((i, idx) => ({
+      id: `migrated-${i.toLowerCase()}-${Date.now().toString(36)}-${idx}`,
+      type: "EMA" as const,
+      enabled: true,
+      period: i === "EMA9" ? 9 : 20,
+      color: LEGACY_EMA_COLORS[i],
+      lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
+      showPriceLabel: true,
+    }));
+
+  const { indicators: _legacyIndicators, ...rest } = sw;
+
   return {
-    ...sw,
-    indicators: (sw.indicators ?? []).filter((i) => !RETIRED_INDICATOR_VALUES.has(i)),
-    priceIndicators: sw.priceIndicators ?? [],
+    ...rest,
+    priceIndicators: [
+      // Cast to Partial here: the TYPE says showPriceLabel is always present,
+      // but a session persisted before this field existed won't actually
+      // have it at runtime — the fallback below is for that real case, not
+      // a type-checking exercise.
+      ...(sw.priceIndicators ?? []).map((p) => ({ showPriceLabel: true, ...(p as Partial<PriceIndicatorInstance>) }) as PriceIndicatorInstance),
+      ...migratedFromLegacyIndicators,
+    ],
+    horizontalLevels: sw.horizontalLevels ?? [],
     gridColor: sw.gridColor ?? DEFAULT_GRID_COLOR,
     timer: sw.timer ?? createDefaultTimerConfig(),
     volumeAvg: sw.volumeAvg ?? createDefaultVolumeAvgConfig(),
