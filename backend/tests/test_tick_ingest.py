@@ -34,7 +34,7 @@ async def test_ticks_within_same_minute_aggregate_into_one_bucket():
         bus.subscribe(EventType.CANDLE_CLOSED, lambda env: received_candles.append(env))
 
         adapter = _FakeAdapter()
-        TickIngestBridge(adapter, bus)
+        bridge = TickIngestBridge(adapter, bus)
 
         base = datetime(2026, 7, 25, 10, 30, 0, tzinfo=timezone.utc)
         adapter.emit(Tick(symbol="NVDA", price=100.0, size=10, exchange_ts=base))
@@ -56,6 +56,7 @@ async def test_ticks_within_same_minute_aggregate_into_one_bucket():
         assert candle["close"] == 99.5  # last tick before rollover
         assert candle["volume"] == 22  # 10 + 5 + 7
     finally:
+        bridge.stop()
         await bus.stop()
 
 
@@ -68,7 +69,7 @@ async def test_every_tick_also_publishes_price_updated():
         bus.subscribe(EventType.PRICE_UPDATED, lambda env: received_ticks.append(env))
 
         adapter = _FakeAdapter()
-        TickIngestBridge(adapter, bus)
+        bridge = TickIngestBridge(adapter, bus)
 
         adapter.emit(Tick(symbol="AAPL", price=200.0, size=1, exchange_ts=datetime.now(timezone.utc)))
         await asyncio.sleep(0.05)
@@ -77,6 +78,7 @@ async def test_every_tick_also_publishes_price_updated():
         assert received_ticks[0].symbol == "AAPL"
         assert received_ticks[0].payload["price"] == 200.0
     finally:
+        bridge.stop()
         await bus.stop()
 
 
@@ -89,7 +91,7 @@ async def test_multiple_symbols_bucket_independently():
         bus.subscribe(EventType.CANDLE_CLOSED, lambda env: received_candles.append(env))
 
         adapter = _FakeAdapter()
-        TickIngestBridge(adapter, bus)
+        bridge = TickIngestBridge(adapter, bus)
 
         base = datetime(2026, 7, 25, 10, 30, 0, tzinfo=timezone.utc)
         adapter.emit(Tick(symbol="NVDA", price=100.0, size=1, exchange_ts=base))
@@ -101,4 +103,49 @@ async def test_multiple_symbols_bucket_independently():
         assert len(received_candles) == 1
         assert received_candles[0].symbol == "NVDA"
     finally:
+        bridge.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_bucket_closes_on_wall_clock_even_without_a_new_tick():
+    """Regression test for the reported bug: a candle used to only close
+    once a tick for the NEXT minute happened to arrive — on a quiet moment
+    that could be tens of seconds late. This drives _flush_stale_buckets
+    directly with a controlled 'now' (instead of sleeping for a real wall-
+    clock minute) to prove the close no longer depends on a new tick ever
+    showing up."""
+    bus = EventBus()
+    await bus.start()
+    try:
+        received_candles: list = []
+        bus.subscribe(EventType.CANDLE_CLOSED, lambda env: received_candles.append(env))
+
+        adapter = _FakeAdapter()
+        bridge = TickIngestBridge(adapter, bus)
+
+        base = datetime(2026, 7, 25, 9, 34, 0, tzinfo=timezone.utc)
+        adapter.emit(Tick(symbol="NVDA", price=100.0, size=10, exchange_ts=base))
+        await asyncio.sleep(0.05)
+
+        assert received_candles == []  # nothing closed yet — no new tick arrived
+
+        # Simulate the wall clock reaching 09:35:42 (the exact reported
+        # symptom: 42 seconds into the next minute) with still no new tick.
+        await bridge._flush_stale_buckets(base + timedelta(minutes=1, seconds=42))
+        await asyncio.sleep(0.05)  # EventBus dispatches subscribers off a queue, not inline with publish()
+
+        assert len(received_candles) == 1
+        candle = received_candles[0].payload
+        assert candle["open"] == 100.0
+        assert candle["close"] == 100.0
+        assert candle["volume"] == 10
+
+        # A late tick for the now-closed minute starts a fresh bucket
+        # rather than raising — the old entry is gone, not stale-referenced.
+        adapter.emit(Tick(symbol="NVDA", price=102.0, size=2, exchange_ts=base + timedelta(minutes=1, seconds=50)))
+        await asyncio.sleep(0.05)
+        assert len(received_candles) == 1  # still just the one close
+    finally:
+        bridge.stop()
         await bus.stop()

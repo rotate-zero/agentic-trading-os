@@ -24,6 +24,8 @@ import {
   VOLUME_AVG_BAR_MAX,
   VOLUME_AVG_BAR_MIN,
   VOLUME_AVG_BAR_STEP,
+  VOLUME_BAR_COLOR_MODES,
+  createDefaultVolumeBarsConfig,
   createHorizontalLevelInstance,
   createPriceIndicatorInstance,
   priceIndicatorLabel,
@@ -36,6 +38,7 @@ import {
   type SubWindowConfig,
   type VolumeAvgIndicatorConfig,
   type VolumeAvgLineConfig,
+  type VolumeBarColorMode,
 } from "../../types/workspace";
 import { MOCK_TICKERS } from "../../mocks/tickers";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -112,7 +115,12 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg";
+type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "volumeBars";
+
+const VOLUME_BAR_COLOR_MODE_LABELS: Record<VolumeBarColorMode, string> = {
+  two_color: "2-Color",
+  one_color: "1-Color",
+};
 
 function RootRow({
   label,
@@ -645,6 +653,18 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                 hint={config.volumeAvg.enabled ? `${activeVolumeAvgLines} line${activeVolumeAvgLines === 1 ? "" : "s"}` : "Off"}
                 onClick={() => setLevel("volumeAvg")}
               />
+              <RootRow
+                label="Volume Bars"
+                hint={config.volumeBars.enabled ? VOLUME_BAR_COLOR_MODE_LABELS[config.volumeBars.colorMode] : "Off"}
+                swatch={
+                  config.volumeBars.enabled
+                    ? config.volumeBars.colorMode === "one_color"
+                      ? config.volumeBars.singleColor
+                      : config.volumeBars.upColor
+                    : undefined
+                }
+                onClick={() => setLevel("volumeBars")}
+              />
             </div>
           )}
 
@@ -885,6 +905,73 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   />
                 ))}
               </div>
+            </div>
+          )}
+
+          {level === "volumeBars" && (
+            <div>
+              <BackRow label="Volume Bars" onClick={() => setLevel("root")} />
+              <button
+                onClick={() => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, enabled: !config.volumeBars.enabled } })}
+                className={`mb-2 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.volumeBars.enabled ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                Show volume bars
+                {config.volumeBars.enabled && <span>&#10003;</span>}
+              </button>
+              {config.volumeBars.enabled && (
+                <>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">Color mode</div>
+                  <div className="mb-2 grid grid-cols-2 gap-1 px-2">
+                    {VOLUME_BAR_COLOR_MODES.map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, colorMode: mode } })}
+                        className={`rounded border px-2 py-1 text-center font-mono text-[11px] ${
+                          config.volumeBars.colorMode === mode
+                            ? "border-signal text-signal"
+                            : "border-base-border text-text-muted hover:text-text-primary"
+                        }`}
+                      >
+                        {VOLUME_BAR_COLOR_MODE_LABELS[mode]}
+                      </button>
+                    ))}
+                  </div>
+                  {config.volumeBars.colorMode === "two_color" ? (
+                    <>
+                      <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                        Up (close &ge; open)
+                      </div>
+                      <ColorField
+                        value={config.volumeBars.upColor}
+                        onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, upColor: hex } })}
+                      />
+                      <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                        Down (close &lt; open)
+                      </div>
+                      <ColorField
+                        value={config.volumeBars.downColor}
+                        onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, downColor: hex } })}
+                      />
+                    </>
+                  ) : (
+                    <>
+                      <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">Bar color</div>
+                      <ColorField
+                        value={config.volumeBars.singleColor}
+                        onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, singleColor: hex } })}
+                      />
+                    </>
+                  )}
+                  <button
+                    onClick={() => updateSubWindow(config.id, { volumeBars: createDefaultVolumeBarsConfig() })}
+                    className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+                  >
+                    Reset to default
+                  </button>
+                </>
+              )}
             </div>
           )}
 

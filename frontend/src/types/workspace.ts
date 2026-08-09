@@ -10,8 +10,18 @@ export const LINK_CONNECTOR_IDS: Exclude<ConnectorId, "none">[] = [0, 1, 2, 3, 4
 // Info tab has no "none" — "General" already means "not tied to one connector".
 export type InfoConnectorMode = "general" | Exclude<ConnectorId, "none">;
 
-export type Timeframe = "1m" | "5m" | "15m" | "1h";
-export const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m", "1h"];
+// 4h/1d added on the UI side ahead of the data actually being available —
+// no free-tier provider currently serves 1-minute (or any minute-level)
+// historical backfill to resample these from at real depth (confirmed
+// decision #39), so both will show sparse/empty charts until that's
+// resolved or a real multi-timeframe backend source exists. Same "build
+// the option now, let the data catch up" posture decision #40 took with
+// the SMA/EMA instance system ahead of daily bars. resampleCandles
+// (utils/resample.ts) and currentBarProgressPct (utils/timerProgress.ts)
+// both already handle any Timeframe generically, so nothing about *how*
+// a timeframe is consumed needed to change — only these two entries.
+export type Timeframe = "1m" | "5m" | "15m" | "1h" | "4h" | "1d";
+export const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
 // ---- Overlay indicators: continuous line series drawn over price (SMA, EMA, VWAP) ----
 //
@@ -305,6 +315,48 @@ export function createDefaultVolumeAvgConfig(): VolumeAvgIndicatorConfig {
   };
 }
 
+// ---- Volume bars (the histogram pane itself, bottom of the chart) ----
+//
+// Distinct from VolumeAvgIndicatorConfig above, which draws horizontal
+// average-volume LINES on top of this pane — this config controls the bars
+// underneath them: whether the pane shows at all, and whether each bar is
+// colored by up/down (two colors) or a single flat color, each fully
+// customizable via hex, same ColorField control used everywhere else in
+// this menu (background, grid, timer, volume-avg lines, indicators,
+// levels) — deliberately no forced alpha/opacity here for the same reason:
+// every other color picker in the app hands back the exact hex chosen, so
+// volume bars doing anything else (e.g. a hardcoded 50% alpha) would be the
+// one inconsistent picker in the file. Previously this was hardcoded in
+// ChartWidget.tsx as a fixed 50%-alpha green/red with no way to turn it
+// off; disabling now collapses the volume pane's price-scale margins to
+// zero height rather than just hiding the bars, so turning it off actually
+// reclaims the vertical space for the candles instead of leaving an empty
+// strip.
+export type VolumeBarColorMode = "two_color" | "one_color";
+export const VOLUME_BAR_COLOR_MODES: VolumeBarColorMode[] = ["two_color", "one_color"];
+
+export interface VolumeBarsConfig {
+  enabled: boolean; // master on/off — false removes the volume pane entirely
+  colorMode: VolumeBarColorMode;
+  upColor: string; // hex — two_color mode, bars where close >= open
+  downColor: string; // hex — two_color mode, bars where close < open
+  singleColor: string; // hex — one_color mode, every bar
+}
+
+export const DEFAULT_VOLUME_BAR_UP_COLOR = "#3FB950"; // matches candle BULL color
+export const DEFAULT_VOLUME_BAR_DOWN_COLOR = "#F85149"; // matches candle BEAR color
+export const DEFAULT_VOLUME_BAR_SINGLE_COLOR = "#58A6FF";
+
+export function createDefaultVolumeBarsConfig(): VolumeBarsConfig {
+  return {
+    enabled: true,
+    colorMode: "two_color",
+    upColor: DEFAULT_VOLUME_BAR_UP_COLOR,
+    downColor: DEFAULT_VOLUME_BAR_DOWN_COLOR,
+    singleColor: DEFAULT_VOLUME_BAR_SINGLE_COLOR,
+  };
+}
+
 export interface SubWindowConfig {
   id: string;
   connector: ConnectorId;
@@ -317,6 +369,7 @@ export interface SubWindowConfig {
   gridColor: string; // hex, e.g. "#1E2530"
   timer: TimerConfig;
   volumeAvg: VolumeAvgIndicatorConfig;
+  volumeBars: VolumeBarsConfig;
 }
 
 export const DEFAULT_SYMBOL = "NVDA";

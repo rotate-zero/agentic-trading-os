@@ -45,6 +45,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           timeframe={config.timeframe}
           timer={config.timer}
           volumeAvg={config.volumeAvg}
+          volumeBars={config.volumeBars}
         />
       </div>
     </div>

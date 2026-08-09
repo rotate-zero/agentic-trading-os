@@ -1,4 +1,5 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { broadcastSync, subscribeSync } from "./crossTabSync";
 import {
   DEFAULT_CHART_BG,
   DEFAULT_GRID_COLOR,
@@ -7,6 +8,7 @@ import {
   PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
   createDefaultTimerConfig,
   createDefaultVolumeAvgConfig,
+  createDefaultVolumeBarsConfig,
   createPriceIndicatorInstance,
   type ConnectorId,
   type GridLayout,
@@ -73,14 +75,14 @@ const SAVED_LAYOUTS_KEY = "trading-workspace:saved-layouts";
 // cross-talk. Grid changes after this use the generic fallback below.
 function makeInitialSubWindows(): SubWindowConfig[] {
   return [
-    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
     // 9/20/50 SMA on the 5m window — the exact motivating example for the
     // instance-based SMA system, shown live instead of making the person
     // configure it themselves to see it work (same rationale as the rest of
     // this function's comment above).
-    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
   ];
 }
 
@@ -90,10 +92,10 @@ function makeInitialSubWindows(): SubWindowConfig[] {
 // without the person needing to configure anything to see the feature.
 function makeSecondaryMainWindowSubWindows(id: string): SubWindowConfig[] {
   return [
-    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
-    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig() },
+    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
   ];
 }
 
@@ -116,6 +118,7 @@ function makeDefaultSubWindows(rows: number, cols: number, prior: SubWindowConfi
         gridColor: DEFAULT_GRID_COLOR,
         timer: createDefaultTimerConfig(),
         volumeAvg: createDefaultVolumeAvgConfig(),
+        volumeBars: createDefaultVolumeBarsConfig(),
       });
     }
   }
@@ -202,6 +205,10 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
     gridColor: sw.gridColor ?? DEFAULT_GRID_COLOR,
     timer: sw.timer ?? createDefaultTimerConfig(),
     volumeAvg: sw.volumeAvg ?? createDefaultVolumeAvgConfig(),
+    // Back-fill for sessions persisted before volumeBars existed — defaults
+    // preserve the previous hardcoded look (two-color, same green/red as
+    // the candles) rather than an unconfigured/empty state.
+    volumeBars: sw.volumeBars ?? createDefaultVolumeBarsConfig(),
   };
 }
 
@@ -232,36 +239,104 @@ function loadSavedLayouts(): SavedLayout[] {
   }
 }
 
-export function WorkspaceProvider({ children }: { children: ReactNode }) {
+/**
+ * lockedMainWindowId: only set for a popped-out `/window/:id` tab (see
+ * App.tsx). When present, this tab's `activeMainWindowId` is pinned to it
+ * for the tab's whole lifetime — an incoming cross-tab sync updates this
+ * tab's copy of `mainWindows` (so edits made elsewhere still show up here)
+ * but never overrides which window THIS tab is looking at, since a
+ * popped-out tab exists specifically to keep showing one particular window
+ * on one particular monitor regardless of what the main tab's active tab
+ * happens to be at any given moment.
+ */
+export function WorkspaceProvider({
+  children,
+  lockedMainWindowId,
+}: {
+  children: ReactNode;
+  lockedMainWindowId?: string;
+}) {
   const [mainWindows, setMainWindows] = useState<MainWindowState[]>(
     () => loadSession()?.mainWindows ?? [makeMainWindow(INITIAL_ID, "Layout 1", makeInitialSubWindows())]
   );
   const [activeMainWindowId, setActiveMainWindowId] = useState(
-    () => loadSession()?.activeMainWindowId ?? INITIAL_ID
+    () => lockedMainWindowId ?? loadSession()?.activeMainWindowId ?? INITIAL_ID
   );
   const [connectorSymbols, setConnectorSymbols] = useState<ConnectorSymbolMap>(
     () => loadSession()?.connectorSymbols ?? defaultConnectorSymbols()
   );
   const [savedLayouts, setSavedLayouts] = useState<SavedLayout[]>(loadSavedLayouts);
 
+  // Last JSON this tab either wrote itself or just applied from an
+  // incoming cross-tab sync message — lets the persistence effects below
+  // tell "a genuine local change happened, go persist+broadcast it" apart
+  // from "this state update IS the thing we just received," which would
+  // otherwise write+broadcast right back and bounce forever between two
+  // open tabs. See crossTabSync.ts's module doc for the fuller picture.
+  const lastSyncedSessionRef = useRef<string>("");
+  const lastSyncedLayoutsRef = useRef<string>("");
+
   // Auto-save the live session on every change — this is what makes "load the
   // same setup in the future" work even without ever pressing an explicit
-  // save button (a page refresh keeps everything, tabs included).
+  // save button (a page refresh keeps everything, tabs included), and now
+  // also what every other open tab of this app picks up live via
+  // broadcastSync (see crossTabSync.ts and the subscribeSync effect below).
   useEffect(() => {
+    const json = JSON.stringify({ mainWindows, activeMainWindowId, connectorSymbols });
+    if (json === lastSyncedSessionRef.current) return; // this IS what we just synced in — don't re-broadcast it
     try {
-      localStorage.setItem(SESSION_KEY, JSON.stringify({ mainWindows, activeMainWindowId, connectorSymbols }));
+      localStorage.setItem(SESSION_KEY, json);
+      lastSyncedSessionRef.current = json;
+      broadcastSync("session");
     } catch {
       // ignore quota / private-browsing errors — session just won't persist
     }
   }, [mainWindows, activeMainWindowId, connectorSymbols]);
 
   useEffect(() => {
+    const json = JSON.stringify(savedLayouts);
+    if (json === lastSyncedLayoutsRef.current) return;
     try {
-      localStorage.setItem(SAVED_LAYOUTS_KEY, JSON.stringify(savedLayouts));
+      localStorage.setItem(SAVED_LAYOUTS_KEY, json);
+      lastSyncedLayoutsRef.current = json;
+      broadcastSync("saved-layouts");
     } catch {
       // same as above
     }
   }, [savedLayouts]);
+
+  // Cross-tab live sync — the other half of the multi-monitor pop-out.
+  // Another tab (main workspace or another popped-out window) writing a
+  // change broadcasts a lightweight "go re-read localStorage" ping (see
+  // crossTabSync.ts); this re-runs the exact same load*() parsing used on
+  // initial mount and applies the result. lockedMainWindowId tabs
+  // deliberately skip applying the incoming activeMainWindowId — see this
+  // function's own doc comment above for why. No-ops entirely if
+  // BroadcastChannel isn't available (subscribeSync returns a no-op
+  // unsubscribe in that case) — same single-tab-only behavior as before
+  // this feature existed.
+  useEffect(() => {
+    return subscribeSync((msg) => {
+      if (msg.kind === "session") {
+        const loaded = loadSession();
+        if (!loaded) return;
+        const json = JSON.stringify({
+          mainWindows: loaded.mainWindows,
+          activeMainWindowId: lockedMainWindowId ?? loaded.activeMainWindowId,
+          connectorSymbols: loaded.connectorSymbols,
+        });
+        lastSyncedSessionRef.current = json; // set BEFORE the state updates below, so the persistence effect above sees a match and skips re-writing/re-broadcasting
+        setMainWindows(loaded.mainWindows);
+        if (!lockedMainWindowId) setActiveMainWindowId(loaded.activeMainWindowId);
+        setConnectorSymbols(loaded.connectorSymbols);
+      } else if (msg.kind === "saved-layouts") {
+        const loaded = loadSavedLayouts();
+        lastSyncedLayoutsRef.current = JSON.stringify(loaded);
+        setSavedLayouts(loaded);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const activeWindow = mainWindows.find((w) => w.id === activeMainWindowId) ?? mainWindows[0];
 
@@ -322,7 +397,14 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     if (activeMainWindowId === id) setActiveMainWindowId(next[0].id);
   };
 
-  const setActiveMainWindow = (id: string) => setActiveMainWindowId(id);
+  // Locked tabs (a popped-out /window/:id) never switch which window is
+  // active — there's no tab strip rendered for them to click in the first
+  // place (see App.tsx's PoppedOutWindowShell), but guarding the setter
+  // itself too means that stays true even if something else ever calls it.
+  const setActiveMainWindow = (id: string) => {
+    if (lockedMainWindowId) return;
+    setActiveMainWindowId(id);
+  };
 
   // --- Saved layouts (no database yet — localStorage stands in for it) ---
 

@@ -49,12 +49,23 @@ async def take_over_streaming(
     old = _streaming_provider
     if old is not None and old is not new_provider and _historical_provider is not old:
         await old.disconnect()
+    # Stop the OLD bridge's background flush loop (tick_ingest.py) regardless
+    # of whether the old provider itself got disconnected above — a provider
+    # kept alive for the historical role still shouldn't have two
+    # TickIngestBridge instances both registered as its on_tick callback
+    # (the second registration just silently overwrites the first's, but the
+    # first's own flush loop would otherwise run forever, doing nothing
+    # useful, until process exit).
+    if _streaming_bridge is not None and _streaming_bridge is not bridge:
+        _streaming_bridge.stop()
     _streaming_provider = new_provider
     _streaming_bridge = bridge
 
 
 def clear_streaming_provider() -> None:
     global _streaming_provider, _streaming_bridge
+    if _streaming_bridge is not None:
+        _streaming_bridge.stop()
     _streaming_provider = None
     _streaming_bridge = None
 
