@@ -1,89 +1,122 @@
-# Zoom fix, candle-close latency fix, volume bar customization, 4h/1d timeframes, multi-monitor pop-out
+# Self-recorded intraday history (closes the "no history before the first live bar" gap)
 
-Copy these into your repo root, overwriting the existing paths. Full reasoning
-for all five items is in `docs/decisions/confirmed-decisions.md` #42; the
-multi-monitor and volume-bar architecture notes are in
-`docs/architecture/system-design.md` §4.11.
+Copy these into your repo root, overwriting the existing paths. Full
+reasoning is in `docs/decisions/confirmed-decisions.md` #43; the
+architecture note is in `docs/architecture/system-design.md` §4.2.
 
-**Docs note:** `docs/architecture/system-design.md` and
-`docs/decisions/confirmed-decisions.md` are included here as full files (per
-your usual "copy and overwrite" instruction), but a `docs-decision-42.patch`
-unified diff is also included as a safer alternative if either file has
-moved since this zip was built — apply with `git apply docs-decision-42.patch`
-from the repo root instead of copying the full files, and it'll fail loudly
-on a conflict rather than silently deleting anything (see confirmed-decisions
-#35's note-to-self on exactly that failure mode).
+**Docs note:** same as last drop — `docs-decision-43.patch` (a unified
+diff of just the two doc files) is included as a safer alternative to
+copying the full files, in case either has moved since this zip was
+built. Apply with `git apply docs-decision-43.patch` from the repo root
+instead, if you'd rather.
 
-## Backend
+## ⚠️ Setup required — this does nothing until you do this once
 
-- `backend/app/services/tick_ingest.py` — **fixes the late-candle bug.**
-  `TickIngestBridge` now has a wall-clock-driven `_flush_loop` that
-  force-closes a stale candle bucket ~250ms after every minute boundary,
-  instead of waiting for the next trade tick to arrive (root cause of the
-  reported 09:34 candle not showing up until 09:34:42). New `stop()` method
-  to cancel this loop cleanly.
-- `backend/app/services/broker_registry.py` — calls the new
-  `TickIngestBridge.stop()` in `take_over_streaming()` and
-  `clear_streaming_provider()`, so the new background loop doesn't leak on
-  every reconnect.
-- `backend/tests/test_tick_ingest.py` — existing tests updated to call
-  `bridge.stop()` in cleanup; new regression test
-  `test_stale_bucket_closes_on_wall_clock_even_without_a_new_tick` drives
-  `_flush_stale_buckets()` directly with a controlled timestamp and
-  reproduces the exact reported symptom.
-  **Verified: full suite 65/65 passing, no leaked-task warnings.**
+The `candles`/`symbols` tables have existed since Phase 2 but nothing
+ever wrote to them. If you don't already have a local Postgres running
+matching `backend/app/core/config.py`'s defaults (`localhost:5432`,
+db `trading_workspace`, user/password `trading`/`trading`) — WSL Ubuntu,
+so this is the same `apt-get` you'd expect:
 
-## Frontend
+```bash
+sudo apt-get update
+sudo apt-get install -y postgresql
+sudo service postgresql start
+sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+sudo -u postgres psql -c "CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;"
+sudo -u postgres psql -c "CREATE DATABASE trading_workspace OWNER trading;"
+```
 
-- `frontend/src/components/chart/ChartWidget.tsx` — **fixes the zoom-reset
-  bug.** New `diffCandles()` tells a live update (last bar refreshed, or one
-  new bar appended) apart from a genuine reset (symbol/timeframe switch, or
-  the candle-count stepper changing). Only a reset now calls
-  `setData()` + re-pin; a live update calls `series.update()` instead, which
-  never touches zoom/pan and only auto-scrolls the new bar into view if
-  you're already at the live edge. Also wired up `volumeBars` — recolors/
-  hides the histogram pane independently of the data effect, so a
-  color/mode change never disturbs zoom either.
-- `frontend/src/types/workspace.ts` — `Timeframe` gains `4h`/`1d`; new
-  `VolumeBarsConfig` type + `createDefaultVolumeBarsConfig()`.
-- `frontend/src/utils/resample.ts`, `frontend/src/utils/timerProgress.ts` —
-  `4h`/`1d` entries added to each timeframe-keyed map.
-- `frontend/src/components/sub-window/SubWindowMenu.tsx` — new "Volume Bars"
-  submenu: show/hide, 2-color vs 1-color, hex pickers, reset-to-default.
-- `frontend/src/components/sub-window/SubWindow.tsx` — passes
-  `config.volumeBars` through to `ChartWidget`.
-- `frontend/src/state/WorkspaceContext.tsx` — `volumeBars` added to every
-  `SubWindowConfig` construction site and to `normalizeSubWindow`'s
-  back-fill (old sessions default to the two-color green/red look, not an
-  empty state). Also: cross-tab live sync (see below) and the new
-  `lockedMainWindowId` prop for the pop-out view.
-- `frontend/src/state/crossTabSync.ts` — **new file.** `BroadcastChannel`-
-  based cross-tab sync: a tab that changes something pings other open tabs
-  to re-read `localStorage`, rather than each tab reading it once at load
-  and never again. Degrades gracefully (no sync, same as before) if
-  `BroadcastChannel` isn't available.
-- `frontend/src/App.tsx` — **rewritten.** Minimal hand-rolled router (`/` vs
-  `/window/:id`, no library) — the popped-out view reuses the same
-  `SubWindowGrid`/`InfoTab`/`GridPicker`/`LayoutsMenu` the main workspace
-  uses, just without the tab strip, plus a link back to `/`.
-- `frontend/src/components/workspace/MainWindowTabs.tsx` — new pop-out
-  button (⧉) per tab, opens `/window/:id` via `window.open()`.
+Then, from `backend/` (with your venv activated):
 
-  **Verified:** `tsc -b` and `vite build` both succeed — only the
-  pre-existing, already-flagged `GridPresetPicker.tsx` dead code (decision
-  #35) remains. SPA fallback for `/window/:id` checked against a real
-  `vite preview` server (`200` for both `/` and `/window/mw-1`).
-  **Not verified:** no live browser click-through of any of this — same
-  caveat carried forward from the last two rounds of UI work (decisions
-  #40, #41). Worth prioritizing before more UI work stacks on top.
+```bash
+alembic upgrade head
+```
 
-## Not included in this drop
+If you already have Postgres running with different credentials, either
+match the defaults above or override via env vars
+(`POSTGRES_HOST`/`PORT`/`DB`/`USER`/`PASSWORD` — see `core/config.py`).
 
-- The multi-monitor discussion surfaced one open question, already resolved
-  with you and built as agreed: original tab keeps a popped-out window as a
-  live mirror (not removed from the strip). No further discussion needed
-  there.
-- Production static-hosting SPA-fallback config (nginx `try_files` or
-  equivalent) isn't needed yet — `vite dev`/`vite preview` both already
-  handle `/window/:id` correctly — but will be needed whenever this actually
-  gets deployed somewhere other than `localhost:5173`.
+**If you skip this:** the app still boots and works exactly as before —
+every DB call is wrapped and soft-fails to "nothing recorded yet," logged
+not raised (verified by literally stopping Postgres and re-running
+everything, see #43's verification note). You just won't get the
+history-persists-across-reconnects behavor until it's set up.
+
+## What changed and why
+
+**The actual bug:** not a bug — a documented, unbuilt piece of the
+architecture. `system-design.md` §4.2 has said "persist candles via a
+write-behind recorder" since it was written; the `candles` table's own
+migration TODO said outright this needed doing "before Market Data
+Engine is actually writing candles." Nothing had ever subscribed to
+`CandleClosed` to do it. Every sub-window's history only ever existed
+for as long as that specific tab had been open and listening live.
+
+- `backend/app/services/candle_recorder.py` — **new.** Subscribes to
+  `CandleClosed`, writes every closed `1m` candle to Postgres. Doesn't do
+  the write inside the Event Bus callback itself (would block live price
+  fan-out for every other subscriber — see the file's own docstring for
+  why) — pushes to an in-memory queue instead, a separate background task
+  drains it via `asyncio.to_thread`.
+- `backend/app/db/partitions.py` — **new.** Auto-creates the current +
+  next month's partition before every write. The original migration only
+  seeded July/August 2026 — without this, writes would silently start
+  failing the moment September arrives, which is 3 weeks away.
+- `backend/app/services/candle_store.py` — **new.** Read side —
+  `get_recorded_candles()`, called by the route below.
+- `backend/app/api/routes/market.py` — `GET /market/candles` now checks
+  self-recorded data FIRST, before ever reaching Polygon. For `1m`
+  specifically this is now the primary path, not a fallback — Polygon's
+  free tier structurally can't serve minute-level data at all (see below).
+- `backend/app/main.py` — `CandleRecorder` starts/stops in `lifespan()`,
+  same pattern as last drop's `TickIngestBridge.stop()`.
+- `backend/app/models/market_data.py` — unrelated bug found by this being
+  the first code to ever actually INSERT into `candles`: `Candle.id`
+  didn't declare `Identity()`, even though its own migration does. Fixed
+  to match — SQLAlchemy was warning about it, not silently corrupting
+  anything, but worth fixing now that it's finally exercised.
+- `backend/tests/test_candle_recorder.py` — **new.** Integration tests
+  against a real local Postgres (write → read back, duplicate-close
+  doesn't double-write). Auto-skips (not fails) if Postgres isn't
+  reachable — verified both ways.
+- `backend/tests/test_market_routes.py` — one new test proving the route
+  itself serves self-recorded data with zero provider connected; a couple
+  of existing tests' fixture ticker names shortened to fit
+  `symbols.ticker VARCHAR(16)` (found because my own first draft of the
+  new test tripped over it).
+
+  **Verified:** real local PostgreSQL 16, not mocked — installed,
+  migrated, used for every claim above, then torn down. Full suite
+  passes both with Postgres up (69/69) and down (65 pass, 4 skip, nothing
+  fails or crashes). A real `uvicorn` process with the DB down still
+  boots and answers with a clean 400, not a crash. **Not verified:** the
+  live-market-hours version of your original report — today's Sunday,
+  markets closed — so this is real-DB-test-level verification, not a
+  click-through with the market actually open.
+
+## Your two questions, answered
+
+**"Is running 2 APIs at once causing this?"** No — Finnhub/Polygon role
+separation isn't a coordination bug and isn't what this fixes. The gap
+was a capability gap in whichever provider held the historical role:
+Polygon's free tier can't serve `1m` data at any window, full stop
+(confirmed against Polygon's now-Massive.com current docs — they
+rebranded sometime in 2026, after my training cutoff). The fix wasn't
+"run them differently," it's "stop depending on either one for data
+neither can provide, and self-supply it from what's already flowing
+through the pipeline."
+
+**The "2 years vs 1 Day bars" mismatch:** expected, not a bug. Massive's
+free ("Stocks Basic") plan is end-of-day/daily-only. The "2 years" figure
+refers to how far back that DAILY data goes, not that minute bars are
+included.
+
+## Known, deliberately deferred
+
+`polygon_provider.py`'s `if not aggs: raise SymbolNotFoundError` still
+conflates "invalid symbol" with "authorized but zero trades in this
+window" (e.g. a weekend query) — real bug, lower priority now that
+self-recorded data is the primary `1m` path and Polygon's only ever a
+last-resort fallback. Flagged in confirmed-decisions #43, not fixed here
+to keep this drop focused.

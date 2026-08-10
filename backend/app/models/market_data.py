@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Numeric, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, ForeignKey, Identity, Numeric, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -51,7 +51,14 @@ class Candle(Base):
     )
 
     # Partitioned tables require the partition key (candle_ts) in the PK.
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    # Identity() here isn't decorative — it must match the migration's own
+    # `sa.Identity()` (alembic/versions/0001_...py) exactly, or SQLAlchemy
+    # warns that this composite PK column has no known default generator
+    # and, on stricter configs, can refuse to proceed at all. This mismatch
+    # was latent since Phase 2 (the model and its own migration disagreed)
+    # and only surfaced now that CandleRecorder (confirmed decision #42) is
+    # the first code ever to actually INSERT into this table.
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     candle_ts: Mapped[datetime] = mapped_column(primary_key=True)
 
     symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)

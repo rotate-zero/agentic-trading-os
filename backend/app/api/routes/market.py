@@ -13,12 +13,16 @@ it.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
-from app.services import broker_registry
+from app.services import broker_registry, candle_store
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/market", tags=["market"])
 
@@ -26,7 +30,7 @@ router = APIRouter(prefix="/market", tags=["market"])
 # backfill. Rough on purpose — IBKR trims to actual trading-session data
 # regardless, so asking for "too much" wall-clock time just means the
 # request covers extra non-trading hours, not extra rows.
-_MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 60 * 24}
+_MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 60 * 24}
 
 
 @router.get("/candles")
@@ -35,17 +39,6 @@ async def get_candles(
     count: int = Query(240, le=1000),
     timeframe: str = Query("1m"),
 ) -> dict:
-    adapter = broker_registry.get_historical_provider()
-    if adapter is None or not adapter.is_connected():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No historical provider connected — call POST /market-data/connect "
-                "(Polygon) or POST /broker/connect (IBKR, once available). Finnhub "
-                "cannot serve this (see GET /finnhub/status)."
-            ),
-        )
-
     if timeframe not in _MINUTES_PER_UNIT:
         raise HTTPException(
             status_code=400,
@@ -54,6 +47,48 @@ async def get_candles(
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=_MINUTES_PER_UNIT[timeframe] * count)
+
+    # Self-recorded first (confirmed decision #42's CandleRecorder) — real
+    # data this app has already seen and persisted, at zero cost and no
+    # provider round-trip. For "1m" specifically this is the ONLY source
+    # that can ever exist at all on a free-tier Polygon/Massive plan (see
+    # confirmed decision #39) — Polygon is only ever reached below as a
+    # fallback for a symbol/range genuinely nothing has been recorded for
+    # yet (a brand-new ticker, or a freshly-migrated/empty database). A
+    # partial match (self-recorded history shorter than the requested
+    # range) is returned as-is rather than topped up from Polygon — Polygon
+    # structurally can't fill a 1m gap anyway, and attempting a merge for
+    # timeframes it CAN serve would be complexity with no current benefit.
+    #
+    # get_recorded_candles is a sync DB call (app/db/session.py: sync
+    # engine by design) — to_thread keeps it off the event loop, same
+    # pattern PolygonAdapter already uses for its own sync REST calls. A
+    # DB that's unreachable is treated as "nothing recorded yet," not a
+    # hard failure — logged, not raised, so the request still falls
+    # through to whatever external provider is connected instead of 500ing
+    # over what's still an optional enhancement path at this phase.
+    try:
+        recorded = await asyncio.to_thread(candle_store.get_recorded_candles, symbol, timeframe, start, end)
+    except Exception:  # noqa: BLE001 — see comment above
+        logger.exception("candle_store.get_recorded_candles failed for %s — falling through to external provider", symbol)
+        recorded = []
+
+    if recorded:
+        return {
+            "symbol": symbol,
+            "candles": [c.model_dump(mode="json") for c in recorded[-count:]],
+        }
+
+    adapter = broker_registry.get_historical_provider()
+    if adapter is None or not adapter.is_connected():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Nothing recorded yet for this symbol/range and no historical provider "
+                "connected — call POST /market-data/connect (Polygon) or POST /broker/connect "
+                "(IBKR, once available). Finnhub cannot serve this (see GET /finnhub/status)."
+            ),
+        )
 
     try:
         candles = await adapter.get_historical(symbol, timeframe, start, end)

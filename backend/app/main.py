@@ -16,6 +16,7 @@ from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
 from app.services import broker_registry
+from app.services.candle_recorder import CandleRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,17 @@ async def lifespan(app: FastAPI):
 
     bus = get_event_bus()
     await bus.start()
+
+    # Starts unconditionally, independent of whether Finnhub/Polygon end up
+    # connected below — it's just a CandleClosed subscriber, ready for
+    # whenever ticks start flowing regardless of which provider ends up
+    # supplying them. A DB that isn't reachable yet doesn't block startup or
+    # crash the app (see CandleRecorder's own docstring) — it degrades to
+    # "not recording," the same soft-fail posture as an unconfigured
+    # Finnhub/Polygon key below, not a hard dependency this app can't start
+    # without.
+    candle_recorder = CandleRecorder(bus)
+    candle_recorder.start()
 
     gateway = get_gateway()
     gateway.attach()
@@ -81,6 +93,7 @@ async def lifespan(app: FastAPI):
 
     for provider in broker_registry.get_all_active_providers():
         await provider.disconnect()
+    candle_recorder.stop()
     await bus.stop()
     logger.info("%s stopped", settings.app_name)
 

@@ -115,6 +115,8 @@ Responsibilities:
 
 Internal structure: `ConnectionManager` → `Normalizer` → `StateCache` → `Publisher` + `HistoricalWriter`, run as independent async tasks fed by one queue so a slow DB write never blocks live price fan-out.
 
+**The `HistoricalWriter` piece of this exists today, ahead of the rest.** `CandleRecorder` (`app/services/candle_recorder.py`) implements exactly the "persist candles via a write-behind recorder (non-blocking)" responsibility above, wired directly onto the current `TickIngestBridge` → `EventBus` pipeline rather than the formal `ConnectionManager`/`Normalizer`/`StateCache` split, which is still Phase 4 work. `GET /market/candles` checks this self-recorded data before ever reaching an external provider — for `1m` specifically it's the only source that can ever exist on a free-tier data plan (§6.1's caveat, decision #39). See `../decisions/confirmed-decisions.md` #43.
+
 ### 4.3 Market Clock
 The single source of truth for anything time/session-related. Every other module asks the Market Clock rather than computing this itself.
 

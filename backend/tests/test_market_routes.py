@@ -41,7 +41,7 @@ class _FakeConnectedAdapter:
 def test_market_candles_requires_connection():
     broker_registry.clear_all()
     with TestClient(app) as client:
-        r = client.get("/market/candles", params={"symbol": "NVDA"})
+        r = client.get("/market/candles", params={"symbol": "__TEST_NOHISTORY__"})
     assert r.status_code == 400
     assert "connected" in r.json()["detail"].lower()
 
@@ -153,11 +153,104 @@ async def test_unexpected_exception_still_gets_cors_headers_and_clean_json():
         with TestClient(app, raise_server_exceptions=False) as client:
             r = client.get(
                 "/market/candles",
-                params={"symbol": "NVDA"},
+                params={"symbol": "__TEST_UNEXPECTED__"},
                 headers={"Origin": "http://localhost:5173"},
             )
         assert r.status_code == 500
         assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
         assert "simulated unexpected error" in r.json()["detail"]
     finally:
+        broker_registry.clear_all()
+
+
+def _db_available() -> bool:
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+
+    try:
+        session = SessionLocal()
+        try:
+            session.execute(text("SELECT 1"))
+            return True
+        finally:
+            session.close()
+    except Exception:  # noqa: BLE001 — this IS the availability check
+        return False
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+def test_market_candles_serves_self_recorded_data_with_no_provider_connected():
+    """
+    The actual feature this file's other tests didn't cover before now:
+    confirmed decision #42's CandleRecorder means /market/candles no
+    longer depends on an external provider AT ALL for a symbol this app
+    has already recorded 1m candles for — proven here through the real
+    route, with broker_registry deliberately empty, not just at the
+    candle_store function level (see test_candle_recorder.py for that).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+    from app.event_bus.bus import EventBus
+    from app.event_bus.events import make_envelope
+    from app.schemas.events.envelope import EventType
+    from app.schemas.events.market_data import CandleClosed
+    from app.services.candle_recorder import CandleRecorder
+
+    ticker = "ZZTESTREC01"
+    session = SessionLocal()
+    try:
+        session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+        session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+        session.commit()
+    finally:
+        session.close()
+
+    broker_registry.clear_all()  # no provider connected at all — this must still work
+
+    async def _seed():
+        bus = EventBus()
+        await bus.start()
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            candle_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=1)
+            await bus.publish(
+                make_envelope(
+                    EventType.CANDLE_CLOSED,
+                    CandleClosed(timeframe="1m", open=10.0, high=11.0, low=9.0, close=10.5, volume=100, candle_ts=candle_ts),
+                    symbol=ticker,
+                )
+            )
+            import asyncio
+
+            await asyncio.sleep(0.3)
+        finally:
+            recorder.stop()
+            await bus.stop()
+
+    import asyncio
+
+    asyncio.run(_seed())
+
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/candles", params={"symbol": ticker, "count": 5, "timeframe": "1m"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbol"] == ticker
+        assert len(body["candles"]) == 1
+        assert body["candles"][0]["open"] == 10.0
+        assert body["candles"][0]["close"] == 10.5
+    finally:
+        session = SessionLocal()
+        try:
+            session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+            session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+            session.commit()
+        finally:
+            session.close()
         broker_registry.clear_all()
