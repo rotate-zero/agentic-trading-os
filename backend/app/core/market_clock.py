@@ -25,6 +25,7 @@ class Session(StrEnum):
     OPEN = "open"
     LUNCH = "lunch"
     POWER_HOUR = "power_hour"
+    AFTER_HOURS = "after_hours"
     CLOSED = "closed"
 
 
@@ -36,12 +37,25 @@ class SessionWindow:
 
 
 # Regular-session boundaries, Eastern time. See scope note above re: accuracy.
+# After-hours end (20:00) is the common convention across providers, but —
+# same scope note as the rest of this list — hasn't been verified against
+# what Finnhub/IBKR actually deliver on this account; the recorder simply
+# won't have rows past whatever the live feed actually stops sending,
+# regardless of where this boundary is drawn.
 _SESSION_WINDOWS: list[SessionWindow] = [
     SessionWindow(Session.PRE_MARKET, time(4, 0), time(9, 30)),
     SessionWindow(Session.OPEN, time(9, 30), time(11, 30)),
     SessionWindow(Session.LUNCH, time(11, 30), time(14, 30)),
     SessionWindow(Session.POWER_HOUR, time(14, 30), time(16, 0)),
+    SessionWindow(Session.AFTER_HOURS, time(16, 0), time(20, 0)),
 ]
+
+# OPEN/LUNCH/POWER_HOUR are one continuous session for anything that cares
+# about session BOUNDARIES (candle aggregation, session-change detection) —
+# they only exist as separate Session values for callers that care about
+# the sub-label itself (e.g. a future "power hour" UI badge). See
+# session_bounds() below, and confirmed-decisions.md re: this split.
+_REGULAR_SESSION_LABELS = {Session.OPEN, Session.LUNCH, Session.POWER_HOUR}
 
 _MARKET_OPEN = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
@@ -111,6 +125,38 @@ class MarketClock:
                 return window.session
         return Session.CLOSED
 
+    def session_bounds(self, ts: datetime | None = None) -> tuple[datetime, datetime] | None:
+        """
+        (start, end) of the session containing `ts`, or None if `ts` falls
+        in CLOSED (overnight, weekend, holiday, or past an early half-day
+        close). This is the anchor candle aggregation buckets off of —
+        see candle_aggregator.py — so that a bucket never straddles a
+        session boundary (e.g. a bar spanning 15:45-16:15 would silently
+        blend regular-session trading with after-hours trading into one
+        misleading bar).
+
+        OPEN/LUNCH/POWER_HOUR all return the SAME bounds (market open to
+        market close) rather than each other's sub-window — regular
+        session is treated as one continuous aggregation domain, not reset
+        at the lunch/power-hour boundaries. Only PRE_MARKET and
+        AFTER_HOURS get their own distinct bounds.
+        """
+        now = self._now(ts)
+        session = self.current_session(now)
+        if session == Session.CLOSED:
+            return None
+
+        if session in _REGULAR_SESSION_LABELS:
+            close_time = time(13, 0) if self.is_half_day(now.date()) else _MARKET_CLOSE
+            start = now.replace(hour=_MARKET_OPEN.hour, minute=_MARKET_OPEN.minute, second=0, microsecond=0)
+            end = now.replace(hour=close_time.hour, minute=close_time.minute, second=0, microsecond=0)
+            return start, end
+
+        window = next(w for w in _SESSION_WINDOWS if w.session == session)
+        start = now.replace(hour=window.start.hour, minute=window.start.minute, second=0, microsecond=0)
+        end = now.replace(hour=window.end.hour, minute=window.end.minute, second=0, microsecond=0)
+        return start, end
+
     def minutes_since_open(self, ts: datetime | None = None) -> int:
         now = self._now(ts)
         if not self.is_market_open(now):
@@ -120,10 +166,14 @@ class MarketClock:
 
     def next_session_boundary(self, ts: datetime | None = None) -> datetime:
         now = self._now(ts)
+        # Every window's start AND end, deduped — subsumes the old
+        # "just append market close" approach, which predated AFTER_HOURS
+        # existing at all and so had no way to represent 20:00 as a
+        # boundary (only 16:00, via _MARKET_CLOSE, was ever a candidate).
+        boundary_times = sorted({w.start for w in _SESSION_WINDOWS} | {w.end for w in _SESSION_WINDOWS})
         candidates = [
-            now.replace(hour=w.start.hour, minute=w.start.minute, second=0, microsecond=0)
-            for w in _SESSION_WINDOWS
-        ] + [now.replace(hour=_MARKET_CLOSE.hour, minute=_MARKET_CLOSE.minute, second=0, microsecond=0)]
+            now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0) for t in boundary_times
+        ]
 
         for boundary in sorted(candidates):
             if boundary > now:

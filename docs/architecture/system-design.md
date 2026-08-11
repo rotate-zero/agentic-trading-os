@@ -115,21 +115,26 @@ Responsibilities:
 
 Internal structure: `ConnectionManager` → `Normalizer` → `StateCache` → `Publisher` + `HistoricalWriter`, run as independent async tasks fed by one queue so a slow DB write never blocks live price fan-out.
 
-**The `HistoricalWriter` piece of this exists today, ahead of the rest.** `CandleRecorder` (`app/services/candle_recorder.py`) implements exactly the "persist candles via a write-behind recorder (non-blocking)" responsibility above, wired directly onto the current `TickIngestBridge` → `EventBus` pipeline rather than the formal `ConnectionManager`/`Normalizer`/`StateCache` split, which is still Phase 4 work. `GET /market/candles` checks this self-recorded data before ever reaching an external provider — for `1m` specifically it's the only source that can ever exist on a free-tier data plan (§6.1's caveat, decision #39). See `../decisions/confirmed-decisions.md` #43.
+**The `HistoricalWriter` piece of this exists today, ahead of the rest.** `CandleRecorder` (`app/services/candle_recorder.py`) implements exactly the "persist candles via a write-behind recorder (non-blocking)" responsibility above, wired directly onto the current `TickIngestBridge` → `EventBus` pipeline rather than the formal `ConnectionManager`/`Normalizer`/`StateCache` split, which is still Phase 4 work. It only ever writes `1m` rows — `TickIngestBridge`'s fixed bucket size. `GET /market/candles` checks this self-recorded data before ever reaching an external provider — for `1m` specifically it's the only source that can ever exist on a free-tier data plan (§6.1's caveat, decision #39). See `../decisions/confirmed-decisions.md` #43.
+
+**5m/15m/1h are derived on read, not recorded separately.** `candle_aggregator.py` builds them hierarchically from the same recorded `1m` rows (`1m → 5m → 15m → 1h`, each level from the nearest coarser level already computed), bucketed session-locally via `MarketClock.session_bounds()` (§4.3) rather than a continuous 24h clock, so a bucket never straddles a session boundary. `GET /market/candles` tries this before falling through to an external provider, same priority as the raw `1m` self-recorded path. `1d` deliberately stays sourced from Polygon's real daily EOD bars rather than reconstructed from however much `1m` history happens to be recorded; `4h` is deliberately unsupported (a clean 400, not an attempt at a session-boundary definition nobody's confirmed — the regular session's 6.5h doesn't divide evenly by 4h). See decision #44.
 
 ### 4.3 Market Clock
 The single source of truth for anything time/session-related. Every other module asks the Market Clock rather than computing this itself.
 
 ```python
 class MarketClock:
-    def current_session(self) -> Session: ...      # pre_market | open | lunch | power_hour | closed
+    def current_session(self) -> Session: ...      # pre_market | open | lunch | power_hour | after_hours | closed
     def is_market_open(self, ts: datetime = None) -> bool: ...
     def is_holiday(self, date: date) -> bool: ...
     def is_half_day(self, date: date) -> bool: ...
     def minutes_since_open(self, ts: datetime = None) -> int: ...
     def next_session_boundary(self) -> datetime: ...
+    def session_bounds(self, ts: datetime = None) -> tuple[datetime, datetime] | None: ...
 ```
 Handles exchange holidays, half-days, and DST in one place. The Scanner's cadence schedule (§4.7) and the Strategy Scheduler (§4.8) both key off `current_session()` rather than raw wall-clock math.
+
+`session_bounds()` (decision #44) is the anchor candle aggregation buckets off of (§4.2) — `open`/`lunch`/`power_hour` collapse to one continuous "regular session" domain for this purpose (same bounds for all three), so a bucket only ever resets at a genuine session-type change (pre-market → regular, regular → after-hours), never at the lunch/power-hour sub-boundaries `current_session()` still distinguishes for other callers.
 
 ### 4.4 Event Bus
 A lightweight, in-process, typed pub/sub — not a full event-sourcing system, not a message broker. Modules publish typed events; anyone can subscribe without the publisher knowing or caring who's listening.

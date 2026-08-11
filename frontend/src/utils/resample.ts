@@ -1,3 +1,11 @@
+// NO LONGER CALLED from the live render path (see confirmed-decisions.md —
+// frontend timeframe wiring / session-local aggregation). SubWindow.tsx now
+// requests config.timeframe directly from the backend via useLiveCandles,
+// which candle_aggregator.py serves for 5m/15m/1h (session-aware, unlike
+// the index-based bucketing below) and Polygon serves for 1d. Left in place
+// rather than deleted — nothing else currently imports it, so it's a
+// removal candidate on the next pass through this file, not touched here.
+//
 import type { Candle } from "../types/market";
 import type { Timeframe } from "../types/workspace";
 

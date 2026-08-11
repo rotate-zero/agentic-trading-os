@@ -80,6 +80,21 @@ def test_market_candles_rejects_unsupported_timeframe():
         broker_registry.clear_all()
 
 
+def test_market_candles_rejects_4h_cleanly():
+    """4h is deliberately unsupported (confirmed-decisions.md) — this must
+    be a clean 400 like any other unsupported timeframe, not the unhandled
+    500 that used to happen when this reached polygon_provider.py's
+    _polygon_params_for() with no "4h" entry in its mapping."""
+    broker_registry.set_historical_provider(_FakeConnectedAdapter())
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/candles", params={"symbol": "NVDA", "timeframe": "4h"})
+        assert r.status_code == 400
+        assert "4h" in r.json()["detail"]
+    finally:
+        broker_registry.clear_all()
+
+
 def test_market_subscribe_requires_connection():
     broker_registry.clear_all()
     with TestClient(app) as client:
@@ -246,6 +261,120 @@ def test_market_candles_serves_self_recorded_data_with_no_provider_connected():
         assert body["candles"][0]["open"] == 10.0
         assert body["candles"][0]["close"] == 10.5
     finally:
+        session = SessionLocal()
+        try:
+            session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+            session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+            session.commit()
+        finally:
+            session.close()
+        broker_registry.clear_all()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+def test_market_candles_serves_aggregated_5m_from_self_recorded_1m_with_no_provider_connected():
+    """
+    The actual feature this delivery adds: /market/candles?timeframe=5m
+    must work off real self-recorded 1m rows via candle_aggregator, with
+    zero provider connected — same "self-recorded is enough on its own"
+    guarantee as the 1m case above, extended to a timeframe the recorder
+    never writes directly.
+
+    Session-bucket-boundary correctness itself is already covered
+    exhaustively in test_candle_aggregator.py against controlled synthetic
+    timestamps; MarketClock.session_bounds is faked out here specifically
+    so THIS test — which seeds real "now"-based timestamps so they land
+    inside the route's real DB query window — isn't also at the mercy of
+    whether it happens to run during actual market hours.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+    from app.event_bus.bus import EventBus
+    from app.event_bus.events import make_envelope
+    from app.schemas.events.envelope import EventType
+    from app.schemas.events.market_data import CandleClosed
+    from app.services import candle_aggregator
+    from app.services.candle_recorder import CandleRecorder
+
+    ticker = "ZZTESTAGG01"
+    session = SessionLocal()
+    try:
+        session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+        session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+        session.commit()
+    finally:
+        session.close()
+
+    broker_registry.clear_all()  # no provider connected — aggregation alone must be enough
+
+    # Five consecutive real minutes ending "now" — guaranteed to land
+    # inside the route's own [start, end] query window (computed from real
+    # wall-clock time), regardless of what time this test happens to run.
+    now_floor = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    candle_times = [now_floor - timedelta(minutes=(4 - i)) for i in range(5)]
+
+    class _FakeOneBigSessionClock:
+        """Forces all five seeded timestamps into exactly one 5-minute
+        bucket by anchoring the fake session to the first candle's own
+        timestamp — sidesteps needing this test to run during a real
+        session at all."""
+
+        def session_bounds(self, ts):
+            return candle_times[0], candle_times[0] + timedelta(hours=1)
+
+    async def _seed():
+        bus = EventBus()
+        await bus.start()
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            for i, ts in enumerate(candle_times):
+                await bus.publish(
+                    make_envelope(
+                        EventType.CANDLE_CLOSED,
+                        CandleClosed(
+                            timeframe="1m",
+                            open=10.0 + i,
+                            high=10.5 + i,
+                            low=9.5 + i,
+                            close=10.2 + i,
+                            volume=100,
+                            candle_ts=ts,
+                        ),
+                        symbol=ticker,
+                    )
+                )
+            import asyncio
+
+            await asyncio.sleep(0.3)
+        finally:
+            recorder.stop()
+            await bus.stop()
+
+    import asyncio
+
+    asyncio.run(_seed())
+
+    real_get_market_clock = candle_aggregator.get_market_clock
+    candle_aggregator.get_market_clock = lambda: _FakeOneBigSessionClock()
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/candles", params={"symbol": ticker, "count": 5, "timeframe": "5m"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbol"] == ticker
+        assert len(body["candles"]) == 1
+        bar = body["candles"][0]
+        assert bar["open"] == 10.0  # first 1m candle's open
+        assert bar["close"] == 14.2  # last 1m candle's close (10.2 + 4)
+        assert bar["high"] == 14.5  # max across all five, not just first/last
+        assert bar["low"] == 9.5  # min across all five
+        assert bar["volume"] == 500
+    finally:
+        candle_aggregator.get_market_clock = real_get_market_clock
         session = SessionLocal()
         try:
             session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})

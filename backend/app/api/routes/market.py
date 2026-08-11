@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
-from app.services import broker_registry, candle_store
+from app.services import broker_registry, candle_aggregator, candle_store
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,16 @@ router = APIRouter(prefix="/market", tags=["market"])
 # backfill. Rough on purpose — IBKR trims to actual trading-session data
 # regardless, so asking for "too much" wall-clock time just means the
 # request covers extra non-trading hours, not extra rows.
-_MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 60 * 24}
+#
+# "4h" deliberately excluded (confirmed-decisions.md): the regular session
+# is 6.5h, which doesn't divide evenly by 4h, and it isn't a timeframe
+# anything in this app actually uses yet — rejecting it cleanly here (a
+# normal 400, same as any other unsupported timeframe) beats inventing a
+# bucket definition nobody's confirmed. polygon_provider.py also has no "4h"
+# entry in its own mapping; that's now unreachable dead code via this route,
+# not a live bug, but worth knowing about if something ever calls that
+# adapter directly instead of through here.
+_MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 60 * 24}
 
 
 @router.get("/candles")
@@ -78,6 +87,27 @@ async def get_candles(
             "symbol": symbol,
             "candles": [c.model_dump(mode="json") for c in recorded[-count:]],
         }
+
+    # 5m/15m/1h: never self-recorded directly (see _MINUTES_PER_UNIT's "4h"
+    # comment — the recorder only ever writes "1m" rows), but derivable from
+    # whatever 1m history IS recorded. Tried before falling through to an
+    # external provider — this is real, session-aware data built from ticks
+    # this app actually saw, strictly better than Polygon's free-tier
+    # intraday (which is paywalled entirely — see confirmed decision #39 —
+    # so would just fail below anyway). "1d" deliberately excluded: it stays
+    # sourced from Polygon's real daily EOD bars rather than reconstructed
+    # from however much 1m history happens to be sitting in this database.
+    if timeframe in candle_aggregator.AGGREGATABLE_TIMEFRAMES:
+        try:
+            aggregated = await asyncio.to_thread(candle_aggregator.aggregate_from_recorded, symbol, timeframe, start, end)
+        except Exception:  # noqa: BLE001 — same "log, fall through" reasoning as the self-recorded lookup above
+            logger.exception("candle_aggregator.aggregate_from_recorded failed for %s — falling through to external provider", symbol)
+            aggregated = []
+        if aggregated:
+            return {
+                "symbol": symbol,
+                "candles": [c.model_dump(mode="json") for c in aggregated[-count:]],
+            }
 
     adapter = broker_registry.get_historical_provider()
     if adapter is None or not adapter.is_connected():

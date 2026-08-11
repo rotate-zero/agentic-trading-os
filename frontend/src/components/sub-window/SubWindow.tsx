@@ -3,7 +3,6 @@ import { ChartWidget } from "../chart/ChartWidget";
 import { SubWindowMenu } from "./SubWindowMenu";
 import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { generateMockOverlays } from "../../mocks/chartObjects";
-import { resampleCandles } from "../../utils/resample";
 import { computePriceIndicator } from "../../utils/indicators";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import type { SubWindowConfig } from "../../types/workspace";
@@ -12,11 +11,13 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   const { resolvedSymbol } = useWorkspace();
   const symbol = resolvedSymbol(config);
 
-  const oneMinCandles = useLiveCandles(symbol);
-  const candles = useMemo(
-    () => resampleCandles(oneMinCandles, config.timeframe),
-    [oneMinCandles, config.timeframe]
-  );
+  // Requests config.timeframe directly from the backend (see
+  // useLiveCandles' own docstring) rather than always pulling 1m and
+  // resampling client-side — resample.ts's index-based bucketing is no
+  // longer wired into the live render path (see that file's own header
+  // note; candle_aggregator.py is now the single source of truth for
+  // 5m/15m/1h, Polygon for 1d).
+  const candles = useLiveCandles(symbol, config.timeframe);
   const overlays = useMemo(() => generateMockOverlays(candles), [candles]);
 
   // Overlay indicators (SMA/EMA/VWAP instances) computed into flat series for
