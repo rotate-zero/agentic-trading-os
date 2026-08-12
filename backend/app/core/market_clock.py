@@ -164,6 +164,18 @@ class MarketClock:
         open_dt = now.replace(hour=_MARKET_OPEN.hour, minute=_MARKET_OPEN.minute, second=0, microsecond=0)
         return max(0, int((now - open_dt).total_seconds() // 60))
 
+    def trading_day(self, ts: datetime | None = None) -> date:
+        """
+        The ET calendar date `ts` falls in — the single definition of "day"
+        for anything that resets daily (currently: Level Interaction Engine's
+        touch counters — trading-intelligence-architecture.md, confirmed
+        decision #46). Deliberately just `_now(ts).date()`: the same
+        ET-conversion `session_bounds()` already does internally, pulled out
+        so a consumer that only needs "which day is this" doesn't need to
+        reimplement the timezone conversion itself.
+        """
+        return self._now(ts).date()
+
     def next_session_boundary(self, ts: datetime | None = None) -> datetime:
         now = self._now(ts)
         # Every window's start AND end, deduped — subsumes the old

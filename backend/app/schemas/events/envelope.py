@@ -24,6 +24,7 @@ class EventType(StrEnum):
     # State intelligence
     MARKET_STATE_CHANGED = "MarketStateChanged"
     CONTEXT_CHANGED = "ContextChanged"
+    LEVEL_INTERACTION_CHANGED = "LevelInteractionChanged"  # confirmed decision #46
 
     # Decision intelligence
     OPPORTUNITY_CREATED = "OpportunityCreated"

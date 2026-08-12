@@ -154,6 +154,8 @@ This exists specifically to prevent the failure mode where Momentum, Breakout, a
 
 Feature values that a strategy actually acted on get persisted to `feature_snapshots` (§4.13) at decision time, not on every tick — that's what makes "why did the AI do that" answerable later without recomputing anything.
 
+**Implementation status (confirmed decision #45):** SMA is the first indicator actually computed here — `app/feature_engine/{indicators.py,engine.py}` — published as `FeaturesUpdated` on every `1m` `CandleClosed`, in-memory rolling window per `(symbol, timeframe)` seeded from `candle_store` on first sight of a symbol, restart-safe by design (same "rebuilt from persisted history" shape as Market State — §4 of the companion doc). Everything else in the paragraph above (EMA, VWAP, ATR, PDH/PDL, relative volume, gap %, opening range, average volume, trend slope, signed-volume imbalance) is still the target shape, not yet built. `1m` only for now — `5m`/`15m`/`1h` need either an aggregated-candle-close event or on-demand derivation that doesn't exist yet; real follow-up work, not assumed to already work. `FeatureSet` gained a `close` field in decision #46, for the Level Interaction Engine below (§4.8) — the first real consumer of this output.
+
 ### 4.6 Portfolio State Engine
 Owns the system's live view of *itself* — the account/position side, as opposed to the Market Data Engine which owns the market side. Tracks: open positions, aggregate exposure, pairwise correlation across open positions, available capital/buying power, realized + unrealized daily P&L, and risk budget consumed so far today.
 
@@ -182,6 +184,7 @@ This section gives each module's software interface — what it consumes, what i
 | Module | Consumes | Emits | Persists to |
 |---|---|---|---|
 | Market State Engine | `FeaturesUpdated` | `MarketStateChanged` | `market_state_history` |
+| Level Interaction Engine | `FeaturesUpdated` | `LevelInteractionChanged` | `level_interaction_state`, `level_interaction_events` |
 | Context Engine | `MarketStateChanged`, Market Clock, event calendar | `ContextChanged` | derived, not stored independently |
 | Strategy Engine | `MarketStateChanged`, `ContextChanged`, `FeaturesUpdated` | `OpportunityCreated` | `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `OpportunityCreated` (all strategies, per symbol) | ranked opportunity list | `ai_decisions` |
@@ -190,6 +193,8 @@ This section gives each module's software interface — what it consumes, what i
 | Governor | `TradePlanned` + Portfolio State + Context | `OrderApproved` / `PlanRejected` | `trades` (approved/rejected) |
 | Position Monitor | `OrderFilled`, ongoing `MarketStateChanged` | `PositionAdjusted` / `PositionClosed` | `positions` |
 | Performance Intelligence | `PositionClosed`, `feature_snapshots`, `market_events` | strategy reweighting signal | `strategy_performance` |
+
+**Implementation status (confirmed decision #46):** Level Interaction Engine is the first module in this table actually built and running — `app/trading_intelligence/level_interaction_engine.py`. Generic by construction: it runs the same touch/holding/rejected/conquered state machine against every key `FeatureSet.features` carries (currently `sma_9`/`sma_20`/`sma_50` — decision #45), so it needs no changes when EMA/VWAP/pivot levels start publishing later. `1m` only, same scoping as decision #45. Market State Engine, Context Engine, and everything below them in this table are still the target shape only, not yet built.
 
 Each module implements a narrow interface (`evaluate()`, `rank()`, `arbitrate()`, `plan()`, `authorize()`) so any single stage can be unit-tested without standing up the full pipeline.
 
@@ -514,7 +519,8 @@ Every event, regardless of type, is wrapped the same way:
 |---|---|
 | `PriceUpdated` | `price`, `size`, `exchange_ts` |
 | `CandleClosed` | `timeframe`, `open`, `high`, `low`, `close`, `volume`, `candle_ts` |
-| `FeaturesUpdated` | `features: {ema_9, ema_20, vwap, atr_14, pdh, pdl, rel_volume, gap_pct, opening_range_high, opening_range_low, avg_volume_20d, trend_slope}` |
+| `FeaturesUpdated` | `timeframe`, `candle_ts`, `close` (confirmed decision #46 — makes this self-contained for a consumer needing both a level value and the raw price), `features: {...}` — **as built (decision #45, `1m` only):** `{sma_9, sma_20, sma_50}` (configurable periods). Everything else below is still the target shape, not yet computed: `ema_9, ema_20, vwap, atr_14, pdh, pdl, rel_volume, gap_pct, opening_range_high, opening_range_low, avg_volume_20d, trend_slope` |
+| `LevelInteractionChanged` | `timeframe`, `level_key` (e.g. `"sma_9"` — whatever key `FeaturesUpdated.features` used, not a hardcoded enum), `trading_day`, `status` (holding\|rejected\|conquered\|unclassified), `zone` (below\|inside_aura\|above), `touch_count_today`, `seconds_in_zone`, `distance_pct`, `anchor_price`, `observed_via` (dwell\|gap\|cold_start_unknown_origin, only set at resolution) — confirmed decision #46, `app/trading_intelligence/level_interaction_engine.py` |
 | `MarketStateChanged` | `dimension` (trend\|volatility\|volume\|vwap_relation\|session\|breadth), `value`, `duration_seconds`, `strength` (increasing\|decreasing\|stable), `confidence`, `previous_value`, `changed_at` |
 | `ContextChanged` | `providers: {calendar: {...}, gap: {...}, levels: {...}, volatility_regime: {...}}` — one key per active provider (§5 of the companion doc) |
 | `OpportunityCreated` | `strategy`, `direction`, `confidence`, `reason`, `suggested_entry`, `suggested_stop`, `suggested_target` |

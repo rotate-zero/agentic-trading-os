@@ -57,6 +57,18 @@ class Settings(BaseSettings):
     # --- CORS (frontend dev server) ---
     cors_allow_origins: list[str] = ["http://localhost:5173"]
 
+    # --- Feature Engine (Phase 4) ---
+    # SMA periods computed on every 1m CandleClosed and published as
+    # FeaturesUpdated (feature_engine/engine.py). Extending to 5m/15m/1h
+    # is real, deliberate follow-up work — see that module's docstring.
+    feature_engine_sma_periods: list[int] = [9, 20, 50]
+
+    # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
+    # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
+    # level_key FeatureEngine publishes. Per-level-type override is real
+    # follow-up work if some level types need a different width later.
+    trading_intelligence_aura_pct: float = 0.002
+
 
 @lru_cache
 def get_settings() -> Settings:

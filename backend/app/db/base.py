@@ -15,3 +15,4 @@ class Base(DeclarativeBase):
 # the only one that exists as of Phase 2 — symbols + candles only;
 # everything else in system-design.md §4.13 is a later phase).
 from app.models import market_data  # noqa: E402,F401
+from app.models import trading_intelligence  # noqa: E402,F401 — level_interaction_state/events (confirmed decision #46)

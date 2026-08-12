@@ -68,3 +68,49 @@ def get_recorded_candles(symbol: str, timeframe: str, start: datetime, end: date
         ]
     finally:
         session.close()
+
+
+def get_recent_closes(
+    symbol: str, timeframe: str, before: datetime, limit: int, *, strict_before: bool = False
+) -> list[float]:
+    """
+    Read-side addition alongside get_recorded_candles() above, for a
+    consumer (app/feature_engine/engine.py) that wants "the last `limit`
+    closes up to a point in time" rather than a wall-clock date range.
+
+    Returns closes in chronological order (oldest -> newest) — the shape a
+    moving-average function needs — even though the query itself runs
+    newest-first: ORDER BY candle_ts DESC LIMIT n is the only way to bound
+    the scan to `limit` rows instead of scanning the whole partition.
+
+    strict_before=True excludes a candle at exactly `before` — used by
+    FeatureEngine to backfill PRIOR closes only; it already has the
+    current candle's own close from the event payload and deliberately
+    doesn't re-read it back from the DB (see feature_engine/engine.py's
+    module docstring on why — avoids a real ordering race against
+    CandleRecorder's write of that same candle).
+
+    Returns [] for "nothing recorded yet," same posture as
+    get_recorded_candles().
+    """
+    session = SessionLocal()
+    try:
+        ts_filter = CandleRow.candle_ts < before if strict_before else CandleRow.candle_ts <= before
+        rows = (
+            session.execute(
+                select(CandleRow.close)
+                .join(Symbol, Symbol.id == CandleRow.symbol_id)
+                .where(
+                    Symbol.ticker == symbol,
+                    CandleRow.timeframe == timeframe,
+                    ts_filter,
+                )
+                .order_by(CandleRow.candle_ts.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        return [float(c) for c in reversed(rows)]
+    finally:
+        session.close()

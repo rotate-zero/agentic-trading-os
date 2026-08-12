@@ -15,8 +15,10 @@ from app.core.config import get_settings
 from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
+from app.feature_engine.engine import FeatureEngine
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
+from app.trading_intelligence.level_interaction_engine import LevelInteractionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,20 @@ async def lifespan(app: FastAPI):
     # without.
     candle_recorder = CandleRecorder(bus)
     candle_recorder.start()
+
+    # Feature Engine's first indicator (Phase 4 kickoff, confirmed decision
+    # #45) — like CandleRecorder, starts unconditionally: it's just a
+    # CandleClosed subscriber, ready for whenever ticks start flowing,
+    # independent of which provider (if any) ends up connected below.
+    feature_engine = FeatureEngine(bus)
+    feature_engine.start()
+
+    # Trading Intelligence's first engine (confirmed decision #46) —
+    # consumes FeatureEngine's FeaturesUpdated output. Same unconditional-
+    # start posture as everything else here: it's just a subscriber, ready
+    # whenever ticks start flowing.
+    level_interaction_engine = LevelInteractionEngine(bus)
+    level_interaction_engine.start()
 
     gateway = get_gateway()
     gateway.attach()
@@ -94,6 +110,8 @@ async def lifespan(app: FastAPI):
     for provider in broker_registry.get_all_active_providers():
         await provider.disconnect()
     candle_recorder.stop()
+    feature_engine.stop()
+    level_interaction_engine.stop()
     await bus.stop()
     logger.info("%s stopped", settings.app_name)
 
