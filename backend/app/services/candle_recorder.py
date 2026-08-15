@@ -81,9 +81,26 @@ class CandleRecorder:
         self._writer_task = asyncio.create_task(self._writer_loop(), name="candle-recorder-writer")
         logger.info("CandleRecorder started — persisting CandleClosed events to Postgres")
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        """
+        Confirmed decision #47 — this used to be `task.cancel()` with
+        nothing awaiting it, which only SCHEDULES cancellation; it doesn't
+        block until the task has actually unwound. Found via a real,
+        reproducible bug, not by inspection: a cancelled task blocked
+        inside `asyncio.to_thread(...)` (this writer's DB call) can't be
+        interrupted until that thread finishes — so `stop()` could return,
+        and a caller could reasonably believe shutdown was complete, while
+        a write was still in flight and landed afterward. That's exactly
+        what corrupted a test's cleanup (a stray write racing a DELETE,
+        producing a foreign-key violation) — a real symptom of the same
+        risk existing in production shutdown, not a test-only artifact.
+        """
         if self._writer_task is not None and not self._writer_task.done():
             self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
         self._writer_task = None
 
     # --- Event Bus subscriber (must stay fast — see module docstring) -------

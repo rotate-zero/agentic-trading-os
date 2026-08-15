@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import broker, dev, finnhub_data, health, market, market_data
+from app.api.routes import broker, dev, finnhub_data, health, intelligence, market, market_data
 from app.api.routes.finnhub_data import connect_finnhub
 from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
@@ -15,10 +15,10 @@ from app.core.config import get_settings
 from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
-from app.feature_engine.engine import FeatureEngine
+from app.feature_engine.engine import get_feature_engine
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
-from app.trading_intelligence.level_interaction_engine import LevelInteractionEngine
+from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +46,14 @@ async def lifespan(app: FastAPI):
     # #45) — like CandleRecorder, starts unconditionally: it's just a
     # CandleClosed subscriber, ready for whenever ticks start flowing,
     # independent of which provider (if any) ends up connected below.
-    feature_engine = FeatureEngine(bus)
+    feature_engine = get_feature_engine(bus)
     feature_engine.start()
 
     # Trading Intelligence's first engine (confirmed decision #46) —
     # consumes FeatureEngine's FeaturesUpdated output. Same unconditional-
     # start posture as everything else here: it's just a subscriber, ready
     # whenever ticks start flowing.
-    level_interaction_engine = LevelInteractionEngine(bus)
+    level_interaction_engine = get_level_interaction_engine(bus)
     level_interaction_engine.start()
 
     gateway = get_gateway()
@@ -105,15 +105,46 @@ async def lifespan(app: FastAPI):
         logger.info("POLYGON_API_KEY not set — skipping Polygon auto-connect")
 
     logger.info("%s started (debug=%s)", settings.app_name, settings.debug)
-    yield
+    try:
+        yield
+    finally:
+        # try/finally added deliberately (confirmed decision #47) — found
+        # via a real, reproducible bug, not by inspection. Without it, an
+        # exception raised anywhere inside the `async with
+        # app.router.lifespan_context(app):` block (which is exactly how
+        # this app's own test suite exercises real engine behavior — see
+        # test_intelligence_routes.py) gets thrown INTO this generator
+        # at the `yield` above. A bare `yield` with no try/finally means
+        # that exception propagates straight out, skipping every line
+        # below entirely — the Event Bus and all three engines never get
+        # told to stop, their background tasks are simply abandoned
+        # (later surfacing as "Task was destroyed but it is pending!"
+        # warnings, often during an unrelated LATER test), and — the part
+        # that actually mattered — abandoned tasks don't stop touching
+        # the database just because nobody's watching anymore. That's
+        # what was racing test cleanup: not a timing window in the
+        # stop() sequence itself, but shutdown never running at all.
+        for provider in broker_registry.get_all_active_providers():
+            await provider.disconnect()
 
-    for provider in broker_registry.get_all_active_providers():
-        await provider.disconnect()
-    candle_recorder.stop()
-    feature_engine.stop()
-    level_interaction_engine.stop()
-    await bus.stop()
-    logger.info("%s stopped", settings.app_name)
+        # Bus stops FIRST, deliberately, not last — separately confirmed
+        # (decision #47) via the same debugging session. With engines
+        # stopped before the bus: while CandleRecorder.stop() is still
+        # draining, the bus is STILL dispatching fresh CandleClosed events
+        # to FeatureEngine (not yet told to stop) and, transitively, fresh
+        # FeaturesUpdated events to LevelInteractionEngine, right up until
+        # each is told to stop in turn. Each engine's own stop() correctly
+        # awaits full completion, but "full completion" of an
+        # ever-refilling queue has no natural bound. Stopping the bus
+        # first cuts off new dispatch at the source: every engine then
+        # drains only whatever was ALREADY in its own queue before the
+        # bus stopped — a fixed, bounded backlog — so "await engine.stop()"
+        # actually means what it says.
+        await bus.stop()
+        await candle_recorder.stop()
+        await feature_engine.stop()
+        await level_interaction_engine.stop()
+        logger.info("%s stopped", settings.app_name)
 
 
 def create_app() -> FastAPI:
@@ -144,6 +175,7 @@ def create_app() -> FastAPI:
     app.include_router(market.router)
     app.include_router(market_data.router)
     app.include_router(finnhub_data.router)
+    app.include_router(intelligence.router)
     app.include_router(channels.router)
 
     return app

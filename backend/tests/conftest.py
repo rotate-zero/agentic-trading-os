@@ -41,6 +41,8 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.api.websocket.manager as manager_module
     import app.core.config as config_module
     import app.event_bus.bus as bus_module
+    import app.feature_engine.engine as feature_engine_module
+    import app.trading_intelligence.level_interaction_engine as level_interaction_engine_module
     from app.services import broker_registry
 
     # Explicit empty string, not delenv: pydantic-settings' BaseSettings
@@ -57,6 +59,8 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
         bus_module._event_bus = None
         manager_module._manager = None
         channels_module._gateway = None
+        feature_engine_module._feature_engine = None  # confirmed decision #47 — same reasoning as _event_bus above
+        level_interaction_engine_module._level_interaction_engine = None  # ditto
         broker_registry.clear_all()
         # market_data.py and finnhub_data.py each keep their own local
         # provider reference (see their module docstrings for why) —

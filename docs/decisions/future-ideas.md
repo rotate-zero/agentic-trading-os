@@ -213,3 +213,17 @@
 **Trigger to revisit:** the free tier's 5-calls/minute budget becomes a real constraint (e.g. wanting more than a handful of symbols polled at a reasonable cadence), or a paid Polygon tier / a different vendor entirely becomes worth the cost once real trading volume justifies it.
 
 **Where a replacement would plug in:** same place `PolygonAdapter`/`FinnhubAdapter` do — `app/broker_adapters/<vendor>_provider.py` implementing `MarketDataProvider`, registered through the existing `broker_registry` (streaming and/or historical role, as appropriate — see `confirmed-decisions.md` #33) and the existing `GET /market/candles` route. No route changes needed; that's the whole point of the interface (`confirmed-decisions.md` #28).
+
+---
+
+## 18. Workspace Preset Save / Export
+
+**What it is:** saving a named preset of a workspace's grid formation (rows/cols layout) plus which components/panels are configured into it — and, secondarily, exporting a preset (e.g. to share or reuse across machines). Confirmed as a real, wanted feature, not something to discard.
+
+**Correction to the record:** `confirmed-decisions.md` #35 characterized `frontend/src/components/workspace/GridPresetPicker.tsx` as an unrelated pre-existing bug — dead code referencing a `GRID_PRESETS` export and `preset`/`setPreset` context fields that don't exist anywhere, found incidentally during an unrelated task and flagged for a fix-or-delete decision. That technical description is still accurate (the file is still broken exactly that way, and still not imported by anything real). What #35 didn't know: the file isn't random abandoned code — it's an incomplete first attempt at *this* feature, wired against a `preset`/`setPreset` shape `WorkspaceContext` never actually grew, while the real, live grid implementation (`GridPicker.tsx`, `gridLayout`/`setGridLayout`) went a different direction. So the honest status is "a real, wanted feature with one abandoned false start sitting in the tree," not "dead code, disposition TBD."
+
+**Priority:** explicitly not now. `GridPresetPicker.tsx` stays exactly as it is — untouched, still filtered out of `tsc -b` output per #35's existing convention — until this is actually picked up.
+
+**Trigger to revisit:** whenever workspace preset save/(export) actually becomes the next thing to build.
+
+**Where it would plug in:** `WorkspaceContext` would need real `gridLayout`+configured-components snapshot/restore support (a preset is more than just the grid shape — it's the grid shape *and* what's configured into it), most naturally alongside the existing session persistence (`loadSession()`/whatever already persists `infoWidthPx` etc. — same mechanism, larger payload). `GridPresetPicker.tsx` is a starting sketch for the picker UI, not a foundation to build on as-is — the `GRID_PRESETS`/`preset`/`setPreset` shape it assumes doesn't match `gridLayout`'s real shape and would need redesigning against whatever the actual save/restore data model ends up being, not just patched to compile.

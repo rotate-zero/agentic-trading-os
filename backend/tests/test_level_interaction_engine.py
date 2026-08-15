@@ -117,7 +117,7 @@ async def test_touch_then_rejected():
         assert rejected["seconds_in_zone"] == 60
         assert rejected["distance_pct"] == -1.0  # (99-100)/100 * 100
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -145,7 +145,7 @@ async def test_touch_then_conquered():
         assert conquered["observed_via"] == "dwell"
         assert conquered["distance_pct"] == 1.0
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -173,7 +173,7 @@ async def test_gap_through_is_always_conquered():
         assert event["seconds_in_zone"] == 0
         assert event["touch_count_today"] == 1
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -200,7 +200,7 @@ async def test_cold_start_unknown_origin_left_unclassified():
         assert event["status"] == "unclassified"
         assert event["observed_via"] == "cold_start_unknown_origin"
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -226,7 +226,7 @@ async def test_touch_count_increments_across_multiple_touches_same_day():
         touch_counts = [e.payload["touch_count_today"] for e in received]
         assert touch_counts == [1, 1, 2, 2]  # holding(1), rejected(1), holding(2), rejected(2)
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -257,7 +257,7 @@ async def test_touch_count_resets_on_trading_day_rollover():
         assert received[2].payload["touch_count_today"] == 1  # day 2 holding — reset, not 2
         assert str(received[2].payload["trading_day"]) == "2026-08-11"
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -284,8 +284,7 @@ async def test_restart_survival_mid_touch():
             await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 100.0, {"sma_9": 100.0})  # touch starts
             await asyncio.sleep(0.2)
         finally:
-            engine_a.stop()
-
+            await engine_a.stop()
         # Fresh instance — no in-memory state for this symbol at all.
         engine_b = LevelInteractionEngine(bus, aura_pct=0.002)
         engine_b.start()
@@ -299,7 +298,7 @@ async def test_restart_survival_mid_touch():
             assert received[0].payload["status"] == "rejected"  # correctly resolved against the PERSISTED touch
             assert received[0].payload["seconds_in_zone"] == 60
         finally:
-            engine_b.stop()
+            await engine_b.stop()
     finally:
         await bus.stop()
         _clean_test_symbol(ticker)
@@ -331,7 +330,96 @@ async def test_multiple_level_keys_tracked_independently():
         assert len(received) == 1  # only sma_9 transitioned — sma_20 stayed "below" throughout
         assert received[0].payload["level_key"] == "sma_9"
     finally:
-        engine.stop()
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_shows_live_holding_state():
+    """
+    Checks the two things get_snapshot() computes fresh at call time
+    rather than reading from persisted state — seconds_in_zone and
+    distance_pct while a touch is still open — by publishing a SECOND
+    candle while still holding, with price drifting slightly closer to
+    the anchor, and confirming distance_pct actually moves to reflect
+    that (not the stale value from touch start).
+    """
+    ticker = "__LIE_SNAP__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+
+    try:
+        await _publish(bus, ticker, _DAY1, 99.0, {"sma_9": 100.0})  # below — not holding yet
+        await asyncio.sleep(0.1)
+        snap = engine.get_snapshot(ticker)
+        below = snap[ticker]["1m"]["sma_9"]
+        assert below["zone"] == "below"
+        assert "holding" not in below
+        assert below["distance_pct"] == -1.0  # confirmed decision #49 — present even outside an active touch
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 100.0, {"sma_9": 100.0})  # touch — anchor=100.0
+        await asyncio.sleep(0.1)
+        snap = engine.get_snapshot(ticker)
+        entry = snap[ticker]["1m"]["sma_9"]
+        assert entry["distance_pct"] == 0.0  # top-level now, not nested under "holding"
+        holding = entry["holding"]
+        assert holding["anchor_price"] == 100.0
+        assert holding["entered_from"] == "below"
+        assert "distance_pct" not in holding  # moved up a level — no longer duplicated here
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=2), 100.15, {"sma_9": 100.0})  # still inside aura, drifted up
+        await asyncio.sleep(0.1)
+        snap = engine.get_snapshot(ticker)
+        entry = snap[ticker]["1m"]["sma_9"]
+        assert entry["distance_pct"] == 0.15  # live — reflects the LATEST close, not the stale touch-start value
+        assert entry["holding"]["anchor_price"] == 100.0  # anchor itself never moves during a hold
+
+        assert engine.get_snapshot(symbol="__LIE_NEVER_SEEN__") == {}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_steady_state_distance_uses_live_level_not_a_frozen_one():
+    """
+    Confirmed decision #49: outside an active touch, distance_pct tracks
+    the CURRENT live level value, not whatever it was when this zone was
+    entered — deliberately different from the holding case (which stays
+    anchored). Proven by drifting the level value itself between two
+    candles that both stay "above," and confirming distance_pct reflects
+    the NEW level, not the one from zone entry.
+    """
+    ticker = "__LIE_STEADY__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+
+    try:
+        await _publish(bus, ticker, _DAY1, 110.0, {"sma_9": 100.0})  # first observation — above, cold start
+        await asyncio.sleep(0.1)
+        snap = engine.get_snapshot(ticker)
+        entry = snap[ticker]["1m"]["sma_9"]
+        assert entry["zone"] == "above"
+        assert entry["distance_pct"] == 10.0  # (110-100)/100*100
+        assert isinstance(entry["seconds_in_zone"], int) and entry["seconds_in_zone"] >= 0
+
+        # Level itself drifts up; price stays above the whole time — no zone transition.
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 112.0, {"sma_9": 105.0})
+        await asyncio.sleep(0.1)
+        snap = engine.get_snapshot(ticker)
+        entry = snap[ticker]["1m"]["sma_9"]
+        assert entry["zone"] == "above"  # confirmed no transition — this is the steady-state path, not a new touch
+        assert round(entry["distance_pct"], 3) == round((112.0 - 105.0) / 105.0 * 100, 3)  # tracks the NEW level
+    finally:
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
@@ -355,6 +443,6 @@ async def test_duplicate_features_updated_dropped():
 
         assert len(received) == 1  # not 2 — the duplicate never reached the state machine
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)

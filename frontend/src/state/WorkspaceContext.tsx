@@ -37,6 +37,9 @@ interface WorkspaceContextValue {
   subWindows: SubWindowConfig[];
   infoCollapsed: boolean;
   infoWidthPx: number;
+  featureEngineCollapsed: boolean;
+  featureEngineWidthPx: number;
+  featureEnginePanelSymbol: string;
 
   // GLOBAL — shared across every Main Window. This is what makes "connector 0
   // in Layout 1" and "connector 0 in Layout 2" the same link group.
@@ -50,6 +53,9 @@ interface WorkspaceContextValue {
   resolvedSymbol: (config: SubWindowConfig) => string;
   setInfoCollapsed: (collapsed: boolean) => void;
   setInfoWidthPx: (width: number) => void;
+  setFeatureEngineCollapsed: (collapsed: boolean) => void;
+  setFeatureEngineWidthPx: (width: number) => void;
+  setFeatureEnginePanelSymbol: (symbol: string) => void;
 
   // No-database save/load — everything lives in localStorage for now. Same
   // JSON shape this produces is what a future workspace_layouts API call
@@ -135,6 +141,9 @@ function makeMainWindow(id: string, label: string, subWindows: SubWindowConfig[]
     subWindows,
     infoCollapsed: false,
     infoWidthPx: 300,
+    featureEngineCollapsed: true, // starts collapsed — a second sidebar shouldn't grab space by default
+    featureEngineWidthPx: 300,
+    featureEnginePanelSymbol: DEFAULT_SYMBOL,
   };
 }
 
@@ -382,6 +391,9 @@ export function WorkspaceProvider({
 
   const setInfoCollapsed = (collapsed: boolean) => updateActive({ infoCollapsed: collapsed });
   const setInfoWidthPx = (width: number) => updateActive({ infoWidthPx: width });
+  const setFeatureEngineCollapsed = (collapsed: boolean) => updateActive({ featureEngineCollapsed: collapsed });
+  const setFeatureEngineWidthPx = (width: number) => updateActive({ featureEngineWidthPx: width });
+  const setFeatureEnginePanelSymbol = (symbol: string) => updateActive({ featureEnginePanelSymbol: symbol });
 
   const addMainWindow = () => {
     const id = `mw-${Date.now()}`;
@@ -492,6 +504,9 @@ export function WorkspaceProvider({
       subWindows: activeWindow.subWindows,
       infoCollapsed: activeWindow.infoCollapsed,
       infoWidthPx: activeWindow.infoWidthPx,
+      featureEngineCollapsed: activeWindow.featureEngineCollapsed,
+      featureEngineWidthPx: activeWindow.featureEngineWidthPx,
+      featureEnginePanelSymbol: activeWindow.featureEnginePanelSymbol,
 
       connectorSymbols,
 
@@ -503,6 +518,9 @@ export function WorkspaceProvider({
       resolvedSymbol,
       setInfoCollapsed,
       setInfoWidthPx,
+      setFeatureEngineCollapsed,
+      setFeatureEngineWidthPx,
+      setFeatureEnginePanelSymbol,
 
       savedLayouts,
       saveCurrentLayout,

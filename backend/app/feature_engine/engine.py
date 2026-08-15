@@ -66,7 +66,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.config import get_settings
-from app.event_bus.bus import EventBus
+from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.feature_engine.indicators import sma
 from app.schemas.events.envelope import EventEnvelope, EventType
@@ -96,16 +96,57 @@ class FeatureEngine:
         # Per-(symbol, timeframe) rolling state — see module docstring.
         self._windows: dict[tuple[str, str], deque[float]] = {}
         self._last_applied_ts: dict[tuple[str, str], datetime] = {}
+        # Most recent successfully-computed FeatureSet per key — confirmed
+        # decision #47. Separate from `_windows` (raw closes, always needed
+        # for the next SMA computation) because this is purely a read-side
+        # cache for get_snapshot(): nothing in the compute path itself
+        # reads it back. A plain dict, not bounded/evicted — one entry per
+        # (symbol, timeframe) actually seen, capped by the real symbol
+        # universe (~100), not by event volume.
+        self._latest: dict[tuple[str, str], FeatureSet] = {}
 
     def start(self) -> None:
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_candle_closed)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="feature-engine-sma")
         logger.info("FeatureEngine started — computing SMA%s on 1m CandleClosed", self._sma_periods)
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        """Awaits actual task completion, not just schedules cancellation
+        — see CandleRecorder.stop()'s docstring for the real bug this
+        fixes (confirmed decision #47)."""
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
         self._worker_task = None
+
+    # --- read-side snapshot (confirmed decision #47) ---------------------------
+
+    def get_snapshot(self, symbol: str | None = None) -> dict[str, dict[str, dict[str, Any]]]:
+        """
+        Current computed state, for the Feature Engine panel (and anything
+        else that wants a point-in-time read rather than subscribing to
+        the event stream). Pure in-memory dict read — no I/O, safe to call
+        directly from an async route handler without asyncio.to_thread.
+
+        Shape: {symbol: {timeframe: {"candle_ts": iso str, "close": float,
+        "features": {level_key: value}}}}. Only includes symbols/timeframes
+        this process has actually computed at least once since startup —
+        deliberately not pre-populated for the whole configured universe,
+        so an empty/missing entry means "nothing computed yet," not "zero."
+        """
+        result: dict[str, dict[str, dict[str, Any]]] = {}
+        for (sym, timeframe), feature_set in self._latest.items():
+            if symbol is not None and sym != symbol:
+                continue
+            result.setdefault(sym, {})[timeframe] = {
+                "candle_ts": feature_set.candle_ts.isoformat(),
+                "close": feature_set.close,
+                "features": dict(feature_set.features),
+            }
+        return result
 
     # --- Event Bus subscriber (must stay fast — same reasoning as CandleRecorder) ---
 
@@ -186,4 +227,25 @@ class FeatureEngine:
             return None  # warm-up: not enough history yet for ANY configured period
 
         payload = FeatureSet(timeframe=timeframe, candle_ts=candle_ts, close=close, features=features)
+        self._latest[key] = payload
         return symbol, payload
+
+
+_feature_engine: FeatureEngine | None = None
+
+
+def get_feature_engine(bus: EventBus | None = None, sma_periods: list[int] | None = None) -> FeatureEngine:
+    """
+    Lazy singleton, matching get_event_bus()/get_gateway()'s existing
+    pattern (confirmed decision #47) — lets a route handler reach the SAME
+    instance main.py's lifespan started, without threading it through
+    FastAPI dependency injection. Tests should keep constructing
+    FeatureEngine(...) directly, the way they already do, rather than
+    going through this — this singleton exists for main.py and routes,
+    not to replace direct construction where a test wants its own isolated
+    instance.
+    """
+    global _feature_engine
+    if _feature_engine is None:
+        _feature_engine = FeatureEngine(bus or get_event_bus(), sma_periods=sma_periods)
+    return _feature_engine

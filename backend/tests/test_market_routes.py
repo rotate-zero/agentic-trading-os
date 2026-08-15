@@ -244,7 +244,7 @@ def test_market_candles_serves_self_recorded_data_with_no_provider_connected():
 
             await asyncio.sleep(0.3)
         finally:
-            recorder.stop()
+            await recorder.stop()
             await bus.stop()
 
     import asyncio
@@ -351,7 +351,7 @@ def test_market_candles_serves_aggregated_5m_from_self_recorded_1m_with_no_provi
 
             await asyncio.sleep(0.3)
         finally:
-            recorder.stop()
+            await recorder.stop()
             await bus.stop()
 
     import asyncio

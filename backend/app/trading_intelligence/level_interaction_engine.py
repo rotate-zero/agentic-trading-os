@@ -104,7 +104,7 @@ from sqlalchemy import select
 from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
 from app.db.session import SessionLocal
-from app.event_bus.bus import EventBus
+from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.models.market_data import Symbol
 from app.models.trading_intelligence import LevelInteractionEvent, LevelInteractionState
@@ -146,16 +146,104 @@ class LevelInteractionEngine:
 
         self._state: dict[tuple[str, str, str], _LiveState] = {}
         self._last_applied_ts: dict[tuple[str, str], datetime] = {}  # (symbol, timeframe) -> candle_ts
+        # Most recent close and level value seen per key — confirmed
+        # decision #47. Needed for get_snapshot()'s "live" reading while a
+        # touch is still holding: the persisted/live state (_state) only
+        # ever stores anchor_price (fixed at touch START), never a running
+        # current price, because nothing in the STATE MACHINE itself needs
+        # one — resolution uses the resolving candle's own close directly.
+        # A snapshot consumer wants "how far away is it *right now*," which
+        # does need a live number, hence this separate cache.
+        self._latest_close: dict[tuple[str, str], float] = {}
+        self._latest_level_value: dict[tuple[str, str, str], float] = {}
 
     def start(self) -> None:
         self._bus.subscribe(EventType.FEATURES_UPDATED, self._on_features_updated)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="level-interaction-engine")
         logger.info("LevelInteractionEngine started — aura=%.3f%% on FeaturesUpdated", self._aura_pct * 100)
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        """Awaits actual task completion, not just schedules cancellation
+        — see CandleRecorder.stop()'s docstring for the real bug this
+        fixes (confirmed decision #47)."""
         if self._worker_task is not None and not self._worker_task.done():
             self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
         self._worker_task = None
+
+    # --- read-side snapshot (confirmed decision #47) ---------------------------
+
+    def get_snapshot(self, symbol: str | None = None) -> dict[str, dict[str, dict[str, dict[str, Any]]]]:
+        """
+        Current live state, for the Feature Engine panel. Pure in-memory
+        dict read — no I/O, safe to call directly from an async route
+        handler.
+
+        Shape: {symbol: {timeframe: {level_key: {...}}}}. Every entry has
+        "zone", "touch_count_today", "trading_day", "seconds_in_zone",
+        and "distance_pct" — confirmed decision #49: these last two used
+        to only appear while actively holding (inside_aura); a real gap,
+        not by design — "how long has price been above the level, and by
+        how much" is exactly as meaningful in the steady "above"/"below"
+        state as mid-touch, and there was no reason to withhold it there.
+
+        `distance_pct`'s semantics genuinely differ by zone, though, and
+        that's deliberate, not an inconsistency:
+        - While `inside_aura` (an active touch): anchored at
+          `touch_anchor_price` — the level's value when THIS touch began
+          — unchanged from before. Answers "how far has price moved
+          since the test started," not re-anchored to the live level
+          each candle (confirmed decision #46 — a drifting SMA during a
+          hold shouldn't be conflated with price actually moving).
+        - While `below`/`above` (steady state, not testing the level):
+          relative to the CURRENT live level value, not a historical
+          anchor. Answers "how far away is it right now" — there's no
+          test in progress to anchor to, and the level itself may have
+          drifted a long way since this zone was entered.
+
+        `seconds_in_zone` is uniform either way — now - zone_entered_ts,
+        computed fresh at call time, so it keeps counting up between
+        candle closes rather than jumping in whole-timeframe steps.
+
+        `holding` is still present only while `inside_aura`, now
+        carrying just the touch-specific extras that don't apply to a
+        steady zone: `anchor_price`, `entered_from`, `entered_ts`.
+        """
+        result: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+        now = datetime.now(timezone.utc)
+        for (sym, timeframe, level_key), state in self._state.items():
+            if symbol is not None and sym != symbol:
+                continue
+
+            latest_close = self._latest_close.get((sym, timeframe))
+            entry: dict[str, Any] = {
+                "zone": state.zone,
+                "touch_count_today": state.touch_count_today,
+                "trading_day": state.trading_day.isoformat(),
+                "seconds_in_zone": int((now - state.zone_entered_ts).total_seconds()),
+                "distance_pct": None,
+            }
+
+            if state.zone == "inside_aura" and state.touch_anchor_price is not None and state.touch_entered_ts is not None:
+                if latest_close is not None:
+                    entry["distance_pct"] = round(
+                        (latest_close - state.touch_anchor_price) / state.touch_anchor_price * 100, 4
+                    )
+                entry["holding"] = {
+                    "anchor_price": state.touch_anchor_price,
+                    "entered_from": state.touch_entered_from,
+                    "entered_ts": state.touch_entered_ts.isoformat(),
+                }
+            else:
+                latest_level_value = self._latest_level_value.get((sym, timeframe, level_key))
+                if latest_close is not None and latest_level_value:
+                    entry["distance_pct"] = round((latest_close - latest_level_value) / latest_level_value * 100, 4)
+
+            result.setdefault(sym, {}).setdefault(timeframe, {})[level_key] = entry
+        return result
 
     # --- Event Bus subscriber (must stay fast) --------------------------------
 
@@ -225,6 +313,11 @@ class LevelInteractionEngine:
         key = (symbol, timeframe, level_key)
         trading_day = get_market_clock().trading_day(candle_ts)
         new_zone = classify_zone(close, level_value, self._aura_pct)
+
+        # Updated on EVERY candle regardless of whether a transition
+        # happens — see the cache fields' own docstring in __init__.
+        self._latest_close[(symbol, timeframe)] = close
+        self._latest_level_value[key] = level_value
 
         state = self._state.get(key)
         if state is None:
@@ -401,3 +494,15 @@ class LevelInteractionEngine:
         session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
         session.commit()
         return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+
+
+_level_interaction_engine: LevelInteractionEngine | None = None
+
+
+def get_level_interaction_engine(bus: EventBus | None = None, aura_pct: float | None = None) -> LevelInteractionEngine:
+    """Lazy singleton, same pattern and same reasoning as
+    feature_engine.engine.get_feature_engine() (confirmed decision #47)."""
+    global _level_interaction_engine
+    if _level_interaction_engine is None:
+        _level_interaction_engine = LevelInteractionEngine(bus or get_event_bus(), aura_pct=aura_pct)
+    return _level_interaction_engine

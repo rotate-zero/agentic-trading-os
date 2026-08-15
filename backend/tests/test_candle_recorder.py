@@ -91,7 +91,7 @@ async def test_candle_recorder_persists_and_candle_store_reads_it_back():
         assert recorded[0].volume == 1234
         assert recorded[0].candle_ts == candle_ts
     finally:
-        recorder.stop()
+        await recorder.stop()
         await bus.stop()
 
 
@@ -116,7 +116,7 @@ async def test_duplicate_candle_closed_does_not_raise_or_duplicate_the_row():
         )
         assert len(recorded) == 1
     finally:
-        recorder.stop()
+        await recorder.stop()
         await bus.stop()
 
 

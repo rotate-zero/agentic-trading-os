@@ -403,4 +403,13 @@ export interface MainWindowState {
   subWindows: SubWindowConfig[]; // length === gridLayout.rows * gridLayout.cols
   infoCollapsed: boolean;
   infoWidthPx: number;
+  // Feature Engine panel (confirmed decision #48) — deliberately separate
+  // from infoCollapsed/infoWidthPx, not reusing them: this is a second,
+  // independent vertically-collapsible panel, not a mode of the Info tab.
+  // Its OWN symbol, not tied to any connector — the panel analyzes
+  // whatever symbol is typed into it, same "search field selects a
+  // symbol for analysis" design agreed in discussion.
+  featureEngineCollapsed: boolean;
+  featureEngineWidthPx: number;
+  featureEnginePanelSymbol: string;
 }

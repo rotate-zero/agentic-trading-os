@@ -80,3 +80,58 @@ export async function subscribeSymbol(symbol: string): Promise<void> {
     throw new ApiError(await parseErrorDetail(res), res.status);
   }
 }
+
+// Matches GET /intelligence/state's response shape exactly (backend/app/
+// api/routes/intelligence.py) — confirmed decision #47/#48. A unit bucket
+// is EITHER a single value node (PDH/PDL/VWAP-style — no numeric period)
+// OR a map of period -> value node (SMA/EMA-style) — the backend's
+// `_parse_level_key` picks one shape or the other per key, never both, so
+// this is a genuine union, not something to force into one shape here.
+export interface LevelInteractionHoldingWireShape {
+  anchor_price: number;
+  entered_from: "below" | "above" | null;
+  entered_ts: string;
+}
+
+export interface LevelInteractionWireShape {
+  zone: "below" | "inside_aura" | "above";
+  touch_count_today: number;
+  trading_day: string;
+  // Confirmed decision #49 — always present, not just while holding.
+  // distance_pct's reference point differs by zone (see the backend's
+  // own docstring, LevelInteractionEngine.get_snapshot()): anchored to
+  // touch start while holding, live against the CURRENT level value
+  // otherwise. null only in the narrow startup window before any close
+  // has been cached yet.
+  seconds_in_zone: number;
+  distance_pct: number | null;
+  holding?: LevelInteractionHoldingWireShape;
+}
+
+export interface FeatureValueNodeWireShape {
+  value: number;
+  candle_ts: string;
+  level_interaction?: LevelInteractionWireShape;
+}
+
+export type FeatureUnitWireShape = FeatureValueNodeWireShape | Record<string, FeatureValueNodeWireShape>;
+
+export interface IntelligenceTimeframeWireShape {
+  close: number;
+  units: Record<string, FeatureUnitWireShape>;
+}
+
+export interface IntelligenceStateWireShape {
+  symbol: string;
+  timeframes: Record<string, IntelligenceTimeframeWireShape>;
+}
+
+/** GET /intelligence/state — confirmed decision #47. */
+export async function fetchIntelligenceState(symbol: string): Promise<IntelligenceStateWireShape> {
+  const url = `${API_BASE_URL}/intelligence/state?symbol=${encodeURIComponent(symbol)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as IntelligenceStateWireShape;
+}

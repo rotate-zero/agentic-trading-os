@@ -99,7 +99,7 @@ async def test_feature_engine_publishes_once_warmed_up_and_not_before():
         features = received[0].payload["features"]
         assert features["sma_3"] == 102.0
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
 
 
@@ -118,7 +118,40 @@ async def test_feature_engine_ignores_non_1m_timeframes():
         await asyncio.sleep(0.1)
         assert received == []
     finally:
-        engine.stop()
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_reflects_latest_computed_values():
+    """
+    Pure in-memory — sma_periods=[1] deliberately: SMA(1) is just the
+    current close, and max_period=1 is the one case _compute_one() skips
+    the cold-start DB backfill entirely (`if self._max_period > 1`), so
+    this proves get_snapshot()'s own shape/filtering logic in isolation
+    from anything DB-related (that's covered separately, with real
+    Postgres, in the cold-start test above).
+    """
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1])
+    engine.start()
+
+    try:
+        await _publish_candle(bus, "__TEST_FE_SNAP_A__", datetime.now(timezone.utc), 100.0)
+        await _publish_candle(bus, "__TEST_FE_SNAP_B__", datetime.now(timezone.utc), 200.0)
+        await asyncio.sleep(0.1)
+
+        full = engine.get_snapshot()
+        assert full["__TEST_FE_SNAP_A__"]["1m"]["features"]["sma_1"] == 100.0
+        assert full["__TEST_FE_SNAP_B__"]["1m"]["features"]["sma_1"] == 200.0
+
+        filtered = engine.get_snapshot(symbol="__TEST_FE_SNAP_A__")
+        assert set(filtered.keys()) == {"__TEST_FE_SNAP_A__"}  # B excluded when filtering by A
+
+        assert engine.get_snapshot(symbol="__TEST_FE_NEVER_PUBLISHED__") == {}
+    finally:
+        await engine.stop()
         await bus.stop()
 
 
@@ -146,7 +179,7 @@ async def test_feature_engine_drops_duplicate_candle_closed():
         assert len(received) == 1
         assert received[-1].payload["features"]["sma_3"] == 102.0  # (100+102+104)/3, not double-counted
     finally:
-        engine.stop()
+        await engine.stop()
         await bus.stop()
 
 
@@ -182,8 +215,7 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
             await _publish_candle(bus, ticker, base_ts + timedelta(minutes=1), 102.0)
             await asyncio.sleep(0.3)  # let the write-behind writer actually land both rows
         finally:
-            recorder.stop()
-
+            await recorder.stop()
         # Phase 2: a FRESH FeatureEngine — no in-memory window for this symbol —
         # simulating what a real restart looks like.
         engine = FeatureEngine(bus, sma_periods=[3])
@@ -198,7 +230,7 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
             assert len(received) == 1  # correct on the FIRST event after cold start, no re-warm-up needed
             assert received[0].payload["features"]["sma_3"] == 102.0
         finally:
-            engine.stop()
+            await engine.stop()
     finally:
         await bus.stop()
         _clean_test_symbol(ticker)

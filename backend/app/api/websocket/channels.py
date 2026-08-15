@@ -28,6 +28,8 @@ router = APIRouter()
 EVENT_TO_CHANNEL: dict[EventType, str] = {
     EventType.PRICE_UPDATED: "market.tick",
     EventType.CANDLE_CLOSED: "market.candle",
+    EventType.FEATURES_UPDATED: "features.updated",  # confirmed decision #47
+    EventType.LEVEL_INTERACTION_CHANGED: "intelligence.level",  # confirmed decision #47
     EventType.OPPORTUNITY_CREATED: "opportunity.new",
     EventType.OPPORTUNITY_SELECTED: "opportunity.selected",
     EventType.ORDER_APPROVED: "orders.status",
