@@ -25,7 +25,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import sma
+from app.feature_engine.indicators import ema, sma, typical_price, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -75,6 +75,53 @@ def test_sma_rejects_nonpositive_period():
         sma([1.0, 2.0, 3.0], 0)
 
 
+def test_ema_matches_hand_computed_recursion():
+    """
+    period=2, seed_multiplier=3 -> needed=6, window=[1..6]. Seed = mean of
+    the OLDEST 2 (mean(1,2)=1.5), then the recursion (k=2/3) is applied
+    forward through closes 3,4,5,6 — worked by hand in the PR/commit this
+    test came with, not just re-derived from the implementation itself:
+    1.5 -> 2.5 -> 3.5 -> 4.5 -> 5.5.
+    """
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert ema(closes, 2, 3) == pytest.approx(5.5)
+
+
+def test_ema_warmup_is_stricter_than_sma_at_the_same_period():
+    """The whole point of D3's resolution (decision #52): EMA needs
+    `period * seed_multiplier` closes, not just `period` — proven directly
+    against the boundary, not just asserted in prose."""
+    period, multiplier = 3, 5
+    needed = period * multiplier
+    assert ema([1.0] * (needed - 1), period, multiplier) is None
+    assert ema([1.0] * needed, period, multiplier) is not None
+    assert sma([1.0] * period, period) is not None  # sma needs far less history at the same period
+
+
+def test_ema_rejects_nonpositive_period_or_multiplier():
+    with pytest.raises(ValueError):
+        ema([1.0, 2.0, 3.0], 0, 5)
+    with pytest.raises(ValueError):
+        ema([1.0, 2.0, 3.0], 2, 0)
+
+
+# --- typical_price / vwap_from_accumulator (confirmed decision #53) --------
+
+
+def test_typical_price_is_high_low_close_average():
+    assert typical_price(high=12.0, low=8.0, close=10.0) == 10.0  # (12+8+10)/3
+
+
+def test_vwap_from_accumulator_divides_pv_by_volume():
+    assert vwap_from_accumulator(cumulative_pv=1000.0, cumulative_volume=100) == 10.0
+
+
+def test_vwap_from_accumulator_returns_none_for_zero_volume():
+    """Defensive against a zero-volume first bar of a session — division
+    by zero must surface as 'not ready', not an exception."""
+    assert vwap_from_accumulator(cumulative_pv=0.0, cumulative_volume=0) is None
+
+
 # --- Tier 2: in-memory accumulation, no DB needed ---------------------------
 
 
@@ -82,7 +129,7 @@ def test_sma_rejects_nonpositive_period():
 async def test_feature_engine_publishes_once_warmed_up_and_not_before():
     bus = EventBus()
     await bus.start()
-    engine = FeatureEngine(bus, sma_periods=[3])
+    engine = FeatureEngine(bus, sma_periods=[3], ema_periods=[])
     engine.start()
 
     received: list = []
@@ -104,10 +151,50 @@ async def test_feature_engine_publishes_once_warmed_up_and_not_before():
 
 
 @pytest.mark.asyncio
+async def test_sma_and_ema_coexist_in_the_same_featureset_with_independent_warmup():
+    """
+    Confirmed decision #52: one shared window, two indicator families, each
+    warming up on its own schedule. period=2 for both, but EMA's
+    seed_multiplier=3 means it needs 6 closes where SMA needs 2 — proven
+    end-to-end through a real EventBus, not just at the pure-function level
+    (test_ema_warmup_is_stricter_than_sma_at_the_same_period already covers
+    that in isolation).
+    """
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[2], ema_periods=[2], ema_seed_multiplier=3)
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        closes = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        for i, close in enumerate(closes):
+            await _publish_candle(bus, "__TEST_FE_EMA_MIX__", base_ts + timedelta(minutes=i), close)
+            await asyncio.sleep(0.05)
+
+        assert len(received) == 5  # 1st candle: neither ready yet (sma_2 needs 2). 2nd-6th: sma_2 ready each time.
+        # Before the 6th candle: sma_2 present, ema_2 deliberately absent (still warming up).
+        for event in received[:-1]:
+            assert "sma_2" in event.payload["features"]
+            assert "ema_2" not in event.payload["features"]
+        # On the 6th candle: both present, ema_2 matching the hand-computed value
+        # test_ema_matches_hand_computed_recursion already verified independently.
+        final_features = received[-1].payload["features"]
+        assert final_features["sma_2"] == 5.5
+        assert final_features["ema_2"] == pytest.approx(5.5)
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
 async def test_feature_engine_ignores_non_1m_timeframes():
     bus = EventBus()
     await bus.start()
-    engine = FeatureEngine(bus, sma_periods=[1])
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
     engine.start()
 
     received: list = []
@@ -134,7 +221,7 @@ async def test_get_snapshot_reflects_latest_computed_values():
     """
     bus = EventBus()
     await bus.start()
-    engine = FeatureEngine(bus, sma_periods=[1])
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
     engine.start()
 
     try:
@@ -162,7 +249,7 @@ async def test_feature_engine_drops_duplicate_candle_closed():
     double-count that close into the SMA window."""
     bus = EventBus()
     await bus.start()
-    engine = FeatureEngine(bus, sma_periods=[3])
+    engine = FeatureEngine(bus, sma_periods=[3], ema_periods=[])
     engine.start()
 
     received: list = []
@@ -218,7 +305,7 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
             await recorder.stop()
         # Phase 2: a FRESH FeatureEngine — no in-memory window for this symbol —
         # simulating what a real restart looks like.
-        engine = FeatureEngine(bus, sma_periods=[3])
+        engine = FeatureEngine(bus, sma_periods=[3], ema_periods=[])
         engine.start()
         received: list = []
         bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
@@ -242,3 +329,327 @@ def test_get_recent_closes_returns_empty_for_a_never_seen_symbol():
 
     result = candle_store.get_recent_closes("__TEST_FE_NEVER_SEEN__", "1m", datetime.now(timezone.utc), limit=10)
     assert result == []
+
+
+# --- Tier 4: aggregated timeframes — 5m/15m/1h (confirmed decision #51) -----
+# Fixed, real trading-session timestamps (same _et() convention as
+# test_candle_aggregator.py), not datetime.now() — session_bounds() must
+# return a real regular-session window for the aggregated path to run at
+# all, which "now" can't guarantee across arbitrary test-run times.
+
+
+def _et(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime(y, m, d, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+
+@pytest.mark.asyncio
+async def test_5m_bucket_completes_only_on_its_final_minute_not_before():
+    """periods=[1] deliberately — see test_get_snapshot_reflects_latest_
+    computed_values's own note on why that sidesteps the DB cold-start
+    branch, isolating this test to boundary-detection timing alone."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)  # a real Tuesday regular session
+        # Minutes :30, :31, :32, :33 — none of these complete the [9:30,9:35) 5m bucket.
+        for i in range(4):
+            await _publish_candle(bus, "__TEST_FE_5M_EARLY__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        timeframes_seen = {e.payload["timeframe"] for e in received}
+        assert timeframes_seen == {"1m"}  # only 1m fired — the 5m bucket hasn't closed yet
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_5m_bucket_completion_publishes_5m_features_with_correct_close():
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        for i in range(5):  # :30 through :34 — :34 is the bucket's last member
+            await _publish_candle(bus, "__TEST_FE_5M_COMPLETE__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        timeframes_seen = {e.payload["timeframe"] for e in received}
+        assert timeframes_seen == {"1m", "5m"}  # exactly one aggregated publish, on the 5th candle
+
+        five_min_events = [e for e in received if e.payload["timeframe"] == "5m"]
+        assert len(five_min_events) == 1
+        payload = five_min_events[0].payload
+        assert payload["close"] == 104.0  # the bucket's own last member's close, matching the 1m payload's close
+        assert payload["features"]["sma_1"] == 104.0
+        assert datetime.fromisoformat(payload["candle_ts"]) == base  # bucket_start, not the completing candle's own ts
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_1h_boundary_publishes_5m_15m_and_1h_together():
+    """The one case worth proving explicitly per test_candle_aggregator.py's
+    own equivalent test: a single 1m close at a real hour boundary must
+    fan out to all three aggregated timeframes, not just the coarsest."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        boundary_ts = _et(2026, 8, 11, 10, 29)  # 60 minutes after session open — closes 5m, 15m, AND 1h at once
+        # Only need the boundary candle itself for this check — sma_periods=[1]
+        # needs no prior history, so nothing earlier in the hour is required.
+        await _publish_candle(bus, "__TEST_FE_1H_BOUNDARY__", boundary_ts, 200.0)
+        await asyncio.sleep(0.1)
+
+        timeframes_seen = {e.payload["timeframe"] for e in received}
+        assert timeframes_seen == {"1m", "5m", "15m", "1h"}
+        for e in received:
+            if e.payload["timeframe"] != "1m":
+                assert e.payload["close"] == 200.0
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_aggregated_timeframe_backfills_prior_bars_on_cold_start():
+    """
+    Same 'simulate a real restart' shape as
+    test_feature_engine_backfills_from_persisted_history_on_cold_start,
+    one level up: an earlier 'process' persists two full prior 5m buckets'
+    worth of real 1m candles via CandleRecorder, then a BRAND NEW
+    FeatureEngine — no in-memory 5m window yet — must backfill BOTH prior
+    5m closes via candle_aggregator.aggregate_from_recorded() (NOT
+    candle_store.get_recent_closes(), which would silently return [] for
+    a "5m"-labeled row that never exists — see _compute_aggregated's own
+    docstring) to have enough history for sma_3 on the immediately NEXT
+    5m bucket's close, correct on the very first aggregated publish after
+    cold start — no re-warm-up, same requirement #45 already established
+    for the 1m path.
+    """
+    ticker = "__FE5MCOLD__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    base = _et(2026, 8, 11, 9, 30)
+
+    try:
+        # Phase 1: an earlier "process" persists TWO full 5m buckets
+        # (09:30-09:34 close=104.0, 09:35-09:39 close=109.0) via a real
+        # CandleRecorder.
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            for i in range(10):
+                await _publish_candle(bus, ticker, base + timedelta(minutes=i), 100.0 + i)
+            await asyncio.sleep(0.3)  # let the write-behind writer land all 10 rows
+        finally:
+            await recorder.stop()
+
+        # Phase 2: a FRESH FeatureEngine — simulating a real restart, no
+        # in-memory window for this symbol at all — needs sma_3 on 5m,
+        # which requires the 2 PRIOR 5m closes above PLUS this third
+        # bucket's own close (114.0) to be correct on the first publish.
+        engine = FeatureEngine(bus, sma_periods=[3], ema_periods=[])
+        engine.start()
+        received: list = []
+        bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+        try:
+            # Third 5m bucket (09:40-09:44), close=114.0.
+            for i in range(10, 15):
+                await _publish_candle(bus, ticker, base + timedelta(minutes=i), 100.0 + i)
+            await asyncio.sleep(0.2)
+
+            five_min_events = [e for e in received if e.payload["timeframe"] == "5m"]
+            assert len(five_min_events) == 1  # correct on the FIRST aggregated event after cold start
+            assert five_min_events[0].payload["close"] == 114.0
+            assert five_min_events[0].payload["features"]["sma_3"] == pytest.approx((104.0 + 109.0 + 114.0) / 3)
+        finally:
+            await engine.stop()
+    finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+# --- Tier 5: VWAP (confirmed decision #53) ----------------------------------
+# _publish_candle() sets open=high=low=close and volume=10 fixed — so
+# typical_price() collapses to plain `close` for every bar here, and VWAP
+# reduces to a simple mean of closes (constant volume weight). That's
+# deliberate: it keeps these tests hand-verifiable without needing a new
+# fixture, and typical_price()'s own H/L/C weighting is already covered
+# directly in Tier 1 (test_typical_price_is_high_low_close_average).
+
+
+@pytest.mark.asyncio
+async def test_vwap_absent_pre_market_present_once_regular_session_opens():
+    """sma_periods=[1] so SOMETHING publishes every candle regardless of
+    VWAP — isolates whether the "vwap" key itself is present, rather than
+    whether a publish happens at all."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        await _publish_candle(bus, "__TEST_FE_VWAP_PM__", _et(2026, 8, 11, 8, 0), 50.0)  # pre-market
+        await _publish_candle(bus, "__TEST_FE_VWAP_PM__", _et(2026, 8, 11, 9, 30), 100.0)  # session open
+        await asyncio.sleep(0.1)
+
+        assert len(received) == 2
+        assert "vwap" not in received[0].payload["features"]  # pre-market: excluded, matching vwap.ts
+        assert received[1].payload["features"]["vwap"] == 100.0  # first regular bar: vwap == its own close
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_vwap_accumulates_within_a_session_and_resets_at_the_next_one():
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        ticker = "__TEST_FE_VWAP_RST__"
+        day1_open = _et(2026, 8, 11, 9, 30)
+        await _publish_candle(bus, ticker, day1_open, 100.0)
+        await _publish_candle(bus, ticker, day1_open + timedelta(minutes=1), 200.0)
+        # Day 2 (2026-08-12, a Wednesday) — a genuinely new regular session.
+        day2_open = _et(2026, 8, 12, 9, 30)
+        await _publish_candle(bus, ticker, day2_open, 300.0)
+        await asyncio.sleep(0.1)
+
+        assert len(received) == 3
+        assert received[0].payload["features"]["vwap"] == 100.0
+        assert received[1].payload["features"]["vwap"] == pytest.approx(150.0)  # mean(100, 200)
+        # Day 2's first bar must NOT be blended with day 1's accumulator —
+        # this is the whole point of the test.
+        assert received[2].payload["features"]["vwap"] == 300.0
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_vwap_is_identical_across_1m_and_5m_featuresets_on_the_same_close():
+    """The core architectural claim in the module docstring: VWAP is
+    computed once, from 1m bars, and the SAME value is attached to every
+    timeframe's FeatureSet — never recomputed per-timeframe from coarser
+    bars, which would let 1m and 5m VWAP silently diverge."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        for i in range(5):  # :30 through :34 — :34 completes the [9:30,9:35) 5m bucket
+            await _publish_candle(bus, "__TEST_FE_VWAP_5M__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        by_timeframe = {e.payload["timeframe"]: e.payload["features"]["vwap"] for e in received}
+        assert set(by_timeframe) == {"1m", "5m"}
+        assert by_timeframe["1m"] == by_timeframe["5m"] == pytest.approx(sum(100.0 + i for i in range(5)) / 5)
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_vwap_publishes_even_while_sma_is_still_warming_up():
+    """extra_features (VWAP) merges in BEFORE _apply_close's "nothing
+    ready yet" check — proven here with an SMA period (50) this test never
+    comes close to satisfying."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[50], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        await _publish_candle(bus, "__TEST_FE_VWAP_WARMUP__", _et(2026, 8, 11, 9, 30), 100.0)
+        await asyncio.sleep(0.1)
+
+        assert len(received) == 1  # published on VWAP alone
+        features = received[0].payload["features"]
+        assert features == {"vwap": 100.0}  # sma_50 genuinely absent — not warmed up, not silently 0
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_vwap_backfills_from_persisted_history_on_cold_start():
+    """Same 'simulate a real restart mid-session' shape as the SMA/5m cold-
+    start tests above: two 1m candles persisted via a real CandleRecorder,
+    then a BRAND NEW FeatureEngine's VWAP must include both — not just the
+    third candle it directly observes — on its very first computation."""
+    ticker = "__FEVWAPCOLD__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    base = _et(2026, 8, 11, 9, 30)
+
+    try:
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            await _publish_candle(bus, ticker, base, 100.0)
+            await _publish_candle(bus, ticker, base + timedelta(minutes=1), 200.0)
+            await asyncio.sleep(0.3)
+        finally:
+            await recorder.stop()
+
+        engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+        engine.start()
+        received: list = []
+        bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+        try:
+            await _publish_candle(bus, ticker, base + timedelta(minutes=2), 300.0)
+            await asyncio.sleep(0.2)
+
+            assert len(received) == 1
+            # mean(100, 200, 300) — NOT just 300.0, which is what a fresh
+            # engine with no backfill would wrongly produce.
+            assert received[0].payload["features"]["vwap"] == pytest.approx(200.0)
+        finally:
+            await engine.stop()
+    finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)

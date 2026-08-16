@@ -50,10 +50,13 @@ from app.core.market_clock import get_market_clock
 from app.schemas.events.market_data import CandleClosed as Candle
 from app.services import candle_store
 
-# width in minutes -> the resulting candle's timeframe label.
-_WIDTH_TO_LABEL: dict[int, str] = {5: "5m", 15: "15m", 60: "1h"}
+# width in minutes -> the resulting candle's timeframe label. Public
+# (confirmed decision #51) — feature_engine/engine.py reads this directly
+# to know which widths to check for live boundary completion, rather than
+# hardcoding a parallel {5, 15, 60} list that could drift from this one.
+WIDTH_TO_LABEL: dict[int, str] = {5: "5m", 15: "15m", 60: "1h"}
 
-AGGREGATABLE_TIMEFRAMES: frozenset[str] = frozenset(_WIDTH_TO_LABEL.values())
+AGGREGATABLE_TIMEFRAMES: frozenset[str] = frozenset(WIDTH_TO_LABEL.values())
 
 
 def aggregate_from_recorded(symbol: str, timeframe: str, start: datetime, end: datetime) -> list[Candle]:
@@ -87,6 +90,36 @@ def aggregate_from_recorded(symbol: str, timeframe: str, start: datetime, end: d
     return _bucket_and_aggregate(fifteen_min, 60)  # "1h" — the only remaining case
 
 
+def bucket_start_for(candle_ts: datetime, session_start: datetime, width_minutes: int) -> datetime:
+    """
+    The session-local bucket a given timestamp falls into, for a bucket
+    width of `width_minutes` anchored at `session_start`. Pulled out as its
+    own public function (confirmed decision #51) so a second module —
+    feature_engine/engine.py's live 5m/15m/1h boundary detection — uses the
+    literal same formula this module already had correct and tested,
+    instead of a parallel reimplementation that could quietly drift from
+    it. `_bucket_and_aggregate` below is just this function's original
+    caller, unchanged in behavior.
+    """
+    width = timedelta(minutes=width_minutes)
+    bucket_index = (candle_ts - session_start) // width
+    return session_start + bucket_index * width
+
+
+def completes_bucket(candle_ts: datetime, session_start: datetime, width_minutes: int) -> bool:
+    """
+    True when a 1m candle at `candle_ts` is the LAST member of its
+    session-local bucket of `width_minutes` — i.e. the very next minute
+    would start a new bucket. This is the live-boundary-crossing check
+    feature_engine/engine.py uses (confirmed decision #51) to know when a
+    5m/15m/1h bar has just closed, without re-deriving the bucketing math
+    this module already owns.
+    """
+    this_bucket = bucket_start_for(candle_ts, session_start, width_minutes)
+    next_bucket = bucket_start_for(candle_ts + timedelta(minutes=1), session_start, width_minutes)
+    return next_bucket != this_bucket
+
+
 def _bucket_and_aggregate(candles: list[Candle], width_minutes: int) -> list[Candle]:
     """
     Groups `candles` (any single timeframe — 1m, or an already-aggregated
@@ -97,7 +130,6 @@ def _bucket_and_aggregate(candles: list[Candle], width_minutes: int) -> list[Can
     last member's close, volume = sum across all members.
     """
     clock = get_market_clock()
-    width = timedelta(minutes=width_minutes)
     buckets: dict[datetime, list[Candle]] = defaultdict(list)
 
     for c in candles:
@@ -111,11 +143,10 @@ def _bucket_and_aggregate(candles: list[Candle], width_minutes: int) -> list[Can
             # was recorded. Dropped rather than mis-bucketed.
             continue
         session_start, _session_end = bounds
-        bucket_index = (c.candle_ts - session_start) // width
-        bucket_start = session_start + bucket_index * width
+        bucket_start = bucket_start_for(c.candle_ts, session_start, width_minutes)
         buckets[bucket_start].append(c)
 
-    label = _WIDTH_TO_LABEL[width_minutes]
+    label = WIDTH_TO_LABEL[width_minutes]
     result: list[Candle] = []
     for bucket_start in sorted(buckets):
         members = sorted(buckets[bucket_start], key=lambda c: c.candle_ts)

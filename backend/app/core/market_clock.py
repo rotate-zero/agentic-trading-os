@@ -112,6 +112,20 @@ class MarketClock:
         close = time(13, 0) if self.is_half_day(now.date()) else _MARKET_CLOSE
         return _MARKET_OPEN <= now.time() < close
 
+    def is_regular_session(self, ts: datetime | None = None) -> bool:
+        """
+        True only for OPEN/LUNCH/POWER_HOUR — the continuous regular-hours
+        window session_bounds() already treats as one domain. False for
+        PRE_MARKET, AFTER_HOURS, and CLOSED. Added for Feature Engine's
+        VWAP (confirmed decision #53), which — matching
+        frontend/src/indicators/vwap.ts's own convention — only
+        accumulates during regular hours; pre-market/after-hours volume
+        never contributes to it, unlike 5m/15m/1h aggregation (decision
+        #51), which happily buckets pre-market and after-hours candles
+        too, just in their own separate buckets.
+        """
+        return self.current_session(ts) in _REGULAR_SESSION_LABELS
+
     def current_session(self, ts: datetime | None = None) -> Session:
         now = self._now(ts)
         if now.weekday() >= 5 or self.is_holiday(now.date()):

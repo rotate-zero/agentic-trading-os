@@ -59,9 +59,22 @@ class Settings(BaseSettings):
 
     # --- Feature Engine (Phase 4) ---
     # SMA periods computed on every 1m CandleClosed and published as
-    # FeaturesUpdated (feature_engine/engine.py). Extending to 5m/15m/1h
-    # is real, deliberate follow-up work — see that module's docstring.
+    # FeaturesUpdated (feature_engine/engine.py). Also the period set used
+    # for 5m/15m/1h (confirmed decision #51) — one shared list rather than
+    # a per-timeframe config, since nothing today needs them to differ;
+    # revisit if that stops being true.
     feature_engine_sma_periods: list[int] = [9, 20, 50]
+
+    # --- Feature Engine: aggregated timeframes (5m/15m/1h — confirmed decision #51) ---
+    # How far back to look, on cold start only, when backfilling the
+    # rolling SMA window for an aggregated timeframe via
+    # candle_aggregator.aggregate_from_recorded(). Generous on purpose —
+    # 1h's largest configured period (50) needs 50 PRIOR closed 1h bars,
+    # which at ~6.5h of regular session per trading day spans well over a
+    # week of calendar time. Live-boundary bucket completion (the common
+    # case, not cold start) never uses this — see engine.py's module
+    # docstring.
+    feature_engine_aggregated_lookback_days: int = 30
 
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every

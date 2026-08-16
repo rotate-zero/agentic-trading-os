@@ -149,3 +149,53 @@ def test_aggregate_from_recorded_builds_1h_end_to_end(monkeypatch: pytest.Monkey
     assert result[0].open == 100
     assert result[0].close == 159
     assert result[0].volume == 600
+
+
+# --- bucket_start_for / completes_bucket (confirmed decision #51) -----------
+# These back feature_engine/engine.py's live 5m/15m/1h boundary detection —
+# tested here, once, at the source, rather than re-derived in that
+# module's own tests, per the whole point of pulling them out as shared
+# functions.
+
+
+def test_bucket_start_for_matches_bucket_and_aggregate_own_grouping():
+    """The extracted helper must land on the exact same bucket boundaries
+    _bucket_and_aggregate() already groups by — proven directly against
+    its real output, not just re-asserting the formula against itself."""
+    session_start = _et(2026, 8, 11, 9, 30)
+    candles = [
+        _one_min(_et(2026, 8, 11, 9, 30), 10, 10, 10, 10, 100),
+        _one_min(_et(2026, 8, 11, 9, 34), 10, 10, 10, 10, 100),
+        _one_min(_et(2026, 8, 11, 9, 35), 10, 10, 10, 10, 100),
+    ]
+    result = candle_aggregator._bucket_and_aggregate(candles, 5)
+    assert candle_aggregator.bucket_start_for(_et(2026, 8, 11, 9, 30), session_start, 5) == result[0].candle_ts
+    assert candle_aggregator.bucket_start_for(_et(2026, 8, 11, 9, 34), session_start, 5) == result[0].candle_ts
+    assert candle_aggregator.bucket_start_for(_et(2026, 8, 11, 9, 35), session_start, 5) == result[1].candle_ts
+
+
+def test_completes_bucket_true_only_on_the_last_minute_of_each_width():
+    session_start = _et(2026, 8, 11, 9, 30)
+    # 5m bucket [09:30, 09:35) — only :34 is the last member.
+    assert candle_aggregator.completes_bucket(_et(2026, 8, 11, 9, 30), session_start, 5) is False
+    assert candle_aggregator.completes_bucket(_et(2026, 8, 11, 9, 33), session_start, 5) is False
+    assert candle_aggregator.completes_bucket(_et(2026, 8, 11, 9, 34), session_start, 5) is True
+    assert candle_aggregator.completes_bucket(_et(2026, 8, 11, 9, 35), session_start, 5) is False  # first minute of the NEXT bucket
+
+
+def test_completes_bucket_1h_boundary_also_completes_5m_and_15m_simultaneously():
+    """The one case worth proving explicitly: at 10:29 (60 minutes after a
+    9:30 session open), a single 1m close completes its 5m, 15m, AND 1h
+    bucket all at once — feature_engine/engine.py must publish all three,
+    not just the coarsest one."""
+    session_start = _et(2026, 8, 11, 9, 30)
+    ts = _et(2026, 8, 11, 10, 29)
+    assert candle_aggregator.completes_bucket(ts, session_start, 5) is True
+    assert candle_aggregator.completes_bucket(ts, session_start, 15) is True
+    assert candle_aggregator.completes_bucket(ts, session_start, 60) is True
+
+
+def test_completes_bucket_false_for_a_mid_bucket_1h_minute():
+    session_start = _et(2026, 8, 11, 9, 30)
+    ts = _et(2026, 8, 11, 10, 15)  # 45 minutes in — completes neither 5m's own boundary check at this width nor 1h
+    assert candle_aggregator.completes_bucket(ts, session_start, 60) is False
