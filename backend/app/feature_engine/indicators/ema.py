@@ -1,37 +1,9 @@
 """
-Feature Engine indicator math — pure functions only. No I/O, no Event Bus
-awareness, no database. app/feature_engine/engine.py is what wires these to
-CandleClosed/FeaturesUpdated; keeping this module pure makes it trivially
-unit-testable without a database, an event loop, or a running app at all
-(see backend/tests/test_feature_engine.py::test_sma_*).
+Exponential Moving Average — pure math only, same posture as every file in
+this package (see indicators/__init__.py's own docstring for why it's a
+package, not one file).
 """
 from __future__ import annotations
-
-
-def sma(closes: list[float], period: int) -> float | None:
-    """
-    Simple Moving Average over the last `period` closes.
-
-    Full recompute from the window on every call, deliberately NOT an
-    incremental running sum (subtract-oldest / add-newest). Incremental
-    accumulates floating-point drift the longer a process runs — exactly
-    the "two places compute the same SMA and they're slightly off" failure
-    mode this needs to not have across a ~100-symbol, long-running process.
-    A fresh mean every close is negligible cost at these periods (9-50
-    candles) and removes drift as a possibility entirely rather than
-    bounding or tolerating it.
-
-    Returns None — not 0.0, not an exception — when there isn't yet enough
-    history for this period ("warm-up"). Callers must treat "not ready yet"
-    and "computed value of zero" as distinct states; returning 0.0 here
-    would collapse that distinction.
-    """
-    if period <= 0:
-        raise ValueError("period must be positive")
-    if len(closes) < period:
-        return None
-    window = closes[-period:]
-    return sum(window) / period
 
 
 def ema(closes: list[float], period: int, seed_multiplier: int) -> float | None:
@@ -83,28 +55,3 @@ def ema(closes: list[float], period: int, seed_multiplier: int) -> float | None:
     for price in window[period:]:
         value = price * k + value * (1 - k)
     return value
-
-
-def typical_price(high: float, low: float, close: float) -> float:
-    """(high + low + close) / 3 — the standard VWAP weighting price for a
-    bar, matching frontend/src/indicators/vwap.ts's own definition exactly
-    (confirmed decision #53)."""
-    return (high + low + close) / 3
-
-
-def vwap_from_accumulator(cumulative_pv: float, cumulative_volume: int) -> float | None:
-    """
-    Divides a running (price*volume, volume) accumulator into a VWAP
-    value. Deliberately NOT the whole VWAP computation — engine.py owns
-    the accumulation itself (session-reset detection, cold-start backfill,
-    regular-hours gating), since none of that is a pure function of a
-    single bar the way sma()/ema() are. This is just the one piece of
-    VWAP's math that IS pure, split out for its own direct test.
-
-    Returns None for zero cumulative volume — defensive against a
-    zero-volume bar being the very first bar of a session, which would
-    otherwise raise a ZeroDivisionError rather than "not ready yet."
-    """
-    if cumulative_volume <= 0:
-        return None
-    return cumulative_pv / cumulative_volume

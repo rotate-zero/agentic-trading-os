@@ -13,22 +13,56 @@ import { computePreviousDayLevels } from "../indicators/previousDayLevels";
 import { computePremarketLevels } from "../indicators/premarketLevels";
 import { computeCamarillaPivots } from "../indicators/camarillaPivots";
 import { computeVPOC } from "../indicators/vpoc";
+import type { IndicatorPoint } from "../indicators/types";
 
 export type { IndicatorPoint } from "../indicators/types";
 
 // Overlay indicators (SMA/EMA/VWAP) — continuous {time,value}[] series drawn
 // as a line on the price pane. Dispatched by instance.type so a new kind is
 // one new case here plus its own file under indicators/.
-export function computePriceIndicator(candles: Candle[], instance: PriceIndicatorInstance) {
+//
+// backendSeries (confirmed decision #54, Stage 1 of the chart migration) is
+// OPTIONAL and keyed "sma_9"/"ema_20"/"vwap" — the same flat convention
+// FeatureSet.features already uses server-side. When Feature Engine has a
+// value for this exact instance (matching period AND timeframe), that's
+// used directly — Feature Engine becomes the source of truth, not a second
+// calculator running alongside sma.ts/ema.ts/vwap.ts. When it doesn't (a
+// non-standard period like SMA(37) nobody's configured server-side, or a
+// timeframe Feature Engine doesn't compute for at all — see
+// feature_engine_sma_periods/feature_engine_ema_periods in config.py),
+// this falls back to the exact same local computation as before —
+// unchanged, not deprecated — with " (local)" appended to the label so
+// the fallback is visible rather than silently indistinguishable from a
+// backend-sourced line (system-design.md's "approximations surfaced,
+// never hidden" principle, applied here to a data-source difference
+// rather than a numeric approximation). frontend/src/indicators/*.ts
+// aren't going anywhere yet; they retire file-by-file only once nothing
+// calls into them for the periods/timeframes actually in use.
+export function computePriceIndicator(
+  candles: Candle[],
+  instance: PriceIndicatorInstance,
+  backendSeries?: Record<string, IndicatorPoint[] | undefined>
+) {
   const label = priceIndicatorLabel(instance);
   const { color, lineWidth, showPriceLabel } = instance;
   switch (instance.type) {
-    case "SMA":
-      return { label, color, lineWidth, showPriceLabel, data: sma(candles, instance.period ?? 20) };
-    case "EMA":
-      return { label, color, lineWidth, showPriceLabel, data: ema(candles, instance.period ?? 20) };
-    case "VWAP":
-      return { label, color, lineWidth, showPriceLabel, data: vwap(candles) };
+    case "SMA": {
+      const period = instance.period ?? 20;
+      const backend = backendSeries?.[`sma_${period}`];
+      if (backend && backend.length > 0) return { label, color, lineWidth, showPriceLabel, data: backend };
+      return { label: `${label} (local)`, color, lineWidth, showPriceLabel, data: sma(candles, period) };
+    }
+    case "EMA": {
+      const period = instance.period ?? 20;
+      const backend = backendSeries?.[`ema_${period}`];
+      if (backend && backend.length > 0) return { label, color, lineWidth, showPriceLabel, data: backend };
+      return { label: `${label} (local)`, color, lineWidth, showPriceLabel, data: ema(candles, period) };
+    }
+    case "VWAP": {
+      const backend = backendSeries?.["vwap"];
+      if (backend && backend.length > 0) return { label, color, lineWidth, showPriceLabel, data: backend };
+      return { label: `${label} (local)`, color, lineWidth, showPriceLabel, data: vwap(candles) };
+    }
   }
 }
 

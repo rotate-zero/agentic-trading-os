@@ -135,3 +135,41 @@ export async function fetchIntelligenceState(symbol: string): Promise<Intelligen
   }
   return (await res.json()) as IntelligenceStateWireShape;
 }
+
+// Matches GET /intelligence/series's response shape (confirmed decision
+// #54, Stage 1 of the chart migration) — one array per "sma_9"/"ema_20"/
+// "vwap" key, same flat-dict-of-keys convention FeatureSet.features
+// already uses server-side (decision #50's D1), not a second convention
+// to learn. A missing key or an empty array both mean "no backend value
+// for this — never warmed up, or this period/timeframe combo isn't one
+// Feature Engine computes" — callers (useFeatureEngineSeries) don't need
+// to distinguish the two.
+export interface FeatureSeriesPointWireShape {
+  candle_ts: string;
+  value: number;
+}
+
+export interface FeatureSeriesWireShape {
+  symbol: string;
+  timeframe: string;
+  series: Record<string, FeatureSeriesPointWireShape[]>;
+}
+
+/**
+ * GET /intelligence/series — confirmed decision #54. Chart backfill for
+ * SMA/EMA/VWAP, as distinct from fetchIntelligenceState's single "current
+ * value" snapshot above — see that route's own module docstring for why
+ * one endpoint can't serve both needs.
+ */
+export async function fetchFeatureSeries(
+  symbol: string,
+  timeframe: string,
+  count = 240,
+): Promise<FeatureSeriesWireShape> {
+  const url = `${API_BASE_URL}/intelligence/series?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&count=${count}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as FeatureSeriesWireShape;
+}

@@ -64,6 +64,17 @@ class Settings(BaseSettings):
     # a per-timeframe config, since nothing today needs them to differ;
     # revisit if that stops being true.
     feature_engine_sma_periods: list[int] = [9, 20, 50]
+    feature_engine_ema_periods: list[int] = [9, 20]
+    feature_engine_ema_seed_multiplier: int = 5
+
+    # EMA periods (confirmed decision #52) — 9/20 match the two legacy
+    # chart presets (WorkspaceContext.tsx's EMA9/EMA20), not copied from
+    # feature_engine_sma_periods, since chart usage never included EMA50.
+    feature_engine_ema_periods: list[int] = [9, 20]
+    # How many periods' worth of history EMA seeds itself over before
+    # publishing — see indicators/ema.py::ema()'s own docstring for the
+    # convergence math this default is based on.
+    feature_engine_ema_seed_multiplier: int = 5
 
     # --- Feature Engine: aggregated timeframes (5m/15m/1h — confirmed decision #51) ---
     # How far back to look, on cold start only, when backfilling the

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 
 class FeatureSet(BaseModel):
-    timeframe: str  # "1m" only in this pass — see feature_engine/engine.py's module docstring
+    timeframe: str  # "1m", "5m", "15m", or "1h" (decision #51) — see feature_engine/engine.py's module docstring
     candle_ts: datetime  # which candle close this FeatureSet was computed from
     close: float  # the raw close this FeatureSet was computed from (confirmed decision #46) —
     # makes FeaturesUpdated self-contained for any consumer that needs BOTH a level value
@@ -24,5 +24,5 @@ class FeatureSet(BaseModel):
     # them — the same class of race feature_engine/engine.py's own module docstring already
     # designed around for CandleRecorder vs. FeatureEngine, applied here one hop further down
     # the chain instead of being reintroduced by a new consumer.
-    features: dict[str, float]  # e.g. {"sma_9": 231.4521, "sma_20": 229.881}
+    features: dict[str, float]  # e.g. {"sma_9": 231.4521, "ema_20": 229.881, "vwap": 230.1} — decisions #45, #52, #53
 

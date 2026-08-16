@@ -336,7 +336,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Trading-intelligence concept | Code location (`system-design.md`) |
 |---|---|
 | Market State (with memory) | `trading_intelligence/market_state_engine.py` → `market_state_history` table |
-| Participation (Market State dimension) | `feature_engine/indicators.py` (signed volume / tick imbalance) → `trading_intelligence/market_state_engine.py` |
+| Participation (Market State dimension) | `feature_engine/indicators/` (signed volume / tick imbalance) → `trading_intelligence/market_state_engine.py` |
 | Context (composed providers) | `trading_intelligence/context_engine/` (`engine.py` + `providers/`) (derived, not persisted) |
 | Sector/correlation context | `trading_intelligence/context_engine/providers/sector_correlation_provider.py` |
 | News-flag context | `trading_intelligence/context_engine/providers/news_flag_provider.py` |

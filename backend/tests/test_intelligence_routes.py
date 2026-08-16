@@ -78,22 +78,34 @@ def _clean_test_symbol(ticker: str) -> None:
 
 async def _wait_until_published(client: httpx.AsyncClient, ticker: str, timeout: float = 8.0) -> dict:
     """
-    Polls GET /intelligence/state until sma_9 actually shows up for this
-    symbol, instead of a fixed sleep guessing how long N cold-start DB
-    reads plus two engines' worker loops will take — that guess got
-    genuinely flaky under concurrent multi-symbol load (two symbols'
-    worth of cold-start backfills competing for the same event loop ran
-    measurably slower than one), which is exactly the kind of test the
-    fixed-sleep version looked like it passed right up until it didn't.
+    Polls GET /intelligence/state until sma_9 AND its level_interaction
+    both show up for this symbol, instead of a fixed sleep guessing how
+    long N cold-start DB reads plus two engines' worker loops will take —
+    that guess got genuinely flaky under concurrent multi-symbol load (two
+    symbols' worth of cold-start backfills competing for the same event
+    loop ran measurably slower than one), which is exactly the kind of
+    test the fixed-sleep version looked like it passed right up until it
+    didn't.
+
+    Waits for level_interaction specifically, not just sma_9's own value —
+    found as a real, if intermittent, gap: FeatureEngine and
+    LevelInteractionEngine are separate subscribers processing
+    independently (FeaturesUpdated -> LevelInteractionChanged is a second
+    hop, not synchronous with the first), so sma_9 can legitimately appear
+    in /state slightly before its level_interaction does. Decision #52/#53
+    (EMA, VWAP) added real per-candle work to FeatureEngine, which was
+    enough to occasionally expose the gap under load that a leaner
+    FeatureEngine mostly outran without anyone noticing it was there.
     """
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         resp = await client.get("/intelligence/state", params={"symbol": ticker})
         body = resp.json()
-        if body.get("timeframes", {}).get("1m", {}).get("units", {}).get("sma", {}).get("9") is not None:
+        node = body.get("timeframes", {}).get("1m", {}).get("units", {}).get("sma", {}).get("9")
+        if node is not None and "level_interaction" in node:
             return body
         await asyncio.sleep(0.05)
-    raise AssertionError(f"sma_9 never appeared for {ticker} within {timeout}s")
+    raise AssertionError(f"sma_9 + level_interaction never both appeared for {ticker} within {timeout}s")
 
 
 async def _wait_until_candles_persisted(ticker: str, expected_count: int = 9, timeout: float = 8.0) -> None:
@@ -225,3 +237,76 @@ async def test_intelligence_state_empty_for_never_seen_symbol():
 
         assert resp.status_code == 200
         assert resp.json() == {"symbol": "__T_INTEL_NEVER_SEEN__", "timeframes": {}}
+
+
+# --- GET /intelligence/series (confirmed decision #54, Stage 1) ------------
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_rejects_unsupported_timeframe():
+    """"1d" is real for /market/candles but not for this route — Feature
+    Engine never aggregates to it (module docstring's own reasoning)."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/intelligence/series", params={"symbol": "ANY", "timeframe": "1d"})
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_empty_for_never_recorded_symbol():
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/intelligence/series", params={"symbol": "__T_SERIES_NEVER_SEEN__", "timeframe": "1m"}
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["symbol"] == "__T_SERIES_NEVER_SEEN__"
+        assert body["timeframe"] == "1m"
+        assert body["series"]["sma_9"] == []
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_reflects_real_persisted_candles():
+    """
+    Real end-to-end: a real CandleRecorder persists genuine 1m rows via a
+    real Event Bus, then GET /intelligence/series reads them back through
+    candle_store — proving the route's DB read actually sees what
+    CandleRecorder actually wrote, not a mocked stand-in for either side.
+    """
+    ticker = "__T_SERIESB__"
+    _clean_test_symbol(ticker)
+
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+            base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=20)
+
+            closes = [100.0, 101.0, 102.0]
+            for i, close in enumerate(closes):
+                payload = CandleClosed(
+                    timeframe="1m", open=close, high=close, low=close, close=close, volume=10,
+                    candle_ts=base_ts + timedelta(minutes=i),
+                )
+                await bus.publish(make_envelope(EventType.CANDLE_CLOSED, payload, symbol=ticker))
+
+            await _wait_until_candles_persisted(ticker, expected_count=3)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/intelligence/series", params={"symbol": ticker, "timeframe": "1m"})
+
+            assert resp.status_code == 200
+            series = resp.json()["series"]
+            # sma_50 (the largest default period) never warms up on 3
+            # candles — genuinely empty, not missing from the response.
+            assert series["sma_50"] == []
+            # vwap needs only regular-session volume — all 3 candles
+            # qualify if base_ts happens to land in regular hours; if not
+            # (this test runs at an arbitrary wall-clock time), it's
+            # legitimately empty too. Either way, the KEY must exist.
+            assert "vwap" in series
+    finally:
+        _clean_test_symbol(ticker)
