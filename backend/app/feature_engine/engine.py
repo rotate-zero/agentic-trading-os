@@ -110,6 +110,24 @@ SMA/EMA, not a third variation on the same rolling-window pattern:
   Pre-market and after-hours volume never contributes, unlike aggregated
   SMA/EMA (decision #51), which happily buckets pre-market/after-hours
   candles too, just kept in their own separate buckets.
+
+Previous-day PDH/PDL/PDC + Camarilla, and today's pre-market H/L
+(confirmed decision #56) — same symbol-keyed shape as VWAP above, for the
+same reason: neither varies by chart timeframe. Genuinely different from
+VWAP in one respect, though: PDH/PDL/PDC is a FIXED value for the whole of
+today (it describes YESTERDAY), recomputed once per calendar-day rollover,
+not accumulated candle-by-candle; pre-market H/L accumulates like VWAP
+does, but gated to PRE_MARKET specifically rather than regular session,
+and — unlike VWAP, which has no meaning outside the session it's scoped
+to — keeps being published (frozen) through the rest of the day once
+pre-market ends, since "where did pre-market top out" stays a meaningful
+question well after 9:30. All four of these are exactly the kind of
+"level" LevelInteractionEngine already tracks generically (confirmed
+decision #46) — publishing them under their own feature keys is the
+entire integration; that engine needed zero code changes to start
+tracking touch/reject/conquer against pdh/pdl/pdc/pmh/pml/cam_* the moment
+they appear in FeatureSet.features, the same way it needed none for
+ema_9/ema_20/vwap either.
 """
 from __future__ import annotations
 
@@ -120,10 +138,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.core.config import get_settings
-from app.core.market_clock import get_market_clock
+from app.core.market_clock import Session, get_market_clock
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
-from app.feature_engine.indicators import ema, sma, typical_price, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, camarilla_pivots, ema, fold_range, sma, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.features import FeatureSet
 from app.services import candle_aggregator, candle_store
@@ -173,6 +191,7 @@ class FeatureEngine:
             if aggregated_lookback_days is not None
             else get_settings().feature_engine_aggregated_lookback_days
         )
+        self._previous_day_lookback_days = get_settings().feature_engine_previous_day_lookback_days
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -194,12 +213,26 @@ class FeatureEngine:
         # "cumulative_volume": int}. Confirmed decision #53.
         self._vwap_state: dict[str, dict[str, Any]] = {}
 
+        # Per-SYMBOL previous-day levels (PDH/PDL/PDC + Camarilla) and
+        # today's premarket range — both confirmed decision #56, both
+        # symbol-keyed for the same reason VWAP is (see module docstring):
+        # neither varies by chart timeframe, so there's exactly one value
+        # per symbol, attached to every timeframe's FeatureSet alike.
+        # {"for_day": date, "values": dict[str, float] | None} —
+        # `values` is None when there's no previous trading day in the
+        # configured lookback window yet (a fresh symbol/deployment).
+        self._previous_day_state: dict[str, dict[str, Any]] = {}
+        # {"for_day": date, "high": float | None, "low": float | None} —
+        # high/low are None until the first premarket bar of `for_day`
+        # has actually been seen (backfilled or live).
+        self._premarket_state: dict[str, dict[str, Any]] = {}
+
     def start(self) -> None:
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_candle_closed)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="feature-engine-sma")
         logger.info(
             "FeatureEngine started — computing SMA%s and EMA%s on 1m CandleClosed, VWAP during regular session, "
-            "plus %s on completed bucket boundaries",
+            "previous-day PDH/PDL/PDC + Camarilla, pre-market H/L, plus %s on completed bucket boundaries",
             self._sma_periods, self._ema_periods, list(candle_aggregator.WIDTH_TO_LABEL.values()),
         )
 
@@ -304,12 +337,15 @@ class FeatureEngine:
             )
             return results
 
-        # VWAP (confirmed decision #53) is computed ONCE per 1m close, not
-        # per timeframe — see module docstring for why — and attached to
-        # every FeatureSet this same close produces below, 1m and any
-        # aggregated ones alike.
+        # VWAP (confirmed decision #53), previous-day levels + Camarilla,
+        # and premarket H/L (both confirmed decision #56) are each
+        # computed ONCE per 1m close, not per timeframe — see module
+        # docstring for why — and attached to every FeatureSet this same
+        # close produces below, 1m and any aggregated ones alike.
         vwap_value = self._update_vwap(symbol, candle_ts, high, low, close, volume)
         extra = {"vwap": round(vwap_value, 6)} if vwap_value is not None else {}
+        extra.update(self._update_previous_day(symbol, candle_ts))
+        extra.update(self._update_premarket(symbol, candle_ts, high, low))
 
         one_min = self._apply_close(key, candle_ts, close, extra)
         if one_min is not None:
@@ -482,6 +518,120 @@ class FeatureEngine:
         self._vwap_state[symbol] = state
 
         return vwap_from_accumulator(state["cumulative_pv"], state["cumulative_volume"])
+
+    def _update_previous_day(self, symbol: str, candle_ts: datetime) -> dict[str, float]:
+        """
+        PDH/PDL/PDC, the nine Camarilla pivots derived from them, and VPOC
+        (confirmed decisions #56, #57) — all computed together from the
+        SAME already-fetched rows for the previous trading day. Camarilla
+        is a pure function of PDH/PDL/PDC specifically; VPOC needs the
+        full row list (a volume-at-price histogram, not just high/low/
+        close), but it's the SAME bounded, already-fully-elapsed day's
+        worth of rows already sitting in `rows` below — no second DB
+        query, no live-growing accumulator. This is what actually resolves
+        D5 (feature-engine-chart-migration.md): D5 worried VPOC needed a
+        continuously-growing histogram that wouldn't fit this flat
+        dict[str, float] shape; the frontend's OWN VPOC is scoped to the
+        previous day only ("VPOC (Prev Day)" — types/workspace.ts), the
+        exact same bounded dataset everything else here already uses. See
+        indicators/vpoc.py's own docstring for the fuller version of this.
+
+        Recomputed once per (symbol, ET calendar day) — cheap to check
+        (`state["for_day"] != today`), expensive to actually do (a
+        multi-day DB scan), so gated the same way VWAP's own session-reset
+        check is. "Previous day" here means the most recent ET calendar
+        date STRICTLY BEFORE today that has any persisted 1m rows at all
+        within `feature_engine_previous_day_lookback_days` — the same
+        definition frontend/src/indicators/sessions.ts's
+        getPreviousTradingDayCandles() already uses (the second-most-recent
+        DISTINCT date actually present in the data, not "yesterday's
+        calendar date" — which would incorrectly assume Monday's previous
+        day is Sunday rather than Friday). Weekends and holidays are
+        skipped automatically this way, for free: no candles were ever
+        recorded on a day the market didn't open, so that date simply
+        never appears as a candidate.
+
+        High/low span the WHOLE calendar day — pre-market and after-hours
+        included, not just regular session — matching
+        previousDayLevels.ts's own choice exactly, not reconsidered here.
+        """
+        today = get_market_clock().trading_day(candle_ts)
+        state = self._previous_day_state.get(symbol)
+
+        if state is None or state["for_day"] != today:
+            lookback_start = candle_ts - timedelta(days=self._previous_day_lookback_days)
+            rows = candle_store.get_recorded_candles(symbol, "1m", lookback_start, candle_ts - _ONE_MINUTE)
+            clock = get_market_clock()
+            by_day: dict[Any, list] = {}
+            for row in rows:
+                by_day.setdefault(clock.trading_day(row.candle_ts), []).append(row)
+            distinct_prior_days = sorted(d for d in by_day if d < today)
+
+            values: dict[str, float] | None = None
+            if distinct_prior_days:
+                previous_day_rows = by_day[distinct_prior_days[-1]]
+                aggregated = aggregate_day(previous_day_rows)
+                if aggregated is not None:
+                    high, low, close = aggregated
+                    values = {"pdc": close, "pdh": high, "pdl": low}
+                    values.update({f"cam_{k}": v for k, v in camarilla_pivots(high, low, close).items()})
+                    vpoc = volume_point_of_control(previous_day_rows)
+                    if vpoc is not None:
+                        values["vpoc"] = vpoc
+            state = {"for_day": today, "values": values}
+            self._previous_day_state[symbol] = state
+
+        if state["values"] is None:
+            return {}  # no previous trading day within the lookback window yet — an honest gap, not an error
+        return {k: round(v, 6) for k, v in state["values"].items()}
+
+    def _update_premarket(self, symbol: str, candle_ts: datetime, high: float, low: float) -> dict[str, float]:
+        """
+        Today's pre-market High/Low (confirmed decision #56) — grows while
+        pre-market is actually forming, then naturally stops changing once
+        regular session starts (there are simply no more pre-market bars
+        for today to fold in), matching
+        frontend/src/indicators/premarketLevels.ts's own docstring: "not a
+        fixed level... only meaningful before/during today's regular
+        session." The STORED value stays available (frozen) through the
+        rest of the day rather than disappearing the moment pre-market
+        ends — a person checking this an hour into regular session still
+        wants to see where pre-market topped out.
+
+        Reset once per (symbol, ET calendar day), same trigger shape as
+        `_update_previous_day` above. On that reset, backfills from
+        whatever of TODAY's pre-market rows are ALREADY persisted (a real
+        process restart mid-morning shouldn't show "no data" just because
+        this process wasn't running for pre-market itself) — classified
+        row-by-row via `current_session()` rather than constructing a
+        separate "today's pre-market window" query, since a 24h lookback
+        plus a per-row session check is simpler and reuses logic
+        MarketClock already owns.
+        """
+        clock = get_market_clock()
+        today = clock.trading_day(candle_ts)
+        state = self._premarket_state.get(symbol)
+
+        if state is None or state["for_day"] != today:
+            lookback_start = candle_ts - timedelta(hours=24)  # generous enough to safely span back to 4:00 ET regardless of DST
+            rows = candle_store.get_recorded_candles(symbol, "1m", lookback_start, candle_ts - _ONE_MINUTE)
+            pm_rows = [r for r in rows if clock.trading_day(r.candle_ts) == today and clock.current_session(r.candle_ts) == Session.PRE_MARKET]
+            if pm_rows:
+                state = {"for_day": today, "high": max(r.high for r in pm_rows), "low": min(r.low for r in pm_rows)}
+            else:
+                state = {"for_day": today, "high": None, "low": None}
+            self._premarket_state[symbol] = state
+
+        if clock.current_session(candle_ts) == Session.PRE_MARKET:
+            # Fold in the CURRENT candle too — deliberately not included in
+            # the backfill query above (which stops one minute before it,
+            # same race-avoidance shape as VWAP's own backfill), so this
+            # is the only place this candle's own high/low get applied.
+            state["high"], state["low"] = fold_range(state["high"], state["low"], high, low)
+
+        if state["high"] is None:
+            return {}  # pre-market hasn't started yet today, or nothing was recorded for it — an honest gap
+        return {"pmh": round(state["high"], 6), "pml": round(state["low"], 6)}
 
 
 _feature_engine: FeatureEngine | None = None

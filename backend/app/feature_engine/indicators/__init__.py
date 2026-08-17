@@ -1,12 +1,13 @@
 """
 Feature Engine indicator math — pure functions only, one file per
-indicator (sma.py, ema.py, vwap.py), not one growing module. Split out of
-what used to be a single indicators.py once VWAP landed alongside SMA/EMA
-made it clear more would keep arriving (PDH/PDL, Camarilla, VPOC — see
-docs/architecture/feature-engine-chart-migration.md Stage 3) — the same
-one-file-per-indicator shape frontend/src/indicators/ already uses
-(sma.ts, ema.ts, vwap.ts), so this side of the migration doesn't stay the
-odd one out.
+indicator (sma.py, ema.py, vwap.py, previous_day.py, camarilla.py,
+premarket.py), not one growing module. Split out of what used to be a
+single indicators.py once VWAP landed alongside SMA/EMA made it clear more
+would keep arriving (confirmed decision #56 added PDH/PDL/PDC, premarket
+H/L, and Camarilla pivots) — the same one-file-per-indicator shape
+frontend/src/indicators/ already uses (sma.ts, ema.ts, vwap.ts,
+previousDayLevels.ts, premarketLevels.ts, camarillaPivots.ts), so this
+side of the migration doesn't stay the odd one out.
 
 No I/O, no Event Bus awareness, no database, in any file here — engine.py
 is what wires these to CandleClosed/FeaturesUpdated for the live path,
@@ -24,8 +25,21 @@ package instead of staying one file.
 """
 from __future__ import annotations
 
+from app.feature_engine.indicators.camarilla import camarilla_pivots
 from app.feature_engine.indicators.ema import ema
+from app.feature_engine.indicators.premarket import fold_range
+from app.feature_engine.indicators.previous_day import aggregate_day
 from app.feature_engine.indicators.sma import sma
+from app.feature_engine.indicators.vpoc import volume_point_of_control
 from app.feature_engine.indicators.vwap import typical_price, vwap_from_accumulator
 
-__all__ = ["ema", "sma", "typical_price", "vwap_from_accumulator"]
+__all__ = [
+    "aggregate_day",
+    "camarilla_pivots",
+    "ema",
+    "fold_range",
+    "sma",
+    "typical_price",
+    "volume_point_of_control",
+    "vwap_from_accumulator",
+]

@@ -3,6 +3,7 @@ import { ChartWidget } from "../chart/ChartWidget";
 import { SubWindowMenu } from "./SubWindowMenu";
 import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { useFeatureEngineSeries } from "../../hooks/useFeatureEngineSeries";
+import { useFeatureEngineLevels } from "../../hooks/useFeatureEngineLevels";
 import { generateMockOverlays } from "../../mocks/chartObjects";
 import { computePriceIndicator } from "../../utils/indicators";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -31,6 +32,14 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   // effect that only sometimes runs.
   const { series: featureSeries } = useFeatureEngineSeries(symbol, config.timeframe);
 
+  // Backend-computed horizontal levels — PDH/PDL/PDC, Camarilla,
+  // pre-market H/L, VPOC (confirmed decision #58, Stage 1 extended to
+  // decision #56/#57's indicators). Unlike featureSeries above, this is
+  // a single flat value lookup, not a per-candle series — see
+  // useFeatureEngineLevels.ts's own docstring for why it doesn't need
+  // its own REST/WS plumbing the way featureSeries does.
+  const featureLevels = useFeatureEngineLevels(symbol, config.timeframe);
+
   // Overlay indicators (SMA/EMA/VWAP instances) computed into flat series for
   // ChartWidget. Keyed by instance.id, which is unique within a sub-window.
   const indicators = useMemo(
@@ -51,6 +60,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           overlays={overlays}
           indicators={indicators}
           horizontalLevels={config.horizontalLevels}
+          horizontalLevelValues={featureLevels}
           candleLimit={config.candleLimit}
           backgroundColor={config.backgroundColor}
           gridColor={config.gridColor}

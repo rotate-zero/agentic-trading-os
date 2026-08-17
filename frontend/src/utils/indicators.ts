@@ -74,11 +74,34 @@ export function computePriceIndicator(
 // resistance levels share the same previous-session lookup; this dispatcher
 // doesn't try to cache across calls, but SubWindow.tsx's useMemo means it
 // only runs when candles or the level list actually change.
-export function computeHorizontalLevel(candles: Candle[], instance: HorizontalLevelInstance) {
+//
+// backendLevels (confirmed decision #58, Stage 1 extended to horizontal
+// levels) is OPTIONAL and keyed lowercase exactly as HorizontalLevelType
+// already is ("pdh", "cam_r1", "vpoc", ...) — see
+// useFeatureEngineLevels.ts's own docstring for where it comes from. Same
+// prefer-backend-fall-back-to-local pattern computePriceIndicator already
+// established for SMA/EMA/VWAP: when Feature Engine has a value for this
+// exact level, it's used directly; when it doesn't (no previous trading
+// day within the configured lookback yet — an honest gap, not an error),
+// this falls back to the EXACT SAME local computation as before,
+// unchanged, with " (local)" appended to the label.
+export function computeHorizontalLevel(
+  candles: Candle[],
+  instance: HorizontalLevelInstance,
+  backendLevels?: Record<string, number | undefined>
+) {
   const label = HORIZONTAL_LEVEL_LABELS[instance.type];
-  const price = resolveHorizontalLevelPrice(candles, instance.type);
+  const backendPrice = backendLevels?.[instance.type.toLowerCase()];
+  const price = backendPrice ?? resolveHorizontalLevelPrice(candles, instance.type);
   if (price === undefined) return undefined;
-  return { label, price, color: instance.color, lineWidth: instance.lineWidth, lineStyle: instance.lineStyle, showPriceLabel: instance.showPriceLabel };
+  return {
+    label: backendPrice !== undefined ? label : `${label} (local)`,
+    price,
+    color: instance.color,
+    lineWidth: instance.lineWidth,
+    lineStyle: instance.lineStyle,
+    showPriceLabel: instance.showPriceLabel,
+  };
 }
 
 function resolveHorizontalLevelPrice(candles: Candle[], type: HorizontalLevelInstance["type"]): number | undefined {

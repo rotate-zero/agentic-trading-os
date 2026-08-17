@@ -64,8 +64,6 @@ class Settings(BaseSettings):
     # a per-timeframe config, since nothing today needs them to differ;
     # revisit if that stops being true.
     feature_engine_sma_periods: list[int] = [9, 20, 50]
-    feature_engine_ema_periods: list[int] = [9, 20]
-    feature_engine_ema_seed_multiplier: int = 5
 
     # EMA periods (confirmed decision #52) — 9/20 match the two legacy
     # chart presets (WorkspaceContext.tsx's EMA9/EMA20), not copied from
@@ -86,6 +84,18 @@ class Settings(BaseSettings):
     # case, not cold start) never uses this — see engine.py's module
     # docstring.
     feature_engine_aggregated_lookback_days: int = 30
+
+    # --- Feature Engine: previous-day levels (PDH/PDL/PDC, Camarilla — confirmed decision #56) ---
+    # How far back to search for "the most recent FULLY ELAPSED trading
+    # day" (candle_ts) — generous for the same reason as the setting
+    # above: skipping a long weekend or holiday cluster still needs to
+    # find a real prior day within this window. Unlike that setting, this
+    # one is never used for warm-up convergence — either a previous day
+    # exists somewhere in this window or PDH/PDL/PDC/Camarilla are simply
+    # absent (same "not enough history yet" state
+    # frontend/src/indicators/sessions.ts's own getPreviousTradingDayCandles()
+    # already has and documents).
+    feature_engine_previous_day_lookback_days: int = 10
 
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every

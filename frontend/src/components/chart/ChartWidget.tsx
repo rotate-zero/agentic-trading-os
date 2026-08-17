@@ -48,6 +48,12 @@ interface ChartWidgetProps {
   overlays: ChartObject[];
   indicators?: IndicatorSeries[];
   horizontalLevels?: HorizontalLevelInstance[];
+  // Backend-computed values for the levels above (confirmed decision
+  // #58) — see computeHorizontalLevel's own comment in utils/indicators.ts
+  // for the lookup convention. Optional: an undefined/missing map means
+  // every level falls back to local computation, same as before this prop
+  // existed.
+  horizontalLevelValues?: Record<string, number | undefined>;
   candleLimit?: CandleLimit;
   backgroundColor?: string;
   gridColor?: string;
@@ -111,6 +117,7 @@ export function ChartWidget({
   overlays,
   indicators = [],
   horizontalLevels = [],
+  horizontalLevelValues,
   candleLimit = "all",
   backgroundColor = "#131720",
   gridColor = DEFAULT_GRID_COLOR,
@@ -413,7 +420,7 @@ export function ChartWidget({
 
     const priceLines = horizontalLevels
       .filter((level) => level.enabled)
-      .map((level) => computeHorizontalLevel(candles, level))
+      .map((level) => computeHorizontalLevel(candles, level, horizontalLevelValues))
       .filter((resolved): resolved is NonNullable<typeof resolved> => resolved !== undefined)
       .map((resolved) =>
         series.createPriceLine({
@@ -429,7 +436,7 @@ export function ChartWidget({
     return () => {
       priceLines.forEach((line) => series.removePriceLine(line));
     };
-  }, [candles, horizontalLevels]);
+  }, [candles, horizontalLevels, horizontalLevelValues]);
 
   // Indicator line series — created/updated/removed as the sub-window's indicator
   // selection changes. Keyed so toggling one indicator doesn't touch the others.

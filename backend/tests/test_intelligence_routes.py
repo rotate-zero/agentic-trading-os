@@ -146,6 +146,64 @@ async def _wait_until_candles_persisted(ticker: str, expected_count: int = 9, ti
 pytestmark = pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
 
 
+def _et(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
+    from zoneinfo import ZoneInfo
+    return datetime(y, m, d, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+
+# The full set of level keys one previous-day computation publishes at
+# once (confirmed decisions #56, #57): PDH/PDL/PDC, all nine Camarilla
+# pivots, and VPOC. Used by tests below that need to wait for ALL of them,
+# not just one or two — see _wait_until_level_interactions_present's own
+# docstring for why that distinction is load-bearing, not pedantic.
+_PREVIOUS_DAY_LEVEL_KEYS = frozenset(
+    {"pdh", "pdl", "pdc", "cam_pp", "cam_r1", "cam_r2", "cam_r3", "cam_r4", "cam_s1", "cam_s2", "cam_s3", "cam_s4", "vpoc"}
+)
+
+
+async def _wait_until_level_interactions_present(
+    client: httpx.AsyncClient, ticker: str, level_keys: frozenset[str], timeout: float = 8.0
+) -> dict:
+    """
+    Waits until EVERY key in `level_keys` has a level_interaction block in
+    GET /intelligence/state — not just one or two of them.
+
+    Found as a real, reproducible ForeignKeyViolation, not a hypothetical:
+    LevelInteractionEngine processes one FeaturesUpdated's worth of level
+    keys in a single asyncio.to_thread() call (_process_one) — a dozen
+    sequential, blocking DB writes for previous-day levels + Camarilla
+    together. Within that call, a given key's in-memory update and its DB
+    persist happen back-to-back with nothing in between (verified directly
+    against _process_one's own source, not assumed) — but the EVENT LOOP
+    is free to service an HTTP request concurrently while that background
+    thread is still midway through the OTHER eleven keys. A test that
+    waits for only "pdh" to show up and then immediately deletes the
+    symbol row can race a still-in-flight persist for "cam_s3" landing
+    moments later — exactly what broke this suite's very first version of
+    these tests. Waiting for ALL the keys a test actually touches closes
+    the gap: by the time the LAST one appears in-memory, its own persist
+    call (synchronous, same thread, same iteration) has already happened
+    too.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        resp = await client.get("/intelligence/state", params={"symbol": ticker})
+        body = resp.json()
+        units = body.get("timeframes", {}).get("1m", {}).get("units", {})
+        if all(k in units and "level_interaction" in units[k] for k in level_keys):
+            return body
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"not all of {sorted(level_keys)} got level_interaction for {ticker} within {timeout}s")
+
+
+async def _publish(bus, ticker: str, ts: datetime, close: float, *, high: float | None = None, low: float | None = None) -> None:
+    payload = CandleClosed(
+        timeframe="1m", open=close, high=high if high is not None else close,
+        low=low if low is not None else close, close=close, volume=10, candle_ts=ts,
+    )
+    await bus.publish(make_envelope(EventType.CANDLE_CLOSED, payload, symbol=ticker))
+
+
 @pytest.mark.asyncio
 async def test_intelligence_state_merges_feature_and_level_interaction_data():
     ticker = "__T_INTEL_A__"
@@ -308,5 +366,160 @@ async def test_intelligence_series_reflects_real_persisted_candles():
             # (this test runs at an arbitrary wall-clock time), it's
             # legitimately empty too. Either way, the KEY must exist.
             assert "vwap" in series
+    finally:
+        _clean_test_symbol(ticker)
+
+
+# --- Previous-day levels, Camarilla, pre-market H/L (confirmed decision #56) -
+# Fixed real trading-day timestamps (_et helper above), not datetime.now() —
+# these levels need an actual "previous day" to exist relative to "today,"
+# which "now" can't guarantee across arbitrary test-run times the way it
+# could for SMA/VWAP's own tests (which don't care what day it is).
+
+
+@pytest.mark.asyncio
+async def test_new_level_types_get_level_interaction_tracking_automatically():
+    """
+    The explicit requirement behind decision #56: PDH/PDL/PDC + Camarilla
+    + pre-market H/L (and VPOC, decision #57) must get
+    LevelInteractionEngine's touch/reject/conquer tracking, the same as
+    SMA/EMA/VWAP already do — without that engine needing to know these
+    key NAMES in advance (it's generic over FeatureSet.features — decision
+    #46). Proven by checking GET /intelligence/state actually returns a
+    level_interaction block for "pdh" and "cam_pp" specifically, not by
+    re-testing the touch/reject/conquer state machine itself
+    (level_interaction_engine.py's own test suite already covers that
+    machinery directly, and it's the identical code path regardless of
+    which key triggers it).
+    """
+    ticker = "__T_NEWLVL__"
+    _clean_test_symbol(ticker)
+
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+
+            # "Yesterday" (a real Tuesday) — high=105, low=95, close=102 (last).
+            yesterday = _et(2026, 8, 11, 9, 30)
+            for i, close in enumerate([100.0, 105.0, 95.0, 102.0]):
+                await _publish(bus, ticker, yesterday + timedelta(minutes=i), close)
+            await _wait_until_candles_persisted(ticker, expected_count=4)
+
+            # "Today" (Wednesday) — first candle triggers the previous-day lookup.
+            today = _et(2026, 8, 12, 9, 30)
+            await _publish(bus, ticker, today, 101.0)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                body = await _wait_until_level_interactions_present(client, ticker, _PREVIOUS_DAY_LEVEL_KEYS)
+
+            units = body["timeframes"]["1m"]["units"]
+            assert units["pdh"]["value"] == 105.0
+            assert units["pdl"]["value"] == 95.0
+            assert units["pdc"]["value"] == 102.0
+            assert units["cam_pp"]["value"] == pytest.approx((105.0 + 95.0 + 102.0) / 3)
+            # VPOC (decision #57) — same 4-candle "yesterday," bucketed;
+            # not hand-verified to a specific bucket here (that's covered
+            # directly in test_feature_engine.py's own VPOC tests) — this
+            # just confirms it publishes and gets tracked, same as
+            # everything else in this test.
+            assert "vpoc" in units
+            assert 95.0 <= units["vpoc"]["value"] <= 105.0  # within the previous day's own range, at minimum
+            assert "level_interaction" in units["vpoc"]
+            # The actual proof: LevelInteractionEngine tracked a key it was
+            # never told about by name, same shape SMA's own tracking has.
+            assert units["pdh"]["level_interaction"]["zone"] in {"above", "below", "inside_aura"}
+            assert units["cam_pp"]["level_interaction"]["zone"] in {"above", "below", "inside_aura"}
+    finally:
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_previous_day_levels_skip_a_weekend_gap():
+    """"Previous day" means the most recent day with data, not literally
+    yesterday's calendar date — Monday's previous day is Friday, not
+    Sunday, since nothing was ever recorded on a day the market didn't
+    open. Matches frontend/src/indicators/sessions.ts's own definition."""
+    ticker = "__T_WKEND__"
+    _clean_test_symbol(ticker)
+
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+
+            friday = _et(2026, 8, 7, 9, 30)  # a real Friday
+            for i, close in enumerate([50.0, 60.0, 40.0, 55.0]):
+                await _publish(bus, ticker, friday + timedelta(minutes=i), close)
+            await _wait_until_candles_persisted(ticker, expected_count=4)
+
+            monday = _et(2026, 8, 10, 9, 30)  # the following Monday — no weekend data exists at all
+            await _publish(bus, ticker, monday, 56.0)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                body = await _wait_until_level_interactions_present(client, ticker, _PREVIOUS_DAY_LEVEL_KEYS)
+
+            units = body["timeframes"]["1m"]["units"]
+            assert units["pdh"]["value"] == 60.0  # Friday's high, correctly reached across the weekend gap
+            assert units["pdl"]["value"] == 40.0
+            assert units["pdc"]["value"] == 55.0
+    finally:
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_premarket_high_low_freezes_once_regular_session_starts():
+    ticker = "__T_PMFREEZE__"
+    _clean_test_symbol(ticker)
+
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+            base = _et(2026, 8, 11, 8, 0)  # pre-market
+            await _publish(bus, ticker, base, 100.0, high=102.0, low=98.0)
+            await _publish(bus, ticker, base + timedelta(minutes=1), 100.0, high=105.0, low=99.0)  # widens the high
+            await _wait_until_candles_persisted(ticker, expected_count=2)
+
+            # Regular session opens — no more pre-market bars will ever
+            # arrive for today, so pmh/pml should stay exactly where
+            # pre-market left them.
+            regular_open = _et(2026, 8, 11, 9, 30)
+            await _publish(bus, ticker, regular_open, 101.0, high=110.0, low=90.0)  # a WIDER regular-session bar — must NOT affect pmh/pml
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                body = None
+                deadline = asyncio.get_event_loop().time() + 8.0
+                while asyncio.get_event_loop().time() < deadline:
+                    resp = await client.get("/intelligence/state", params={"symbol": ticker})
+                    candidate = resp.json()
+                    units = candidate.get("timeframes", {}).get("1m", {}).get("units", {})
+                    # Parsed-datetime comparison, not a raw string match —
+                    # avoids depending on exactly how the offset gets
+                    # formatted, while still correctly confirming the
+                    # regular-session candle (not just the pre-market ones)
+                    # has actually landed before asserting anything. This
+                    # matters here specifically: catching pmh/pml at a
+                    # transient state right after the 2nd pre-market candle
+                    # but BEFORE the regular-session one would give a false
+                    # pass even if regular-session candles were incorrectly
+                    # folded in too — the exact bug this test exists to catch.
+                    candle_ts_raw = units.get("pmh", {}).get("candle_ts")
+                    if candle_ts_raw and datetime.fromisoformat(candle_ts_raw) >= regular_open:
+                        body = candidate
+                        break
+                    await asyncio.sleep(0.05)
+                assert body is not None, "the regular-session candle's update never landed within 8s"
+
+                units = body["timeframes"]["1m"]["units"]
+                assert units["pmh"]["value"] == 105.0  # frozen at pre-market's own high — NOT 110 from the regular-session bar
+                assert units["pml"]["value"] == 98.0
+
+                # Same cleanup-race concern _wait_until_level_interactions_present's
+                # own docstring explains, applied here too before _clean_test_symbol
+                # runs: pmh/pml is only 2 keys (lower risk than Camarilla's 12), but
+                # sma/ema/vwap are also active on this symbol with default periods —
+                # wait for the two THIS test actually asserts against, at minimum.
+                await _wait_until_level_interactions_present(client, ticker, frozenset({"pmh", "pml"}))
     finally:
         _clean_test_symbol(ticker)

@@ -25,7 +25,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import ema, sma, typical_price, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, camarilla_pivots, ema, fold_range, sma, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -120,6 +120,76 @@ def test_vwap_from_accumulator_returns_none_for_zero_volume():
     """Defensive against a zero-volume first bar of a session — division
     by zero must surface as 'not ready', not an exception."""
     assert vwap_from_accumulator(cumulative_pv=0.0, cumulative_volume=0) is None
+
+
+# --- aggregate_day / camarilla_pivots / fold_range (confirmed decision #56) -
+
+
+def test_aggregate_day_computes_high_low_close():
+    base = _et(2026, 8, 11, 9, 30)
+    rows = [
+        _flat_row(base, close=100.0, high=105.0, low=95.0),
+        _flat_row(base + timedelta(minutes=1), close=102.0, high=103.0, low=101.0),
+        _flat_row(base + timedelta(minutes=2), close=98.0, high=99.0, low=90.0),
+    ]
+    result = aggregate_day(rows)
+    assert result == (105.0, 90.0, 98.0)  # (high, low, LAST row's close)
+
+
+def test_aggregate_day_returns_none_for_empty_list():
+    assert aggregate_day([]) is None
+
+
+def test_camarilla_pivots_matches_hand_computed_values():
+    # range=20 -> r1/s1=+-1.833.., r2/s2=+-3.666.., r3/s3=+-5.5, r4/s4=+-11
+    result = camarilla_pivots(high=110.0, low=90.0, close=100.0)
+    assert result["pp"] == 100.0
+    assert result["r1"] == pytest.approx(101.8333333)
+    assert result["r4"] == pytest.approx(111.0)
+    assert result["s1"] == pytest.approx(98.1666667)
+    assert result["s4"] == pytest.approx(89.0)
+
+
+def test_fold_range_seeds_from_none():
+    assert fold_range(None, None, new_high=10.0, new_low=5.0) == (10.0, 5.0)
+
+
+def test_fold_range_expands_only_when_the_new_bar_actually_widens_it():
+    assert fold_range(current_high=10.0, current_low=5.0, new_high=8.0, new_low=6.0) == (10.0, 5.0)  # narrower bar — no change
+    assert fold_range(current_high=10.0, current_low=5.0, new_high=12.0, new_low=3.0) == (12.0, 3.0)  # wider bar — both move
+
+
+# --- volume_point_of_control (confirmed decision #57) -----------------------
+
+
+def test_volume_point_of_control_matches_hand_computed_bucket():
+    """
+    Flat rows (high=low=close, matching _flat_row's default) so typical
+    price == close exactly. closes=[10,60,60,90], bucket_count=4 ->
+    range=[10,90], bucket_size=20 -> buckets [10,30) [30,50) [50,70) [70,90].
+    close=10 -> bucket 0 (vol 5); close=60 -> bucket 2 (vol 20 each, two
+    rows, total 40); close=90 -> (90-10)/20=4.0, clamped to the LAST
+    bucket (3, vol 3) — the exact edge case the clamp exists for. Bucket 2
+    wins with 40. VPOC = 10 + 20*(2+0.5) = 60.
+    """
+    base = _et(2026, 8, 11, 9, 30)
+    rows = [
+        _flat_row(base, close=10.0, volume=5),
+        _flat_row(base + timedelta(minutes=1), close=60.0, volume=20),
+        _flat_row(base + timedelta(minutes=2), close=60.0, volume=20),
+        _flat_row(base + timedelta(minutes=3), close=90.0, volume=3),
+    ]
+    assert volume_point_of_control(rows, bucket_count=4) == pytest.approx(60.0)
+
+
+def test_volume_point_of_control_returns_none_for_empty_list():
+    assert volume_point_of_control([]) is None
+
+
+def test_volume_point_of_control_degenerate_range_returns_the_flat_price():
+    base = _et(2026, 8, 11, 9, 30)
+    rows = [_flat_row(base, close=50.0, volume=10), _flat_row(base + timedelta(minutes=1), close=50.0, volume=20)]
+    assert volume_point_of_control(rows) == 50.0
 
 
 # --- Tier 2: in-memory accumulation, no DB needed ---------------------------
@@ -341,6 +411,16 @@ def test_get_recent_closes_returns_empty_for_a_never_seen_symbol():
 def _et(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
     from zoneinfo import ZoneInfo
     return datetime(y, m, d, hh, mm, tzinfo=ZoneInfo("America/New_York"))
+
+
+def _flat_row(ts: datetime, close: float, *, high: float | None = None, low: float | None = None, volume: int = 10) -> CandleClosed:
+    """A CandleClosed with explicit high/low (unlike _publish_candle's own
+    open=high=low=close shortcut) — needed wherever a test actually checks
+    that high/low get used, not just close (aggregate_day, fold_range)."""
+    return CandleClosed(
+        timeframe="1m", open=close, high=high if high is not None else close,
+        low=low if low is not None else close, close=close, volume=volume, candle_ts=ts,
+    )
 
 
 @pytest.mark.asyncio
