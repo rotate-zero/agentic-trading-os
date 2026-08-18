@@ -97,6 +97,38 @@ class Settings(BaseSettings):
     # already has and documents).
     feature_engine_previous_day_lookback_days: int = 10
 
+    # --- Feature Engine: Daily Levels (confirmed decision #59; daily-levels-design.md) ---
+    # How many days of 1D candle history to cluster. NOT yet empirically
+    # verified against a real Polygon key (design doc §2 / decision #59's
+    # D1 — no network access to Polygon exists in the environment this
+    # default was written in). 180 is the spec's own starting point;
+    # Saqib's own fallback is 90 if 180 turns out to hit depth/rate-limit
+    # problems in practice — change this one value, nothing else, if so.
+    daily_levels_lookback_days: int = 180
+    # The clustering "aura" — two points count toward the same level if
+    # they're within this fraction of the cluster's own eventual average
+    # (indicators/daily_levels.py's corrected whole-cluster test, not a
+    # naive stale-average check — see that module's docstring for why the
+    # distinction matters). 0.002 = 0.2%, the spec's own number.
+    daily_levels_cluster_pct: float = 0.002
+    # §1.1's same-candle validity gate — a cluster must draw from at
+    # least this many DISTINCT 1D candles to count as a real level, even
+    # though `strength` itself counts total points (open+close), not
+    # candles. Prevents one small-range/doji candle's own open and close
+    # from manufacturing a "level" by itself.
+    daily_levels_min_distinct_candles: int = 2
+    # Day-over-day proximity-reconciliation tolerance for level identity
+    # (design doc §4) — NOT YET USED. Stage 1 (the current build) mints a
+    # fresh level_id every day rather than reconciling against yesterday's
+    # survivors; this setting exists now so Stage 2 has a config knob
+    # ready rather than needing a second config-file round trip, but
+    # nothing reads it yet. Starting default matches the clustering
+    # tolerance above — day-over-day drift and within-cluster spread are
+    # different questions that happen to share a starting value, not
+    # proven to need the same one; revisit once Stage 2 can observe real
+    # drift.
+    daily_levels_identity_match_pct: float = 0.002
+
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
     # level_key FeatureEngine publishes. Per-level-type override is real

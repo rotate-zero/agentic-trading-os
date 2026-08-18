@@ -9,7 +9,31 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class DailyLevel(BaseModel):
+    """One clustered support/resistance zone — decision #59,
+    docs/architecture/daily-levels-design.md §3. A variable-length,
+    day-to-day-reshaping collection, which is exactly why this is its own
+    field rather than more dict[str, float] entries on `features` below:
+    forcing (price, strength) pairs into fake flat keys would leak
+    strength values into LevelInteractionEngine's generic key-iteration
+    as if they were levels themselves.
+
+    `level_id` is the persistent cross-day identity design doc §4
+    describes (proximity-reconciled, never rank-based) — Stage 1 (this
+    field's first populated version) mints a fresh id every day rather
+    than reconciling against yesterday's, since that reconciliation is
+    explicitly Stage 2, not yet built. Do not treat a Stage-1-era
+    `level_id` as stable across days yet — engine.py's docstring flags
+    this same limitation at the point where ids are actually minted.
+    """
+
+    level_id: str
+    price: float
+    strength: int
+    distinct_candle_count: int
 
 
 class FeatureSet(BaseModel):
@@ -25,4 +49,5 @@ class FeatureSet(BaseModel):
     # designed around for CandleRecorder vs. FeatureEngine, applied here one hop further down
     # the chain instead of being reintroduced by a new consumer.
     features: dict[str, float]  # e.g. {"sma_9": 231.4521, "ema_20": 229.881, "vwap": 230.1} — decisions #45, #52, #53
+    daily_levels: list[DailyLevel] = Field(default_factory=list)  # decision #59 — see DailyLevel above
 

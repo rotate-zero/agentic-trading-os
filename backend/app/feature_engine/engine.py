@@ -128,6 +128,28 @@ entire integration; that engine needed zero code changes to start
 tracking touch/reject/conquer against pdh/pdl/pdc/pmh/pml/cam_* the moment
 they appear in FeatureSet.features, the same way it needed none for
 ema_9/ema_20/vwap either.
+
+Daily Levels (confirmed decision #59; docs/architecture/daily-levels-
+design.md) breaks two of the patterns above, on purpose, not by
+accident: it's the first indicator here with a genuine EXTERNAL-PROVIDER
+dependency (fetched via broker_registry.get_historical_provider(), the
+same provider-agnostic seam GET /market/candles uses — never Polygon by
+name), and the first published as a variable-length `daily_levels` list
+on FeatureSet rather than more dict[str, float] entries on `features`
+(a collection-valued feature is a genuinely different shape from a
+scalar one — see schemas/events/features.py::DailyLevel's own
+docstring). Computed once per (symbol, ET calendar day), same cadence as
+previous-day/premarket above, but via a SEPARATE async refresh
+(_maybe_refresh_daily_levels, called from _worker_loop before the
+thread-offloaded _compute_one) rather than folded into
+_update_previous_day/_update_premarket — those two do their own
+synchronous DB reads directly inside the already-thread-offloaded
+_compute_one; MarketDataProvider.get_historical() is itself async and
+needs a real event loop to await it with. STAGE 1 ONLY: this build
+computes and publishes daily_levels but mints a fresh level_id every
+day rather than reconciling identity against yesterday's survivors
+(design doc §4) — that reconciliation, and the persistence table it
+needs, is Stage 2, not built yet.
 """
 from __future__ import annotations
 
@@ -137,14 +159,26 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
 from app.core.config import get_settings
 from app.core.market_clock import Session, get_market_clock
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
-from app.feature_engine.indicators import aggregate_day, camarilla_pivots, ema, fold_range, sma, typical_price, volume_point_of_control, vwap_from_accumulator
+from app.feature_engine.indicators import (
+    DailyCandlePoint,
+    aggregate_day,
+    camarilla_pivots,
+    cluster_daily_levels,
+    ema,
+    fold_range,
+    sma,
+    typical_price,
+    volume_point_of_control,
+    vwap_from_accumulator,
+)
 from app.schemas.events.envelope import EventEnvelope, EventType
-from app.schemas.events.features import FeatureSet
-from app.services import candle_aggregator, candle_store
+from app.schemas.events.features import DailyLevel, FeatureSet
+from app.services import broker_registry, candle_aggregator, candle_store
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +226,9 @@ class FeatureEngine:
             else get_settings().feature_engine_aggregated_lookback_days
         )
         self._previous_day_lookback_days = get_settings().feature_engine_previous_day_lookback_days
+        self._daily_levels_lookback_days = get_settings().daily_levels_lookback_days
+        self._daily_levels_cluster_pct = get_settings().daily_levels_cluster_pct
+        self._daily_levels_min_distinct_candles = get_settings().daily_levels_min_distinct_candles
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -227,13 +264,30 @@ class FeatureEngine:
         # has actually been seen (backfilled or live).
         self._premarket_state: dict[str, dict[str, Any]] = {}
 
+        # Per-SYMBOL Daily Levels (confirmed decision #59) —
+        # {"for_day": date, "levels": list[DailyLevel]}. Same symbol-keyed
+        # shape as VWAP/previous-day/premarket above, and the same
+        # once-per-(symbol, ET day) cache/gate shape as previous-day/
+        # premarket, but refreshed in _maybe_refresh_daily_levels() (async
+        # worker loop, not _compute_one) since it needs an actual
+        # provider network call — see that method's docstring. STAGE 1
+        # LIMITATION, flagged rather than hidden: `level_id` values here
+        # are freshly minted every day, not yet reconciled against
+        # yesterday's survivors (daily-levels-design.md §4 / Stage 2, not
+        # built yet) — do not wire LevelInteractionEngine against these
+        # ids expecting cross-day stability until Stage 2 lands.
+        self._daily_levels_state: dict[str, dict[str, Any]] = {}
+
     def start(self) -> None:
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_candle_closed)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="feature-engine-sma")
         logger.info(
             "FeatureEngine started — computing SMA%s and EMA%s on 1m CandleClosed, VWAP during regular session, "
-            "previous-day PDH/PDL/PDC + Camarilla, pre-market H/L, plus %s on completed bucket boundaries",
+            "previous-day PDH/PDL/PDC + Camarilla, pre-market H/L, plus %s on completed bucket boundaries; "
+            "Daily Levels clustered once per (symbol, ET day) from up to %s days of 1D history when a "
+            "historical provider is connected (decision #59)",
             self._sma_periods, self._ema_periods, list(candle_aggregator.WIDTH_TO_LABEL.values()),
+            self._daily_levels_lookback_days,
         )
 
     async def stop(self) -> None:
@@ -258,10 +312,17 @@ class FeatureEngine:
         directly from an async route handler without asyncio.to_thread.
 
         Shape: {symbol: {timeframe: {"candle_ts": iso str, "close": float,
-        "features": {level_key: value}}}}. Only includes symbols/timeframes
-        this process has actually computed at least once since startup —
-        deliberately not pre-populated for the whole configured universe,
-        so an empty/missing entry means "nothing computed yet," not "zero."
+        "features": {level_key: value}, "daily_levels": [{"level_id":
+        ..., "price": ..., "strength": ..., "distinct_candle_count":
+        ...}, ...]}}} — the last key added by decision #59; empty list
+        when nothing's been clustered yet for that symbol (no historical
+        provider connected, or genuinely fewer than 2 candles confirming
+        any zone), same "empty means not-yet, not zero" meaning the rest
+        of this docstring already describes. Only includes symbols/
+        timeframes this process has actually computed at least once since
+        startup — deliberately not pre-populated for the whole configured
+        universe, so an empty/missing entry means "nothing computed yet,"
+        not "zero."
         """
         result: dict[str, dict[str, dict[str, Any]]] = {}
         for (sym, timeframe), feature_set in self._latest.items():
@@ -271,6 +332,7 @@ class FeatureEngine:
                 "candle_ts": feature_set.candle_ts.isoformat(),
                 "close": feature_set.close,
                 "features": dict(feature_set.features),
+                "daily_levels": [level.model_dump() for level in feature_set.daily_levels],
             }
         return result
 
@@ -290,6 +352,7 @@ class FeatureEngine:
             while True:
                 item = await self._queue.get()
                 try:
+                    await self._maybe_refresh_daily_levels(item)
                     results = await asyncio.to_thread(self._compute_one, item)
                     for symbol, payload in results:
                         await self._bus.publish(make_envelope(EventType.FEATURES_UPDATED, payload, symbol=symbol))
@@ -299,6 +362,118 @@ class FeatureEngine:
                     self._queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    # --- Daily Levels refresh (confirmed decision #59) -----------------------
+
+    async def _maybe_refresh_daily_levels(self, item: dict[str, Any]) -> None:
+        """
+        Daily Levels needs up to `daily_levels_lookback_days` of 1D candle
+        history — the first Feature Engine indicator with a genuine
+        external-provider dependency (market.py's own "1d" routing has
+        always gone straight to whichever provider holds the historical
+        role, never self-recorded — decision #44). Fetched through
+        broker_registry.get_historical_provider() — the SAME
+        provider-agnostic seam GET /market/candles already uses — so a
+        future IBKR historical-role change needs zero changes here; this
+        method never imports or knows about Polygon specifically.
+
+        Lives in the ASYNC worker loop, called before the thread-offloaded
+        _compute_one(), not inside it: MarketDataProvider.get_historical()
+        is itself `async def` (it already thread-offloads its own
+        blocking REST call internally, same as PolygonAdapter.get_historical
+        does) — a plain sync function running via asyncio.to_thread has no
+        event loop of its own to await it with. _compute_one() only ever
+        does a synchronous, already-cached read of the result this method
+        stores in `self._daily_levels_state`.
+
+        Gated the same once-per-(symbol, ET day) way as
+        _update_previous_day/_update_premarket: a fast, synchronous cache
+        check runs on every candle; an actual network fetch only happens
+        when today's clustering hasn't run yet for this symbol. A slow
+        fetch here delays this worker loop picking up its NEXT queued
+        item (this loop is already strictly serial — see module
+        docstring) — an accepted, rare, once-per-symbol-per-day cost, not
+        a new class of problem.
+        """
+        symbol = item["symbol"]
+        candle_ts = item["candle_ts"]
+        if isinstance(candle_ts, str):
+            candle_ts = datetime.fromisoformat(candle_ts)
+        if candle_ts.tzinfo is None:
+            candle_ts = candle_ts.replace(tzinfo=timezone.utc)
+
+        today = get_market_clock().trading_day(candle_ts)
+        state = self._daily_levels_state.get(symbol)
+        if state is not None and state["for_day"] == today:
+            return  # already fresh for today — no I/O, the common case on every candle
+
+        provider = broker_registry.get_historical_provider()
+        if provider is None:
+            # No historical provider connected — an honest gap, same
+            # treatment as _update_previous_day finding no prior trading
+            # day: leave whatever was last computed in place rather than
+            # wiping it to empty on what may be a transient disconnect,
+            # but still stamp today's date so this check stays cheap
+            # (no-op) for the rest of the day instead of retrying on
+            # every single candle.
+            if state is None:
+                logger.info(
+                    "Daily Levels: no historical provider connected for %s yet — levels unavailable until one is",
+                    symbol,
+                )
+                self._daily_levels_state[symbol] = {"for_day": today, "levels": []}
+            return
+
+        lookback_start = candle_ts - timedelta(days=self._daily_levels_lookback_days)
+        try:
+            candles = await provider.get_historical(symbol, "1d", lookback_start, candle_ts)
+        except SymbolNotFoundError:
+            logger.warning("Daily Levels: %s not resolvable by the historical provider — levels unavailable", symbol)
+            self._daily_levels_state[symbol] = {"for_day": today, "levels": []}
+            return
+        except HistoricalDataUnavailableError as exc:
+            logger.warning("Daily Levels: historical provider can't serve 1d data for %s (%s) — levels unavailable", symbol, exc)
+            self._daily_levels_state[symbol] = {"for_day": today, "levels": []}
+            return
+        except Exception:  # noqa: BLE001 — one bad fetch must not stall the worker loop or crash on an unexpected provider error
+            logger.exception("Daily Levels: fetching 1d history failed for %s — leaving prior levels in place", symbol)
+            return  # deliberately does NOT overwrite state on an unexpected error — stale is better than silently empty
+
+        # Strictly-prior days only — today's 1D bar, if a provider even
+        # returns one mid-session, hasn't finished forming and shouldn't
+        # contribute a point (same "already fully elapsed" requirement
+        # _update_previous_day applies to its own single previous day —
+        # same clock.trading_day() comparison that method uses, not a
+        # raw timestamp cutoff, so this handles weekends/holidays the
+        # same free way that method's own docstring describes).
+        clock = get_market_clock()
+        prior_candles = sorted(
+            (c for c in candles if clock.trading_day(c.candle_ts) < today), key=lambda c: c.candle_ts
+        )
+
+        points: list[DailyCandlePoint] = []
+        for idx, candle in enumerate(prior_candles):
+            points.append(DailyCandlePoint(candle_index=idx, price=candle.open))
+            points.append(DailyCandlePoint(candle_index=idx, price=candle.close))
+
+        clustered = cluster_daily_levels(
+            points, cluster_pct=self._daily_levels_cluster_pct, min_distinct_candles=self._daily_levels_min_distinct_candles
+        )
+        # Freshly minted every day, sorted by price ascending purely for
+        # a stable/readable id ordering within a single day — NOT a
+        # cross-day identity scheme. See this class's __init__ docstring
+        # note on _daily_levels_state and design doc §4 / Stage 2.
+        clustered_sorted = sorted(clustered, key=lambda lvl: lvl.price)
+        levels = [
+            DailyLevel(
+                level_id=f"{symbol}-DL-{idx + 1}",
+                price=lvl.price,
+                strength=lvl.strength,
+                distinct_candle_count=lvl.distinct_candle_count,
+            )
+            for idx, lvl in enumerate(clustered_sorted)
+        ]
+        self._daily_levels_state[symbol] = {"for_day": today, "levels": levels}
 
     # --- computation (runs off-loop via asyncio.to_thread — see module docstring) ---
 
@@ -346,8 +521,15 @@ class FeatureEngine:
         extra = {"vwap": round(vwap_value, 6)} if vwap_value is not None else {}
         extra.update(self._update_previous_day(symbol, candle_ts))
         extra.update(self._update_premarket(symbol, candle_ts, high, low))
+        # Daily Levels (confirmed decision #59) — a pure, already-cached
+        # read here (see _maybe_refresh_daily_levels, called earlier in
+        # the async worker loop, not this thread-offloaded method).
+        # Symbol-keyed, attached to every FeatureSet this close produces
+        # below, same as vwap/extra above — a list, not a features dict
+        # entry, so threaded through as its own parameter.
+        daily_levels = self._daily_levels_state.get(symbol, {}).get("levels", [])
 
-        one_min = self._apply_close(key, candle_ts, close, extra)
+        one_min = self._apply_close(key, candle_ts, close, extra, daily_levels)
         if one_min is not None:
             results.append((symbol, one_min))
 
@@ -361,14 +543,19 @@ class FeatureEngine:
             for width in _AGGREGATED_WIDTHS:
                 if not candle_aggregator.completes_bucket(candle_ts, session_start, width):
                     continue
-                aggregated = self._compute_aggregated(symbol, width, session_start, candle_ts, close, extra)
+                aggregated = self._compute_aggregated(symbol, width, session_start, candle_ts, close, extra, daily_levels)
                 if aggregated is not None:
                     results.append((symbol, aggregated))
 
         return results
 
     def _apply_close(
-        self, key: tuple[str, str], candle_ts: datetime, close: float, extra_features: dict[str, float]
+        self,
+        key: tuple[str, str],
+        candle_ts: datetime,
+        close: float,
+        extra_features: dict[str, float],
+        daily_levels: list[DailyLevel] | None = None,
     ) -> FeatureSet | None:
         """The original 1m computation, unchanged in behavior aside from
         `extra_features` — pulled out of _compute_one() so
@@ -415,7 +602,13 @@ class FeatureEngine:
         if not features:
             return None  # warm-up: not enough history yet for ANY configured period
 
-        payload = FeatureSet(timeframe=timeframe, candle_ts=candle_ts, close=close, features=features)
+        payload = FeatureSet(
+            timeframe=timeframe,
+            candle_ts=candle_ts,
+            close=close,
+            features=features,
+            daily_levels=daily_levels or [],
+        )
         self._latest[key] = payload
         return payload
 
@@ -427,6 +620,7 @@ class FeatureEngine:
         candle_ts: datetime,
         close: float,
         extra_features: dict[str, float],
+        daily_levels: list[DailyLevel] | None = None,
     ) -> FeatureSet | None:
         """
         The just-completed 5m/15m/1h bucket's close is this same 1m
@@ -473,7 +667,7 @@ class FeatureEngine:
                 window.extend(closes[-(self._window_capacity - 1):])
             self._windows[key] = window
 
-        return self._apply_close(key, bucket_start, close, extra_features)
+        return self._apply_close(key, bucket_start, close, extra_features, daily_levels)
 
     def _update_vwap(
         self, symbol: str, candle_ts: datetime, high: float, low: float, close: float, volume: int
