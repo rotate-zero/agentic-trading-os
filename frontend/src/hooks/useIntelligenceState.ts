@@ -3,6 +3,7 @@ import {
   fetchIntelligenceState,
   subscribeSymbol,
   ApiError,
+  type DailyLevelWireShape,
   type FeatureValueNodeWireShape,
   type IntelligenceStateWireShape,
   type LevelInteractionWireShape,
@@ -38,8 +39,8 @@ function isValueNode(
 // consistent, always-array shape so the component doesn't need to
 // type-narrow the union itself. Pure and separately testable in spirit,
 // even though there's no test runner wired up on the frontend yet.
-function normalize(wire: IntelligenceStateWireShape): FeatureTimeframe[] {
-  return Object.entries(wire.timeframes).map(([timeframe, tf]) => {
+function normalize(wire: IntelligenceStateWireShape): { timeframes: FeatureTimeframe[]; dailyLevels: DailyLevelWireShape[] } {
+  const timeframes = Object.entries(wire.timeframes).map(([timeframe, tf]) => {
     const units: FeatureUnit[] = Object.entries(tf.units).map(([unitKey, unit]) => {
       if (isValueNode(unit)) {
         return {
@@ -67,6 +68,7 @@ function normalize(wire: IntelligenceStateWireShape): FeatureTimeframe[] {
     units.sort((a, b) => a.key.localeCompare(b.key));
     return { timeframe, close: tf.close, units };
   });
+  return { timeframes, dailyLevels: wire.daily_levels };
 }
 
 /**
@@ -89,16 +91,23 @@ function normalize(wire: IntelligenceStateWireShape): FeatureTimeframe[] {
  * showing needs to start that stream itself, not assume it already
  * exists elsewhere.
  */
-export function useIntelligenceState(symbol: string): { timeframes: FeatureTimeframe[]; loading: boolean } {
+export function useIntelligenceState(
+  symbol: string,
+  dailyLevelsLookbackDays?: number | null
+): { timeframes: FeatureTimeframe[]; dailyLevels: DailyLevelWireShape[]; loading: boolean } {
   const [timeframes, setTimeframes] = useState<FeatureTimeframe[]>([]);
+  const [dailyLevels, setDailyLevels] = useState<DailyLevelWireShape[]>([]);
   const [loading, setLoading] = useState(true);
   const symbolRef = useRef(symbol);
   symbolRef.current = symbol;
+  const lookbackRef = useRef(dailyLevelsLookbackDays);
+  lookbackRef.current = dailyLevelsLookbackDays;
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setTimeframes([]); // clear the previous symbol's stale data immediately on switch
+    setDailyLevels([]);
 
     subscribeSymbol(symbol).catch((err: unknown) => {
       const detail = err instanceof ApiError ? err.message : String(err);
@@ -106,10 +115,12 @@ export function useIntelligenceState(symbol: string): { timeframes: FeatureTimef
     });
 
     const load = () => {
-      fetchIntelligenceState(symbolRef.current)
+      fetchIntelligenceState(symbolRef.current, lookbackRef.current)
         .then((wire) => {
           if (!cancelled && wire.symbol === symbolRef.current) {
-            setTimeframes(normalize(wire));
+            const normalized = normalize(wire);
+            setTimeframes(normalized.timeframes);
+            setDailyLevels(normalized.dailyLevels);
             setLoading(false);
           }
         })
@@ -134,7 +145,13 @@ export function useIntelligenceState(symbol: string): { timeframes: FeatureTimef
       unsubFeatures();
       unsubLevels();
     };
-  }, [symbol]);
+    // dailyLevelsLookbackDays is intentionally in this array (not just
+    // symbol) — changing the lookback selector should trigger an
+    // immediate refetch with the new value, not wait for the next
+    // WebSocket-driven update. lookbackRef exists so `load()` inside the
+    // WebSocket handler always reads the CURRENT value without needing
+    // onUpdate itself to be recreated on every lookback change.
+  }, [symbol, dailyLevelsLookbackDays]);
 
-  return { timeframes, loading };
+  return { timeframes, dailyLevels, loading };
 }

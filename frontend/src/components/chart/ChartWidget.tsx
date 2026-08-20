@@ -11,8 +11,9 @@ import {
 } from "lightweight-charts";
 import type { Candle, ChartObject } from "../../types/market";
 import type { IndicatorPoint } from "../../utils/indicators";
-import type { CandleLimit, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
-import { DEFAULT_GRID_COLOR, createDefaultVolumeBarsConfig } from "../../types/workspace";
+import type { CandleLimit, DailyLevelsConfig, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
+import { DEFAULT_GRID_COLOR, createDefaultDailyLevelsConfig, createDefaultVolumeBarsConfig } from "../../types/workspace";
+import type { DailyLevelWireShape } from "../../services/api-client";
 import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
 import { computeHorizontalLevel } from "../../utils/indicators";
 import { TimerBadge } from "./TimerBadge";
@@ -61,17 +62,28 @@ interface ChartWidgetProps {
   timer?: TimerConfig;
   volumeAvg?: VolumeAvgIndicatorConfig;
   volumeBars?: VolumeBarsConfig;
+  // Daily Levels (confirmed decisions #59-#61) — deliberately NOT part of
+  // horizontalLevels/horizontalLevelValues above: those are a small,
+  // FIXED set of named types (PDH, CAM_R1, ...), one HorizontalLevelInstance
+  // per type the user opted into. Daily Levels is a variable-COUNT,
+  // backend-clustered list with no local fallback (DailyLevelsConfig's own
+  // comment) — a genuinely different shape, so it gets its own prop pair
+  // rather than being forced into that one.
+  dailyLevels?: DailyLevelWireShape[];
+  dailyLevelsConfig?: DailyLevelsConfig;
 }
 
 const BULL = "#3FB950";
 const BEAR = "#F85149";
 const SIGNAL = "#E3B341";
 
-// Stable reference for the default param below — an inline object literal
-// as a default value would be a fresh reference on every render a caller
-// omits the prop, which is harmless here (SubWindow.tsx always passes
-// config.volumeBars explicitly) but costs nothing to avoid.
+// Stable reference for the default params below — an inline object
+// literal as a default value would be a fresh reference on every render
+// a caller omits the prop, which is harmless here (SubWindow.tsx always
+// passes config.volumeBars/config.dailyLevelsConfig explicitly) but costs
+// nothing to avoid.
 const DEFAULT_VOLUME_BARS = createDefaultVolumeBarsConfig();
+const DEFAULT_DAILY_LEVELS_CONFIG = createDefaultDailyLevelsConfig();
 
 function volumeBarColor(candle: Candle, config: VolumeBarsConfig): string {
   return config.colorMode === "one_color" ? config.singleColor : candle.close >= candle.open ? config.upColor : config.downColor;
@@ -125,6 +137,8 @@ export function ChartWidget({
   timer,
   volumeAvg,
   volumeBars = DEFAULT_VOLUME_BARS,
+  dailyLevels = [],
+  dailyLevelsConfig = DEFAULT_DAILY_LEVELS_CONFIG,
 }: ChartWidgetProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -437,6 +451,45 @@ export function ChartWidget({
       priceLines.forEach((line) => series.removePriceLine(line));
     };
   }, [candles, horizontalLevels, horizontalLevelValues]);
+
+  // Daily Levels (confirmed decisions #59-#62) — one price line per
+  // backend-clustered zone, filtered by minStrength AND an optional
+  // price range (minPrice/maxPrice — decision #62, added specifically
+  // because a symbol's full 180-day price spread crowded out other
+  // indicators; a band around the current price is a more direct fix
+  // than strength filtering alone), drawn with a SINGLE uniform
+  // color/width from dailyLevelsConfig (Saqib's own call: one color for
+  // all of them, not a per-level gradient/opacity scheme). Strength is
+  // communicated as a short text tag on the line's title instead —
+  // "DL-N" (decision #62 shortened this from the original "Daily Level
+  // · Strength N") — rather than encoded visually, so it reads as an
+  // explicit number without eating pane width. Same createPriceLine
+  // mechanism as horizontalLevels above, same recreate-on-every-change
+  // posture (price lines are cheap), but its own effect since it's
+  // keyed off a genuinely different prop pair, not an instance list.
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series || !dailyLevelsConfig.enabled) return;
+
+    const priceLines = dailyLevels
+      .filter((level) => level.strength >= dailyLevelsConfig.minStrength)
+      .filter((level) => dailyLevelsConfig.minPrice == null || level.price >= dailyLevelsConfig.minPrice)
+      .filter((level) => dailyLevelsConfig.maxPrice == null || level.price <= dailyLevelsConfig.maxPrice)
+      .map((level) =>
+        series.createPriceLine({
+          price: level.price,
+          color: dailyLevelsConfig.color,
+          lineWidth: Math.min(4, Math.max(1, Math.round(dailyLevelsConfig.lineWidth))) as LineWidth,
+          lineStyle: LineStyle.Solid,
+          axisLabelVisible: dailyLevelsConfig.showPriceLabels,
+          title: `DL-${level.strength}`,
+        })
+      );
+
+    return () => {
+      priceLines.forEach((line) => series.removePriceLine(line));
+    };
+  }, [dailyLevels, dailyLevelsConfig]);
 
   // Indicator line series — created/updated/removed as the sub-window's indicator
   // selection changes. Keyed so toggling one indicator doesn't touch the others.

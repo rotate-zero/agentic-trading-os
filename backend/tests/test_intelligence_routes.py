@@ -69,6 +69,15 @@ def _clean_test_symbol(ticker: str) -> None:
             ),
             {"t": ticker},
         )
+        # Daily Levels Stage 2 (confirmed decision #63) — daily_levels_state
+        # also has a FK to symbols; without this, deleting the symbols row
+        # below throws a real ForeignKeyViolation for any ticker Daily
+        # Levels has ever persisted a row for (found via the full-suite
+        # run that exposed this, not assumed ahead of time).
+        session.execute(
+            text("DELETE FROM daily_levels_state WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"),
+            {"t": ticker},
+        )
         session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
         session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
         session.commit()
@@ -294,7 +303,7 @@ async def test_intelligence_state_empty_for_never_seen_symbol():
             resp = await client.get("/intelligence/state", params={"symbol": "__T_INTEL_NEVER_SEEN__"})
 
         assert resp.status_code == 200
-        assert resp.json() == {"symbol": "__T_INTEL_NEVER_SEEN__", "timeframes": {}}
+        assert resp.json() == {"symbol": "__T_INTEL_NEVER_SEEN__", "timeframes": {}, "daily_levels": []}
 
 
 # --- GET /intelligence/series (confirmed decision #54, Stage 1) ------------
@@ -522,4 +531,146 @@ async def test_premarket_high_low_freezes_once_regular_session_starts():
                 # wait for the two THIS test actually asserts against, at minimum.
                 await _wait_until_level_interactions_present(client, ticker, frozenset({"pmh", "pml"}))
     finally:
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_daily_levels_appear_in_intelligence_state():
+    """
+    Daily Levels (decision #59/#60/#61) end-to-end through the real route
+    and real singleton FeatureEngine — the engine-level mechanics
+    (clustering correctness, same-candle validity, the three provider-
+    failure paths) are already covered thoroughly by test_daily_levels.py;
+    this test's only job is confirming the ROUTE actually surfaces
+    whatever FeatureEngine.get_snapshot() computed, symbol-scoped at the
+    top level rather than nested under a timeframe (module docstring).
+    """
+    from app.services import broker_registry
+
+    ticker = "__T_INTEL_DL__"
+    _clean_test_symbol(ticker)
+
+    class _FakeHistoricalProvider:
+        async def get_historical(self, symbol, timeframe, start, end):
+            base = end - timedelta(days=5)
+            return [
+                CandleClosed(timeframe="1d", open=100.10, high=100.10, low=100.10, close=100.10, volume=1000, candle_ts=base),
+                CandleClosed(timeframe="1d", open=100.20, high=100.20, low=100.20, close=100.20, volume=1000, candle_ts=base + timedelta(days=1)),
+            ]
+
+        async def disconnect(self) -> None:
+            # The real app's lifespan shutdown calls disconnect() on every
+            # registered provider (broker_registry.get_all_active_providers())
+            # — real providers implement this for real cleanup; this fake
+            # just needs to not blow up when it's called.
+            pass
+
+    original_provider = broker_registry.get_historical_provider()
+    broker_registry.set_historical_provider(_FakeHistoricalProvider())
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+            now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+            await _publish(bus, ticker, now, 130.0)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                body = None
+                deadline = asyncio.get_event_loop().time() + 8.0
+                while asyncio.get_event_loop().time() < deadline:
+                    resp = await client.get("/intelligence/state", params={"symbol": ticker})
+                    candidate = resp.json()
+                    if candidate.get("daily_levels"):
+                        body = candidate
+                        break
+                    await asyncio.sleep(0.05)
+                assert body is not None, "daily_levels never appeared within 8s"
+
+                # Top-level, not nested under timeframes — the module
+                # docstring's whole reason this isn't per-timeframe.
+                assert "daily_levels" in body
+                assert "timeframes" in body
+                levels = body["daily_levels"]
+                assert len(levels) == 1
+                assert levels[0]["strength"] == 4  # open==close per fixture candle — same shape test_daily_levels.py's engine test uses
+                assert levels[0]["distinct_candle_count"] == 2
+                assert levels[0]["price"] == pytest.approx(100.15, abs=0.01)
+                # Stage 2 (decision #63) derives level_id from the persisted
+                # row's own DB identity, not a per-symbol rank counter —
+                # same fix already applied in test_daily_levels.py's own
+                # equivalent assertion, for the same reason.
+                level_id = levels[0]["level_id"]
+                assert level_id.startswith(f"{ticker}-DL-")
+                assert level_id.removeprefix(f"{ticker}-DL-").isdigit()
+    finally:
+        if original_provider is not None:
+            broker_registry.set_historical_provider(original_provider)
+        else:
+            broker_registry.clear_historical_provider()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_daily_levels_carry_level_interaction_once_touched():
+    """Stage 3 (confirmed decision #64) — closes the gap decision #61
+    explicitly flagged ("No level_interaction data attached to these yet").
+    Publishes a SECOND candle whose close actually lands inside the daily
+    level's aura (unlike test_daily_levels_appear_in_intelligence_state's
+    own candle, which stays far away on purpose to keep that test
+    focused on the clustering/route wiring alone) and confirms the route
+    attaches real, per-timeframe interaction data — not just that the
+    field exists."""
+    from app.services import broker_registry
+
+    ticker = "__T_INTEL_DLLI__"
+    _clean_test_symbol(ticker)
+
+    class _FakeHistoricalProvider:
+        async def get_historical(self, symbol, timeframe, start, end):
+            base = end - timedelta(days=5)
+            return [
+                CandleClosed(timeframe="1d", open=100.10, high=100.10, low=100.10, close=100.10, volume=1000, candle_ts=base),
+                CandleClosed(timeframe="1d", open=100.20, high=100.20, low=100.20, close=100.20, volume=1000, candle_ts=base + timedelta(days=1)),
+            ]
+
+        async def disconnect(self) -> None:
+            pass
+
+    original_provider = broker_registry.get_historical_provider()
+    broker_registry.set_historical_provider(_FakeHistoricalProvider())
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+            now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+            # First candle: far away, just gets Daily Levels computed.
+            await _publish(bus, ticker, now, 130.0)
+            # Second candle: close lands right on the clustered level
+            # (~100.15, per the same fixture shape used elsewhere) —
+            # a real touch, which LevelInteractionEngine should pick up
+            # via its new daily_levels loop with zero special-casing.
+            await _publish(bus, ticker, now + timedelta(minutes=1), 100.15)
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                body = None
+                deadline = asyncio.get_event_loop().time() + 8.0
+                while asyncio.get_event_loop().time() < deadline:
+                    resp = await client.get("/intelligence/state", params={"symbol": ticker})
+                    candidate = resp.json()
+                    levels = candidate.get("daily_levels", [])
+                    if levels and levels[0].get("level_interaction"):
+                        body = candidate
+                        break
+                    await asyncio.sleep(0.05)
+                assert body is not None, "level_interaction never appeared on the daily_levels entry within 8s"
+
+                level = body["daily_levels"][0]
+                assert "1m" in level["level_interaction"]
+                assert level["level_interaction"]["1m"]["zone"] == "inside_aura"
+                assert level["level_interaction"]["1m"]["touch_count_today"] == 1
+    finally:
+        if original_provider is not None:
+            broker_registry.set_historical_provider(original_provider)
+        else:
+            broker_registry.clear_historical_provider()
         _clean_test_symbol(ticker)

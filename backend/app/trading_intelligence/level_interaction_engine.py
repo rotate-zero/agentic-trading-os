@@ -17,6 +17,19 @@ Matches trading-intelligence-architecture.md §7's "design it around a
 question it answers" — the question here is "how is price behaving around
 a key level," not "how is price behaving around the SMA."
 
+Daily Levels (confirmed decision #64, Stage 3 of daily-levels-design.md)
+is the one deliberate exception to "zero code changes for a new level
+type," flagged as such back in decisions #59/#61 before it was ever
+built: `daily_levels` is a separate LIST field on `FeatureSet`, not
+`features` dict entries, so `_process_one` below walks it with its own
+small loop. `_process_level` itself needed no changes at all — `level_id`
+slots in as `level_key`, `price` as `level_value`, the exact same generic
+contract every dict-based level type already satisfies. Everything below
+this point (aura, touch/holding/rejected/conquered, gap-through,
+cold-start-unknown-origin, daily reset, get_snapshot()'s shape) applies to
+Daily Levels identically and required no further changes — only the
+iteration surface in `_process_one` grew.
+
 Trigger and precision: candle-close only (confirmed choice — no tick
 stream in this setup). This means a "touch" is only ever observed at
 whatever granularity CandleClosed actually fires at (currently 1m —
@@ -304,6 +317,29 @@ class LevelInteractionEngine:
             except Exception:  # noqa: BLE001 — one bad level must not block the others in this same candle
                 logger.exception(
                     "LevelInteractionEngine failed on %s %s %s at %s", symbol, timeframe, level_key, candle_ts
+                )
+
+        # Daily Levels (Stage 3, confirmed decision #64) — a separate
+        # `daily_levels` LIST field on FeatureSet, not `features` dict
+        # entries (decision #59's own schema choice), so it needs its own
+        # loop here rather than fitting into features.items() above.
+        # Reuses _process_level completely unmodified: `level_id` is the
+        # level_key, `price` is the level_value — the exact same generic
+        # contract every other level type already satisfies through the
+        # dict above. This is the first (and, per decision #59/#61's own
+        # framing, deliberately the ONLY) place this engine's "zero code
+        # changes for a new level type" property doesn't hold — recorded
+        # as an acknowledged exception, not something that happened
+        # quietly in a diff.
+        for daily_level in item.get("daily_levels", []):
+            level_key = daily_level.get("level_id")
+            try:
+                event = self._process_level(symbol, timeframe, level_key, float(daily_level["price"]), close, candle_ts)
+                if event is not None:
+                    results.append((symbol, event))
+            except Exception:  # noqa: BLE001 — same per-level isolation as the features.items() loop above
+                logger.exception(
+                    "LevelInteractionEngine failed on Daily Level %s for %s %s at %s", level_key, symbol, timeframe, candle_ts
                 )
         return results
 

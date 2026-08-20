@@ -156,15 +156,19 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+
+from sqlalchemy import select
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
 from app.core.config import get_settings
 from app.core.market_clock import Session, get_market_clock
+from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.feature_engine.indicators import (
+    ClusteredLevel,
     DailyCandlePoint,
     aggregate_day,
     camarilla_pivots,
@@ -176,6 +180,8 @@ from app.feature_engine.indicators import (
     volume_point_of_control,
     vwap_from_accumulator,
 )
+from app.models.daily_levels import DailyLevelState
+from app.models.market_data import Symbol
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.features import DailyLevel, FeatureSet
 from app.services import broker_registry, candle_aggregator, candle_store
@@ -229,6 +235,10 @@ class FeatureEngine:
         self._daily_levels_lookback_days = get_settings().daily_levels_lookback_days
         self._daily_levels_cluster_pct = get_settings().daily_levels_cluster_pct
         self._daily_levels_min_distinct_candles = get_settings().daily_levels_min_distinct_candles
+        # Unused until Stage 2 (decision #63) — decision #60 added this
+        # setting ahead of time specifically so this moment wouldn't need
+        # a second config round-trip. Now actually read.
+        self._daily_levels_identity_match_pct = get_settings().daily_levels_identity_match_pct
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -407,6 +417,26 @@ class FeatureEngine:
         if state is not None and state["for_day"] == today:
             return  # already fresh for today — no I/O, the common case on every candle
 
+        # Restart-survival (Stage 2, confirmed decision #63): a fresh
+        # process starts with an EMPTY in-memory cache regardless of
+        # whether today's reconciliation already ran in a prior process
+        # instance before a restart. Check the persisted table first —
+        # one indexed query, no network call — before assuming a
+        # provider fetch is needed. A symbol whose reconciliation
+        # genuinely hasn't run yet today returns None here (falls
+        # through to the normal fetch path below); one that HAS gets its
+        # already-persisted, already-reconciled levels back immediately.
+        # Known, accepted limitation: this short-circuit doesn't restore
+        # the RAW candle cache (only the provider fetch path populates
+        # that), so get_daily_levels()'s custom-lookback preview won't
+        # have anything to slice until the next natural per-day refresh —
+        # a minor gap, not a correctness issue, and not worth persisting
+        # ~360 raw candles per symbol just to close it.
+        persisted_today = await asyncio.to_thread(self._load_confirmed_daily_levels_for_today, symbol, today)
+        if persisted_today is not None:
+            self._daily_levels_state[symbol] = {"for_day": today, "levels": persisted_today, "candles": []}
+            return
+
         provider = broker_registry.get_historical_provider()
         if provider is None:
             # No historical provider connected — an honest gap, same
@@ -451,29 +481,260 @@ class FeatureEngine:
             (c for c in candles if clock.trading_day(c.candle_ts) < today), key=lambda c: c.candle_ts
         )
 
+        clustered = self._cluster_raw(prior_candles)
+        # Reconciliation is DB-backed (Stage 2, decision #63) — genuine
+        # I/O, so thread-offloaded from this async method the same
+        # discipline as everywhere else in this file that talks to
+        # Postgres from FeatureEngine (there wasn't any before Stage 2;
+        # LevelInteractionEngine's own persistence — sync SessionLocal
+        # calls — already runs safely off-loop because ITS caller is
+        # thread-offloaded at a higher level. This one has to do it
+        # itself, since it's called directly from the async worker loop.)
+        levels = await asyncio.to_thread(self._reconcile_and_persist_daily_levels, symbol, today, clustered)
+        # Cache the raw candles alongside the computed levels, not just
+        # the levels themselves — get_daily_levels() below re-clusters
+        # from a SLICE of these on demand (e.g. "last 30 days" instead of
+        # the configured default) without a second provider fetch. The
+        # expensive part (the network call above) still only happens once
+        # per (symbol, ET day); re-clustering a cached ~360-point list is
+        # cheap enough to do per-request.
+        self._daily_levels_state[symbol] = {"for_day": today, "levels": levels, "candles": prior_candles}
+
+    def _cluster_raw(self, prior_candles: list[Any]) -> list[ClusteredLevel]:
+        """Shared by every caller that needs raw clustered zones before
+        any identity gets assigned — _maybe_refresh_daily_levels (the
+        cached default, reconciled+persisted below) and get_daily_levels
+        (an on-demand custom lookback, minted ephemeral — decision #62's
+        own design choice to keep that path ad-hoc, not tracked)."""
         points: list[DailyCandlePoint] = []
         for idx, candle in enumerate(prior_candles):
             points.append(DailyCandlePoint(candle_index=idx, price=candle.open))
             points.append(DailyCandlePoint(candle_index=idx, price=candle.close))
 
-        clustered = cluster_daily_levels(
+        return cluster_daily_levels(
             points, cluster_pct=self._daily_levels_cluster_pct, min_distinct_candles=self._daily_levels_min_distinct_candles
         )
-        # Freshly minted every day, sorted by price ascending purely for
-        # a stable/readable id ordering within a single day — NOT a
-        # cross-day identity scheme. See this class's __init__ docstring
-        # note on _daily_levels_state and design doc §4 / Stage 2.
+
+    def _mint_adhoc_daily_levels(self, symbol: str, clustered: list[ClusteredLevel]) -> list[DailyLevel]:
+        """Ephemeral, rank-based ids — NOT persisted, NOT reconciled
+        against yesterday's DB state. Two callers, on purpose: (a)
+        get_daily_levels()'s custom-lookback preview (decision #62 — kept
+        deliberately ad-hoc, not tracked, since it's a "what if" display
+        control, not the tracked default), and (b) a soft-fail fallback
+        if DB-backed reconciliation itself throws (Daily Levels should
+        still show SOMETHING on a transient DB hiccup rather than nothing
+        — same posture as every other soft-fail persistence path in this
+        codebase). The "-preview-" marker makes it impossible to mistake
+        one of these for a genuinely tracked, Stage-3-ready level_id."""
         clustered_sorted = sorted(clustered, key=lambda lvl: lvl.price)
-        levels = [
+        return [
             DailyLevel(
-                level_id=f"{symbol}-DL-{idx + 1}",
+                level_id=f"{symbol}-DL-preview-{idx + 1}",
                 price=lvl.price,
                 strength=lvl.strength,
                 distinct_candle_count=lvl.distinct_candle_count,
             )
             for idx, lvl in enumerate(clustered_sorted)
         ]
-        self._daily_levels_state[symbol] = {"for_day": today, "levels": levels}
+
+    # --- Daily Levels persistence (sync — always called via asyncio.to_thread) ---
+
+    def _load_confirmed_daily_levels_for_today(self, symbol: str, today: date) -> list[DailyLevel] | None:
+        """Restart-survival's DB read (Stage 2, decision #63). Returns
+        None when today's reconciliation genuinely hasn't run yet for
+        this symbol (the normal per-day case — falls through to a
+        provider fetch) — deliberately distinct from an empty list, which
+        IS a real, valid "already confirmed today, zero levels currently
+        qualify" outcome, not a sentinel for "not checked."
+
+        Known, accepted imprecision: a symbol whose active levels ALL got
+        archived today (reconciliation ran, matched nothing, zero rows
+        remain active) is indistinguishable here from "hasn't run yet" —
+        both read back zero active rows. Falls through to a redundant
+        provider re-fetch that reproduces the same (correct) empty
+        result — a bounded, one-time-per-restart inefficiency for a rare
+        edge case, not a correctness bug, and not worth a second query
+        against archived_day to close.
+        """
+        session = SessionLocal()
+        try:
+            symbol_id = session.execute(select(Symbol.id).where(Symbol.ticker == symbol)).scalar_one_or_none()
+            if symbol_id is None:
+                return None  # never persisted anything for this symbol — nothing to restore
+            rows = (
+                session.execute(
+                    select(DailyLevelState)
+                    .where(
+                        DailyLevelState.symbol_id == symbol_id,
+                        DailyLevelState.status == "active",
+                        DailyLevelState.last_confirmed_day == today,
+                    )
+                    .order_by(DailyLevelState.price)
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                return None
+            return [
+                DailyLevel(level_id=r.level_id, price=float(r.price), strength=r.strength, distinct_candle_count=r.distinct_candle_count)
+                for r in rows
+            ]
+        except Exception:  # noqa: BLE001 — a DB hiccup on this read must not crash startup; treat as brand-new (falls through to a normal fetch)
+            logger.exception("Daily Levels: failed to check persisted state for %s — falling back to a fresh fetch", symbol)
+            return None
+        finally:
+            session.close()
+
+    def _reconcile_and_persist_daily_levels(self, symbol: str, today: date, clustered: list[ClusteredLevel]) -> list[DailyLevel]:
+        """
+        The day-over-day identity reconciliation itself (design doc §4,
+        Stage 2, confirmed decision #63) — greedy nearest-price matching
+        between today's fresh clusters and yesterday's still-active
+        persisted levels, NOT rank-based (design doc §4 explicitly
+        rejected rank: a level's rank among others can change day to day
+        even when the physical zone hasn't moved).
+
+        Algorithm: build every (today-cluster, active-row) pair whose
+        price distance is within daily_levels_identity_match_pct of the
+        larger of the two prices, sort ALL such candidate pairs by
+        distance ascending, then greedily claim matches — each cluster
+        and each row used at most once, closest pairs claimed first. A
+        matched cluster carries its row's existing level_id forward (with
+        updated price/strength/distinct_candle_count/last_confirmed_day);
+        an unmatched cluster mints a brand-new level_id from its own
+        fresh row's DB identity. Any active row that matched nothing gets
+        archived (status/archived_day set), not deleted — design doc §4's
+        own "unmatched survivor is archived, not deleted" language.
+        """
+        session = SessionLocal()
+        try:
+            symbol_id = self._get_or_create_symbol_id(session, symbol)
+            active_rows = (
+                session.execute(
+                    select(DailyLevelState).where(DailyLevelState.symbol_id == symbol_id, DailyLevelState.status == "active")
+                )
+                .scalars()
+                .all()
+            )
+
+            tolerance_pct = self._daily_levels_identity_match_pct
+            candidate_pairs: list[tuple[float, int, int]] = []
+            for c_idx, cluster in enumerate(clustered):
+                for r_idx, row in enumerate(active_rows):
+                    row_price = float(row.price)
+                    distance = abs(cluster.price - row_price)
+                    tolerance = max(cluster.price, row_price) * tolerance_pct
+                    if distance <= tolerance:
+                        candidate_pairs.append((distance, c_idx, r_idx))
+            candidate_pairs.sort(key=lambda pair: pair[0])
+
+            matched_row_for_cluster: dict[int, Any] = {}
+            used_row_indices: set[int] = set()
+            for _distance, c_idx, r_idx in candidate_pairs:
+                if c_idx in matched_row_for_cluster or r_idx in used_row_indices:
+                    continue  # closest pairs already claimed one side of this pair — skip, don't double-assign
+                matched_row_for_cluster[c_idx] = active_rows[r_idx]
+                used_row_indices.add(r_idx)
+
+            result: list[DailyLevel] = []
+            for c_idx, cluster in enumerate(clustered):
+                row = matched_row_for_cluster.get(c_idx)
+                if row is not None:
+                    row.price = cluster.price
+                    row.strength = cluster.strength
+                    row.distinct_candle_count = cluster.distinct_candle_count
+                    row.last_confirmed_day = today
+                    level_id = row.level_id
+                else:
+                    new_row = DailyLevelState(
+                        symbol_id=symbol_id,
+                        level_id="",  # placeholder — real id derived from this row's own PK right after flush, below
+                        price=cluster.price,
+                        strength=cluster.strength,
+                        distinct_candle_count=cluster.distinct_candle_count,
+                        status="active",
+                        first_seen_day=today,
+                        last_confirmed_day=today,
+                    )
+                    session.add(new_row)
+                    session.flush()  # populate new_row.id (Identity column) without committing yet
+                    new_row.level_id = f"{symbol}-DL-{new_row.id}"
+                    level_id = new_row.level_id
+                result.append(
+                    DailyLevel(level_id=level_id, price=cluster.price, strength=cluster.strength, distinct_candle_count=cluster.distinct_candle_count)
+                )
+
+            for r_idx, row in enumerate(active_rows):
+                if r_idx not in used_row_indices:
+                    row.status = "archived"
+                    row.archived_day = today
+
+            session.commit()
+            result.sort(key=lambda lvl: lvl.price)
+            return result
+        except Exception:  # noqa: BLE001 — same soft-fail posture as CandleRecorder/LevelInteractionEngine: an unreachable DB must not crash this engine
+            logger.exception("Daily Levels: reconciliation/persist failed for %s — falling back to ephemeral ids for this refresh", symbol)
+            session.rollback()
+            return self._mint_adhoc_daily_levels(symbol, clustered)
+        finally:
+            session.close()
+
+    def _get_or_create_symbol_id(self, session: Any, ticker: str) -> int:
+        """Same pattern as LevelInteractionEngine._get_or_create_symbol_id
+        and CandleRecorder._get_or_create_symbol_id — duplicated rather
+        than shared, matching how this codebase already has this exact
+        helper twice; a third small copy here is consistent with that
+        existing choice, not a new one."""
+        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        if existing is not None:
+            return existing
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.commit()
+        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+
+    def get_daily_levels(self, symbol: str, lookback_days: int | None = None) -> list[DailyLevel]:
+        """
+        Confirmed decision #62 — backs GET /intelligence/state's optional
+        `daily_levels_lookback_days` query param (the frontend's lookback
+        selector: 30/60/90/... days instead of the server's configured
+        default). Re-clusters from the RAW candles _maybe_refresh_daily_levels
+        already cached for this symbol — no new provider call, since the
+        expensive part already happened once for today; slicing a cached
+        ~360-point list and re-running cluster_daily_levels is cheap
+        enough to do on every request that asks for a non-default lookback.
+
+        `lookback_days=None` (or omitted): returns exactly what's already
+        cached for today — the pre-computed default, zero extra work,
+        same values GET /intelligence/state has always returned.
+
+        A `lookback_days` LARGER than what's actually cached (fewer
+        trading days exist than requested — a recent IPO, or a value
+        bigger than the server's own configured
+        `daily_levels_lookback_days`) is silently clamped to whatever IS
+        cached, not an error — same "return what's available" honesty
+        the rest of this feature already practices (§2's provider-gap
+        handling), not a reason to fail the whole request.
+        """
+        state = self._daily_levels_state.get(symbol)
+        if state is None:
+            return []
+        if lookback_days is None:
+            return state["levels"]
+
+        candles: list[Any] = state.get("candles", [])
+        if not candles:
+            # Either a pre-Stage-4.1 cached entry (no provider was
+            # connected when it was written) or a restart-survival
+            # short-circuit (_maybe_refresh_daily_levels's own docstring —
+            # that path restores levels but not raw candles) — nothing to
+            # slice from either way; falls back to the tracked default.
+            return state["levels"]
+
+        sliced = candles[-lookback_days:] if lookback_days < len(candles) else candles
+        return self._mint_adhoc_daily_levels(symbol, self._cluster_raw(sliced))
 
     # --- computation (runs off-loop via asyncio.to_thread — see module docstring) ---
 

@@ -25,6 +25,12 @@ import {
   VOLUME_AVG_BAR_MIN,
   VOLUME_AVG_BAR_STEP,
   VOLUME_BAR_COLOR_MODES,
+  DAILY_LEVELS_MIN_STRENGTH_FLOOR,
+  DAILY_LEVELS_MIN_STRENGTH_CEILING,
+  DAILY_LEVELS_LOOKBACK_PRESETS,
+  DAILY_LEVELS_LINE_WIDTH_MIN,
+  DAILY_LEVELS_LINE_WIDTH_MAX,
+  createDefaultDailyLevelsConfig,
   createDefaultVolumeBarsConfig,
   createHorizontalLevelInstance,
   createPriceIndicatorInstance,
@@ -115,7 +121,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "volumeBars";
+type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "volumeBars" | "dailyLevels";
 
 const VOLUME_BAR_COLOR_MODE_LABELS: Record<VolumeBarColorMode, string> = {
   two_color: "2-Color",
@@ -665,6 +671,12 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                 }
                 onClick={() => setLevel("volumeBars")}
               />
+              <RootRow
+                label="Daily Levels"
+                hint={config.dailyLevelsConfig.enabled ? `Strength \u2265 ${config.dailyLevelsConfig.minStrength}` : "Off"}
+                swatch={config.dailyLevelsConfig.enabled ? config.dailyLevelsConfig.color : undefined}
+                onClick={() => setLevel("dailyLevels")}
+              />
             </div>
           )}
 
@@ -966,6 +978,185 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   )}
                   <button
                     onClick={() => updateSubWindow(config.id, { volumeBars: createDefaultVolumeBarsConfig() })}
+                    className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+                  >
+                    Reset to default
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {level === "dailyLevels" && (
+            <div>
+              <BackRow label="Daily Levels" onClick={() => setLevel("root")} />
+              <button
+                onClick={() =>
+                  updateSubWindow(config.id, { dailyLevelsConfig: { ...config.dailyLevelsConfig, enabled: !config.dailyLevelsConfig.enabled } })
+                }
+                className={`mb-2 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.dailyLevelsConfig.enabled ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                Show Daily Levels
+                {config.dailyLevelsConfig.enabled && <span>&#10003;</span>}
+              </button>
+              {config.dailyLevelsConfig.enabled && (
+                <>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    Min strength — hides weaker levels; each is tagged with its own
+                    strength on the chart regardless
+                  </div>
+                  <div className="mb-2 flex items-center gap-1 px-2">
+                    <button
+                      onClick={() =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            minStrength: Math.max(DAILY_LEVELS_MIN_STRENGTH_FLOOR, config.dailyLevelsConfig.minStrength - 1),
+                          },
+                        })
+                      }
+                      disabled={config.dailyLevelsConfig.minStrength <= DAILY_LEVELS_MIN_STRENGTH_FLOOR}
+                      className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+                    >
+                      &minus;
+                    </button>
+                    <span className="w-6 text-center font-mono text-[10px] text-text-primary">
+                      {config.dailyLevelsConfig.minStrength}
+                    </span>
+                    <button
+                      onClick={() =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            minStrength: Math.min(DAILY_LEVELS_MIN_STRENGTH_CEILING, config.dailyLevelsConfig.minStrength + 1),
+                          },
+                        })
+                      }
+                      disabled={config.dailyLevelsConfig.minStrength >= DAILY_LEVELS_MIN_STRENGTH_CEILING}
+                      className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+                    >
+                      +
+                    </button>
+                  </div>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    Price range — hides levels outside this band; leave a
+                    field blank for no bound on that side (decision #62)
+                  </div>
+                  <div className="mb-2 flex items-center gap-1 px-2">
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="Min"
+                      value={config.dailyLevelsConfig.minPrice ?? ""}
+                      onChange={(e) =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            minPrice: e.target.value === "" ? null : Number(e.target.value),
+                          },
+                        })
+                      }
+                      className="w-16 rounded border border-base-border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary focus:border-signal focus:outline-none"
+                    />
+                    <span className="font-mono text-[10px] text-text-muted">&ndash;</span>
+                    <input
+                      type="number"
+                      inputMode="decimal"
+                      placeholder="Max"
+                      value={config.dailyLevelsConfig.maxPrice ?? ""}
+                      onChange={(e) =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            maxPrice: e.target.value === "" ? null : Number(e.target.value),
+                          },
+                        })
+                      }
+                      className="w-16 rounded border border-base-border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary focus:border-signal focus:outline-none"
+                    />
+                    <span className="font-mono text-[9px] text-text-muted">USD</span>
+                  </div>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    History — how far back to cluster from (decision #62,
+                    re-clustered server-side from already-fetched data, no
+                    extra fetch)
+                  </div>
+                  <div className="mb-2 flex flex-wrap gap-1 px-2">
+                    {DAILY_LEVELS_LOOKBACK_PRESETS.map((preset) => (
+                      <button
+                        key={preset.label}
+                        onClick={() =>
+                          updateSubWindow(config.id, {
+                            dailyLevelsConfig: { ...config.dailyLevelsConfig, lookbackDays: preset.days },
+                          })
+                        }
+                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] ${
+                          config.dailyLevelsConfig.lookbackDays === preset.days
+                            ? "border-signal bg-signal/20 text-signal"
+                            : "border-base-border text-text-primary hover:border-signal"
+                        }`}
+                      >
+                        {preset.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    Color — one color for every level; strength shows as a tag on
+                    each line instead
+                  </div>
+                  <ColorField
+                    value={config.dailyLevelsConfig.color}
+                    onChange={(hex) => updateSubWindow(config.id, { dailyLevelsConfig: { ...config.dailyLevelsConfig, color: hex } })}
+                  />
+                  <div className="mb-1 mt-2 flex items-center gap-1 px-2">
+                    <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Width</span>
+                    <button
+                      onClick={() =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            lineWidth: Math.max(DAILY_LEVELS_LINE_WIDTH_MIN, config.dailyLevelsConfig.lineWidth - 1),
+                          },
+                        })
+                      }
+                      disabled={config.dailyLevelsConfig.lineWidth <= DAILY_LEVELS_LINE_WIDTH_MIN}
+                      className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+                    >
+                      &minus;
+                    </button>
+                    <span className="w-4 text-center font-mono text-[10px] text-text-primary">{config.dailyLevelsConfig.lineWidth}</span>
+                    <button
+                      onClick={() =>
+                        updateSubWindow(config.id, {
+                          dailyLevelsConfig: {
+                            ...config.dailyLevelsConfig,
+                            lineWidth: Math.min(DAILY_LEVELS_LINE_WIDTH_MAX, config.dailyLevelsConfig.lineWidth + 1),
+                          },
+                        })
+                      }
+                      disabled={config.dailyLevelsConfig.lineWidth >= DAILY_LEVELS_LINE_WIDTH_MAX}
+                      className="flex h-5 w-5 items-center justify-center rounded border border-base-border font-mono text-[11px] text-text-primary hover:border-signal disabled:opacity-30 disabled:hover:border-base-border"
+                    >
+                      +
+                    </button>
+                  </div>
+                  <button
+                    onClick={() =>
+                      updateSubWindow(config.id, {
+                        dailyLevelsConfig: { ...config.dailyLevelsConfig, showPriceLabels: !config.dailyLevelsConfig.showPriceLabels },
+                      })
+                    }
+                    className={`mt-1 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-[11px] ${
+                      config.dailyLevelsConfig.showPriceLabels ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                    }`}
+                  >
+                    Show price on axis
+                    {config.dailyLevelsConfig.showPriceLabels && <span>&#10003;</span>}
+                  </button>
+                  <button
+                    onClick={() => updateSubWindow(config.id, { dailyLevelsConfig: createDefaultDailyLevelsConfig() })}
                     className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
                   >
                     Reset to default

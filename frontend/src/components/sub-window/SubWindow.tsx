@@ -4,6 +4,7 @@ import { SubWindowMenu } from "./SubWindowMenu";
 import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { useFeatureEngineSeries } from "../../hooks/useFeatureEngineSeries";
 import { useFeatureEngineLevels } from "../../hooks/useFeatureEngineLevels";
+import { useDailyLevels } from "../../hooks/useDailyLevels";
 import { generateMockOverlays } from "../../mocks/chartObjects";
 import { computePriceIndicator } from "../../utils/indicators";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -40,6 +41,13 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   // its own REST/WS plumbing the way featureSeries does.
   const featureLevels = useFeatureEngineLevels(symbol, config.timeframe);
 
+  // Backend-clustered Daily Levels (confirmed decisions #59-#61) —
+  // symbol-scoped, not per-timeframe (see useDailyLevels.ts's own
+  // docstring for why it takes no timeframe argument), so this doesn't
+  // need to be recomputed when config.timeframe changes the way
+  // featureLevels above does.
+  const dailyLevels = useDailyLevels(symbol, config.dailyLevelsConfig.lookbackDays);
+
   // Overlay indicators (SMA/EMA/VWAP instances) computed into flat series for
   // ChartWidget. Keyed by instance.id, which is unique within a sub-window.
   const indicators = useMemo(
@@ -68,6 +76,8 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           timer={config.timer}
           volumeAvg={config.volumeAvg}
           volumeBars={config.volumeBars}
+          dailyLevels={dailyLevels}
+          dailyLevelsConfig={config.dailyLevelsConfig}
         />
       </div>
     </div>

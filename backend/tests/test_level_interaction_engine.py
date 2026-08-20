@@ -69,8 +69,10 @@ def _clean_test_symbol(ticker: str) -> None:
         session.close()
 
 
-async def _publish(bus: EventBus, symbol: str, candle_ts: datetime, close: float, features: dict[str, float]) -> None:
-    payload = FeatureSet(timeframe="1m", candle_ts=candle_ts, close=close, features=features)
+async def _publish(
+    bus: EventBus, symbol: str, candle_ts: datetime, close: float, features: dict[str, float], daily_levels: list[dict] | None = None
+) -> None:
+    payload = FeatureSet(timeframe="1m", candle_ts=candle_ts, close=close, features=features, daily_levels=daily_levels or [])
     await bus.publish(make_envelope(EventType.FEATURES_UPDATED, payload, symbol=symbol))
 
 
@@ -442,6 +444,165 @@ async def test_duplicate_features_updated_dropped():
         await asyncio.sleep(0.2)
 
         assert len(received) == 1  # not 2 — the duplicate never reached the state machine
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+# --- Daily Levels (Stage 3, confirmed decision #64) --------------------------
+#
+# The design doc's own prescribed proof (§9's Stage 3 checkbox, written
+# before any of this existed): "a test that publishes daily_levels and
+# confirms touch/reject/conquer tracking works against a level_id the
+# engine was never told about by name." These tests deliberately use a
+# level_id in Stage 2's real format ("TICKER-DL-<n>") specifically so
+# nothing here could be mistaken for the engine special-casing a "DL"
+# pattern — it's tracked purely because _process_one now walks the
+# daily_levels list at all, identically to every other level_key.
+
+
+@pytest.mark.asyncio
+async def test_daily_level_gets_touch_then_rejected_tracking():
+    """The core Stage 3 proof — mirrors test_touch_then_rejected() above
+    exactly, but through daily_levels instead of features, confirming
+    the SAME state machine, SAME event shape, SAME everything applies —
+    only the source of the level_key differs."""
+    ticker = "__LIE_DLREJ__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    daily_level = {"level_id": f"{ticker}-DL-42", "price": 100.0, "strength": 3, "distinct_candle_count": 2}
+
+    try:
+        await _publish(bus, ticker, _DAY1, 99.0, {}, daily_levels=[daily_level])
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 100.0, {}, daily_levels=[daily_level])  # touch
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=2), 99.0, {}, daily_levels=[daily_level])   # rejected
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 2
+        holding, rejected = received[0].payload, received[1].payload
+        assert holding["level_key"] == f"{ticker}-DL-42"
+        assert holding["status"] == "holding" and holding["touch_count_today"] == 1
+        assert rejected["level_key"] == f"{ticker}-DL-42"
+        assert rejected["status"] == "rejected"
+        assert rejected["observed_via"] == "dwell"
+        assert rejected["distance_pct"] == -1.0
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_daily_level_conquered():
+    """Same shape as test_touch_then_conquered() above, through
+    daily_levels — confirms BOTH resolution directions work, not just
+    rejected."""
+    ticker = "__LIE_DLCNQ__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    daily_level = {"level_id": f"{ticker}-DL-7", "price": 100.0, "strength": 5, "distinct_candle_count": 3}
+
+    try:
+        await _publish(bus, ticker, _DAY1, 99.0, {}, daily_levels=[daily_level])
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 100.0, {}, daily_levels=[daily_level])   # touch, from below
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=2), 101.0, {}, daily_levels=[daily_level])   # exits ABOVE — conquered
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 2
+        assert received[1].payload["status"] == "conquered"
+        assert received[1].payload["level_key"] == f"{ticker}-DL-7"
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_daily_levels_and_scalar_features_tracked_independently_in_the_same_event():
+    """A single FeaturesUpdated carrying BOTH a scalar feature (sma_9)
+    AND a daily_levels entry — proves the two loops in _process_one
+    don't interfere with each other, and per-level isolation (module
+    docstring) holds across the two different iteration sources, not
+    just within one of them."""
+    ticker = "__LIE_DLMIX__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    daily_level = {"level_id": f"{ticker}-DL-3", "price": 200.0, "strength": 2, "distinct_candle_count": 2}
+
+    try:
+        # Both levels start "below" their respective values (close 99 <
+        # sma 100; close 99 is nowhere near daily-level 200, also "below").
+        await _publish(bus, ticker, _DAY1, 99.0, {"sma_9": 100.0}, daily_levels=[daily_level])
+        # Touch the SMA only — the daily level (at 200) stays "below", untouched.
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), 100.0, {"sma_9": 100.0}, daily_levels=[daily_level])
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 1
+        assert received[0].payload["level_key"] == "sma_9"  # the daily level produced NO event — correctly untouched
+        assert received[0].payload["status"] == "holding"
+
+        # Now touch the daily level too. Moving close all the way to 200
+        # legitimately drags sma_9 (aura around 100) into "conquered" as
+        # a real, separate side effect — not a test bug to work around,
+        # just why this asserts per-level-key rather than an exact total
+        # count from here on: both loops in _process_one fired, on their
+        # own genuinely different transitions, independently of each other.
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=2), 200.0, {"sma_9": 100.0}, daily_levels=[daily_level])
+        await asyncio.sleep(0.2)
+
+        by_key = {e.payload["level_key"]: e.payload for e in received}
+        assert by_key[f"{ticker}-DL-3"]["status"] == "holding"
+        assert by_key["sma_9"]["status"] == "conquered"
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_get_snapshot_includes_daily_levels_with_zero_special_casing():
+    """get_snapshot() (module docstring: {symbol: {timeframe: {level_key:
+    {...}}}}) needed NO code changes for Stage 3 — this test exists to
+    prove that claim directly rather than leave it asserted only in a
+    comment. A daily level's level_id shows up as just another key,
+    identical in shape to sma_9's entry."""
+    ticker = "__LIE_DLSNAP__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+
+    daily_level = {"level_id": f"{ticker}-DL-9", "price": 50.0, "strength": 4, "distinct_candle_count": 2}
+
+    try:
+        await _publish(bus, ticker, _DAY1, 50.0, {}, daily_levels=[daily_level])  # cold-start-unknown-origin, inside_aura
+        await asyncio.sleep(0.2)
+
+        snapshot = engine.get_snapshot(ticker)
+        entry = snapshot[ticker]["1m"][f"{ticker}-DL-9"]
+        assert entry["zone"] == "inside_aura"
+        assert entry["touch_count_today"] == 1
+        assert "holding" in entry
     finally:
         await engine.stop()
         await bus.stop()

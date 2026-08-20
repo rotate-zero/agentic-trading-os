@@ -121,14 +121,41 @@ export interface IntelligenceTimeframeWireShape {
   units: Record<string, FeatureUnitWireShape>;
 }
 
+// Daily Levels (confirmed decisions #59-#61) — a clustered support/
+// resistance zone. No level_interaction field yet (unlike
+// FeatureValueNodeWireShape above) — Stage 3, LevelInteractionEngine
+// reading daily_levels rather than just FeatureSet.features, isn't built.
+// level_id is NOT yet stable across days (Stage 1/backend engine.py's own
+// docstring flags this same limitation) — don't key any client-side
+// state off it expecting continuity yet.
+export interface DailyLevelWireShape {
+  level_id: string;
+  price: number;
+  strength: number;
+  distinct_candle_count: number;
+}
+
 export interface IntelligenceStateWireShape {
   symbol: string;
   timeframes: Record<string, IntelligenceTimeframeWireShape>;
+  // Symbol-scoped, not nested under any one timeframe — see
+  // GET /intelligence/state's own module docstring for why.
+  daily_levels: DailyLevelWireShape[];
 }
 
 /** GET /intelligence/state — confirmed decision #47. */
-export async function fetchIntelligenceState(symbol: string): Promise<IntelligenceStateWireShape> {
-  const url = `${API_BASE_URL}/intelligence/state?symbol=${encodeURIComponent(symbol)}`;
+export async function fetchIntelligenceState(
+  symbol: string,
+  dailyLevelsLookbackDays?: number | null
+): Promise<IntelligenceStateWireShape> {
+  let url = `${API_BASE_URL}/intelligence/state?symbol=${encodeURIComponent(symbol)}`;
+  // null/undefined both mean "server default" (confirmed decision #62) —
+  // only append the param when a caller actually chose a specific
+  // lookback, so every OTHER consumer of this function (FeatureEnginePanel,
+  // etc.) keeps getting exactly the response shape it always has.
+  if (dailyLevelsLookbackDays != null) {
+    url += `&daily_levels_lookback_days=${encodeURIComponent(dailyLevelsLookbackDays)}`;
+  }
   const res = await fetch(url);
   if (!res.ok) {
     throw new ApiError(await parseErrorDetail(res), res.status);

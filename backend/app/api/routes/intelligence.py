@@ -7,6 +7,14 @@ Symbol -> Timeframe -> Unit -> Period -> Variables hierarchy discussed and
 confirmed before any of this was built, so the frontend doesn't need to
 stitch two responses together itself.
 
+Also carries a top-level `daily_levels` array (confirmed decision #61,
+Stage 4) — symbol-scoped, not nested under any one timeframe, since the
+same list is attached to every timeframe's FeatureSet on a given close
+(see FeatureEngine.get_snapshot()'s own docstring). No `level_interaction`
+data attached to these yet — Stage 3 (LevelInteractionEngine reading
+daily_levels, not just `features`) isn't built; this is deliberately just
+the raw price/strength/level_id shape for now.
+
 Deliberately NOT pre-populated for the whole configured symbol universe —
 same posture as both engines' own get_snapshot() docstrings: a symbol/
 timeframe/unit that's never been computed simply isn't in the response, so
@@ -75,15 +83,40 @@ def _parse_level_key(level_key: str) -> tuple[str, str | None]:
 
 
 @router.get("/state")
-async def get_intelligence_state(symbol: str = Query(...)) -> dict[str, Any]:
+async def get_intelligence_state(
+    symbol: str = Query(...),
+    daily_levels_lookback_days: int | None = Query(
+        None,
+        description=(
+            "Confirmed decision #62. Omit for the server-configured default "
+            "(the pre-computed, cached snapshot — zero extra work). When "
+            "provided, re-clusters on the fly from already-cached raw candles "
+            "(no new provider fetch) — e.g. 30 for 'past 30 days only'. Larger "
+            "than what's actually cached is silently clamped, not an error."
+        ),
+    ),
+) -> dict[str, Any]:
     feature_snapshot = get_feature_engine().get_snapshot(symbol)
     level_snapshot = get_level_interaction_engine().get_snapshot(symbol)
 
     timeframes: dict[str, Any] = {}
+    daily_levels: list[dict[str, Any]] = []
 
     for timeframe, tf_data in feature_snapshot.get(symbol, {}).items():
         units: dict[str, Any] = {}
         level_data_for_tf = level_snapshot.get(symbol, {}).get(timeframe, {})
+
+        # Daily Levels (confirmed decision #59/#60/#62) is symbol-scoped,
+        # not per-timeframe — the same list is attached to every
+        # timeframe's FeatureSet on a given close (see
+        # FeatureEngine.get_snapshot()'s own docstring). Read once from
+        # whichever timeframe happens to be iterated first rather than
+        # duplicated per timeframe below; all of them carry an identical
+        # snapshot as of this same read, since _maybe_refresh_daily_levels
+        # runs once per (symbol, ET day) before any of a tick's
+        # timeframes are computed.
+        if not daily_levels and tf_data.get("daily_levels"):
+            daily_levels = tf_data["daily_levels"]
 
         for level_key, value in tf_data["features"].items():
             unit, period = _parse_level_key(level_key)
@@ -101,7 +134,38 @@ async def get_intelligence_state(symbol: str = Query(...)) -> dict[str, Any]:
 
         timeframes[timeframe] = {"close": tf_data["close"], "units": units}
 
-    return {"symbol": symbol, "timeframes": timeframes}
+    if daily_levels_lookback_days is not None:
+        # Re-cluster from cached raw candles at the caller's chosen
+        # lookback (decision #62) — overrides whatever the loop above
+        # picked up from the pre-computed default snapshot. Cheap: no new
+        # provider fetch, see get_daily_levels()'s own docstring.
+        daily_levels = [level.model_dump() for level in get_feature_engine().get_daily_levels(symbol, daily_levels_lookback_days)]
+
+    # Daily Levels x Level Interaction (Stage 3, confirmed decision #64) —
+    # closes the gap decision #61 explicitly left open ("No level_interaction
+    # data attached to these yet — Stage 3 isn't built"). Deliberately
+    # AFTER the lookback override above, not before: it must apply to
+    # whichever `daily_levels` list is actually being returned, not just
+    # the pre-computed default that a custom lookback request replaces.
+    # Unlike the `units` loop earlier, `daily_levels` itself stays a flat,
+    # symbol-scoped list (decision #61's own deliberate shape — not
+    # nested per timeframe), so interaction state — which genuinely DOES
+    # differ per timeframe, same as every other level type — is attached
+    # as a `{timeframe: {...}}` dict on each entry rather than picking
+    # just one timeframe to represent all of them. A level with no
+    # interaction history yet for any timeframe (nothing published
+    # through it so far, or an ad-hoc preview level from a custom
+    # lookback, which never gets a REAL, persisted level_id and so can
+    # never match anything here) simply gets an empty dict — same "empty
+    # means not-yet, not zero" convention as everywhere else in this route.
+    for level in daily_levels:
+        level["level_interaction"] = {
+            tf: tf_levels[level["level_id"]]
+            for tf, tf_levels in level_snapshot.get(symbol, {}).items()
+            if level["level_id"] in tf_levels
+        }
+
+    return {"symbol": symbol, "timeframes": timeframes, "daily_levels": daily_levels}
 
 
 @router.get("/series")

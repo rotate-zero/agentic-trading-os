@@ -357,6 +357,94 @@ export function createDefaultVolumeBarsConfig(): VolumeBarsConfig {
   };
 }
 
+// ---- Daily Levels (confirmed decisions #59-#61) ----
+//
+// Unlike HorizontalLevelInstance above, this is NOT a list the user builds
+// one instance at a time — Feature Engine publishes a variable-COUNT set
+// of clustered support/resistance zones per symbol (0 to 15+, reshaping
+// day to day), all the same "type," so there's nothing per-instance to
+// configure. One config object controls how ALL of them render, same
+// single-object-with-enabled-flag shape as VolumeAvgIndicatorConfig
+// above, not the multi-instance HorizontalLevelInstance[] shape.
+//
+// No local/"(local)" fallback exists for this one (unlike every
+// HorizontalLevelType, which has a real frontend/src/indicators/*.ts to
+// fall back to) — daily-levels-design.md §6 flagged this gap directly:
+// there was never an existing client-side implementation to port from.
+// When nothing's connected on the backend, this simply renders nothing,
+// same as the rest of this app's "empty means not-yet, not zero"
+// convention — never a silently-wrong local computation standing in.
+export interface DailyLevelsConfig {
+  enabled: boolean; // opt-in, same convention as Volume Avg and the Indicators list
+  minStrength: number; // hide clusters below this point-count — Saqib's own stated
+  // plan for "too many levels": filter/toggle in the UI, not an algorithmic cap
+  // server-side (daily-levels-design.md §6) — this IS that control.
+  // Price-range filter (confirmed decision #62) — null means "no bound
+  // on this side." A SECOND, more direct way to cut down on-screen
+  // clutter than minStrength alone: Saqib's own reported symptom was
+  // levels spanning the symbol's whole 180-day price history visually
+  // burying other indicators, so restricting to a band around the
+  // current price (e.g. 90-110) is a more precise tool than filtering
+  // by strength when the actual problem is HOW FAR AWAY a level is, not
+  // how weak it is.
+  minPrice: number | null;
+  maxPrice: number | null;
+  // How many of the most recent 1D candles to cluster from (confirmed
+  // decision #62) — re-clustered on demand server-side from ALREADY
+  // fetched/cached candles (engine.py's get_daily_levels()), so changing
+  // this is cheap: no new provider call, just a fast in-memory re-run of
+  // the same clustering function on a shorter slice. null means "use the
+  // server's configured default" (daily_levels_lookback_days, 180 unless
+  // changed) rather than duplicating that number here — one source of
+  // truth for what "default" means.
+  lookbackDays: number | null;
+  color: string; // hex
+  lineWidth: number; // px, integer DAILY_LEVELS_LINE_WIDTH_MIN..MAX floor, same
+  // createPriceLine physical-pixel-rounding note as HorizontalLevelInstance.lineWidth
+  showPriceLabels: boolean; // the price-axis tag, same as HorizontalLevelInstance.showPriceLabel
+}
+
+export const DAILY_LEVELS_MIN_STRENGTH_FLOOR = 2; // matches the backend's own
+// daily_levels_min_distinct_candles validity gate — a level can't have
+// fewer than 2 contributing points in the first place (indicators/daily_levels.py),
+// so a UI filter below this number would just be a no-op, not a real lower bound
+export const DAILY_LEVELS_MIN_STRENGTH_CEILING = 20;
+export const DAILY_LEVELS_LINE_WIDTH_MIN = 1;
+export const DAILY_LEVELS_LINE_WIDTH_MAX = 4;
+export const DEFAULT_DAILY_LEVELS_COLOR = "#D29922"; // amber — distinct from every
+// existing HORIZONTAL_LEVEL_DEFAULT_COLORS entry and from VWAP/SMA/EMA's own
+// default palette, so Daily Levels reads as its own thing on a busy chart
+
+// Confirmed decision #62 — a small fixed set of common choices rather
+// than a free-form day-count input; matches Saqib's own examples ("past
+// 30 days, 60 days"). The backend accepts ANY positive integer (it's
+// just a slice length), so this list is a UI convenience, not a
+// server-side constraint — SubWindowMenu.tsx could grow a custom-value
+// input later without any backend change.
+export const DAILY_LEVELS_LOOKBACK_PRESETS: { label: string; days: number | null }[] = [
+  { label: "30d", days: 30 },
+  { label: "60d", days: 60 },
+  { label: "90d", days: 90 },
+  { label: "Default", days: null },
+];
+
+export function createDefaultDailyLevelsConfig(): DailyLevelsConfig {
+  return {
+    enabled: false, // opt-in, same convention as Volume Avg and the Indicators list starting empty
+    minStrength: DAILY_LEVELS_MIN_STRENGTH_FLOOR,
+    minPrice: null,
+    maxPrice: null,
+    lookbackDays: null, // server default
+    color: DEFAULT_DAILY_LEVELS_COLOR,
+    lineWidth: 1,
+    showPriceLabels: false, // off by default — a dense cluster of levels with every
+    // axis label showing at once is exactly the "too many things on screen" case
+    // Saqib's own filter/toggle plan exists for; the short "DL-N" line title
+    // (ChartWidget.tsx) is the primary way strength reads visually, labels are
+    // an opt-in on top of that
+  };
+}
+
 export interface SubWindowConfig {
   id: string;
   connector: ConnectorId;
@@ -370,6 +458,7 @@ export interface SubWindowConfig {
   timer: TimerConfig;
   volumeAvg: VolumeAvgIndicatorConfig;
   volumeBars: VolumeBarsConfig;
+  dailyLevelsConfig: DailyLevelsConfig; // confirmed decision #61 — see that type's own comment
 }
 
 export const DEFAULT_SYMBOL = "NVDA";

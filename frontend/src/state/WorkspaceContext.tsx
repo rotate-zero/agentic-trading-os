@@ -9,6 +9,7 @@ import {
   createDefaultTimerConfig,
   createDefaultVolumeAvgConfig,
   createDefaultVolumeBarsConfig,
+  createDefaultDailyLevelsConfig,
   createPriceIndicatorInstance,
   type ConnectorId,
   type GridLayout,
@@ -81,14 +82,14 @@ const SAVED_LAYOUTS_KEY = "trading-workspace:saved-layouts";
 // cross-talk. Grid changes after this use the generic fallback below.
 function makeInitialSubWindows(): SubWindowConfig[] {
   return [
-    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
     // 9/20/50 SMA on the 5m window — the exact motivating example for the
     // instance-based SMA system, shown live instead of making the person
     // configure it themselves to see it work (same rationale as the rest of
     // this function's comment above).
-    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
-    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
-    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
   ];
 }
 
@@ -98,10 +99,10 @@ function makeInitialSubWindows(): SubWindowConfig[] {
 // without the person needing to configure anything to see the feature.
 function makeSecondaryMainWindowSubWindows(id: string): SubWindowConfig[] {
   return [
-    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
-    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
-    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
-    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig() },
+    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
   ];
 }
 
@@ -125,6 +126,7 @@ function makeDefaultSubWindows(rows: number, cols: number, prior: SubWindowConfi
         timer: createDefaultTimerConfig(),
         volumeAvg: createDefaultVolumeAvgConfig(),
         volumeBars: createDefaultVolumeBarsConfig(),
+        dailyLevelsConfig: createDefaultDailyLevelsConfig(),
       });
     }
   }
@@ -218,6 +220,11 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
     // preserve the previous hardcoded look (two-color, same green/red as
     // the candles) rather than an unconfigured/empty state.
     volumeBars: sw.volumeBars ?? createDefaultVolumeBarsConfig(),
+    // Back-fill for sessions persisted before Daily Levels existed
+    // (decision #61) — defaults to disabled, same "opt-in" convention
+    // createDefaultDailyLevelsConfig() itself already uses, so an old
+    // saved layout doesn't suddenly show a new indicator nobody asked for.
+    dailyLevelsConfig: sw.dailyLevelsConfig ?? createDefaultDailyLevelsConfig(),
   };
 }
 
