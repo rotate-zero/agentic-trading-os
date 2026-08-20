@@ -619,11 +619,21 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
 
       {open && (
         <div
-          className={`absolute right-0 top-full z-20 rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
+          className={`absolute right-0 top-full z-20 max-h-[80vh] overflow-y-auto rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
             level === "volumeAvg" || level === "overlay" || level === "levels" ? "w-72" : "w-56"
           }`}
         >
-          {level === "root" && (
+          {/* No max-height/overflow existed here before — the panel just
+              grew as tall as its content and got clipped by the viewport
+              with no way to scroll past it, unnoticed until Daily Levels
+              (decision #65) became the longest panel in this menu (enable
+              toggle, min-strength stepper, price-range inputs, lookback
+              presets, color, width, price-label toggle, reset — more
+              stacked sections than any earlier panel had). max-h-[80vh]
+              is viewport-relative rather than a fixed px/rem value
+              specifically because this dropdown can open anywhere
+              vertically on a busy multi-window layout, not just near the
+              top of the screen. */}          {level === "root" && (
             <div className="flex flex-col">
               <RootRow label="Timeframe" hint={config.timeframe} onClick={() => setLevel("timeframe")} />
               <RootRow

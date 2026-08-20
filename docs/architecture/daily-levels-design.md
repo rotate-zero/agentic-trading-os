@@ -160,7 +160,7 @@ This is the first time this engine's "zero code changes for a new level type" pr
 
 | # | Decision needed | Where it blocks | Status |
 |---|---|---|---|
-| D1 | `daily_levels_lookback_days` final default (180 vs. 90) | Stage 1 | Depends on the empirical Polygon depth/rate-limit check (§2) — not yet run. |
+| D1 | `daily_levels_lookback_days` final default (180 vs. 90) | Stage 1 | **Resolved (decision #65):** confirmed against a real `GET /market/candles?symbol=AAPL&timeframe=1d&count=180` call — the full 180-calendar-day window came back with no truncation or gap, earliest candle landing almost exactly on the expected 180-days-back date. 180 stays the default. Tested for one liquid, long-established symbol; a recent IPO with less than 180 days of trading history is an inherent data-availability limit, not a provider capacity problem, and is already handled by this feature's existing "use whatever's actually available" clamping. |
 | D2 | `daily_levels_identity_match_pct` final value | Stage 2 | Starting default = `daily_levels_cluster_pct` (0.2%); revisit once real day-over-day drift is observed against live data. |
 | D3 | Whether Stage 4 (frontend rendering) is in scope for this feature's first delivery, or a fully separate later piece of work | Stage 4 | **Resolved (decision #61):** yes, in scope, and built ahead of Stages 2/3 — see Stage 4's own checkbox below for why that ordering was fine. |
 
