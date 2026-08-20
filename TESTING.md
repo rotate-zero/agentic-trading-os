@@ -1,48 +1,84 @@
-# Testing this delivery — feedback fixes from your first browser session (decision #49)
+# TESTING — decision #66 (Camarilla panel-grouping fix + after-hours feed-status tool)
 
-Step 5, on top of Steps 1–4 already in your repo. Thanks for the real click-through — this is exactly the feedback that's most useful.
+## What's in this zip
 
-## 0. What's in this zip
+Unzip directly into your project root — paths already match `agentic-trading-os`'s
+own layout, nothing to move around:
 
-Modified:
-- `backend/app/trading_intelligence/level_interaction_engine.py` — `get_snapshot()` redesigned, `seconds_in_zone`/`distance_pct` always present now
-- `backend/tests/test_level_interaction_engine.py` — updated + one new test
-- `backend/tests/test_intelligence_routes.py` — updated for the new shape
-- `frontend/src/services/api-client.ts` — wire types updated to match
-- `frontend/src/components/intelligence/FeatureEnginePanel.tsx` — always shows duration/distance, widened resize handle
+```
+backend/app/api/routes/intelligence.py   — _parse_level_key Camarilla fix
+backend/app/api/routes/market.py         — new GET /market/feed-status route
+backend/app/services/candle_store.py     — new get_latest_recorded_candle()
+backend/tests/test_intelligence_routes.py  — 2 existing assertions updated for the new nesting
+backend/tests/test_intelligence_helpers.py — NEW FILE, 4 pure-function tests
+backend/tests/test_market_routes.py        — 2 new tests for /market/feed-status
+docs/decisions/confirmed-decisions.md      — decision #66 appended
+frontend/src/hooks/useIntelligenceState.ts — period-sort fix for non-numeric periods
+```
 
-Docs: `confirmed-decisions.md` (decision #49).
+Only these 8 files changed. No migration, no new config, no `pip`/`npm`
+package changes.
 
-Unzip and copy `backend/` and `frontend/` and `docs/` on top of your repo root.
-
-## 1. The three things, in order
-
-**Timeframe stuck at 1m** — expected, not a bug. Feature Engine only computes `1m` right now (decisions #45/#46). Extending it is real, already-flagged, deferred work.
-
-**Resize handle** — widened from 6px to 10px, bumped its priority, and made it faintly visible at rest instead of invisible until hover. I'm being direct about this: I compared it line-by-line against Info's own handle and the logic is identical, so I can't be certain this is actually the root cause without a real browser to test in. **Please tell me if this fixes it** — and if you get a moment, try dragging Info's own handle too. If that one's also stiff, it tells us this was never specific to the new panel.
-
-**Missing variables** — real gap, fixed properly. `zone`, `touches today`, `distance`, and `time in zone` now all show regardless of whether the level is currently being held or just sitting steadily above/below. Distance now shows the SMA-as-zero percentage you asked about in both cases — anchored to where the touch began while actively holding, live against the current SMA value otherwise (details in decision #49 if you want the reasoning).
-
-**Time format:** shipped both together — e.g. `4m 12s (4 candles)` — rather than picking one. Reasoning's in decision #49; happy to change if you'd rather have just one.
-
-## 2. Run it
+## Backend
 
 ```bash
-cd agentic-trading-os/backend
-source venv/bin/activate
+cd backend
+source .venv/bin/activate   # or however you activate your venv
 pytest -q
 ```
-**Expect: 114 passed.**
+
+Expect **181 passed** (up from 172). Nothing here needs a fresh migration —
+no schema changes in this delivery.
+
+If you want to eyeball the actual shape of both fixes against a real
+running process:
 
 ```bash
-cd ../frontend
-npx tsc -b 2>&1 | grep -v "GridPresetPicker"   # expect empty
-npx vite build                                  # expect success
-npm run dev
+uvicorn app.main:app --reload
+# in another terminal:
+curl "http://localhost:8000/intelligence/state?symbol=AAPL" | python3 -m json.tool
+# look for a top-level "camarilla" unit under timeframes.1m.units, with
+# "pp"/"r1"-"r4"/"s1"-"s4" nested inside it — not nine separate flat
+# "cam_pp"/"cam_r1"/... units like before.
+
+curl "http://localhost:8000/market/feed-status?symbol=AAPL"
+# {"symbol": "AAPL", "market_session": "...", "checked_at": "...",
+#  "latest_recorded_candle_ts": null or a timestamp,
+#  "staleness_seconds": null or a number}
 ```
 
-Then the same as before — backend running, frontend running, type a symbol into the Feature Engine panel.
+## Frontend
 
-## 3. What I still can't verify myself
+```bash
+cd frontend
+npx tsc -b     # expect only the pre-existing, already-flagged GridPresetPicker.tsx errors — nothing new
+npx vite build # expect a clean build
+```
 
-Same limitation as last time: no browser here. Everything above is confirmed via `pytest`, `tsc`, and `vite build`, plus a real backend boot confirming the new response shape — but not confirmed by actually looking at it or dragging anything. Your next look is what actually closes this out.
+No visual change to check — the Camarilla family will just render as one
+grouped "CAMARILLA" accordion in the Feature Engine panel instead of nine
+separate ones once you're looking at a symbol with previous-day levels
+computed, but I haven't click-through tested this in a real browser (no
+browser available in this environment — same standing gap every panel
+change carries).
+
+## The actual #44 verification — still needs you, not code
+
+`GET /market/feed-status` is a diagnostic tool, not the empirical check
+itself — nothing in my sandbox has a route to Finnhub. To actually answer
+"does the feed keep delivering through 20:00 ET," during a real trading
+day:
+
+1. Have the backend running with Finnhub connected and a symbol subscribed
+   (streaming) sometime after ~4:00 PM ET.
+2. Every few minutes through the after-hours window, run:
+   ```bash
+   curl "http://localhost:8000/market/feed-status?symbol=<your symbol>"
+   ```
+3. `staleness_seconds` should stay small (roughly 60-ish, one candle-width)
+   the whole way to 20:00 if the feed is genuinely live that long. If it
+   starts climbing well before 20:00 and never comes back down, that's the
+   feed stopping early — the actual finding #44 has been waiting on.
+
+Whatever you see, let me know and I'll log it as its own decision entry
+the same way D1 got logged once you ran that one.

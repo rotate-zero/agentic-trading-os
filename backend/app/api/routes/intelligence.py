@@ -69,12 +69,28 @@ _MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
 
 def _parse_level_key(level_key: str) -> tuple[str, str | None]:
     """
-    "sma_9" -> ("sma", "9"); "vwap" -> ("vwap", None). Split only on the
-    LAST underscore, and only when what follows it is purely numeric — a
-    future unit name that itself contains an underscore (unlikely, but
-    not this function's job to assume against) wouldn't be misread as
-    having a numeric period it doesn't have.
+    "sma_9" -> ("sma", "9"); "vwap" -> ("vwap", None); "cam_r1" ->
+    ("camarilla", "r1"). Split only on the LAST underscore, and only when
+    what follows it is purely numeric — a future unit name that itself
+    contains an underscore (unlikely, but not this function's job to
+    assume against) wouldn't be misread as having a numeric period it
+    doesn't have.
+
+    Camarilla (decision #56) is special-cased ahead of that rule, not
+    folded into it: its nine keys (`cam_pp`, `cam_r1`-`cam_r4`,
+    `cam_s1`-`cam_s4`, from indicators/camarilla.py) already share the
+    `cam_` prefix the generic rule was built for, but their suffixes
+    (`pp`, `r1`, ...) aren't numeric, so the digit check silently sent
+    each one down the flat "no period" path instead — nine standalone
+    accordion rows in the panel where every other multi-value family
+    (SMA, EMA) gets exactly one, grouped by period. Flagged as a known,
+    non-blocking display quirk in decision #56 and left for a follow-up
+    rather than fixed inline there, since nothing about Level Interaction
+    tracking depended on it (that engine walks FeatureSet.features by key
+    regardless of how this route chooses to group them for display).
     """
+    if level_key.startswith("cam_"):
+        return "camarilla", level_key[len("cam_"):]
     if "_" in level_key:
         unit, _, suffix = level_key.rpartition("_")
         if suffix.isdigit():

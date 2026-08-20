@@ -62,7 +62,20 @@ function normalize(wire: IntelligenceStateWireShape): { timeframes: FeatureTimef
           candleTs: node.candle_ts,
           levelInteraction: node.level_interaction,
         }))
-        .sort((a, b) => Number(a.period) - Number(b.period));
+        // Numeric sort for SMA/EMA-style periods ("9", "20", ...); for a
+        // non-numeric family (Camarilla's "pp"/"r1"-"r4"/"s1"-"s4" — the
+        // decision #66 grouping fix on the backend), Number(period) is
+        // NaN for both sides and `NaN - NaN` is itself NaN, which V8
+        // treats as "equal" but isn't guaranteed to be by spec across
+        // engines — falling back to 0 explicitly keeps the backend's own
+        // dict-insertion order (pp, r1-r4, s1-s4 — camarilla.py's own
+        // return order) rather than leaving it to an unspecified
+        // comparator result.
+        .sort((a, b) => {
+          const an = Number(a.period);
+          const bn = Number(b.period);
+          return Number.isFinite(an) && Number.isFinite(bn) ? an - bn : 0;
+        });
       return { key: unitKey, entries };
     });
     units.sort((a, b) => a.key.localeCompare(b.key));

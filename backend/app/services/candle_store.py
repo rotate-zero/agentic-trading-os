@@ -70,6 +70,48 @@ def get_recorded_candles(symbol: str, timeframe: str, start: datetime, end: date
         session.close()
 
 
+def get_latest_recorded_candle(symbol: str, timeframe: str) -> Candle | None:
+    """
+    The single most recently persisted candle for (symbol, timeframe), or
+    None if nothing's recorded yet. Built for GET /market/feed-status
+    (decision #44's still-open after-hours verification item): "how far
+    behind is the live feed right now" is a single-row question, not a
+    range query — a plain ORDER BY candle_ts DESC LIMIT 1, rather than
+    calling get_recorded_candles() with an artificially wide [start, end]
+    window just to pick out its own last element.
+
+    Same "let the caller decide how to treat a DB failure" posture as
+    get_recorded_candles()/get_recent_closes() above — no try/except here;
+    GET /market/feed-status wraps this call itself (see that route).
+    """
+    session = SessionLocal()
+    try:
+        row = (
+            session.execute(
+                select(CandleRow)
+                .join(Symbol, Symbol.id == CandleRow.symbol_id)
+                .where(Symbol.ticker == symbol, CandleRow.timeframe == timeframe)
+                .order_by(CandleRow.candle_ts.desc())
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if row is None:
+            return None
+        return Candle(
+            timeframe=row.timeframe,
+            open=float(row.open),
+            high=float(row.high),
+            low=float(row.low),
+            close=float(row.close),
+            volume=row.volume,
+            candle_ts=row.candle_ts,
+        )
+    finally:
+        session.close()
+
+
 def get_recent_closes(
     symbol: str, timeframe: str, before: datetime, limit: int, *, strict_before: bool = False
 ) -> list[float]:

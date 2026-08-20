@@ -33,6 +33,7 @@ import httpx
 import pytest
 from sqlalchemy import text
 
+from app.api.routes.intelligence import _parse_level_key
 from app.db.session import SessionLocal
 from app.event_bus.bus import get_event_bus
 from app.event_bus.events import make_envelope
@@ -170,6 +171,25 @@ _PREVIOUS_DAY_LEVEL_KEYS = frozenset(
 )
 
 
+def _find_unit_node(units: dict, raw_key: str) -> dict | None:
+    """
+    Locates whatever node GET /intelligence/state actually nests a given
+    RAW FeatureSet key under — mirroring _parse_level_key's own grouping
+    by importing and calling it directly, not reimplementing its rule
+    here where the two could quietly drift apart. "sma_9" nests under
+    units["sma"]["9"]; "cam_r1" nests under units["camarilla"]["r1"]
+    (decision #66's grouping fix); "pdh"/"vwap" are their own flat
+    units["pdh"]/units["vwap"], no nesting. Returns None if not present
+    yet — same "absent means not published yet" reading the route
+    itself uses, not a KeyError.
+    """
+    unit_key, period = _parse_level_key(raw_key)
+    node = units.get(unit_key)
+    if node is None or period is None:
+        return node
+    return node.get(period)
+
+
 async def _wait_until_level_interactions_present(
     client: httpx.AsyncClient, ticker: str, level_keys: frozenset[str], timeout: float = 8.0
 ) -> dict:
@@ -193,13 +213,20 @@ async def _wait_until_level_interactions_present(
     the gap: by the time the LAST one appears in-memory, its own persist
     call (synchronous, same thread, same iteration) has already happened
     too.
+
+    Looks each RAW key up via _find_unit_node rather than `k in units`
+    directly (decision #66): every caller of this helper passes raw
+    FeatureSet-shaped keys like "cam_pp", but the route groups Camarilla's
+    nine of those under one "camarilla" family now, not nine flat
+    top-level units — a literal `k in units` membership check would never
+    find them and this helper would just time out.
     """
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         resp = await client.get("/intelligence/state", params={"symbol": ticker})
         body = resp.json()
         units = body.get("timeframes", {}).get("1m", {}).get("units", {})
-        if all(k in units and "level_interaction" in units[k] for k in level_keys):
+        if all((node := _find_unit_node(units, k)) is not None and "level_interaction" in node for k in level_keys):
             return body
         await asyncio.sleep(0.05)
     raise AssertionError(f"not all of {sorted(level_keys)} got level_interaction for {ticker} within {timeout}s")
@@ -426,7 +453,13 @@ async def test_new_level_types_get_level_interaction_tracking_automatically():
             assert units["pdh"]["value"] == 105.0
             assert units["pdl"]["value"] == 95.0
             assert units["pdc"]["value"] == 102.0
-            assert units["cam_pp"]["value"] == pytest.approx((105.0 + 95.0 + 102.0) / 3)
+            # cam_pp groups under "camarilla" (decision #66's panel-grouping
+            # fix), not its own flat "cam_pp" unit — the level_interaction
+            # engine tracked it under the RAW key "cam_pp" regardless of how
+            # this route groups it for display (see _wait_until_level_interactions_present's
+            # own use of _PREVIOUS_DAY_LEVEL_KEYS just above), so only the
+            # response-shape lookup changes here, not what's being proven.
+            assert units["camarilla"]["pp"]["value"] == pytest.approx((105.0 + 95.0 + 102.0) / 3)
             # VPOC (decision #57) — same 4-candle "yesterday," bucketed;
             # not hand-verified to a specific bucket here (that's covered
             # directly in test_feature_engine.py's own VPOC tests) — this
@@ -438,7 +471,7 @@ async def test_new_level_types_get_level_interaction_tracking_automatically():
             # The actual proof: LevelInteractionEngine tracked a key it was
             # never told about by name, same shape SMA's own tracking has.
             assert units["pdh"]["level_interaction"]["zone"] in {"above", "below", "inside_aura"}
-            assert units["cam_pp"]["level_interaction"]["zone"] in {"above", "below", "inside_aura"}
+            assert units["camarilla"]["pp"]["level_interaction"]["zone"] in {"above", "below", "inside_aura"}
     finally:
         _clean_test_symbol(ticker)
 

@@ -272,6 +272,103 @@ def test_market_candles_serves_self_recorded_data_with_no_provider_connected():
 
 
 @pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+def test_feed_status_reports_null_staleness_for_a_never_seen_symbol():
+    """
+    Decision #44's still-open after-hours item, tooling half (decision
+    #66): a symbol nothing has ever been recorded for gets None/None, not
+    a 404 or a 500 — same "absent means not-yet" convention used
+    everywhere else in this codebase (e.g. FeatureEngine's warm-up
+    returning None, not 0.0), not something special-cased for this route.
+    """
+    broker_registry.clear_all()
+    with TestClient(app) as client:
+        r = client.get("/market/feed-status", params={"symbol": "__T_NEVERSEEN__"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "__T_NEVERSEEN__"
+    assert body["latest_recorded_candle_ts"] is None
+    assert body["staleness_seconds"] is None
+    assert "market_session" in body  # always present regardless of recorded data
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+def test_feed_status_reports_staleness_for_a_real_recorded_candle():
+    """
+    The actual point of this route: given a real 1m candle recorded
+    `known_age_seconds` ago, `staleness_seconds` reflects that age —
+    proven against a real Postgres row via CandleRecorder, the same
+    seed pattern test_market_candles_serves_self_recorded_data_with_no_provider_connected
+    above already established, not asserted against a mocked candle_store.
+    """
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+    from app.event_bus.bus import EventBus
+    from app.event_bus.events import make_envelope
+    from app.schemas.events.envelope import EventType
+    from app.schemas.events.market_data import CandleClosed
+    from app.services.candle_recorder import CandleRecorder
+
+    ticker = "ZZTESTFEED1"
+    session = SessionLocal()
+    try:
+        session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+        session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+        session.commit()
+    finally:
+        session.close()
+
+    broker_registry.clear_all()
+    known_age_seconds = 180
+
+    async def _seed():
+        bus = EventBus()
+        await bus.start()
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            candle_ts = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=known_age_seconds)
+            await bus.publish(
+                make_envelope(
+                    EventType.CANDLE_CLOSED,
+                    CandleClosed(timeframe="1m", open=10.0, high=11.0, low=9.0, close=10.5, volume=100, candle_ts=candle_ts),
+                    symbol=ticker,
+                )
+            )
+            await asyncio.sleep(0.3)
+        finally:
+            await recorder.stop()
+            await bus.stop()
+
+    asyncio.run(_seed())
+
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/feed-status", params={"symbol": ticker})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["symbol"] == ticker
+        assert body["latest_recorded_candle_ts"] is not None
+        # Real wall-clock elapsed between seeding and this assertion, plus
+        # the deliberate known_age_seconds offset — generous tolerance
+        # rather than an exact match, same reasoning any wall-clock-based
+        # assertion in this suite already needs.
+        assert known_age_seconds - 5 <= body["staleness_seconds"] <= known_age_seconds + 30
+    finally:
+        session = SessionLocal()
+        try:
+            session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
+            session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
+            session.commit()
+        finally:
+            session.close()
+        broker_registry.clear_all()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
 def test_market_candles_serves_aggregated_5m_from_self_recorded_1m_with_no_provider_connected():
     """
     The actual feature this delivery adds: /market/candles?timeframe=5m

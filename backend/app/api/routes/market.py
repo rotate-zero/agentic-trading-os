@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
+from app.core.market_clock import get_market_clock
 from app.services import broker_registry, candle_aggregator, candle_store
 
 logger = logging.getLogger(__name__)
@@ -158,3 +159,53 @@ async def subscribe(symbol: str = Query(...)) -> dict:
     except SymbolNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "subscribed", "symbol": symbol}
+
+
+@router.get("/feed-status")
+async def get_feed_status(symbol: str = Query(...)) -> dict:
+    """
+    Confirmed decision #44's still-open after-hours item: the 16:00-20:00
+    AFTER_HOURS boundary (market_clock.py) is the common industry
+    convention, never verified against what Finnhub/IBKR actually deliver
+    on this account — CandleRecorder simply won't have rows past wherever
+    the live feed actually stops, regardless of where that boundary is
+    drawn. That's a real-feed check, not something this sandbox can run
+    (no network route to Finnhub here) — this route is the TOOL for
+    running it, not the check itself: point it at a real symbol during an
+    actual live session and read `staleness_seconds` directly instead of
+    querying the `candles` table by hand.
+
+    `staleness_seconds` is `None` until at least one 1m candle has been
+    recorded for the symbol at all (same "absent means not-yet, not
+    zero" convention used throughout this codebase — see e.g.
+    FeatureEngine's warm-up returning None, not 0.0). A small, expected
+    value (roughly one candle-width) during AFTER_HOURS confirms the feed
+    is still genuinely live all the way through this window; a value that
+    stops growing past a certain wall-clock time — well before 20:00 —
+    is exactly the signal decision #44 flagged as unverified.
+    """
+    clock = get_market_clock()
+    now = datetime.now(timezone.utc)
+
+    # Same log-not-raise posture as GET /candles above — a DB hiccup here
+    # should report "unknown," not 500 a route that exists purely to help
+    # diagnose something else.
+    try:
+        latest = await asyncio.to_thread(candle_store.get_latest_recorded_candle, symbol, "1m")
+    except Exception:  # noqa: BLE001 — see comment above
+        logger.exception("candle_store.get_latest_recorded_candle failed for %s", symbol)
+        latest = None
+
+    staleness_seconds = None
+    latest_candle_ts = None
+    if latest is not None:
+        latest_candle_ts = latest.candle_ts.isoformat()
+        staleness_seconds = round((now - latest.candle_ts).total_seconds(), 1)
+
+    return {
+        "symbol": symbol,
+        "market_session": clock.current_session().value,
+        "checked_at": now.isoformat(),
+        "latest_recorded_candle_ts": latest_candle_ts,
+        "staleness_seconds": staleness_seconds,
+    }
