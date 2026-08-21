@@ -171,10 +171,13 @@ from app.feature_engine.indicators import (
     ClusteredLevel,
     DailyCandlePoint,
     aggregate_day,
+    atr,
     camarilla_pivots,
     cluster_daily_levels,
     ema,
     fold_range,
+    gap,
+    session_change,
     sma,
     typical_price,
     volume_point_of_control,
@@ -239,6 +242,11 @@ class FeatureEngine:
         # setting ahead of time specifically so this moment wouldn't need
         # a second config round-trip. Now actually read.
         self._daily_levels_identity_match_pct = get_settings().daily_levels_identity_match_pct
+        # ATR(1D, 14) (confirmed decisions #67/#68) — settings-only, no
+        # constructor override, same precedent as the Daily Levels
+        # settings just above (tests that need a different period
+        # monkeypatch get_settings(), not a constructor kwarg).
+        self._atr_period = get_settings().feature_engine_atr_period
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -287,6 +295,44 @@ class FeatureEngine:
         # built yet) — do not wire LevelInteractionEngine against these
         # ids expecting cross-day stability until Stage 2 lands.
         self._daily_levels_state: dict[str, dict[str, Any]] = {}
+
+        # Per-SYMBOL shared daily-candle cache (confirmed decision #68,
+        # D1) — the raw, complete-days-strictly-before-today `1d` candles
+        # `_maybe_refresh_daily_levels` already fetches for Daily Levels
+        # (decision #59/#60), extracted out of `_daily_levels_state` into
+        # its own dict so ATR (below) can read the SAME fetch rather than
+        # issuing a second provider call per symbol per day. Populated in
+        # the exact same place `_daily_levels_state[symbol]["candles"]`
+        # used to be written (see `_maybe_refresh_daily_levels`); read by
+        # `get_daily_levels()`'s custom-lookback preview (unchanged
+        # behavior, just a different dict) AND by `_update_atr` below. A
+        # real, accepted coupling, not an oversight — see this engine's
+        # design doc §1 for the reasoning and the one-line reversal to
+        # full independence if that ever needs revisiting.
+        self._daily_candle_cache: dict[str, list[Any]] = {}
+
+        # Per-SYMBOL ATR (confirmed decisions #67/#68,
+        # docs/architecture/feature-engine-indicator-expansion.md §1) —
+        # {"for_day": date, "features": dict[str, float]}. Recomputed
+        # once per (symbol, ET day) from `self._daily_candle_cache`
+        # above, then frozen — no live-capture branch needed the way Gap
+        # has one, since this is a pure derived value from an
+        # already-fetched cache, not something that waits for a specific
+        # live candle to arrive.
+        self._atr_state: dict[str, dict[str, Any]] = {}
+
+        # Per-SYMBOL Gap (confirmed decisions #67/#68,
+        # docs/architecture/feature-engine-indicator-expansion.md §3) —
+        # {"for_day": date, "regular_open": float | None}. `regular_open`
+        # is None until today's regular session has actually started
+        # (backfilled or live), then frozen for the rest of `for_day` —
+        # deliberately NOT reset/refolded on every candle the way
+        # premarket high/low is, since Gap is a single captured value,
+        # not a running range. Session % Change (session_change.py) needs
+        # no state of its own — it's a pure function of `close` (already
+        # in hand) and `pdc` (already computed below) — so only Gap gets
+        # a state dict here.
+        self._gap_state: dict[str, dict[str, Any]] = {}
 
     def start(self) -> None:
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_candle_closed)
@@ -427,14 +473,16 @@ class FeatureEngine:
         # through to the normal fetch path below); one that HAS gets its
         # already-persisted, already-reconciled levels back immediately.
         # Known, accepted limitation: this short-circuit doesn't restore
-        # the RAW candle cache (only the provider fetch path populates
-        # that), so get_daily_levels()'s custom-lookback preview won't
-        # have anything to slice until the next natural per-day refresh —
-        # a minor gap, not a correctness issue, and not worth persisting
-        # ~360 raw candles per symbol just to close it.
+        # the shared RAW candle cache (`self._daily_candle_cache` —
+        # confirmed decision #68; only the provider fetch path below
+        # populates that), so get_daily_levels()'s custom-lookback
+        # preview AND ATR (`_update_atr` below) won't have anything to
+        # read for this symbol until the next natural per-day refresh —
+        # a minor gap, not a correctness issue for either, and not worth
+        # persisting ~360 raw candles per symbol just to close it.
         persisted_today = await asyncio.to_thread(self._load_confirmed_daily_levels_for_today, symbol, today)
         if persisted_today is not None:
-            self._daily_levels_state[symbol] = {"for_day": today, "levels": persisted_today, "candles": []}
+            self._daily_levels_state[symbol] = {"for_day": today, "levels": persisted_today}
             return
 
         provider = broker_registry.get_historical_provider()
@@ -491,14 +539,18 @@ class FeatureEngine:
         # thread-offloaded at a higher level. This one has to do it
         # itself, since it's called directly from the async worker loop.)
         levels = await asyncio.to_thread(self._reconcile_and_persist_daily_levels, symbol, today, clustered)
-        # Cache the raw candles alongside the computed levels, not just
-        # the levels themselves — get_daily_levels() below re-clusters
-        # from a SLICE of these on demand (e.g. "last 30 days" instead of
-        # the configured default) without a second provider fetch. The
-        # expensive part (the network call above) still only happens once
-        # per (symbol, ET day); re-clustering a cached ~360-point list is
-        # cheap enough to do per-request.
-        self._daily_levels_state[symbol] = {"for_day": today, "levels": levels, "candles": prior_candles}
+        # Cache the raw candles in the SHARED cache (confirmed decision
+        # #68, D1) — not just the levels themselves, and not nested
+        # inside `_daily_levels_state` anymore. Two consumers now:
+        # get_daily_levels() below re-clusters from a SLICE of these on
+        # demand (e.g. "last 30 days" instead of the configured default)
+        # without a second provider fetch, and `_update_atr` reads the
+        # trailing `period + 1` entries for Wilder ATR — both without a
+        # second network call, since the expensive part (the fetch above)
+        # only happens once per (symbol, ET day) regardless of how many
+        # features end up reading its result.
+        self._daily_candle_cache[symbol] = prior_candles
+        self._daily_levels_state[symbol] = {"for_day": today, "levels": levels}
 
     def _cluster_raw(self, prior_candles: list[Any]) -> list[ClusteredLevel]:
         """Shared by every caller that needs raw clustered zones before
@@ -724,13 +776,14 @@ class FeatureEngine:
         if lookback_days is None:
             return state["levels"]
 
-        candles: list[Any] = state.get("candles", [])
+        candles: list[Any] = self._daily_candle_cache.get(symbol, [])
         if not candles:
             # Either a pre-Stage-4.1 cached entry (no provider was
             # connected when it was written) or a restart-survival
             # short-circuit (_maybe_refresh_daily_levels's own docstring —
-            # that path restores levels but not raw candles) — nothing to
-            # slice from either way; falls back to the tracked default.
+            # that path restores levels but not the shared raw-candle
+            # cache) — nothing to slice from either way; falls back to
+            # the tracked default.
             return state["levels"]
 
         sliced = candles[-lookback_days:] if lookback_days < len(candles) else candles
@@ -752,6 +805,7 @@ class FeatureEngine:
 
         symbol = item["symbol"]
         timeframe = item["timeframe"]
+        open_price = float(item["open"])
         high = float(item["high"])
         low = float(item["low"])
         close = float(item["close"])
@@ -782,6 +836,24 @@ class FeatureEngine:
         extra = {"vwap": round(vwap_value, 6)} if vwap_value is not None else {}
         extra.update(self._update_previous_day(symbol, candle_ts))
         extra.update(self._update_premarket(symbol, candle_ts, high, low))
+        # Session % Change + Gap (confirmed decisions #67/#68,
+        # docs/architecture/feature-engine-indicator-expansion.md §2/§3) —
+        # both reference `pdc` from _update_previous_day just above, read
+        # here off `extra` rather than re-deriving it, same "receive
+        # already-known values, don't re-fetch" shape camarilla_pivots
+        # uses for high/low/close. Session % Change needs no state of its
+        # own (pure function of close + pdc); Gap needs _update_gap for
+        # the one-time "today's regular open" capture/freeze.
+        pdc_value = extra.get("pdc")
+        extra.update(session_change(close, pdc_value))
+        extra.update(self._update_gap(symbol, candle_ts, open_price, pdc_value))
+        # ATR(1D, 14) + ATR% (confirmed decisions #67/#68,
+        # docs/architecture/feature-engine-indicator-expansion.md §1) —
+        # reads the SHARED daily-candle cache _maybe_refresh_daily_levels
+        # populated earlier in the async worker loop (decision #68, D1),
+        # same "pure, already-cached read here" shape the Daily Levels
+        # comment just below already uses for its own state.
+        extra.update(self._update_atr(symbol, candle_ts))
         # Daily Levels (confirmed decision #59) — a pure, already-cached
         # read here (see _maybe_refresh_daily_levels, called earlier in
         # the async worker loop, not this thread-offloaded method).
@@ -1087,6 +1159,118 @@ class FeatureEngine:
         if state["high"] is None:
             return {}  # pre-market hasn't started yet today, or nothing was recorded for it — an honest gap
         return {"pmh": round(state["high"], 6), "pml": round(state["low"], 6)}
+
+    def _update_gap(self, symbol: str, candle_ts: datetime, open_price: float, pdc: float | None) -> dict[str, float]:
+        """
+        Gap % / $ (confirmed decisions #67/#68,
+        docs/architecture/feature-engine-indicator-expansion.md §3) — the
+        traditional opening gap, captured ONCE at today's regular-session
+        open and frozen for the rest of the day, deliberately distinct
+        from Session % Change's continuous drift (session_change.py, no
+        state of its own). Same "established once, frozen" shape as
+        pre-market H/L's freeze in _update_premarket just above, but
+        triggered at the opposite session boundary: pmh/pml accumulate
+        through PRE_MARKET and freeze once regular session starts; Gap
+        captures a single value on the FIRST candle where today
+        transitions INTO regular session, and never updates again that
+        day regardless of how many more regular-session candles follow.
+
+        Reset once per (symbol, ET calendar day), same trigger shape as
+        every other daily-reset state in this engine. Restart-safe the
+        same way _update_premarket is: on reset, backfills from whatever
+        of today's regular-session rows are already persisted (a real
+        process restart mid-morning shouldn't lose today's gap just
+        because this process wasn't running at 9:30) by taking the
+        EARLIEST such row's open — `candle_store.get_recorded_candles`
+        already returns chronological order, same assumption
+        previous_day.py's aggregate_day makes — rather than only ever
+        capturing it live.
+
+        `is_regular_session()` rather than `current_session() ==
+        Session.OPEN` specifically: OPEN/LUNCH/POWER_HOUR are one
+        continuous domain for anything that cares about session
+        BOUNDARIES (MarketClock's own docstring) — this is exactly that
+        kind of concern ("has today's regular session begun"), not a
+        sub-label concern, even though in practice the first regular-
+        session candle of any day will always land within the OPEN
+        sub-window specifically.
+
+        The actual gap math (this function receives `pdc` already
+        computed by _update_previous_day above rather than re-deriving
+        it) lives in indicators/gap.py, same split every other file in
+        this package keeps.
+        """
+        clock = get_market_clock()
+        today = clock.trading_day(candle_ts)
+        state = self._gap_state.get(symbol)
+
+        if state is None or state["for_day"] != today:
+            lookback_start = candle_ts - timedelta(hours=24)
+            rows = candle_store.get_recorded_candles(symbol, "1m", lookback_start, candle_ts - _ONE_MINUTE)
+            regular_rows = [r for r in rows if clock.trading_day(r.candle_ts) == today and clock.is_regular_session(r.candle_ts)]
+            regular_open = regular_rows[0].open if regular_rows else None
+            state = {"for_day": today, "regular_open": regular_open}
+            self._gap_state[symbol] = state
+
+        if state["regular_open"] is None and clock.is_regular_session(candle_ts):
+            # This candle IS the first regular-session candle of today —
+            # not included in the backfill query above (stops one minute
+            # before it, same race-avoidance shape as VWAP/premarket's own
+            # backfill), so this is the only place this candle's own open
+            # gets applied. Guarded by `state["regular_open"] is None` so
+            # it only ever fires once per day — every later regular-
+            # session candle this same run processes leaves it frozen.
+            state["regular_open"] = open_price
+
+        return gap(state["regular_open"], pdc)
+
+    def _update_atr(self, symbol: str, candle_ts: datetime) -> dict[str, float]:
+        """
+        ATR(1D, `self._atr_period`) + ATR% (confirmed decisions #67/#68,
+        docs/architecture/feature-engine-indicator-expansion.md §1) —
+        Wilder's classic Average True Range over the last
+        `self._atr_period` COMPLETE daily bars, strictly before today,
+        recomputed once per `(symbol, ET day)` and frozen for the rest of
+        the day. Same "no accidental look-ahead" rule
+        `_update_previous_day` already established for PDH/PDL/PDC: only
+        a trading day strictly before today ever contributes, and today's
+        still-forming daily bar never does — inherited for free here
+        rather than re-implemented, since `_maybe_refresh_daily_levels`'s
+        own "Strictly-prior days only" filtering already guarantees the
+        candles this method reads satisfy it.
+
+        Reads from `self._daily_candle_cache`, NOT its own fetch — that
+        cache is populated once per (symbol, ET day) by
+        `_maybe_refresh_daily_levels`, the async, I/O-doing method that
+        already runs BEFORE `_compute_one` in the worker loop (see
+        `_worker_loop`: `await self._maybe_refresh_daily_levels(item)`
+        always precedes `await asyncio.to_thread(self._compute_one,
+        item)` for the same queued item, strictly serially) — the SAME
+        daily-candle fetch Daily Levels itself uses (decision #68, D1),
+        avoiding a second provider call per symbol per day. Purely
+        synchronous here, no I/O of its own, same "async fetches, sync
+        computes" split `_update_previous_day`/`_update_premarket`/
+        `_update_gap` all already keep.
+
+        A real, accepted coupling, not an oversight: if
+        `_maybe_refresh_daily_levels` hasn't populated the shared cache
+        yet today (no historical provider connected, a restart-survival
+        short-circuit that skips the raw-candle cache, a fetch error —
+        see that method's own docstring for each), ATR is honestly absent
+        too — `atr()` itself returns {} on too few candles, same "empty
+        means not-yet, not zero" convention this engine uses throughout —
+        in exactly the same situations Daily Levels itself would also be
+        affected, rather than a new, independent failure mode.
+        """
+        today = get_market_clock().trading_day(candle_ts)
+        state = self._atr_state.get(symbol)
+        if state is not None and state["for_day"] == today:
+            return state["features"]
+
+        prior_candles = self._daily_candle_cache.get(symbol, [])
+        features = atr(prior_candles, self._atr_period)
+        self._atr_state[symbol] = {"for_day": today, "features": features}
+        return features
 
 
 _feature_engine: FeatureEngine | None = None

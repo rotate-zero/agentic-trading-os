@@ -129,6 +129,15 @@ class Settings(BaseSettings):
     # drift.
     daily_levels_identity_match_pct: float = 0.002
 
+    # --- Feature Engine: ATR (confirmed decisions #67/#68; feature-engine-indicator-expansion.md) ---
+    # Wilder ATR period, over 1D bars — the timeframe itself is NOT
+    # configurable (deliberately, per the original design brief: "we
+    # intentionally do not want an intraday ATR as part of this initial
+    # feature set" — hardcoded "1d" in engine.py, not a second setting
+    # here). 14 is the spec's own starting point, same "one value to
+    # change, nothing else" shape as daily_levels_lookback_days above.
+    feature_engine_atr_period: int = 14
+
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
     # level_key FeatureEngine publishes. Per-level-type override is real

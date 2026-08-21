@@ -1,84 +1,75 @@
-# TESTING — decision #66 (Camarilla panel-grouping fix + after-hours feed-status tool)
+# TESTING — Feature Engine indicator expansion, Stages 1 + 2 (combined)
+
+Stage 1's own zip failed to download, so this is a single combined
+delivery covering both stages — everything needed is in this one archive,
+nothing depends on the earlier zip. Unzip directly onto the repo root
+(paths mirror the repo layout).
 
 ## What's in this zip
 
-Unzip directly into your project root — paths already match `agentic-trading-os`'s
-own layout, nothing to move around:
+**New files:**
+- `backend/app/feature_engine/indicators/session_change.py` — Stage 1,
+  pure math for Session % / $ Change.
+- `backend/app/feature_engine/indicators/gap.py` — Stage 1, pure math for
+  Gap % / $.
+- `backend/app/feature_engine/indicators/atr.py` — Stage 2, Wilder ATR
+  pure math.
 
-```
-backend/app/api/routes/intelligence.py   — _parse_level_key Camarilla fix
-backend/app/api/routes/market.py         — new GET /market/feed-status route
-backend/app/services/candle_store.py     — new get_latest_recorded_candle()
-backend/tests/test_intelligence_routes.py  — 2 existing assertions updated for the new nesting
-backend/tests/test_intelligence_helpers.py — NEW FILE, 4 pure-function tests
-backend/tests/test_market_routes.py        — 2 new tests for /market/feed-status
-docs/decisions/confirmed-decisions.md      — decision #66 appended
-frontend/src/hooks/useIntelligenceState.ts — period-sort fix for non-numeric periods
-```
+**Updated files (each already contains BOTH stages' changes, not just
+one):**
+- `backend/app/feature_engine/engine.py` — `open` now read from the
+  candle payload; `_update_gap` (Stage 1); the daily-candle cache
+  extracted out of `self._daily_levels_state[symbol]["candles"]` into its
+  own shared `self._daily_candle_cache[symbol]`, and `_update_atr` (Stage
+  2) reading from it — the same fetch Daily Levels itself uses, zero
+  second provider call.
+- `backend/app/feature_engine/indicators/__init__.py` — exports `gap`,
+  `session_change`, and `atr`.
+- `backend/app/core/config.py` — new `feature_engine_atr_period: int = 14`.
+- `backend/tests/test_feature_engine.py` — 15 new tests total (9 from
+  Stage 1, 6 from Stage 2).
+- `docs/architecture/feature-engine-indicator-expansion.md` — Stage 0
+  through Stage 2 all marked complete; D1/D2/D3 resolved AND implemented.
+- `docs/architecture/system-design.md` — §4.5 reflects Session % Change,
+  Gap, and ATR all now actually computed.
+- `docs/decisions/confirmed-decisions.md` — decisions **#67, #68, #69**.
 
-Only these 8 files changed. No migration, no new config, no `pip`/`npm`
-package changes.
-
-## Backend
+## How to verify
 
 ```bash
 cd backend
-source .venv/bin/activate   # or however you activate your venv
+pip install -r requirements.txt --break-system-packages   # no new dependency, harmless to re-run
+alembic upgrade head                                       # no new migration — no-op if already at 0003
 pytest -q
 ```
 
-Expect **181 passed** (up from 172). Nothing here needs a fresh migration —
-no schema changes in this delivery.
+Expect **196 passed** on a clean DB — verified directly for this exact
+combined file set (not inferred from the two separate stage deliveries):
+unzipped this exact zip onto a completely fresh checkout, reset Postgres
+to a freshly-migrated empty state, and ran the full suite before sending
+this. Same result both times.
 
-If you want to eyeball the actual shape of both fixes against a real
-running process:
+Two KNOWN, pre-existing, intermittent failure classes may show up
+depending on timing — neither caused by this work, both confirmed
+pre-existing by reproducing them against a completely unmodified
+checkout:
 
-```bash
-uvicorn app.main:app --reload
-# in another terminal:
-curl "http://localhost:8000/intelligence/state?symbol=AAPL" | python3 -m json.tool
-# look for a top-level "camarilla" unit under timeframes.1m.units, with
-# "pp"/"r1"-"r4"/"s1"-"s4" nested inside it — not nine separate flat
-# "cam_pp"/"cam_r1"/... units like before.
+1. Three tests in `test_feature_engine.py` that seed timestamps with
+   `datetime.now()` instead of the file's own `_et()` helper (decision #68).
+2. A `symbols` FK-violation in `test_intelligence_routes.py` — a
+   different specific test fails each run, same error shape, passes in
+   isolation every time (decision #69).
 
-curl "http://localhost:8000/market/feed-status?symbol=AAPL"
-# {"symbol": "AAPL", "market_session": "...", "checked_at": "...",
-#  "latest_recorded_candle_ts": null or a timestamp,
-#  "staleness_seconds": null or a number}
-```
-
-## Frontend
+Neither is in scope for this delivery to fix. To isolate just the new work:
 
 ```bash
-cd frontend
-npx tsc -b     # expect only the pre-existing, already-flagged GridPresetPicker.tsx errors — nothing new
-npx vite build # expect a clean build
+pytest -q -k "session_change or gap or atr" tests/test_feature_engine.py -v
 ```
 
-No visual change to check — the Camarilla family will just render as one
-grouped "CAMARILLA" accordion in the Feature Engine panel instead of nine
-separate ones once you're looking at a symbol with previous-day levels
-computed, but I haven't click-through tested this in a real browser (no
-browser available in this environment — same standing gap every panel
-change carries).
+Expect **15 passed**.
 
-## The actual #44 verification — still needs you, not code
+## Next stage
 
-`GET /market/feed-status` is a diagnostic tool, not the empirical check
-itself — nothing in my sandbox has a route to Finnhub. To actually answer
-"does the feed keep delivering through 20:00 ET," during a real trading
-day:
-
-1. Have the backend running with Finnhub connected and a symbol subscribed
-   (streaming) sometime after ~4:00 PM ET.
-2. Every few minutes through the after-hours window, run:
-   ```bash
-   curl "http://localhost:8000/market/feed-status?symbol=<your symbol>"
-   ```
-3. `staleness_seconds` should stay small (roughly 60-ish, one candle-width)
-   the whole way to 20:00 if the feed is genuinely live that long. If it
-   starts climbing well before 20:00 and never comes back down, that's the
-   feed stopping early — the actual finding #44 has been waiting on.
-
-Whatever you see, let me know and I'll log it as its own decision entry
-the same way D1 got logged once you ran that one.
+Stage 3 (Linear Regression) is next — introduces a new per-indicator
+`(timeframe, period)` config shape (`feature_engine_regression_configs`)
+and extends `_window_capacity`. Not started.

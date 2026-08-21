@@ -25,7 +25,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import aggregate_day, camarilla_pivots, ema, fold_range, sma, typical_price, volume_point_of_control, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -190,6 +190,77 @@ def test_volume_point_of_control_degenerate_range_returns_the_flat_price():
     base = _et(2026, 8, 11, 9, 30)
     rows = [_flat_row(base, close=50.0, volume=10), _flat_row(base + timedelta(minutes=1), close=50.0, volume=20)]
     assert volume_point_of_control(rows) == 50.0
+
+
+# --- session_change / gap (confirmed decisions #67/#68) ---------------------
+
+
+def test_session_change_computes_pct_and_dollar_change_from_pdc():
+    result = session_change(close=105.0, pdc=100.0)
+    assert result == {"session_pct_change": 5.0, "session_dollar_change": 5.0}
+
+
+def test_session_change_returns_empty_when_pdc_is_none():
+    """No prior trading day in the lookback window yet (fresh
+    symbol/deployment) — an honest gap, not an error, same convention
+    `pdc` itself already carries."""
+    assert session_change(close=105.0, pdc=None) == {}
+
+
+def test_gap_computes_pct_and_dollar_gap_from_regular_open_and_pdc():
+    result = gap(regular_open=102.0, pdc=100.0)
+    assert result == {"gap_pct": 2.0, "gap_dollars": 2.0}
+
+
+def test_gap_returns_empty_when_regular_open_is_none():
+    """Before today's regular session has started (pre-market)."""
+    assert gap(regular_open=None, pdc=100.0) == {}
+
+
+def test_gap_returns_empty_when_pdc_is_none():
+    """Fresh symbol/deployment, no prior trading day yet."""
+    assert gap(regular_open=102.0, pdc=None) == {}
+
+
+def test_session_change_defined_before_gap_when_only_pdc_is_known():
+    """The intentional asymmetry called out in
+    docs/architecture/feature-engine-indicator-expansion.md §3: a
+    pre-market FeatureSet has `pdc` (previous day already elapsed) but not
+    yet `regular_open` (today's regular session hasn't started). Session %
+    Change only needs `pdc`, so it's defined; Gap also needs
+    `regular_open`, so it isn't yet — not a bug, a real state difference."""
+    pdc = 100.0
+    assert session_change(close=98.0, pdc=pdc) != {}
+    assert gap(regular_open=None, pdc=pdc) == {}
+
+
+# --- atr (confirmed decisions #67/#68) ---------------------------------------
+
+
+def _daily_bar(open_: float, high: float, low: float, close: float) -> CandleClosed:
+    return CandleClosed(timeframe="1d", open=open_, high=high, low=low, close=close, volume=1000, candle_ts=_et(2026, 8, 10, 20, 0))
+
+
+def test_atr_computes_wilder_average_true_range_from_the_seed_window():
+    # period=2 needs 3 candles. TR(B) = max(110-100, |110-100|, |100-100|)
+    # = 10. TR(C) = max(112-104, |112-108|, |104-108|) = 8. ATR = (10+8)/2
+    # = 9. ATR% uses the LAST candle's close (110): 9/110*100.
+    candles = [
+        _daily_bar(100.0, 105.0, 95.0, 100.0),
+        _daily_bar(100.0, 110.0, 100.0, 108.0),
+        _daily_bar(108.0, 112.0, 104.0, 110.0),
+    ]
+    result = atr(candles, period=2)
+    assert result["atr_2"] == pytest.approx(9.0)
+    assert result["atr_2_pct"] == pytest.approx(9.0 / 110.0 * 100.0)
+
+
+def test_atr_returns_empty_when_fewer_than_period_plus_one_candles():
+    """period=14 needs 15 candles (14 True Ranges, each needing a prior
+    close) — an honest gap, not a fabricated partial-period average, same
+    convention as everywhere else in this engine."""
+    candles = [_daily_bar(100.0, 101.0, 99.0, 100.0) for _ in range(14)]  # one short
+    assert atr(candles, period=14) == {}
 
 
 # --- Tier 2: in-memory accumulation, no DB needed ---------------------------
@@ -733,3 +804,310 @@ async def test_vwap_backfills_from_persisted_history_on_cold_start():
     finally:
         await bus.stop()
         _clean_test_symbol(ticker)
+
+
+# --- Tier 6: Session % Change / Gap / ATR (confirmed decisions #67/#68) -----
+
+
+@pytest.mark.asyncio
+async def test_session_change_and_gap_absent_when_no_previous_day_known():
+    """Fresh symbol, no persisted history at all — `pdc` is None, so both
+    families stay absent end-to-end rather than publishing a fabricated 0.
+    sma_periods=[1] so something publishes regardless of these two."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        await _publish_candle(bus, "__TEST_FE_SESSGAP_NOPDC__", _et(2026, 8, 11, 9, 30), 100.0)
+        await _publish_candle(bus, "__TEST_FE_SESSGAP_NOPDC__", _et(2026, 8, 11, 9, 31), 101.0)
+        await asyncio.sleep(0.1)
+
+        assert len(received) == 2
+        for envelope in received:
+            features = envelope.payload["features"]
+            assert "session_pct_change" not in features
+            assert "session_dollar_change" not in features
+            assert "gap_pct" not in features
+            assert "gap_dollars" not in features
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_gap_captures_regular_open_once_and_freezes_through_the_session():
+    """Session % Change and Gap both key off the SAME `pdc`, but only
+    Session % Change keeps tracking `close` afterward — the core
+    architectural claim the whole distinction rests on
+    (feature-engine-indicator-expansion.md §2/§3), proven end-to-end here
+    rather than only at the pure-function level above."""
+    ticker = "__FEGAPFRZ__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+
+    try:
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            day1 = _et(2026, 8, 11, 9, 30)  # prior trading day — establishes pdc = 100.0
+            await _publish_candle(bus, ticker, day1, 100.0)
+            await asyncio.sleep(0.2)
+        finally:
+            await recorder.stop()
+
+        engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+        engine.start()
+        received: list = []
+        bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+        try:
+            day2 = _et(2026, 8, 12, 9, 30)  # today's regular session
+            await _publish_candle(bus, ticker, day2, 110.0)  # first regular candle: establishes gap
+            await _publish_candle(bus, ticker, day2 + timedelta(minutes=1), 120.0)  # close keeps moving
+            await asyncio.sleep(0.2)
+
+            assert len(received) == 2
+            first, second = (e.payload["features"] for e in received)
+
+            # Gap = 110 vs pdc 100 = +10% / +$10 — captured on the FIRST
+            # regular candle and must stay IDENTICAL on the second, even
+            # though close moved from 110 to 120.
+            assert first["gap_pct"] == pytest.approx(10.0)
+            assert first["gap_dollars"] == pytest.approx(10.0)
+            assert second["gap_pct"] == pytest.approx(10.0)
+            assert second["gap_dollars"] == pytest.approx(10.0)
+
+            # Session % Change, by contrast, tracks `close` continuously.
+            assert first["session_pct_change"] == pytest.approx(10.0)
+            assert second["session_pct_change"] == pytest.approx(20.0)
+        finally:
+            await engine.stop()
+    finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_gap_backfills_regular_open_on_cold_start():
+    """Same 'simulate a real restart mid-morning' shape as VWAP's own
+    cold-start test above: day2's FIRST regular-session candle is
+    persisted BEFORE a brand-new FeatureEngine ever starts — that
+    engine's first LIVE observation is day2's SECOND candle, at a
+    different close entirely. Gap must still reflect the backfilled first
+    candle's open, not mistake the second candle it directly saw for the
+    regular open."""
+    ticker = "__FEGAPCOLD__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    day1 = _et(2026, 8, 11, 9, 30)
+    day2 = _et(2026, 8, 12, 9, 30)
+
+    try:
+        recorder = CandleRecorder(bus)
+        recorder.start()
+        try:
+            await _publish_candle(bus, ticker, day1, 100.0)  # prior day — pdc
+            await _publish_candle(bus, ticker, day2, 108.0)  # today's ACTUAL regular open
+            await asyncio.sleep(0.2)
+        finally:
+            await recorder.stop()
+
+        engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+        engine.start()
+        received: list = []
+        bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+        try:
+            await _publish_candle(bus, ticker, day2 + timedelta(minutes=1), 150.0)  # this engine's first LIVE candle
+            await asyncio.sleep(0.2)
+
+            assert len(received) == 1
+            features = received[0].payload["features"]
+            # regular_open backfilled as 108.0 (day2's persisted FIRST
+            # candle), not 150.0 (the only candle this engine instance
+            # directly observed live).
+            assert features["gap_pct"] == pytest.approx(8.0)     # (108-100)/100 * 100
+            assert features["gap_dollars"] == pytest.approx(8.0)
+            # Session % Change is unaffected by the backfill — it still
+            # tracks the LIVE close.
+            assert features["session_pct_change"] == pytest.approx(50.0)  # (150-100)/100 * 100
+        finally:
+            await engine.stop()
+    finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+def test_update_atr_freezes_for_the_day_then_recomputes_the_next_day():
+    """_update_atr's own once-per-(symbol, ET day) gate, tested directly
+    against the shared cache rather than through the async worker loop —
+    same "poke internal state directly" convention
+    test_daily_levels.py's own restart/reconciliation tests already use.
+    No bus start, no event loop needed: `_update_atr` is plain sync and
+    touches nothing but `self._daily_candle_cache`/`self._atr_state`."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    ticker = "__TEST_FE_ATR_FREEZE__"
+
+    day1_candles = [_daily_bar(100.0 + i, 101.0 + i, 99.0 + i, 100.0 + i) for i in range(15)]
+    engine._daily_candle_cache[ticker] = day1_candles
+
+    day1_ts = _et(2026, 8, 11, 9, 31)
+    first = engine._update_atr(ticker, day1_ts)
+    assert "atr_14" in first and "atr_14_pct" in first
+
+    # Simulate the shared cache changing LATER the same day (e.g. a
+    # Daily Levels re-fetch on some future refresh path) — ATR must NOT
+    # pick this up until tomorrow's own reset.
+    engine._daily_candle_cache[ticker] = [_daily_bar(1.0, 1.0, 1.0, 1.0) for _ in range(15)]
+    same_day_later = engine._update_atr(ticker, day1_ts + timedelta(minutes=1))
+    assert same_day_later == first
+
+    day2_ts = _et(2026, 8, 12, 9, 31)
+    next_day = engine._update_atr(ticker, day2_ts)
+    assert next_day != first  # recomputed fresh from the mutated cache
+    assert next_day["atr_14"] == pytest.approx(0.0)  # every mutated bar is flat — TR is 0 everywhere
+
+
+def test_update_atr_absent_when_shared_cache_not_yet_populated():
+    """Fresh symbol, `_maybe_refresh_daily_levels` hasn't run for it yet
+    (or ran into one of its own honest-gap cases) — `_daily_candle_cache`
+    has nothing for this symbol, so ATR stays honestly absent rather than
+    fabricating a value, same convention `atr()` itself already carries."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    assert engine._update_atr("__TEST_FE_ATR_NOCACHE__", _et(2026, 8, 11, 9, 31)) == {}
+
+
+# --- Tier 3: ATR reuses Daily Levels' shared fetch (confirmed decision #68, D1) --
+
+
+class _FakeHistoricalProvider:
+    """Duck-typed MarketDataProvider stand-in, same shape as
+    test_daily_levels.py's own — get_historical() only, counting calls so
+    these tests can assert the shared-cache claim directly (ATR must NOT
+    cause a second fetch), not just that both features' numbers come out
+    right independently."""
+
+    def __init__(self, candles_by_symbol: dict[str, list[CandleClosed]]) -> None:
+        self._candles_by_symbol = candles_by_symbol
+        self.call_count = 0
+
+    async def get_historical(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[CandleClosed]:
+        self.call_count += 1
+        return self._candles_by_symbol.get(symbol, [])
+
+
+def _daily_candle_ago(days_ago: int, close: float, as_of: datetime) -> CandleClosed:
+    ts = as_of - timedelta(days=days_ago)
+    return CandleClosed(timeframe="1d", open=close, high=close + 1.0, low=close - 1.0, close=close, volume=1000, candle_ts=ts)
+
+
+def _clean_atr_symbol(ticker: str) -> None:
+    """FK-safe cleanup order — daily_levels_state references symbols.id
+    with no ON DELETE CASCADE (same reason test_daily_levels.py's own
+    _delete_daily_levels_rows_for exists), so it has to go first."""
+    session = SessionLocal()
+    try:
+        symbol_id = session.execute(text("SELECT id FROM symbols WHERE ticker = :t"), {"t": ticker}).scalar()
+        if symbol_id is not None:
+            session.execute(text("DELETE FROM daily_levels_state WHERE symbol_id = :sid"), {"sid": symbol_id})
+        session.execute(text(f"DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = '{ticker}')"))
+        session.execute(text(f"DELETE FROM symbols WHERE ticker = '{ticker}'"))
+        session.commit()
+    finally:
+        session.close()
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_atr_reuses_daily_levels_shared_fetch_without_a_second_provider_call():
+    """The actual point of decision #68's D1: ATR must read Daily Levels'
+    own fetch, not trigger a second one. `fake.call_count == 1` after
+    ATR AND Daily Levels both appear in the same FeatureSet is the direct
+    proof, not an inference from timing."""
+    from app.services import broker_registry
+
+    ticker = "__TESTFEATR1__"
+    _clean_atr_symbol(ticker)
+    broker_registry.clear_all()
+
+    now = _et(2026, 8, 11, 15, 0)
+    # 20 flat-price days: comfortably more than ATR's default period+1
+    # (15), and — since every close is identical — well over Daily
+    # Levels' own min_distinct_candles (2), so one fetch genuinely feeds
+    # both readiness thresholds at once rather than only ATR's.
+    fake = _FakeHistoricalProvider({ticker: [_daily_candle_ago(d, 100.0, now) for d in range(1, 21)]})
+    broker_registry.set_historical_provider(fake)
+
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[], ema_periods=[])
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        await _publish_candle(bus, ticker, now, 130.0)
+        await asyncio.sleep(0.2)
+
+        assert fake.call_count == 1  # the shared-cache claim, proven directly
+        assert len(received) == 1
+        features = received[0].payload["features"]
+        assert "atr_14" in features
+        assert "atr_14_pct" in features
+        assert len(received[0].payload["daily_levels"]) >= 1  # same fetch also fed Daily Levels
+    finally:
+        await engine.stop()
+        await bus.stop()
+        broker_registry.clear_all()
+        _clean_atr_symbol(ticker)
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_atr_absent_when_too_few_prior_daily_candles_even_though_daily_levels_populates():
+    """Each feature reads the SAME shared cache but has its OWN
+    readiness threshold — Daily Levels only needs 2 distinct candles
+    (default `daily_levels_min_distinct_candles`) to cluster something,
+    while ATR(14) needs 15. 5 candles is enough for the former, nowhere
+    near enough for the latter — proves the shared cache doesn't force
+    one readiness gate onto both consumers."""
+    from app.services import broker_registry
+
+    ticker = "__TESTFEATR2__"
+    _clean_atr_symbol(ticker)
+    broker_registry.clear_all()
+
+    now = _et(2026, 8, 11, 15, 0)
+    fake = _FakeHistoricalProvider({ticker: [_daily_candle_ago(d, 100.0, now) for d in range(1, 6)]})  # only 5
+    broker_registry.set_historical_provider(fake)
+
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[], ema_periods=[])
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        await _publish_candle(bus, ticker, now, 130.0)
+        await asyncio.sleep(0.2)
+
+        assert len(received) == 1
+        features = received[0].payload["features"]
+        assert "atr_14" not in features
+        assert "atr_14_pct" not in features
+        assert len(received[0].payload["daily_levels"]) >= 1  # Daily Levels' own lower bar is met
+    finally:
+        await engine.stop()
+        await bus.stop()
+        broker_registry.clear_all()
+        _clean_atr_symbol(ticker)
