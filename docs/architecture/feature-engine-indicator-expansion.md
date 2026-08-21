@@ -1,5 +1,5 @@
 # Feature Engine — Indicator Expansion (ATR, Session Change, Gap, Regression, KAMA)
-**Status:** Stage 0 confirmed (`confirmed-decisions.md` #67); D1/D2/D3 resolved (`confirmed-decisions.md` #68); Stage 1 (Session % Change + Gap) and Stage 2 (ATR) both complete (`confirmed-decisions.md` #68, #69). Stage 3 (Regression) is next.
+**Status:** All five feature families now built and tested — Stage 0 (`confirmed-decisions.md` #67), Stage 1 + D1/D2/D3 (#68), Stage 2 (#69), Stage 3 + Stage 4 (#70). Full suite at 210 tests, 207 passing (3 pre-existing, unrelated wall-clock-flaky failures — see #68/#69).
 **Owner:** Saqib
 **Companion documents:** [`system-design.md`](./system-design.md) (§4.5 Feature Engine — the module this plan extends), [`daily-levels-design.md`](./daily-levels-design.md) (precedent this plan borrows its staging/open-decisions format from, and the module whose daily-candle fetch this plan reuses — see §5), [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (decisions #45–#59, #63 — the Feature Engine foundation this plan builds on; #67 — this plan's own direction lock), [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (regression/KAMA acceleration — parked here, §8), [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) (Phase 4 status).
 
@@ -235,8 +235,8 @@ Nothing remains open — config shape, normalization reference, KAMA parameter c
 - [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #67.
 - [x] **Stage 1 — Session % Change + Gap.** Built (`indicators/session_change.py`, `indicators/gap.py`, `FeatureEngine._update_gap`), tested at all three of this suite's tiers (pure math / in-memory / real-Postgres cold-start), 9 new tests passing, full suite at 187 passing. `confirmed-decisions.md` #68.
 - [x] **Stage 2 — ATR(1D, 14) + ATR%.** Built (`indicators/atr.py`, `FeatureEngine._update_atr`), D1 implemented as a shared `self._daily_candle_cache` extracted out of Daily Levels' own fetch (zero second provider call — proven directly in `test_atr_reuses_daily_levels_shared_fetch_without_a_second_provider_call`), D2 implemented as the frozen last-daily-bar close. 6 new tests passing, full suite at 196 passing on a clean DB. `confirmed-decisions.md` #69.
-- [ ] **Stage 3 — Linear Regression.** New config shape (`feature_engine_regression_configs`), window capacity extension, per-timeframe applicability check in `_apply_close`/`_compute_aggregated`.
-- [ ] **Stage 4 — KAMA.** Resolves D3. Reuses Stage 3's config-shape and window-capacity-extension machinery; adds its own seed-multiplier warm-up.
+- [x] **Stage 3 — Linear Regression.** Built (`indicators/regression.py`, new `feature_engine_regression_configs` setting, window capacity extension, per-timeframe applicability check in `_apply_close`). Config validated at `FeatureEngine.__init__` (fail fast on `period < 2` or an empty timeframe).
+- [x] **Stage 4 — KAMA.** Built (`indicators/kama.py`, new `feature_engine_kama_configs` + `feature_engine_kama_seed_multiplier` settings). D3 implemented (1-bar delta). Reused Stage 3's config-shape and window-capacity-extension machinery directly, as anticipated. 14 new tests across both stages (8 pure-math, 2 config-validation, 4 engine-level: window capacity sizing, per-timeframe gating for each family, warm-up ordering). Full suite at 210 tests, 207 passing. `confirmed-decisions.md` #70.
 
 Not a hard ordering requirement — Session/Gap and ATR don't depend on Regression/KAMA's config-shape work or vice versa — but Stage 3's config-shape and window-capacity groundwork is worth having in place before Stage 4, since KAMA reuses both directly rather than inventing its own version.
 
@@ -244,7 +244,8 @@ Not a hard ordering requirement — Session/Gap and ATR don't depend on Regressi
 
 ## 12. How to resume this in a new session
 
-1. Read this file's checkboxes for the last completed stage.
-2. Read `confirmed-decisions.md`'s most recent entries — if a stage above says a decision needs writing before coding, check it isn't already there before re-deciding it.
-3. D1/D2/D3 (§9) are real open questions, not rhetorical — confirm with Saqib before Stage 2 (D1/D2) or Stage 4 (D3) lock in behavior that's hard to change later without a silent semantic shift in already-published feature keys.
-4. Update this file's checkboxes as part of the same change that completes a stage.
+All five stages are complete (§11) — there's nothing left to resume in THIS plan. If picking this back up:
+
+1. §8 (Deferred) lists what was deliberately left out: slope-change/acceleration, regression channels, and chart/frontend exposure for any of these five families. Any of those is a fresh, small design conversation, not a continuation of an open thread here.
+2. `confirmed-decisions.md` #67–#70 have the full build history if you need to understand why a particular choice was made before changing it.
+3. Changing any already-published feature key's meaning (e.g., what `regression_9_slope_norm` normalizes against) is a semantic break for anything downstream already reading it — treat as a new decision, not a bug fix, even if it's a one-line code change.

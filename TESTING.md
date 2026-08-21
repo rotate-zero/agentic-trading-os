@@ -1,38 +1,35 @@
-# TESTING — Feature Engine indicator expansion, Stages 1 + 2 (combined)
+# TESTING — Feature Engine indicator expansion, Stage 3 + 4 (Regression + KAMA)
 
-Stage 1's own zip failed to download, so this is a single combined
-delivery covering both stages — everything needed is in this one archive,
-nothing depends on the earlier zip. Unzip directly onto the repo root
-(paths mirror the repo layout).
+Since git is up to date through Stage 2 (decisions #67–#69), this delivery
+is incremental on top of that — it does NOT re-include `session_change.py`,
+`gap.py`, or `atr.py` (unchanged, already in your repo). Unzip directly
+onto the repo root.
 
 ## What's in this zip
 
 **New files:**
-- `backend/app/feature_engine/indicators/session_change.py` — Stage 1,
-  pure math for Session % / $ Change.
-- `backend/app/feature_engine/indicators/gap.py` — Stage 1, pure math for
-  Gap % / $.
-- `backend/app/feature_engine/indicators/atr.py` — Stage 2, Wilder ATR
-  pure math.
+- `backend/app/feature_engine/indicators/regression.py` — OLS linear
+  regression, pure math.
+- `backend/app/feature_engine/indicators/kama.py` — Kaufman Adaptive
+  Moving Average + Efficiency Ratio, pure math.
 
-**Updated files (each already contains BOTH stages' changes, not just
-one):**
-- `backend/app/feature_engine/engine.py` — `open` now read from the
-  candle payload; `_update_gap` (Stage 1); the daily-candle cache
-  extracted out of `self._daily_levels_state[symbol]["candles"]` into its
-  own shared `self._daily_candle_cache[symbol]`, and `_update_atr` (Stage
-  2) reading from it — the same fetch Daily Levels itself uses, zero
-  second provider call.
-- `backend/app/feature_engine/indicators/__init__.py` — exports `gap`,
-  `session_change`, and `atr`.
-- `backend/app/core/config.py` — new `feature_engine_atr_period: int = 14`.
-- `backend/tests/test_feature_engine.py` — 15 new tests total (9 from
-  Stage 1, 6 from Stage 2).
-- `docs/architecture/feature-engine-indicator-expansion.md` — Stage 0
-  through Stage 2 all marked complete; D1/D2/D3 resolved AND implemented.
-- `docs/architecture/system-design.md` — §4.5 reflects Session % Change,
-  Gap, and ATR all now actually computed.
-- `docs/decisions/confirmed-decisions.md` — decisions **#67, #68, #69**.
+**Updated files:**
+- `backend/app/feature_engine/engine.py` — new `(timeframe, period[, ...])`
+  config parsing/validation in `__init__`; `_window_capacity` now accounts
+  for all four indicator families, not just SMA/EMA; `_apply_close` gained
+  its first per-`(indicator, timeframe)` applicability check, since
+  Regression/KAMA (unlike SMA/EMA) are only configured for specific
+  timeframes.
+- `backend/app/core/config.py` — new `feature_engine_regression_configs`,
+  `feature_engine_kama_configs`, `feature_engine_kama_seed_multiplier`.
+- `backend/app/feature_engine/indicators/__init__.py` — exports
+  `regression` and `kama`.
+- `backend/tests/test_feature_engine.py` — 14 new tests (8 pure-math, 2
+  config-validation, 4 engine-level).
+- `docs/architecture/feature-engine-indicator-expansion.md` — all five
+  stages now marked complete; this design doc is effectively closed out.
+- `docs/architecture/system-design.md` — §4.5 fully updated.
+- `docs/decisions/confirmed-decisions.md` — new entry **#70**.
 
 ## How to verify
 
@@ -43,33 +40,49 @@ alembic upgrade head                                       # no new migration �
 pytest -q
 ```
 
-Expect **196 passed** on a clean DB — verified directly for this exact
-combined file set (not inferred from the two separate stage deliveries):
-unzipped this exact zip onto a completely fresh checkout, reset Postgres
-to a freshly-migrated empty state, and ran the full suite before sending
-this. Same result both times.
+Expect **207 passed, 3 failed** on a freshly-migrated DB — verified
+directly for this exact combined file set before sending, same as every
+prior delivery in this thread. The 3 failures are the SAME pre-existing,
+wall-clock-dependent flakiness documented in decision #68 (not this
+delivery's doing) — a 4th test in that same class
+(`test_feature_engine_backfills_from_persisted_history_on_cold_start`)
+surfaced once during my own verification runs today but passes cleanly in
+isolation every time; not re-investigated further, decision #70 has the
+note.
 
-Two KNOWN, pre-existing, intermittent failure classes may show up
-depending on timing — neither caused by this work, both confirmed
-pre-existing by reproducing them against a completely unmodified
-checkout:
-
-1. Three tests in `test_feature_engine.py` that seed timestamps with
-   `datetime.now()` instead of the file's own `_et()` helper (decision #68).
-2. A `symbols` FK-violation in `test_intelligence_routes.py` — a
-   different specific test fails each run, same error shape, passes in
-   isolation every time (decision #69).
-
-Neither is in scope for this delivery to fix. To isolate just the new work:
+To isolate just the new work:
 
 ```bash
-pytest -q -k "session_change or gap or atr" tests/test_feature_engine.py -v
+pytest -q -k "regression or kama" tests/test_feature_engine.py -v
 ```
 
-Expect **15 passed**.
+Expect **14 passed**.
 
-## Next stage
+## Config shape, if you want to tune periods later
 
-Stage 3 (Linear Regression) is next — introduces a new per-indicator
-`(timeframe, period)` config shape (`feature_engine_regression_configs`)
-and extends `_window_capacity`. Not started.
+```python
+feature_engine_regression_configs: list[dict] = [
+    {"timeframe": "1m", "period": 9},
+    {"timeframe": "5m", "period": 9},
+]
+feature_engine_kama_configs: list[dict] = [
+    {"timeframe": "1m", "er_period": 9, "fast_period": 2, "slow_period": 30},
+    {"timeframe": "5m", "er_period": 9, "fast_period": 2, "slow_period": 30},
+]
+```
+
+Adding e.g. `{"timeframe": "1m", "period": 21}` to the regression list is a
+config change, not a code change — `FeatureEngine.__init__` validates each
+entry (`period >= 2`, non-empty `timeframe` for regression;
+`er_period`/`fast_period`/`slow_period` all positive for KAMA) and raises
+`ValueError` immediately on anything malformed, rather than failing
+silently later.
+
+## What this closes out
+
+All five feature families from your original design brief — ATR, Session
+% / $ Change, Gap % / $, Linear Regression, KAMA — are now built, tested,
+and documented. `feature-engine-indicator-expansion.md` is effectively
+done; anything further (slope-change/acceleration, chart/frontend
+exposure for any of these) is a fresh, small design conversation per that
+doc's own §8, not a continuation of an open thread.

@@ -39,13 +39,16 @@ read on every candle:
     startup" shape already decided for Market State Engine
     (trading-intelligence-architecture.md §4), applied here.
 
-    One window, two indicator families (decision #52): the deque holds raw
-    closes only, never a derived value — SMA and EMA both read from the
-    SAME window, each just slicing the trailing portion it actually needs
-    (sma() needs `period`; ema() needs `period * seed_multiplier`, always
-    >= SMA's own requirement at the periods this project actually
-    configures). The window's maxlen is sized to the LARGER of the two
-    families' needs (`self._window_capacity`), not SMA's alone.
+    One window, four indicator families (decisions #52, #67/#68): the deque
+    holds raw closes only, never a derived value — SMA, EMA, Regression, and
+    KAMA all read from the SAME window, each just slicing the trailing
+    portion it actually needs (sma() needs `period`; ema() needs `period *
+    seed_multiplier`; regression() needs `period`; kama() needs `er_period +
+    slow_period * seed_multiplier`). The window's maxlen is sized to the
+    LARGEST of all four families' needs (`self._window_capacity`), not any
+    one alone. Regression and KAMA are also the first two families where
+    "applies to every timeframe that fires" isn't true — see
+    `_apply_close`'s own per-config timeframe check.
 
 Same subscribe-fast / process-slow split as CandleRecorder: the Event Bus
 subscriber callback only enqueues (near-instant, no I/O); a background task
@@ -177,6 +180,8 @@ from app.feature_engine.indicators import (
     ema,
     fold_range,
     gap,
+    kama,
+    regression,
     session_change,
     sma,
     typical_price,
@@ -211,6 +216,9 @@ class FeatureEngine:
         ema_periods: list[int] | None = None,
         ema_seed_multiplier: int | None = None,
         aggregated_lookback_days: int | None = None,
+        regression_configs: list[dict] | None = None,
+        kama_configs: list[dict] | None = None,
+        kama_seed_multiplier: int | None = None,
     ) -> None:
         self._bus = bus
         self._sma_periods = sma_periods if sma_periods is not None else get_settings().feature_engine_sma_periods
@@ -220,15 +228,59 @@ class FeatureEngine:
             if ema_seed_multiplier is not None
             else get_settings().feature_engine_ema_seed_multiplier
         )
+        # Regression / KAMA (confirmed decisions #67/#68,
+        # docs/architecture/feature-engine-indicator-expansion.md §4) —
+        # UNLIKE Daily Levels/ATR's settings-only precedent, these DO take
+        # constructor overrides (same reasoning as sma_periods/ema_periods
+        # above): tests need small custom periods, not the real 9/30-bar
+        # defaults, to stay fast and hand-verifiable. `_regression_configs`
+        # is a list of {"timeframe": str, "period": int}; `_kama_configs`
+        # is a list of {"timeframe": str, "er_period": int, "fast_period":
+        # int, "slow_period": int} — validated here (fail fast on a
+        # malformed setting) rather than by config.py itself, matching
+        # that file's own "keep config.py minimal, validate at the point
+        # of use" precedent (see its own comment on these two settings).
+        self._regression_configs = (
+            regression_configs if regression_configs is not None else get_settings().feature_engine_regression_configs
+        )
+        for cfg in self._regression_configs:
+            if not cfg.get("timeframe") or int(cfg.get("period", 0)) < 2:
+                raise ValueError(f"invalid feature_engine_regression_configs entry: {cfg!r}")
+        self._kama_configs = kama_configs if kama_configs is not None else get_settings().feature_engine_kama_configs
+        for cfg in self._kama_configs:
+            if (
+                not cfg.get("timeframe")
+                or int(cfg.get("er_period", 0)) < 1
+                or int(cfg.get("fast_period", 0)) < 1
+                or int(cfg.get("slow_period", 0)) < 1
+            ):
+                raise ValueError(f"invalid feature_engine_kama_configs entry: {cfg!r}")
+        self._kama_seed_multiplier = (
+            kama_seed_multiplier if kama_seed_multiplier is not None else get_settings().feature_engine_kama_seed_multiplier
+        )
         # How many raw closes the rolling window needs to hold — the
-        # LARGER of SMA's own max period and EMA's max period times its
-        # seed multiplier (confirmed decision #52). One shared window per
-        # (symbol, timeframe) backs both indicator families; each reads
-        # only the trailing slice it actually needs (sma()/ema() both
-        # already do this internally).
+        # LARGEST of all four indicator families' needs (confirmed
+        # decisions #52, #67/#68): SMA's own max period; EMA's max period
+        # times its seed multiplier; Regression's max configured period;
+        # KAMA's max `er_period + slow_period * seed_multiplier` (its own
+        # docstring has the full "why the +er_period" reasoning). One
+        # shared window per (symbol, timeframe) backs ALL FOUR families —
+        # each reads only the trailing slice it actually needs
+        # (sma()/ema()/regression()/kama() all do this internally). A
+        # real, accepted cost: 15m/1h windows now also carry this much
+        # history even though Regression/KAMA are never evaluated for
+        # those timeframes (see _apply_close's own per-timeframe
+        # applicability check below) — the design doc's own §7 already
+        # anticipated and accepted this tradeoff rather than it being an
+        # oversight.
         sma_max = max(self._sma_periods) if self._sma_periods else 0
         ema_max = max(self._ema_periods) * self._ema_seed_multiplier if self._ema_periods else 0
-        self._window_capacity = max(sma_max, ema_max)
+        regression_max = max((cfg["period"] for cfg in self._regression_configs), default=0)
+        kama_max = max(
+            (cfg["er_period"] + cfg["slow_period"] * self._kama_seed_multiplier for cfg in self._kama_configs),
+            default=0,
+        )
+        self._window_capacity = max(sma_max, ema_max, regression_max, kama_max)
         self._lookback_days = (
             aggregated_lookback_days
             if aggregated_lookback_days is not None
@@ -930,6 +982,23 @@ class FeatureEngine:
             value = ema(closes, period, self._ema_seed_multiplier)
             if value is not None:
                 features[f"ema_{period}"] = round(value, 6)
+        # Regression / KAMA (confirmed decisions #67/#68) — the FIRST
+        # indicator families in this engine where "applies to every
+        # timeframe that fires" (SMA/EMA's own assumption above) isn't
+        # true: both are configured for specific timeframes only (1m+5m
+        # by default, not 15m/1h), so each config is checked against
+        # THIS call's own `timeframe` before computing anything, rather
+        # than computed unconditionally the way SMA/EMA loops are.
+        for cfg in self._regression_configs:
+            if cfg["timeframe"] != timeframe:
+                continue
+            features.update(regression(closes, cfg["period"]))
+        for cfg in self._kama_configs:
+            if cfg["timeframe"] != timeframe:
+                continue
+            features.update(
+                kama(closes, cfg["er_period"], cfg["fast_period"], cfg["slow_period"], self._kama_seed_multiplier)
+            )
         features.update(extra_features)
 
         if not features:

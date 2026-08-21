@@ -25,7 +25,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, kama, regression, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -232,6 +232,71 @@ def test_session_change_defined_before_gap_when_only_pdc_is_known():
     pdc = 100.0
     assert session_change(close=98.0, pdc=pdc) != {}
     assert gap(regular_open=None, pdc=pdc) == {}
+
+
+# --- regression (confirmed decisions #67/#68) --------------------------------
+
+
+def test_regression_computes_slope_intercept_and_perfect_fit_for_linear_data():
+    closes = [100.0, 101.0, 102.0, 103.0, 104.0]  # exactly +1/bar
+    result = regression(closes, period=5)
+    assert result["regression_5_slope"] == pytest.approx(1.0)
+    assert result["regression_5_value"] == pytest.approx(104.0)  # fitted value at the last bar == the actual close
+    assert result["regression_5_deviation"] == pytest.approx(0.0)
+    assert result["regression_5_r2"] == pytest.approx(1.0)
+    assert "regression_5_slope_norm" in result  # nonzero stdev here, so normalization is defined
+
+
+def test_regression_flat_window_has_zero_slope_and_r2_one_but_no_normalized_slope():
+    """The degenerate case documented in regression.py's own docstring:
+    r2=1.0 (a constant window is trivially, perfectly explained by its
+    own mean) is still published, but slope_norm is specifically omitted
+    (its own denominator — stdev — is 0)."""
+    result = regression([50.0] * 5, period=5)
+    assert result["regression_5_slope"] == 0.0
+    assert result["regression_5_r2"] == pytest.approx(1.0)
+    assert "regression_5_slope_norm" not in result
+
+
+def test_regression_returns_empty_when_insufficient_closes():
+    assert regression([1.0, 2.0], period=5) == {}
+
+
+def test_regression_returns_empty_when_period_below_two():
+    """A single point has no defined slope — an honest gap, not a crash."""
+    assert regression([1.0, 2.0, 3.0], period=1) == {}
+
+
+# --- kama (confirmed decisions #67/#68) ---------------------------------------
+
+
+def test_kama_converges_to_a_flat_price_with_zero_slope_and_no_er():
+    closes = [77.0] * 200  # well past er_period(9) + slow_period(30)*seed_multiplier(5) = 159
+    result = kama(closes, er_period=9, fast_period=2, slow_period=30, seed_multiplier=5)
+    assert result["kama_9"] == pytest.approx(77.0)
+    assert result["kama_9_slope"] == 0.0
+    assert result["kama_9_dist"] == 0.0
+    assert "kama_9_er" not in result  # genuinely 0/0 on a perfectly flat window
+    assert "kama_9_slope_norm" not in result
+
+
+def test_kama_returns_empty_when_insufficient_closes():
+    needed = 9 + 30 * 5  # 159
+    assert kama([1.0] * (needed - 1), er_period=9, fast_period=2, slow_period=30, seed_multiplier=5) == {}
+    assert kama([1.0] * needed, er_period=9, fast_period=2, slow_period=30, seed_multiplier=5) != {}
+
+
+def test_kama_near_perfect_efficiency_on_a_straight_trend():
+    closes = [100.0 + i for i in range(200)]  # +1/bar, dead straight
+    result = kama(closes, er_period=9, fast_period=2, slow_period=30, seed_multiplier=5)
+    assert result["kama_9_er"] > 0.9
+    assert result["kama_9_slope"] > 0.9  # tracks the ~1/bar trend closely once converged
+
+
+def test_kama_low_efficiency_on_a_choppy_series():
+    closes = [100.0 + (1 if i % 2 == 0 else -1) for i in range(200)]  # alternating, no net direction
+    result = kama(closes, er_period=9, fast_period=2, slow_period=30, seed_multiplier=5)
+    assert result["kama_9_er"] < 0.3
 
 
 # --- atr (confirmed decisions #67/#68) ---------------------------------------
@@ -1111,3 +1176,142 @@ async def test_atr_absent_when_too_few_prior_daily_candles_even_though_daily_lev
         await bus.stop()
         broker_registry.clear_all()
         _clean_atr_symbol(ticker)
+
+
+# --- Tier 7: Regression / KAMA config shape + per-timeframe gating (confirmed decisions #67/#68) --
+
+
+def test_feature_engine_rejects_invalid_regression_config():
+    with pytest.raises(ValueError):
+        FeatureEngine(EventBus(), regression_configs=[{"timeframe": "1m", "period": 1}])  # period < 2
+    with pytest.raises(ValueError):
+        FeatureEngine(EventBus(), regression_configs=[{"timeframe": "", "period": 9}])  # empty timeframe
+
+
+def test_feature_engine_rejects_invalid_kama_config():
+    with pytest.raises(ValueError):
+        FeatureEngine(EventBus(), kama_configs=[{"timeframe": "1m", "er_period": 0, "fast_period": 2, "slow_period": 30}])
+    with pytest.raises(ValueError):
+        FeatureEngine(EventBus(), kama_configs=[{"timeframe": "1m", "er_period": 9, "fast_period": 2, "slow_period": 0}])
+
+
+def test_window_capacity_accounts_for_regression_and_kama():
+    """confirmed decision #67/#68: the shared window must grow to cover
+    whichever of the four indicator families needs the most history, not
+    just SMA/EMA. period=50 here deliberately exceeds every other
+    family's own default need."""
+    engine = FeatureEngine(
+        EventBus(),
+        sma_periods=[3],
+        ema_periods=[],
+        regression_configs=[{"timeframe": "1m", "period": 50}],
+        kama_configs=[],
+    )
+    assert engine._window_capacity == 50
+
+    engine2 = FeatureEngine(
+        EventBus(),
+        sma_periods=[3],
+        ema_periods=[],
+        regression_configs=[],
+        kama_configs=[{"timeframe": "1m", "er_period": 5, "fast_period": 2, "slow_period": 10}],
+        kama_seed_multiplier=3,
+    )
+    assert engine2._window_capacity == 5 + 10 * 3  # er_period + slow_period * seed_multiplier
+
+
+@pytest.mark.asyncio
+async def test_regression_only_computed_for_its_configured_timeframe():
+    """Regression/KAMA are the first indicator families where 'applies to
+    every timeframe that fires' isn't true (SMA/EMA's own assumption) —
+    configured here for 1m only, so the SAME close's 5m FeatureSet must
+    NOT carry regression_* keys even though its own window (backed by
+    the same shared deque machinery) would otherwise be warmed up too."""
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(
+        bus, sma_periods=[1], ema_periods=[], regression_configs=[{"timeframe": "1m", "period": 3}], kama_configs=[]
+    )
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        for i in range(5):  # :30 through :34 — :34 completes the [9:30,9:35) 5m bucket
+            await _publish_candle(bus, "__TEST_FE_REG_TF__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        by_timeframe = {e.payload["timeframe"]: e.payload["features"] for e in received}
+        assert "regression_3_slope" in by_timeframe["1m"]
+        assert "regression_3_slope" not in by_timeframe["5m"]
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_kama_only_computed_for_its_configured_timeframe():
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(
+        bus,
+        sma_periods=[1],
+        ema_periods=[],
+        regression_configs=[],
+        kama_configs=[{"timeframe": "1m", "er_period": 2, "fast_period": 1, "slow_period": 2}],
+        kama_seed_multiplier=1,  # needed = 2 + 2*1 = 4
+    )
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        for i in range(5):  # :34 completes the [9:30,9:35) 5m bucket; 5 closes > needed(4)
+            await _publish_candle(bus, "__TEST_FE_KAMA_TF__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        by_timeframe = {e.payload["timeframe"]: e.payload["features"] for e in received}
+        assert "kama_2" in by_timeframe["1m"]
+        assert "kama_2" not in by_timeframe["5m"]
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_regression_and_kama_absent_before_their_window_warms_up():
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(
+        bus,
+        sma_periods=[1],
+        ema_periods=[],
+        regression_configs=[{"timeframe": "1m", "period": 3}],
+        kama_configs=[{"timeframe": "1m", "er_period": 2, "fast_period": 1, "slow_period": 2}],
+        kama_seed_multiplier=1,  # kama needed = 4, the larger of the two — governs window_capacity
+    )
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        base = _et(2026, 8, 11, 9, 30)
+        for i in range(3):  # only 3 closes — short of kama's needed(4), short of regression's period(3)... wait period=3 IS met at i=2
+            await _publish_candle(bus, "__TEST_FE_WARMUP__", base + timedelta(minutes=i), 100.0 + i)
+        await asyncio.sleep(0.1)
+
+        # After 3 closes: regression(period=3) is warmed (needs exactly 3), kama(needed=4) is not.
+        last = received[-1].payload["features"]
+        assert "regression_3_slope" in last
+        assert "kama_2" not in last
+
+        await _publish_candle(bus, "__TEST_FE_WARMUP__", base + timedelta(minutes=3), 103.0)
+        await asyncio.sleep(0.1)
+
+        last = received[-1].payload["features"]
+        assert "kama_2" in last  # now warmed at 4 closes
+    finally:
+        await engine.stop()
+        await bus.stop()

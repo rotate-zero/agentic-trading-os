@@ -138,6 +138,35 @@ class Settings(BaseSettings):
     # change, nothing else" shape as daily_levels_lookback_days above.
     feature_engine_atr_period: int = 14
 
+    # --- Feature Engine: Linear Regression + KAMA (confirmed decisions #67/#68; feature-engine-indicator-expansion.md §4) ---
+    # `list[dict]`, not a flat `list[int]` like SMA/EMA above — regression
+    # and KAMA need independent (timeframe, period[, ...]) pairs where the
+    # TIMEFRAME list itself is indicator-specific (both start scoped to
+    # 1m+5m only, unlike SMA/EMA's uniform fan-out across every timeframe
+    # this engine computes). This is the single source of truth for both
+    # which periods AND which timeframes — FeatureEngine.__init__ parses
+    # and validates each entry (period >= 2, timeframe non-empty) rather
+    # than this file doing it, matching Daily Levels' own precedent of
+    # keeping config.py itself minimal and putting real structure at the
+    # point of use.
+    feature_engine_regression_configs: list[dict] = [
+        {"timeframe": "1m", "period": 9},
+        {"timeframe": "5m", "period": 9},
+    ]
+    # `er_period` alone doesn't fully define classic Kaufman KAMA — the
+    # original design brief flagged this itself — so `fast_period`/
+    # `slow_period` are explicit fields here, not hardcoded constants
+    # inside engine.py.
+    feature_engine_kama_configs: list[dict] = [
+        {"timeframe": "1m", "er_period": 9, "fast_period": 2, "slow_period": 30},
+        {"timeframe": "5m", "er_period": 9, "fast_period": 2, "slow_period": 30},
+    ]
+    # Mirrors feature_engine_ema_seed_multiplier's role, applied to
+    # `slow_period` instead of `period` — the parameter that drives the
+    # longest memory in KAMA's recursion (indicators/kama.py's own
+    # docstring has the full reasoning).
+    feature_engine_kama_seed_multiplier: int = 5
+
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
     # level_key FeatureEngine publishes. Per-level-type override is real
