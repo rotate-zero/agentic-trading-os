@@ -17,11 +17,11 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
 from app.core.market_clock import get_market_clock
-from app.services import broker_registry, candle_aggregator, candle_store
+from app.services import broker_registry, candle_aggregator, candle_store, live_tick_relay
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +159,34 @@ async def subscribe(symbol: str = Query(...)) -> dict:
     except SymbolNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "subscribed", "symbol": symbol}
+
+
+@router.post("/active-symbols")
+async def set_active_symbols(symbols: list[str] = Body(..., embed=True)) -> dict:
+    """
+    Sets the small (max 8), actively tick-monitored symbol set LiveTickRelay
+    uses for throttled 5s PriceSnapshot fluidity (decision #72) — intended
+    caller is whatever process decides "these are the most-active symbols
+    right now" (eventually Market Scanner; a manual call meanwhile, since
+    Scanner itself isn't built yet). Deliberately separate from POST
+    /subscribe: that call tells a MarketDataProvider to start streaming a
+    symbol at all; this call is a much narrower "of the symbols already
+    streaming, which ones should also get throttled tick-fluidity
+    snapshots" — a symbol can be subscribed without being in this set, and
+    should be for anything beyond the top 8.
+    """
+    relay = live_tick_relay.get_live_tick_relay()
+    try:
+        relay.set_active_symbols(symbols)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "ok", "active_symbols": relay.get_active_symbols()}
+
+
+@router.get("/active-symbols")
+async def get_active_symbols() -> dict:
+    relay = live_tick_relay.get_live_tick_relay()
+    return {"active_symbols": relay.get_active_symbols()}
 
 
 @router.get("/feed-status")

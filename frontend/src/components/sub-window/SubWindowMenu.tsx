@@ -603,7 +603,9 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
           />
         )}
         <span className="truncate font-mono text-xs font-semibold text-text-primary">{displaySymbol}</span>
-        <span className="shrink-0 font-mono text-[10px] text-text-muted">{config.timeframe}</span>
+        <span className="shrink-0 font-mono text-[10px] text-text-muted">
+          {config.liveTick ? "tick" : config.timeframe}
+        </span>
         {activeOverlayCount > 0 && (
           <span className="truncate font-mono text-[10px] text-text-muted">
             {config.priceIndicators.filter((p) => p.enabled).map(priceIndicatorLabel).join(", ")}
@@ -635,7 +637,7 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
               vertically on a busy multi-window layout, not just near the
               top of the screen. */}          {level === "root" && (
             <div className="flex flex-col">
-              <RootRow label="Timeframe" hint={config.timeframe} onClick={() => setLevel("timeframe")} />
+              <RootRow label="Timeframe" hint={config.liveTick ? "Tick" : config.timeframe} onClick={() => setLevel("timeframe")} />
               <RootRow
                 label="Indicators"
                 hint={activeOverlayCount > 0 ? `${activeOverlayCount} active` : "None"}
@@ -693,15 +695,37 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
           {level === "timeframe" && (
             <div>
               <BackRow label="Timeframe" onClick={() => setLevel("root")} />
+              {/* Decision #72 — "Tick" lives in this same list, not a
+                  separate menu section: conceptually it's the person
+                  picking what the currently-forming bar does, exactly
+                  like picking 1m/5m/etc picks what a closed bar means.
+                  It always forces timeframe to "1m" together with
+                  liveTick — tick fluidity has no meaning against a 5m/
+                  15m/1h/1d bar (see live_tick_relay.py: it only ever
+                  tracks the current 1m bar) — and picking any real
+                  timeframe below turns liveTick back off, so the two
+                  never end up in an inconsistent combination. */}
+              <button
+                onClick={() => {
+                  updateSubWindow(config.id, { timeframe: "1m", liveTick: true });
+                  setLevel("root");
+                }}
+                className={`flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.liveTick ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                <span>Tick</span>
+                <span className="text-[10px] text-text-muted">live</span>
+              </button>
               {TIMEFRAMES.map((tf) => (
                 <button
                   key={tf}
                   onClick={() => {
-                    updateSubWindow(config.id, { timeframe: tf });
+                    updateSubWindow(config.id, { timeframe: tf, liveTick: false });
                     setLevel("root");
                   }}
                   className={`flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
-                    config.timeframe === tf ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                    !config.liveTick && config.timeframe === tf ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
                   }`}
                 >
                   {tf}

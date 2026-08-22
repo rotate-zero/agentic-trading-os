@@ -36,6 +36,19 @@ const MAX_CANDLES = 500; // bounds client memory for a long-running session — 
  * to keep in sync, for data that only changes once a minute regardless of
  * which approach is used).
  *
+ * liveTick (decision #72) — optional, only meaningful while timeframe is
+ * "1m" (SubWindowMenu's Tick toggle enforces that pairing; this hook
+ * defensively no-ops the subscription otherwise rather than trusting the
+ * caller). When on, also listens on "market.tick.snapshot" for throttled
+ * PriceSnapshot updates to the CURRENTLY FORMING bar and upserts it into
+ * `candles` via `_upsertLast`. This is why the market.candle handler below
+ * ALSO went through `_upsertLast` rather than a blind append: once a
+ * provisional snapshot bar can already occupy the array's last slot, the
+ * real CandleClosed for that same minute must replace it, not duplicate
+ * it. A symbol/timeframe not actually in LiveTickRelay's small active set
+ * (see live_tick_relay.py) simply never receives snapshot pushes — the
+ * bar then only ever updates on real 1m close, same as liveTick===false.
+ *
  * Error handling is deliberately minimal: failures log to the console
  * rather than surfacing in the UI. This codebase has no established
  * error-display pattern yet (every previous data source was a
@@ -43,12 +56,35 @@ const MAX_CANDLES = 500; // bounds client memory for a long-running session — 
  * separate, explicitly-scoped piece of work, not something to improvise
  * here as a side effect of the data-source swap.
  */
-export function useLiveCandles(symbol: string, timeframe: Timeframe = "1m"): Candle[] {
+function _upsertLast(prev: Candle[], candle: Candle): Candle[] {
+  if (prev.length === 0) {
+    // No backfill/anchor bar yet — nothing to revise in place, and
+    // appending a bare provisional bar with no prior context isn't worth
+    // the edge cases (e.g. it briefly being the ONLY bar on the chart).
+    // The next real backfill or CandleClosed establishes the anchor.
+    return prev;
+  }
+  const last = prev[prev.length - 1];
+  if (candle.time === last.time) {
+    const next = prev.slice();
+    next[next.length - 1] = candle;
+    return next;
+  }
+  if (candle.time > last.time) {
+    const next = [...prev, candle];
+    return next.length > MAX_CANDLES ? next.slice(next.length - MAX_CANDLES) : next;
+  }
+  return prev; // stale/out-of-order for a minute already closed and moved past — ignore
+}
+
+export function useLiveCandles(symbol: string, timeframe: Timeframe = "1m", liveTick = false): Candle[] {
   const [candles, setCandles] = useState<Candle[]>([]);
   const symbolRef = useRef(symbol);
   const timeframeRef = useRef(timeframe);
+  const liveTickRef = useRef(liveTick);
   symbolRef.current = symbol;
   timeframeRef.current = timeframe;
+  liveTickRef.current = liveTick;
 
   useEffect(() => {
     let cancelled = false;
@@ -68,7 +104,7 @@ export function useLiveCandles(symbol: string, timeframe: Timeframe = "1m"): Can
         console.error(`useLiveCandles(${symbol}, ${timeframe}): backfill failed — ${detail}`);
       });
 
-    const unsubscribe = workspaceSocket.subscribe("market.candle", (msg: WireMessage) => {
+    const unsubscribeCandle = workspaceSocket.subscribe("market.candle", (msg: WireMessage) => {
       if (msg.symbol !== symbolRef.current) return; // one channel, many symbols — filter client-side
       if (!msg.payload) return;
 
@@ -81,10 +117,7 @@ export function useLiveCandles(symbol: string, timeframe: Timeframe = "1m"): Can
         // the channel contract, not something the type system can verify
         // structurally from a plain Record."
         const candle = toCandle(msg.payload as unknown as CandleWireShape);
-        setCandles((prev) => {
-          const next = [...prev, candle];
-          return next.length > MAX_CANDLES ? next.slice(next.length - MAX_CANDLES) : next;
-        });
+        setCandles((prev) => _upsertLast(prev, candle));
         return;
       }
 
@@ -98,11 +131,24 @@ export function useLiveCandles(symbol: string, timeframe: Timeframe = "1m"): Can
         });
     });
 
+    // Decision #72 — only ever subscribed while liveTick is on; a no-op
+    // unsubscribe otherwise so the cleanup below stays unconditional.
+    const unsubscribeTick = liveTick
+      ? workspaceSocket.subscribe("market.tick.snapshot", (msg: WireMessage) => {
+          if (msg.symbol !== symbolRef.current) return;
+          if (timeframeRef.current !== "1m") return; // tick fluidity only ever describes the 1m forming bar
+          if (!msg.payload) return;
+          const snapshot = toCandle(msg.payload as unknown as CandleWireShape);
+          setCandles((prev) => _upsertLast(prev, snapshot));
+        })
+      : () => {};
+
     return () => {
       cancelled = true;
-      unsubscribe();
+      unsubscribeCandle();
+      unsubscribeTick();
     };
-  }, [symbol, timeframe]);
+  }, [symbol, timeframe, liveTick]);
 
   return candles;
 }

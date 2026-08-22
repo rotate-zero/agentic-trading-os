@@ -28,6 +28,9 @@ router = APIRouter()
 EVENT_TO_CHANNEL: dict[EventType, str] = {
     EventType.PRICE_UPDATED: "market.tick",
     EventType.CANDLE_CLOSED: "market.candle",
+    EventType.PRICE_SNAPSHOT: "market.tick.snapshot",  # decision #72 — deliberately its own channel,
+    # NOT reused on "market.tick": useLatestPrices (the watchlist) already listens there at raw tick
+    # frequency, and collapsing the two would silently throttle the watchlist down to 5s too.
     EventType.FEATURES_UPDATED: "features.updated",  # confirmed decision #47
     EventType.LEVEL_INTERACTION_CHANGED: "intelligence.level",  # confirmed decision #47
     EventType.OPPORTUNITY_CREATED: "opportunity.new",

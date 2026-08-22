@@ -450,6 +450,14 @@ export interface SubWindowConfig {
   connector: ConnectorId;
   symbol: string; // only authoritative when connector === 'none'
   timeframe: Timeframe;
+  // Decision #72 — deliberately NOT a Timeframe value ("tick" isn't a
+  // backend-fetchable resolution; GET /market/candles has no such
+  // timeframe). Independent boolean layered on top of `timeframe` instead:
+  // true only ever makes sense while timeframe === "1m" (see SubWindowMenu's
+  // toggle, which enforces that pairing), and means "also apply throttled
+  // PriceSnapshot updates to the currently-forming bar," not "fetch a
+  // different resolution."
+  liveTick: boolean;
   priceIndicators: PriceIndicatorInstance[]; // opt-in, starts empty — SMA/EMA/VWAP
   horizontalLevels: HorizontalLevelInstance[]; // opt-in, starts empty — PDH/PDL/Camarilla/VPOC/etc.
   candleLimit: CandleLimit;

@@ -42,6 +42,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.core.config as config_module
     import app.event_bus.bus as bus_module
     import app.feature_engine.engine as feature_engine_module
+    import app.services.live_tick_relay as live_tick_relay_module
     import app.trading_intelligence.level_interaction_engine as level_interaction_engine_module
     from app.services import broker_registry
 
@@ -61,6 +62,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
         channels_module._gateway = None
         feature_engine_module._feature_engine = None  # confirmed decision #47 — same reasoning as _event_bus above
         level_interaction_engine_module._level_interaction_engine = None  # ditto
+        live_tick_relay_module._live_tick_relay = None  # ditto — decision #72
         broker_registry.clear_all()
         # market_data.py and finnhub_data.py each keep their own local
         # provider reference (see their module docstrings for why) —

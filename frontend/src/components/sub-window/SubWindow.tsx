@@ -20,7 +20,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   // longer wired into the live render path (see that file's own header
   // note; candle_aggregator.py is now the single source of truth for
   // 5m/15m/1h, Polygon for 1d).
-  const candles = useLiveCandles(symbol, config.timeframe);
+  const candles = useLiveCandles(symbol, config.timeframe, config.liveTick);
   const overlays = useMemo(() => generateMockOverlays(candles), [candles]);
 
   // Backend-computed SMA/EMA/VWAP (confirmed decision #54, Stage 1 of the

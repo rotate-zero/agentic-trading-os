@@ -18,6 +18,7 @@ from app.event_bus.bus import get_event_bus
 from app.feature_engine.engine import get_feature_engine
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
+from app.services.live_tick_relay import get_live_tick_relay
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,14 @@ async def lifespan(app: FastAPI):
     # without.
     candle_recorder = CandleRecorder(bus)
     candle_recorder.start()
+
+    # Throttled tick-fluidity relay (decision #72) — same unconditional-start
+    # posture as CandleRecorder just above: it's a PriceUpdated subscriber
+    # with an empty active-symbol set until something (a manual POST
+    # /market/active-symbols call today; Market Scanner eventually) tells it
+    # otherwise, so starting it costs nothing when no symbols are active yet.
+    tick_relay = get_live_tick_relay(bus)
+    tick_relay.start()
 
     # Feature Engine's first indicator (Phase 4 kickoff, confirmed decision
     # #45) — like CandleRecorder, starts unconditionally: it's just a
@@ -142,6 +151,7 @@ async def lifespan(app: FastAPI):
         # actually means what it says.
         await bus.stop()
         await candle_recorder.stop()
+        await tick_relay.stop()
         await feature_engine.stop()
         await level_interaction_engine.stop()
         logger.info("%s stopped", settings.app_name)

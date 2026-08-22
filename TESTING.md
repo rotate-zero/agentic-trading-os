@@ -1,66 +1,77 @@
-# TESTING — Relative Volume (RVOL)
+# TESTING — LiveTickRelay / "Tick" fluidity (decision #72)
 
-Incremental on top of everything already in your repo through decision
-#70. Unzip directly onto the repo root.
+Unzip this directly at the project root (`agentic-trading-os/`) — every
+path inside mirrors the real repo, so it overwrites the modified files and
+adds the new ones in place.
 
-## What's in this zip
+## Files touched
 
-**New file:**
-- `backend/app/feature_engine/indicators/rvol.py` — RVOL pure math.
+**New:**
+- `backend/app/services/live_tick_relay.py` — the relay itself
+- `backend/tests/test_live_tick_relay.py` — 6 new tests
 
-**Updated files:**
-- `backend/app/feature_engine/engine.py` — new `_update_rvol`; **`_update_vwap`'s
-  return type changed from `float | None` to `dict[str, float]`** so it can
-  also publish `session_volume` (previously tracked internally, never
-  exposed) — RVOL reads that plus the shared daily-candle cache ATR/Daily
-  Levels already populate. Zero new provider calls, zero new accumulator.
-- `backend/app/core/config.py` — new `feature_engine_rvol_lookback_days: int = 5`.
-- `backend/app/feature_engine/indicators/__init__.py` — exports `rvol`.
-- `backend/tests/test_feature_engine.py` — 9 new tests, plus **one
-  existing test updated** (`test_vwap_publishes_even_while_sma_is_still_warming_up`
-  had an exact-equality assertion on the published features dict that
-  needed to include the new `session_volume` key — not a design change,
-  just an assertion that needed updating alongside the refactor).
+**Modified:**
+- `backend/app/schemas/events/envelope.py` — new `EventType.PRICE_SNAPSHOT`
+- `backend/app/schemas/events/market_data.py` — new `PriceSnapshot` model
+- `backend/app/api/websocket/channels.py` — new `market.tick.snapshot` channel
+- `backend/app/api/routes/market.py` — new `POST`/`GET /market/active-symbols`
+- `backend/app/main.py` — wires `LiveTickRelay` into app startup/shutdown
+- `backend/tests/conftest.py` — resets the new singleton between tests
+- `frontend/src/types/workspace.ts` — new `SubWindowConfig.liveTick` field
+- `frontend/src/state/WorkspaceContext.tsx` — `liveTick: false` added to all 9 existing config literals
+- `frontend/src/hooks/useLiveCandles.ts` — new `liveTick` param + `_upsertLast` fix (see decision #72 for why the existing `CandleClosed` handler needed a fix too, not just a new branch)
+- `frontend/src/components/sub-window/SubWindow.tsx` — passes `config.liveTick` through
+- `frontend/src/components/sub-window/SubWindowMenu.tsx` — new "Tick" option in the Timeframe menu
+- `docs/decisions/confirmed-decisions.md` — decision #72, full writeup
+- `docs/architecture/system-design.md` — `PriceSnapshot` added to §10.3's contract table
 
-## New feature key
-
-`rvol` — session_volume so far ÷ (avg of last 5 complete trading days'
-volume × elapsed fraction of the regular session). >1.0 means busier than
-normal for this time of day; <1.0 means quieter. Only present during
-regular session, and only once 5 complete prior daily volumes are cached.
-
-`session_volume` also now appears alongside `vwap` whenever `vwap` does —
-today's regular-session cumulative volume, previously computed internally
-but never published on its own.
-
-## How to verify
+## Backend
 
 ```bash
 cd backend
-pip install -r requirements.txt --break-system-packages   # no new dependency
-alembic upgrade head                                       # no new migration
-pytest -q
+pip install -r requirements.txt --break-system-packages   # if not already installed
+pytest tests/test_live_tick_relay.py -v                    # the 6 new tests, isolated
+pytest tests/ -q                                            # full suite against real local Postgres 16
 ```
 
-Expect **216–218 passed** out of 219 on a freshly-migrated DB (exact count
-varies run to run) — the handful of failures are two ALREADY-DOCUMENTED
-pre-existing flaky classes (decisions #68, #69/#70), not this delivery's
-doing: a wall-clock-timing class in `test_feature_engine.py`, and an
-order-dependent class in `test_intelligence_routes.py` (a different
-specific test fails each run — this time it also included a
-`ZeroDivisionError` variant of the same underlying issue, noted in
-decision #71). Both pass cleanly every time in isolation.
+Expect all of `test_live_tick_relay.py` to pass. I ran the full suite in a
+sandbox with **no local Postgres available** — 161 passed, 21 failed (all
+21 are the pre-existing DB-dependent tests, e.g. `test_daily_levels.py`,
+`test_feature_engine.py`, failing on `connection to server ... Connection
+refused` — nothing to do with this change). Against your real local
+Postgres those should all pass as before; if anything outside
+`test_live_tick_relay.py` fails there, that's worth flagging back to me.
 
-To isolate just the new work:
+## Frontend
 
 ```bash
-pytest -q -k "rvol" tests/test_feature_engine.py -v
+cd frontend
+npm install       # if not already installed
+npx tsc -b 2>&1 | grep -v "GridPresetPicker"    # should print nothing
+npx vite build                                    # should complete clean
 ```
 
-Expect **9 passed**.
+Both ran clean in the sandbox (zero non-`GridPresetPicker` TypeScript
+errors, `vite build` succeeded — 74 modules, no warnings beyond the usual
+chunk-size notice).
 
-## Worth knowing before you look at the code
+## What I could NOT verify (flagging honestly, not glossing over it)
 
-`_update_vwap` is now the internal mechanism behind THREE published
-features (`vwap`, `session_volume`, and — indirectly — `rvol`), not one.
-If you ever touch its accumulator logic, all three are affected.
+- **No real browser session** — same standing limitation as every other
+  frontend change here. The "Tick" toggle's actual visual behavior against
+  real Finnhub ticks hasn't been seen, only reasoned through against the
+  exact code read from the live repo and proven at the unit-test level.
+- **`POST /market/active-symbols` untested against a real running
+  server** — reasoned correct, not yet exercised live. Try something like:
+  ```bash
+  curl -X POST http://localhost:8000/market/active-symbols \
+    -H "Content-Type: application/json" \
+    -d '{"symbols": ["NVDA", "AAPL"]}'
+  ```
+  then open a chart on one of those symbols, switch it to "Tick" via the
+  Timeframe menu, and watch the last bar during live market hours.
+- **No scanning process exists yet** to call `set_active_symbols`
+  automatically — until Market Scanner is built, you set the active set
+  manually via the endpoint above. A symbol's chart can be switched to
+  "Tick" mode even if it's NOT in the active set; it just won't visibly
+  do anything beyond normal 1m-close updates until it is.

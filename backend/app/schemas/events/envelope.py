@@ -19,6 +19,7 @@ class EventType(StrEnum):
     # Market data
     PRICE_UPDATED = "PriceUpdated"
     CANDLE_CLOSED = "CandleClosed"
+    PRICE_SNAPSHOT = "PriceSnapshot"  # throttled in-progress-bar snapshot — see live_tick_relay.py, decision #72
     FEATURES_UPDATED = "FeaturesUpdated"
 
     # State intelligence
