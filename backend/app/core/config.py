@@ -167,6 +167,15 @@ class Settings(BaseSettings):
     # docstring has the full reasoning).
     feature_engine_kama_seed_multiplier: int = 5
 
+    # --- Feature Engine: Relative Volume (confirmed decision #71) ---
+    # Average DAILY volume lookback, in complete trading days strictly
+    # before today — same "strictly prior" convention PDC/ATR already
+    # use. Resolved as 5 (not the 7 initially mentioned) directly by
+    # Saqib. Settings-only, no constructor override — same precedent as
+    # feature_engine_atr_period above (5 is already small enough for
+    # tests to use directly).
+    feature_engine_rvol_lookback_days: int = 5
+
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
     # level_key FeatureEngine publishes. Per-level-type override is real

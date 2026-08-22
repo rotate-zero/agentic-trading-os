@@ -249,3 +249,24 @@ All five stages are complete (§11) — there's nothing left to resume in THIS p
 1. §8 (Deferred) lists what was deliberately left out: slope-change/acceleration, regression channels, and chart/frontend exposure for any of these five families. Any of those is a fresh, small design conversation, not a continuation of an open thread here.
 2. `confirmed-decisions.md` #67–#70 have the full build history if you need to understand why a particular choice was made before changing it.
 3. Changing any already-published feature key's meaning (e.g., what `regression_9_slope_norm` normalizes against) is a semantic break for anything downstream already reading it — treat as a new decision, not a bug fix, even if it's a one-line code change.
+
+---
+
+## 13. Addendum — Relative Volume (confirmed decision #71)
+
+Not part of the original five-family brief above; added separately per direct request after Stage 4 closed this doc out. Documented here anyway rather than only in the decision log, since it reuses this doc's own shared-cache infrastructure directly and introduces judgment calls worth having written down somewhere more discoverable than a single decision-log entry.
+
+**Definition:** `rvol = session_volume / (avg_daily_volume * elapsed_fraction)` — a time-of-day-normalized proxy for "how busy is today, right now, relative to normal," NOT the naive `session_volume / avg_daily_volume` (misleadingly low most of the day) and NOT a full per-minute historical volume profile either (the "textbook" scanner definition, needing far more history than a handful of daily totals). `avg_daily_volume` is the mean of the last **5** complete trading days strictly before today (lookback resolved directly by Saqib, down from an initially-mentioned 7) — `indicators/rvol.py`'s own docstring has the full reasoning for why the proxy formula was chosen over the two alternatives.
+
+**Reuses existing infrastructure on two fronts, not one:**
+- `avg_daily_volume` comes from the SAME shared `self._daily_candle_cache` ATR and Daily Levels already read (decision #68's D1 extended to a third consumer) — zero new provider calls.
+- `session_volume` (today's regular-session cumulative volume so far) already existed as an internal value inside `_update_vwap`'s own accumulator, previously never published on its own. Rather than have RVOL either reach into `_update_vwap`'s private state directly or stand up a second, fully redundant accumulator (its own restart-safe backfill query against `candle_store`, duplicating real logic, not just a trivial running sum), `_update_vwap` itself was refactored to publish `session_volume` as its own feature key — and, as a byproduct, its return type changed from `float | None` to `dict[str, float]`, matching every OTHER `_update_*` helper in this engine (it was the one holdout). `session_volume` is a genuinely useful standalone value in its own right, not purely a means to RVOL.
+
+**Two judgment calls, both flagged rather than picked silently:**
+- The proxy formula itself (time-of-day-normalized, not a full intraday profile) — a real accuracy/complexity tradeoff, not the only defensible choice.
+- Elapsed minutes floored at 1 for the very first regular-session candle of the day, rather than left at `minutes_since_open()`'s natural 0 (which would divide by zero). Deliberately NOT omitting RVOL for that first candle either — unusually heavy opening-minute volume against a normal day's pace is often the most information-dense reading of the whole session, not noise worth suppressing.
+
+**Undefined cases:** outside regular session (mirrors `_update_vwap`'s own scoping exactly — not a separate restriction invented for RVOL); fewer than 5 complete prior daily volumes cached yet.
+
+**Tested:** 4 pure-function tests (`rvol()`'s own math and each degenerate-input case), 4 in-memory tests calling `_update_rvol` directly (the elapsed-minutes flooring, the averaging logic against the real `MarketClock`, the two absence cases), 1 real-Postgres integration test extending the D1 shared-cache proof to a THIRD consumer (`fake.call_count == 1` with `rvol`, `atr_14`, AND `daily_levels` all present in one `FeatureSet`) — full details in decision #71.
+

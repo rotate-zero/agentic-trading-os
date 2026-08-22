@@ -182,6 +182,7 @@ from app.feature_engine.indicators import (
     gap,
     kama,
     regression,
+    rvol,
     session_change,
     sma,
     typical_price,
@@ -299,6 +300,9 @@ class FeatureEngine:
         # settings just above (tests that need a different period
         # monkeypatch get_settings(), not a constructor kwarg).
         self._atr_period = get_settings().feature_engine_atr_period
+        # Relative Volume (confirmed decision #71) — settings-only, no
+        # constructor override, same precedent as _atr_period above.
+        self._rvol_lookback_days = get_settings().feature_engine_rvol_lookback_days
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -884,8 +888,8 @@ class FeatureEngine:
         # computed ONCE per 1m close, not per timeframe — see module
         # docstring for why — and attached to every FeatureSet this same
         # close produces below, 1m and any aggregated ones alike.
-        vwap_value = self._update_vwap(symbol, candle_ts, high, low, close, volume)
-        extra = {"vwap": round(vwap_value, 6)} if vwap_value is not None else {}
+        vwap_features = self._update_vwap(symbol, candle_ts, high, low, close, volume)
+        extra = dict(vwap_features)
         extra.update(self._update_previous_day(symbol, candle_ts))
         extra.update(self._update_premarket(symbol, candle_ts, high, low))
         # Session % Change + Gap (confirmed decisions #67/#68,
@@ -906,6 +910,13 @@ class FeatureEngine:
         # same "pure, already-cached read here" shape the Daily Levels
         # comment just below already uses for its own state.
         extra.update(self._update_atr(symbol, candle_ts))
+        # Relative Volume (confirmed decision #71) — reads
+        # `session_volume` off `extra` (published by _update_vwap just
+        # above, same "receive already-known values" shape session_change/
+        # gap already use for `pdc`) and the SAME shared daily-candle
+        # cache ATR just above reads, for its own average-daily-volume
+        # denominator — zero new provider calls, zero new accumulator.
+        extra.update(self._update_rvol(symbol, candle_ts, extra.get("session_volume")))
         # Daily Levels (confirmed decision #59) — a pure, already-cached
         # read here (see _maybe_refresh_daily_levels, called earlier in
         # the async worker loop, not this thread-offloaded method).
@@ -1073,20 +1084,39 @@ class FeatureEngine:
 
     def _update_vwap(
         self, symbol: str, candle_ts: datetime, high: float, low: float, close: float, volume: int
-    ) -> float | None:
+    ) -> dict[str, float]:
         """
         See module docstring for why this is symbol-keyed, monotonically
-        accumulating, and regular-session-only. Returns None outside
+        accumulating, and regular-session-only. Returns {} outside
         regular hours (nothing to publish — matching
         frontend/src/indicators/vwap.ts, which simply doesn't emit a point
         for pre-market/after-hours candles either) or on the pathological
         zero-cumulative-volume case (see vwap_from_accumulator()).
+
+        Also returns `session_volume` (confirmed decision #71) — the SAME
+        `state["cumulative_volume"]` this method already tracks for its
+        own VWAP calculation, published as its own feature key rather
+        than kept purely internal, specifically so `_update_rvol` below
+        can read it off the shared `extra` dict (same "receive
+        already-known values" shape session_change/gap already use for
+        `pdc`) instead of either reaching into this method's private
+        `self._vwap_state` directly or standing up a second, redundant
+        restart-safe accumulator+backfill-query pair that would just
+        duplicate everything below. `session_volume` is a genuinely
+        useful standalone value too (today's regular-session cumulative
+        volume), not purely a means to RVOL.
+
+        Return type changed from `float | None` to `dict[str, float]`
+        (decision #71) to match every other `_update_*` helper in this
+        engine (`_update_previous_day`/`_update_premarket`/`_update_gap`/
+        `_update_atr` all already return dicts) — this was the one
+        holdout, not a new convention invented for RVOL's sake.
         """
         if not get_market_clock().is_regular_session(candle_ts):
-            return None
+            return {}
         bounds = get_market_clock().session_bounds(candle_ts)
         if bounds is None:  # pragma: no cover — is_regular_session() true implies bounds exist
-            return None
+            return {}
         session_start, _session_end = bounds
 
         state = self._vwap_state.get(symbol)
@@ -1113,7 +1143,11 @@ class FeatureEngine:
         state["cumulative_volume"] += volume
         self._vwap_state[symbol] = state
 
-        return vwap_from_accumulator(state["cumulative_pv"], state["cumulative_volume"])
+        result: dict[str, float] = {"session_volume": float(state["cumulative_volume"])}
+        vwap_value = vwap_from_accumulator(state["cumulative_pv"], state["cumulative_volume"])
+        if vwap_value is not None:
+            result["vwap"] = round(vwap_value, 6)
+        return result
 
     def _update_previous_day(self, symbol: str, candle_ts: datetime) -> dict[str, float]:
         """
@@ -1340,6 +1374,65 @@ class FeatureEngine:
         features = atr(prior_candles, self._atr_period)
         self._atr_state[symbol] = {"for_day": today, "features": features}
         return features
+
+    def _update_rvol(self, symbol: str, candle_ts: datetime, session_volume: float | None) -> dict[str, float]:
+        """
+        Relative Volume (confirmed decision #71) — how busy today's
+        regular session has been so far, relative to a NORMAL day by this
+        same point in time. Not part of the original five-family design
+        brief; added separately per direct request. No state of its own:
+        every input is either already computed elsewhere this same close
+        (`session_volume`, from `_update_vwap`) or read fresh from
+        already-cached data (`self._daily_candle_cache`, the SAME shared
+        cache ATR reads — decision #68's D1 precedent extended to a
+        second consumer) — nothing here needs its own once-per-day
+        freeze/reset gate the way Gap or ATR do.
+
+        `session_volume` being None means _update_vwap returned {} for
+        this candle (outside regular session — see its own docstring) —
+        RVOL is honestly absent there too, same scoping VWAP itself
+        already uses, not a new restriction invented for RVOL.
+
+        Average daily volume: the mean of the last `self._rvol_lookback_days`
+        COMPLETE prior daily volumes in the shared cache — same "strictly
+        before today" rule ATR/PDC already established, inherited for
+        free rather than re-implemented (the cache is already filtered
+        that way by `_maybe_refresh_daily_levels`). Absent (too few prior
+        days cached yet) → RVOL is honestly absent, same convention as
+        every other feature reading this cache.
+
+        Elapsed time: `get_market_clock().minutes_since_open(candle_ts)`,
+        floored at 1 rather than left at its natural 0 for the very FIRST
+        regular-session candle of the day — a deliberate judgment call,
+        not an oversight: `minutes_since_open` measures against the
+        bar's OPEN timestamp, so the literal first candle reports 0
+        elapsed minutes even though real market time has been passing
+        while it formed. Flooring at 1 avoids a division by zero AND
+        avoids omitting RVOL specifically for what's often the most
+        information-dense candle of the day (unusually heavy volume in
+        the first minute against a normal day's pace is a genuinely
+        meaningful signal, not noise worth suppressing) — see
+        indicators/rvol.py's own docstring for why this is a proxy
+        formula, not full time-of-day-profile normalization.
+        """
+        if session_volume is None:
+            return {}
+
+        prior_candles = self._daily_candle_cache.get(symbol, [])
+        if len(prior_candles) < self._rvol_lookback_days:
+            return {}
+        recent = prior_candles[-self._rvol_lookback_days :]
+        avg_daily_volume = sum(c.volume for c in recent) / self._rvol_lookback_days
+
+        clock = get_market_clock()
+        bounds = clock.session_bounds(candle_ts)
+        if bounds is None:  # pragma: no cover — session_volume not None implies regular session, implies bounds exist
+            return {}
+        session_start, session_end = bounds
+        total_session_minutes = int((session_end - session_start).total_seconds() // 60)
+        elapsed_minutes = max(1, clock.minutes_since_open(candle_ts))
+
+        return rvol(session_volume, avg_daily_volume, elapsed_minutes, total_session_minutes)
 
 
 _feature_engine: FeatureEngine | None = None

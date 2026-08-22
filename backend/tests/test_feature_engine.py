@@ -25,7 +25,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, kama, regression, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, kama, regression, rvol, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -297,6 +297,29 @@ def test_kama_low_efficiency_on_a_choppy_series():
     closes = [100.0 + (1 if i % 2 == 0 else -1) for i in range(200)]  # alternating, no net direction
     result = kama(closes, er_period=9, fast_period=2, slow_period=30, seed_multiplier=5)
     assert result["kama_9_er"] < 0.3
+
+
+# --- rvol (confirmed decision #71) --------------------------------------------
+
+
+def test_rvol_computes_ratio_against_time_of_day_normalized_expected_volume():
+    # Half the session has elapsed (195 of 390 minutes); a normal day
+    # would have done 500 shares by now (half of avg 1000/day). 600
+    # actual -> 1.2x normal pace.
+    result = rvol(session_volume=600.0, avg_daily_volume=1000.0, elapsed_minutes=195, total_session_minutes=390)
+    assert result == {"rvol": pytest.approx(1.2)}
+
+
+def test_rvol_returns_empty_when_avg_daily_volume_not_positive():
+    assert rvol(session_volume=100.0, avg_daily_volume=0.0, elapsed_minutes=10, total_session_minutes=390) == {}
+
+
+def test_rvol_returns_empty_when_total_session_minutes_not_positive():
+    assert rvol(session_volume=100.0, avg_daily_volume=1000.0, elapsed_minutes=10, total_session_minutes=0) == {}
+
+
+def test_rvol_returns_empty_when_elapsed_minutes_not_positive():
+    assert rvol(session_volume=0.0, avg_daily_volume=1000.0, elapsed_minutes=0, total_session_minutes=390) == {}
 
 
 # --- atr (confirmed decisions #67/#68) ---------------------------------------
@@ -822,7 +845,7 @@ async def test_vwap_publishes_even_while_sma_is_still_warming_up():
 
         assert len(received) == 1  # published on VWAP alone
         features = received[0].payload["features"]
-        assert features == {"vwap": 100.0}  # sma_50 genuinely absent — not warmed up, not silently 0
+        assert features == {"vwap": 100.0, "session_volume": 10.0}  # sma_50 genuinely absent — not warmed up, not silently 0; session_volume (decision #71) now publishes alongside vwap whenever _update_vwap is in regular session
     finally:
         await engine.stop()
         await bus.stop()
@@ -1315,3 +1338,113 @@ async def test_regression_and_kama_absent_before_their_window_warms_up():
     finally:
         await engine.stop()
         await bus.stop()
+
+
+# --- Tier 8: Relative Volume (confirmed decision #71) -----------------------
+
+
+def test_update_rvol_absent_when_session_volume_is_none():
+    """Mirrors _update_vwap's own outside-regular-session {} — RVOL is
+    honestly absent for the same reason, not a separate restriction."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    assert engine._update_rvol("__TEST_FE_RVOL_NOSESS__", _et(2026, 8, 11, 9, 30), None) == {}
+
+
+def test_update_rvol_absent_when_insufficient_daily_history():
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    ticker = "__TEST_FE_RVOL_SHORT__"
+    engine._daily_candle_cache[ticker] = [_daily_bar(100.0, 101.0, 99.0, 100.0) for _ in range(4)]  # lookback default is 5
+    assert engine._update_rvol(ticker, _et(2026, 8, 11, 9, 45), session_volume=50.0) == {}
+
+
+def test_update_rvol_uses_average_of_last_lookback_days_volumes():
+    """Direct poke against the real MarketClock (not a mocked
+    elapsed-time), proving the averaging AND the elapsed-fraction
+    machinery together, not just rvol()'s own isolated math."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    ticker = "__TEST_FE_RVOL_AVG__"
+
+    def _bar(volume: int) -> CandleClosed:
+        return CandleClosed(timeframe="1d", open=1.0, high=1.0, low=1.0, close=1.0, volume=volume, candle_ts=_et(2026, 8, 10, 20, 0))
+
+    engine._daily_candle_cache[ticker] = [_bar(v) for v in (100, 200, 300, 400, 500)]  # mean = 300
+
+    # 9:30 + 195 minutes = 12:45 -> exactly half of the 390-minute regular
+    # session has elapsed. Expected-by-now = 300 * 0.5 = 150.
+    result = engine._update_rvol(ticker, _et(2026, 8, 11, 12, 45), session_volume=180.0)
+    assert result == {"rvol": pytest.approx(180.0 / 150.0)}
+
+
+def test_update_rvol_floors_elapsed_minutes_at_one_for_the_very_first_candle():
+    """minutes_since_open() naturally returns 0 at the EXACT session-open
+    timestamp — floored at 1 here (deliberate judgment call, see
+    _update_rvol's own docstring) rather than crashing on a division by
+    zero or omitting RVOL for what's often the most information-dense
+    candle of the day."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    ticker = "__TEST_FE_RVOL_FIRST__"
+    engine._daily_candle_cache[ticker] = [_daily_bar(100.0, 101.0, 99.0, 100.0) for _ in range(5)]  # volume=1000 each
+    result = engine._update_rvol(ticker, _et(2026, 8, 11, 9, 30), session_volume=5.0)
+    assert "rvol" in result
+    assert result["rvol"] > 0
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_rvol_reuses_the_shared_daily_cache_and_published_session_volume():
+    """Extends decision #68's D1 shared-cache proof to a THIRD consumer:
+    ATR, Daily Levels, AND RVOL all read from the SAME single fetch —
+    `fake.call_count == 1` with all three present in one FeatureSet is
+    the direct proof, not an inference. `session_volume` (from
+    _update_vwap) is also proven reused rather than RVOL standing up its
+    own duplicate accumulator, since the only volume this test ever
+    publishes live is the single candle below."""
+    from app.services import broker_registry
+
+    ticker = "__TESTFERVOL1__"
+    _clean_atr_symbol(ticker)
+    broker_registry.clear_all()
+
+    now = _et(2026, 8, 11, 9, 30)
+    # 20 flat-price, flat-volume days: past ATR's period+1(15) and RVOL's
+    # lookback(5) both, and — same close every day — past Daily Levels'
+    # min_distinct_candles(2) too. avg_daily_volume = 100 exactly.
+    fake = _FakeHistoricalProvider(
+        {ticker: [CandleClosed(timeframe="1d", open=100.0, high=101.0, low=99.0, close=100.0, volume=100, candle_ts=now - timedelta(days=d)) for d in range(1, 21)]}
+    )
+    broker_registry.set_historical_provider(fake)
+
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[], ema_periods=[])
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        # 9:30 + 41 minutes = 10:11 -> deliberately NOT the last minute of
+        # any 5m bucket (minute % 5 != 4), so this single candle produces
+        # exactly one FeatureSet (1m only), not an early 5m-bucket
+        # completion too — candle_aggregator.py completes a bucket on
+        # seeing its OWN last minute regardless of how many earlier
+        # minutes in that bucket were actually captured, an unrelated
+        # mechanic this test needs to avoid tripping, not something to
+        # assert on here. Expected-by-now = 100 * 41/390 minutes. This
+        # single candle's own volume (10, _publish_candle's fixed
+        # default) IS the entire session_volume so far (first bar of the
+        # session).
+        await _publish_candle(bus, ticker, now + timedelta(minutes=41), 130.0)
+        await asyncio.sleep(0.2)
+
+        assert fake.call_count == 1  # the shared-cache claim, extended to a third consumer
+        assert len(received) == 1
+        features = received[0].payload["features"]
+        assert features["rvol"] == pytest.approx(10.0 / (100.0 * 41 / 390))
+        assert features["session_volume"] == pytest.approx(10.0)
+        assert "atr_14" in features  # same fetch, same close, second consumer
+        assert len(received[0].payload["daily_levels"]) >= 1  # same fetch, third consumer
+    finally:
+        await engine.stop()
+        await bus.stop()
+        broker_registry.clear_all()
+        _clean_atr_symbol(ticker)

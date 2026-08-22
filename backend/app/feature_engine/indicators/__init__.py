@@ -34,6 +34,7 @@ from app.feature_engine.indicators.kama import kama
 from app.feature_engine.indicators.premarket import fold_range
 from app.feature_engine.indicators.previous_day import aggregate_day
 from app.feature_engine.indicators.regression import regression
+from app.feature_engine.indicators.rvol import rvol
 from app.feature_engine.indicators.sma import sma
 from app.feature_engine.indicators.session_change import session_change
 from app.feature_engine.indicators.vpoc import volume_point_of_control
@@ -51,6 +52,7 @@ __all__ = [
     "gap",
     "kama",
     "regression",
+    "rvol",
     "session_change",
     "sma",
     "typical_price",
