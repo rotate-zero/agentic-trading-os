@@ -11,12 +11,13 @@ import {
 } from "lightweight-charts";
 import type { Candle, ChartObject } from "../../types/market";
 import type { IndicatorPoint } from "../../utils/indicators";
-import type { CandleLimit, ChartStyle, DailyLevelsConfig, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
+import type { CandleLimit, ChartStyle, DailyLevelsConfig, HorizontalLevelInstance, HudConfig, HudVariableKey, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
 import { DEFAULT_CHART_STYLE, DEFAULT_GRID_COLOR, createDefaultDailyLevelsConfig, createDefaultVolumeBarsConfig } from "../../types/workspace";
 import type { DailyLevelWireShape } from "../../services/api-client";
 import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
 import { computeHorizontalLevel } from "../../utils/indicators";
 import { TimerBadge } from "./TimerBadge";
+import { HudBox } from "./HudBox";
 
 export interface IndicatorSeries {
   key: string;
@@ -75,6 +76,14 @@ interface ChartWidgetProps {
   // rather than being forced into that one.
   dailyLevels?: DailyLevelWireShape[];
   dailyLevelsConfig?: DailyLevelsConfig;
+  // On-chart Feature Engine readout box (types/workspace.ts's HudConfig) —
+  // hud is the person's styling/content choices, hudValues is the live
+  // data SubWindow.tsx already resolved via useHudFeatures.ts. Same
+  // "config here, computed values passed in as a plain prop" split
+  // indicators/horizontalLevelValues above already use — ChartWidget
+  // itself does no data-fetching.
+  hud?: HudConfig;
+  hudValues?: Partial<Record<HudVariableKey, number>>;
 }
 
 const BULL = "#3FB950";
@@ -151,6 +160,8 @@ export function ChartWidget({
   volumeBars = DEFAULT_VOLUME_BARS,
   dailyLevels = [],
   dailyLevelsConfig = DEFAULT_DAILY_LEVELS_CONFIG,
+  hud,
+  hudValues = {},
 }: ChartWidgetProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -492,7 +503,7 @@ export function ChartWidget({
           color: line.color,
           lineWidth: 1,
           lineStyle: 1, // dotted
-          axisLabelVisible: true,
+          axisLabelVisible: line.showPriceLabel,
           title: line.label,
         });
       });
@@ -632,6 +643,7 @@ export function ChartWidget({
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
       {timeframe && timer && <TimerBadge timeframe={timeframe} timer={timer} />}
+      {hud && <HudBox config={hud} values={hudValues} />}
       {rectBoxes.map((box, i) => (
         <div
           key={i}

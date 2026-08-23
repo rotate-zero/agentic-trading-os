@@ -32,7 +32,11 @@ import {
   DAILY_LEVELS_LOOKBACK_PRESETS,
   DAILY_LEVELS_LINE_WIDTH_MIN,
   DAILY_LEVELS_LINE_WIDTH_MAX,
+  HUD_OPACITY_MIN,
+  HUD_OPACITY_MAX,
+  HUD_VARIABLE_KEYS,
   createDefaultDailyLevelsConfig,
+  createDefaultHudConfig,
   createDefaultVolumeBarsConfig,
   createHorizontalLevelInstance,
   createPriceIndicatorInstance,
@@ -41,6 +45,9 @@ import {
   type ChartStyle,
   type HorizontalLevelInstance,
   type HorizontalLevelType,
+  type HudLineConfig,
+  type HudSegment,
+  type HudVariableKey,
   type LineStyleOption,
   type OverlayIndicatorType,
   type PriceIndicatorInstance,
@@ -49,6 +56,7 @@ import {
   type VolumeAvgLineConfig,
   type VolumeBarColorMode,
 } from "../../types/workspace";
+import { HUD_VARIABLES } from "../../utils/hud";
 import { MOCK_TICKERS } from "../../mocks/tickers";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -124,7 +132,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "chartStyle" | "background" | "timer" | "volumeAvg" | "volumeBars" | "dailyLevels";
+type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "chartStyle" | "background" | "timer" | "volumeAvg" | "volumeBars" | "dailyLevels" | "hud";
 
 const VOLUME_BAR_COLOR_MODE_LABELS: Record<VolumeBarColorMode, string> = {
   two_color: "2-Color",
@@ -275,6 +283,15 @@ function VolumeAvgLineRow({
           </div>
         )}
       </div>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={line.showPriceLabel}
+          onChange={(e) => patchLine({ showPriceLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show price tag
+      </label>
       <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
         <input
           type="color"
@@ -294,6 +311,119 @@ function VolumeAvgLineRow({
             isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
           }`}
         />
+      </div>
+    </div>
+  );
+}
+
+// One HUD line's editor: enable checkbox, then its ordered segments
+// (literal text + variables) rendered as small removable chips, plus
+// controls to append a new text segment or a new variable segment.
+// Variable chips show the catalog label (utils/hud.ts's HUD_VARIABLES),
+// not the raw key, so "GAP"/"DAY"/"ATR"/... reads the same here as it
+// will on the actual chart. Segments are an ordered array specifically so
+// a line can freely mix "some text" + a variable + "more text" rather
+// than being locked to a fixed template — the literal ask ("text field
+// will only contain text and variables") taken at face value rather than
+// simplified into a fixed two-variable-per-line shape.
+let hudMenuSegmentCounter = 0;
+function newHudSegmentId(): string {
+  hudMenuSegmentCounter += 1;
+  return `hud-seg-${Date.now().toString(36)}-${hudMenuSegmentCounter}`;
+}
+
+function HudLineEditor({
+  line,
+  index,
+  onChange,
+}: {
+  line: HudLineConfig;
+  index: number;
+  onChange: (patch: Partial<HudLineConfig>) => void;
+}) {
+  const [addVariable, setAddVariable] = useState<HudVariableKey | "">("");
+
+  const updateTextSegment = (segId: string, value: string) => {
+    onChange({ segments: line.segments.map((s) => (s.id === segId && s.kind === "text" ? { ...s, value } : s)) });
+  };
+  const removeSegment = (segId: string) => {
+    onChange({ segments: line.segments.filter((s) => s.id !== segId) });
+  };
+  const addText = () => {
+    const seg: HudSegment = { id: newHudSegmentId(), kind: "text", value: " " };
+    onChange({ segments: [...line.segments, seg] });
+  };
+  const addVar = (key: HudVariableKey) => {
+    const seg: HudSegment = { id: newHudSegmentId(), kind: "variable", variable: key };
+    onChange({ segments: [...line.segments, seg] });
+  };
+
+  return (
+    <div className="mb-2 rounded border border-base-border/60 px-2 py-1.5">
+      <label className="mb-1 flex items-center gap-1.5 font-mono text-[11px] text-text-primary">
+        <input
+          type="checkbox"
+          checked={line.enabled}
+          onChange={(e) => onChange({ enabled: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Line {index + 1}
+      </label>
+      <div className="mb-1.5 flex flex-wrap items-center gap-1">
+        {line.segments.length === 0 && (
+          <span className="font-mono text-[10px] text-text-muted">Empty — add text or a variable below</span>
+        )}
+        {line.segments.map((seg) =>
+          seg.kind === "variable" ? (
+            <span
+              key={seg.id}
+              className="flex items-center gap-1 rounded bg-signal/20 px-1.5 py-0.5 font-mono text-[10px] text-signal"
+            >
+              {HUD_VARIABLES[seg.variable].label}
+              <button onClick={() => removeSegment(seg.id)} className="text-signal/70 hover:text-signal" title="Remove">
+                &times;
+              </button>
+            </span>
+          ) : (
+            <span key={seg.id} className="flex items-center gap-1 rounded border border-base-border bg-base-bg px-1 py-0.5">
+              <input
+                value={seg.value}
+                onChange={(e) => updateTextSegment(seg.id, e.target.value)}
+                placeholder="text"
+                className="w-12 bg-transparent font-mono text-[10px] text-text-primary outline-none"
+              />
+              <button onClick={() => removeSegment(seg.id)} className="text-text-muted hover:text-text-primary" title="Remove">
+                &times;
+              </button>
+            </span>
+          )
+        )}
+      </div>
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={addText}
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-signal"
+        >
+          + Text
+        </button>
+        <select
+          value={addVariable}
+          onChange={(e) => {
+            const key = e.target.value as HudVariableKey | "";
+            if (key) {
+              addVar(key);
+              setAddVariable("");
+            }
+          }}
+          className="rounded border border-base-border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary outline-none focus:border-signal"
+        >
+          <option value="">+ Variable&hellip;</option>
+          {HUD_VARIABLE_KEYS.map((key) => (
+            <option key={key} value={key}>
+              {HUD_VARIABLES[key].label} ({key})
+            </option>
+          ))}
+        </select>
       </div>
     </div>
   );
@@ -630,7 +760,7 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
       {open && (
         <div
           className={`absolute right-0 top-full z-20 max-h-[80vh] overflow-y-auto rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
-            level === "volumeAvg" || level === "overlay" || level === "levels" ? "w-72" : "w-56"
+            level === "volumeAvg" || level === "overlay" || level === "levels" || level === "hud" ? "w-72" : "w-56"
           }`}
         >
           {/* No max-height/overflow existed here before — the panel just
@@ -701,6 +831,12 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                 hint={config.dailyLevelsConfig.enabled ? `Strength \u2265 ${config.dailyLevelsConfig.minStrength}` : "Off"}
                 swatch={config.dailyLevelsConfig.enabled ? config.dailyLevelsConfig.color : undefined}
                 onClick={() => setLevel("dailyLevels")}
+              />
+              <RootRow
+                label="HUD"
+                hint={config.hud.enabled ? `${config.hud.lines.filter((l) => l.enabled).length} line(s)` : "Off"}
+                swatch={config.hud.enabled ? config.hud.textColor : undefined}
+                onClick={() => setLevel("hud")}
               />
             </div>
           )}
@@ -1239,6 +1375,95 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   </button>
                   <button
                     onClick={() => updateSubWindow(config.id, { dailyLevelsConfig: createDefaultDailyLevelsConfig() })}
+                    className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+                  >
+                    Reset to default
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {level === "hud" && (
+            <div>
+              <BackRow label="HUD" onClick={() => setLevel("root")} />
+              <button
+                onClick={() => updateSubWindow(config.id, { hud: { ...config.hud, enabled: !config.hud.enabled } })}
+                className={`mb-2 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-xs ${
+                  config.hud.enabled ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                }`}
+              >
+                Show HUD
+                {config.hud.enabled && <span>&#10003;</span>}
+              </button>
+              {config.hud.enabled && (
+                <>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    Lines — each line mixes literal text with live values (GAP,
+                    DAY, ATR, P/L, RVOL, VOL); ATR is ATR(14), the only period
+                    the backend computes
+                  </div>
+                  <div className="px-2">
+                    {config.hud.lines.map((line, idx) => (
+                      <HudLineEditor
+                        key={line.id}
+                        line={line}
+                        index={idx}
+                        onChange={(patch) =>
+                          updateSubWindow(config.id, {
+                            hud: {
+                              ...config.hud,
+                              lines: config.hud.lines.map((l) => (l.id === line.id ? { ...l, ...patch } : l)),
+                            },
+                          })
+                        }
+                      />
+                    ))}
+                  </div>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                    Position
+                  </div>
+                  <div className="mb-2 grid grid-cols-2 gap-1 px-2">
+                    {(["left", "right"] as const).map((align) => (
+                      <button
+                        key={align}
+                        onClick={() => updateSubWindow(config.id, { hud: { ...config.hud, align } })}
+                        className={`rounded border px-2 py-1 text-center font-mono text-[11px] capitalize ${
+                          config.hud.align === align
+                            ? "border-signal text-signal"
+                            : "border-base-border text-text-muted hover:text-text-primary"
+                        }`}
+                      >
+                        {align}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">Background</div>
+                  <ColorField
+                    value={config.hud.backgroundColor}
+                    onChange={(hex) => updateSubWindow(config.id, { hud: { ...config.hud, backgroundColor: hex } })}
+                  />
+                  <div className="mb-1 mt-2 flex items-center gap-2 px-2">
+                    <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Opacity</span>
+                    <input
+                      type="range"
+                      min={HUD_OPACITY_MIN}
+                      max={HUD_OPACITY_MAX}
+                      value={config.hud.backgroundOpacity}
+                      onChange={(e) =>
+                        updateSubWindow(config.id, { hud: { ...config.hud, backgroundOpacity: Number(e.target.value) } })
+                      }
+                      className="h-1 flex-1 accent-signal"
+                    />
+                    <span className="w-8 text-right font-mono text-[10px] text-text-primary">{config.hud.backgroundOpacity}%</span>
+                  </div>
+                  <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">Text color</div>
+                  <ColorField
+                    value={config.hud.textColor}
+                    onChange={(hex) => updateSubWindow(config.id, { hud: { ...config.hud, textColor: hex } })}
+                  />
+                  <button
+                    onClick={() => updateSubWindow(config.id, { hud: createDefaultHudConfig() })}
                     className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
                   >
                     Reset to default

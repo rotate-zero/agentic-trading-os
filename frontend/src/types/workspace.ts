@@ -307,6 +307,14 @@ export interface VolumeAvgLineConfig {
   color: string; // hex
   barCount: number; // ignored when adjustable is false
   adjustable: boolean;
+  // The price-axis tag (createPriceLine's axisLabelVisible) — same field
+  // name/meaning as PriceIndicatorInstance.showPriceLabel and
+  // HorizontalLevelInstance.showPriceLabel. Previously hardcoded to
+  // `true` with no way to turn it off (ChartWidget.tsx's volumeAvg
+  // effect); this closes that gap so every label-bearing indicator on
+  // the chart follows the same on/off convention, not just three of the
+  // four. See confirmed-decisions.md #74.
+  showPriceLabel: boolean;
 }
 
 export interface VolumeAvgIndicatorConfig {
@@ -322,10 +330,10 @@ export function createDefaultVolumeAvgConfig(): VolumeAvgIndicatorConfig {
   return {
     enabled: false, // opt-in, same convention as the Indicators list starting empty
     lines: [
-      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", barCount: 0, adjustable: false },
-      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", barCount: 3, adjustable: true },
-      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", barCount: 6, adjustable: true },
-      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", barCount: 9, adjustable: true },
+      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", barCount: 0, adjustable: false, showPriceLabel: true },
+      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", barCount: 3, adjustable: true, showPriceLabel: true },
+      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", barCount: 6, adjustable: true, showPriceLabel: true },
+      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", barCount: 9, adjustable: true, showPriceLabel: true },
     ],
   };
 }
@@ -460,6 +468,117 @@ export function createDefaultDailyLevelsConfig(): DailyLevelsConfig {
   };
 }
 
+// ---- HUD text box (small on-chart readout, top of the price pane) ----
+//
+// A floating, multi-line text overlay pinned to the top of the chart pane —
+// same "fixed frame chrome over the candles" mechanism as TimerBadge.tsx,
+// but showing live Feature Engine values instead of bar-progress. Each of
+// its (always exactly 3, same "fixed slot count, per-slot enabled" shape as
+// VolumeAvgIndicatorConfig.lines above) lines is user-composed from an
+// ordered mix of literal text and live variables — not a fixed template —
+// so a line reads as e.g. "GAP +1.20%  DAY +0.85%" by combining two
+// variable segments with a plain-text separator between them, and the
+// person can freely add more text or swap in different variables.
+//
+// Variables map 1:1 onto specific Feature Engine keys (engine.py's
+// indicators/gap.py, session_change.py, atr.py, rvol.py, and
+// _update_vwap's session_volume) via useHudFeatures.ts — see that hook's
+// own docstring for the exact key-by-key mapping and why ATR is the
+// period-14 value (atr_14/atr_14_pct) rather than a shorter period: no
+// other period is computed anywhere in the system (feature_engine_atr_period
+// is a single global setting, currently 14), a real gap surfaced and
+// resolved with Saqib in chat rather than silently substituted. See
+// confirmed-decisions.md #75.
+export type HudVariableKey =
+  | "gap_pct"
+  | "gap_dollars"
+  | "session_pct_change"
+  | "session_dollar_change"
+  | "atr"
+  | "atr_pct"
+  | "rvol"
+  | "session_volume";
+
+// Label/formatting metadata lives in utils/hud.ts (HUD_VARIABLES), not
+// here — this file stays pure shape/config, same split the rest of
+// workspace.ts keeps between "what's configurable" (here) and "how it's
+// computed/rendered" (utils/, ChartWidget.tsx).
+export const HUD_VARIABLE_KEYS: HudVariableKey[] = [
+  "gap_pct",
+  "gap_dollars",
+  "session_pct_change",
+  "session_dollar_change",
+  "atr",
+  "atr_pct",
+  "rvol",
+  "session_volume",
+];
+
+export interface HudTextSegment {
+  id: string;
+  kind: "text";
+  value: string;
+}
+
+export interface HudVariableSegment {
+  id: string;
+  kind: "variable";
+  variable: HudVariableKey;
+}
+
+export type HudSegment = HudTextSegment | HudVariableSegment;
+
+export interface HudLineConfig {
+  id: "line1" | "line2" | "line3";
+  enabled: boolean;
+  segments: HudSegment[];
+}
+
+export type HudAlign = "left" | "right";
+
+export interface HudConfig {
+  enabled: boolean; // master on/off for the whole box
+  lines: HudLineConfig[]; // always exactly 3, in fixed order (line1, line2, line3)
+  backgroundColor: string; // hex
+  backgroundOpacity: number; // 0-100, applied on top of backgroundColor (see hexWithOpacity in utils/hud.ts)
+  textColor: string; // hex
+  align: HudAlign; // which corner of the chart pane the box sits in
+}
+
+export const HUD_OPACITY_MIN = 0;
+export const HUD_OPACITY_MAX = 100;
+export const DEFAULT_HUD_BACKGROUND = "#131720"; // matches DEFAULT_CHART_BG — reads as part of the
+// chart's own chrome by default, same "blend in until deliberately changed" choice DEFAULT_GRID_COLOR made
+export const DEFAULT_HUD_TEXT_COLOR = "#E6EDF3"; // matches theme.colors.text.primary, tailwind.config.js
+
+let hudSegmentCounter = 0;
+function hudSegmentId(): string {
+  hudSegmentCounter += 1;
+  return `hud-seg-${Date.now()}-${hudSegmentCounter}`;
+}
+
+function textSeg(value: string): HudTextSegment {
+  return { id: hudSegmentId(), kind: "text", value };
+}
+function varSeg(variable: HudVariableKey): HudVariableSegment {
+  return { id: hudSegmentId(), kind: "variable", variable };
+}
+
+export function createDefaultHudConfig(): HudConfig {
+  return {
+    enabled: false, // opt-in, same convention as Volume Avg/Daily Levels starting disabled
+    lines: [
+      { id: "line1", enabled: true, segments: [varSeg("gap_pct"), textSeg("  "), varSeg("session_pct_change")] },
+      { id: "line2", enabled: true, segments: [varSeg("atr"), textSeg("  "), varSeg("session_dollar_change")] },
+      { id: "line3", enabled: true, segments: [varSeg("rvol"), textSeg("  "), varSeg("session_volume")] },
+    ],
+    backgroundColor: DEFAULT_HUD_BACKGROUND,
+    backgroundOpacity: 70,
+    textColor: DEFAULT_HUD_TEXT_COLOR,
+    align: "left", // TimerBadge already owns the top-right corner; left avoids the two overlapping by default
+  };
+}
+
 export interface SubWindowConfig {
   id: string;
   connector: ConnectorId;
@@ -483,6 +602,7 @@ export interface SubWindowConfig {
   volumeAvg: VolumeAvgIndicatorConfig;
   volumeBars: VolumeBarsConfig;
   dailyLevelsConfig: DailyLevelsConfig; // confirmed decision #61 — see that type's own comment
+  hud: HudConfig; // on-chart Feature Engine readout box, confirmed decision #75 — see that type's own comment
 }
 
 export const DEFAULT_SYMBOL = "NVDA";

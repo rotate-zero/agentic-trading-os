@@ -5,6 +5,7 @@ import { useLiveCandles } from "../../hooks/useLiveCandles";
 import { useFeatureEngineSeries } from "../../hooks/useFeatureEngineSeries";
 import { useFeatureEngineLevels } from "../../hooks/useFeatureEngineLevels";
 import { useDailyLevels } from "../../hooks/useDailyLevels";
+import { useHudFeatures } from "../../hooks/useHudFeatures";
 import { generateMockOverlays } from "../../mocks/chartObjects";
 import { computePriceIndicator } from "../../utils/indicators";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -48,6 +49,13 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
   // featureLevels above does.
   const dailyLevels = useDailyLevels(symbol, config.dailyLevelsConfig.lookbackDays);
 
+  // Live values for the HUD box's variables (gap, session change, ATR,
+  // RVOL, session volume) — see useHudFeatures.ts's own docstring. Called
+  // unconditionally, same "cheap, don't gate behind config.hud.enabled"
+  // choice featureSeries above already makes, for the same reason: it's
+  // one more subscription to an already-open channel, not a new request.
+  const hudValues = useHudFeatures(symbol, config.timeframe);
+
   // Overlay indicators (SMA/EMA/VWAP instances) computed into flat series for
   // ChartWidget. Keyed by instance.id, which is unique within a sub-window.
   const indicators = useMemo(
@@ -79,6 +87,8 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           volumeBars={config.volumeBars}
           dailyLevels={dailyLevels}
           dailyLevelsConfig={config.dailyLevelsConfig}
+          hud={config.hud}
+          hudValues={hudValues}
         />
       </div>
     </div>
