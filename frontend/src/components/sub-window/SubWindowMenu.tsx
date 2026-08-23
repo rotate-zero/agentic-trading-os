@@ -4,7 +4,9 @@ import {
   CANDLE_LIMIT_MAX,
   CANDLE_LIMIT_MIN,
   CANDLE_LIMIT_STEP,
+  CHART_STYLES,
   DEFAULT_CHART_BG,
+  DEFAULT_CHART_STYLE,
   DEFAULT_GRID_COLOR,
   DEFAULT_TIMER_COLOR,
   HORIZONTAL_LEVEL_GROUPS,
@@ -36,6 +38,7 @@ import {
   createPriceIndicatorInstance,
   priceIndicatorLabel,
   type CandleLimit,
+  type ChartStyle,
   type HorizontalLevelInstance,
   type HorizontalLevelType,
   type LineStyleOption,
@@ -121,11 +124,16 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   );
 }
 
-type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "background" | "timer" | "volumeAvg" | "volumeBars" | "dailyLevels";
+type MenuLevel = "root" | "timeframe" | "overlay" | "levels" | "connector" | "candles" | "chartStyle" | "background" | "timer" | "volumeAvg" | "volumeBars" | "dailyLevels";
 
 const VOLUME_BAR_COLOR_MODE_LABELS: Record<VolumeBarColorMode, string> = {
   two_color: "2-Color",
   one_color: "1-Color",
+};
+
+const CHART_STYLE_LABELS: Record<ChartStyle, string> = {
+  candlestick: "Candlestick",
+  bar: "Bar (OHLC)",
 };
 
 function RootRow({
@@ -655,6 +663,11 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
               />
               <RootRow label="Candles" hint={candleLimitLabel(config.candleLimit)} onClick={() => setLevel("candles")} />
               <RootRow
+                label="Chart Style"
+                hint={CHART_STYLE_LABELS[config.chartStyle]}
+                onClick={() => setLevel("chartStyle")}
+              />
+              <RootRow
                 label="Background"
                 hint={config.backgroundColor}
                 swatch={config.backgroundColor}
@@ -877,6 +890,41 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   +
                 </button>
               </div>
+            </div>
+          )}
+
+          {level === "chartStyle" && (
+            <div>
+              <BackRow label="Chart Style" onClick={() => setLevel("root")} />
+              {/* Global default is DEFAULT_CHART_STYLE ("candlestick"),
+                  applied to every newly-created sub-window; this screen is
+                  the per-sub-window override, same "shared default,
+                  independently overridable" shape every other display
+                  setting in this menu already has (background/grid, volume
+                  bars, etc.) — confirmed decision #73. A future third
+                  style is one more entry in CHART_STYLES, no menu
+                  restructuring needed. */}
+              <div className="grid grid-cols-2 gap-1 px-2">
+                {CHART_STYLES.map((style) => (
+                  <button
+                    key={style}
+                    onClick={() => updateSubWindow(config.id, { chartStyle: style })}
+                    className={`rounded border px-2 py-1 text-center font-mono text-[11px] ${
+                      config.chartStyle === style
+                        ? "border-signal text-signal"
+                        : "border-base-border text-text-muted hover:text-text-primary"
+                    }`}
+                  >
+                    {CHART_STYLE_LABELS[style]}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => updateSubWindow(config.id, { chartStyle: DEFAULT_CHART_STYLE })}
+                className="mt-2 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+              >
+                Reset to default
+              </button>
             </div>
           )}
 

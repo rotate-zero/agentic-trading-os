@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState, type R
 import { broadcastSync, subscribeSync } from "./crossTabSync";
 import {
   DEFAULT_CHART_BG,
+  DEFAULT_CHART_STYLE,
   DEFAULT_GRID_COLOR,
   DEFAULT_SYMBOL,
   LINK_CONNECTOR_IDS,
@@ -82,14 +83,14 @@ const SAVED_LAYOUTS_KEY = "trading-workspace:saved-layouts";
 // cross-talk. Grid changes after this use the generic fallback below.
 function makeInitialSubWindows(): SubWindowConfig[] {
   return [
-    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-0", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 9)], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
     // 9/20/50 SMA on the 5m window — the exact motivating example for the
     // instance-based SMA system, shown live instead of making the person
     // configure it themselves to see it work (same rationale as the rest of
     // this function's comment above).
-    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
-    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
-    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-1", connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "5m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("SMA", 0, 9), createPriceIndicatorInstance("SMA", 1, 20), createPriceIndicatorInstance("SMA", 2, 50)], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-2", connector: "none", symbol: "TSLA", timeframe: "15m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: "sw-3", connector: 1, symbol: "AAPL", timeframe: "1h", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
   ];
 }
 
@@ -99,10 +100,10 @@ function makeInitialSubWindows(): SubWindowConfig[] {
 // without the person needing to configure anything to see the feature.
 function makeSecondaryMainWindowSubWindows(id: string): SubWindowConfig[] {
   return [
-    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
-    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
-    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
-    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-0`, connector: 0, symbol: DEFAULT_SYMBOL, timeframe: "15m", liveTick: false, priceIndicators: [createPriceIndicatorInstance("EMA", 0, 20)], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-1`, connector: "none", symbol: "MSFT", timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-2`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
+    { id: `${id}-sw-3`, connector: "none", symbol: DEFAULT_SYMBOL, timeframe: "1m", liveTick: false, priceIndicators: [], horizontalLevels: [], candleLimit: "all", chartStyle: DEFAULT_CHART_STYLE, backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR, timer: createDefaultTimerConfig(), volumeAvg: createDefaultVolumeAvgConfig(), volumeBars: createDefaultVolumeBarsConfig(), dailyLevelsConfig: createDefaultDailyLevelsConfig() },
   ];
 }
 
@@ -121,6 +122,7 @@ function makeDefaultSubWindows(rows: number, cols: number, prior: SubWindowConfi
         priceIndicators: i === 0 ? [createPriceIndicatorInstance("EMA", 0, 9)] : [],
         horizontalLevels: [],
         candleLimit: "all",
+        chartStyle: DEFAULT_CHART_STYLE,
         backgroundColor: DEFAULT_CHART_BG,
         gridColor: DEFAULT_GRID_COLOR,
         timer: createDefaultTimerConfig(),
@@ -213,6 +215,11 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
       ...migratedFromLegacyIndicators,
     ],
     horizontalLevels: sw.horizontalLevels ?? [],
+    // Back-fill for sessions persisted before chartStyle existed (decision
+    // #73) — candlestick is what every prior saved layout was already
+    // rendering unconditionally, so this is the only backfill value that
+    // doesn't silently change an old layout's appearance.
+    chartStyle: sw.chartStyle ?? DEFAULT_CHART_STYLE,
     gridColor: sw.gridColor ?? DEFAULT_GRID_COLOR,
     timer: sw.timer ?? createDefaultTimerConfig(),
     volumeAvg: sw.volumeAvg ?? createDefaultVolumeAvgConfig(),

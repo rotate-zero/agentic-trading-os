@@ -11,8 +11,8 @@ import {
 } from "lightweight-charts";
 import type { Candle, ChartObject } from "../../types/market";
 import type { IndicatorPoint } from "../../utils/indicators";
-import type { CandleLimit, DailyLevelsConfig, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
-import { DEFAULT_GRID_COLOR, createDefaultDailyLevelsConfig, createDefaultVolumeBarsConfig } from "../../types/workspace";
+import type { CandleLimit, ChartStyle, DailyLevelsConfig, HorizontalLevelInstance, LineStyleOption, Timeframe, TimerConfig, VolumeAvgIndicatorConfig, VolumeBarsConfig } from "../../types/workspace";
+import { DEFAULT_CHART_STYLE, DEFAULT_GRID_COLOR, createDefaultDailyLevelsConfig, createDefaultVolumeBarsConfig } from "../../types/workspace";
 import type { DailyLevelWireShape } from "../../services/api-client";
 import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
 import { computeHorizontalLevel } from "../../utils/indicators";
@@ -56,6 +56,10 @@ interface ChartWidgetProps {
   // existed.
   horizontalLevelValues?: Record<string, number | undefined>;
   candleLimit?: CandleLimit;
+  // Candlestick (default) or bar (OHLC sticks, confirmed decision #73).
+  // Purely a rendering choice — same underlying candle data either way,
+  // see the series-swap effect below for how switching this live works.
+  chartStyle?: ChartStyle;
   backgroundColor?: string;
   gridColor?: string;
   timeframe?: Timeframe;
@@ -87,6 +91,13 @@ const DEFAULT_DAILY_LEVELS_CONFIG = createDefaultDailyLevelsConfig();
 
 function volumeBarColor(candle: Candle, config: VolumeBarsConfig): string {
   return config.colorMode === "one_color" ? config.singleColor : candle.close >= candle.open ? config.upColor : config.downColor;
+}
+
+// Shared by the candle/volume data effect AND the chart-style-swap effect
+// below (decision #73) — both need the exact same OHLC point shape,
+// hoisted out of the data effect's own closure rather than duplicated.
+function toCandlePoint(c: Candle): { time: UTCTimestamp; open: number; high: number; low: number; close: number } {
+  return { time: c.time as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close };
 }
 
 // Structural diff between two candle arrays, used by the data effect below
@@ -131,6 +142,7 @@ export function ChartWidget({
   horizontalLevels = [],
   horizontalLevelValues,
   candleLimit = "all",
+  chartStyle = DEFAULT_CHART_STYLE,
   backgroundColor = "#131720",
   gridColor = DEFAULT_GRID_COLOR,
   timeframe,
@@ -142,7 +154,19 @@ export function ChartWidget({
 }: ChartWidgetProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
-  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  // Widened to accept either series type (decision #73) — every downstream
+  // consumer (overlays, horizontalLevels, dailyLevels effects below) only
+  // ever calls the series-agnostic subset of the API (createPriceLine,
+  // setMarkers, priceToCoordinate, removePriceLine), which both
+  // ISeriesApi<"Candlestick"> and ISeriesApi<"Bar"> implement identically —
+  // confirmed by reading lightweight-charts' own typings before widening
+  // this, not assumed.
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | ISeriesApi<"Bar"> | null>(null);
+  // Tracks which style is CURRENTLY live on candleSeriesRef — separate from
+  // the chartStyle prop itself so the swap effect below can tell "prop
+  // changed, need to swap" apart from "prop unchanged, this run is for
+  // something else." Seeded from the mount effect's own initial choice.
+  const currentChartStyleRef = useRef<ChartStyle>(chartStyle);
   const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const lineSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const [rectBoxes, setRectBoxes] = useState<RectBox[]>([]);
@@ -176,13 +200,23 @@ export function ChartWidget({
       autoSize: true,
     });
 
-    const candleSeries = chart.addCandlestickSeries({
-      upColor: BULL,
-      downColor: BEAR,
-      borderVisible: false,
-      wickUpColor: BULL,
-      wickDownColor: BEAR,
-    });
+    // Deliberately reads chartStyle from this render's closure even though
+    // this effect's deps are [] (mount-only, same reasoning as the chart
+    // itself not being recreated on every symbol switch) — that's correct
+    // here specifically because currentChartStyleRef is seeded from the
+    // same initial value above, so the swap effect below picks up any
+    // LATER change to chartStyle on its own; this line only needs to be
+    // right for the very first render.
+    const candleSeries =
+      chartStyle === "bar"
+        ? chart.addBarSeries({ upColor: BULL, downColor: BEAR })
+        : chart.addCandlestickSeries({
+            upColor: BULL,
+            downColor: BEAR,
+            borderVisible: false,
+            wickUpColor: BULL,
+            wickDownColor: BEAR,
+          });
 
     const volumeSeries = chart.addHistogramSeries({
       priceFormat: { type: "volume" },
@@ -203,7 +237,56 @@ export function ChartWidget({
       volumeSeriesRef.current = null;
       lineSeriesRef.current.clear();
     };
+    // chartStyle deliberately excluded — see this effect's own comment
+    // above the candleSeries ternary for why reading it once at mount is
+    // correct here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Chart style (candlestick vs. bar, decision #73) — swaps the LIVE series
+  // in place when SubWindowMenu's toggle changes, rather than recreating
+  // the whole chart (which would lose zoom/pan, same reasoning the mount
+  // effect above already documents for symbol/timeframe switches). Mirrors
+  // the add/remove shape the indicator-line-series effect further below
+  // already uses. Declared right after the mount effect and BEFORE the
+  // overlays/horizontalLevels/dailyLevels effects specifically so that,
+  // within the same render's effect pass, this effect's setup (which
+  // reassigns candleSeriesRef.current to the new series) runs before
+  // theirs — each of those effects now also lists chartStyle as a
+  // dependency, so a style change makes them clean up (removing their
+  // price lines/markers from the OLD series, while it's still attached to
+  // the chart) and then redraw fresh onto candleSeriesRef.current, which by
+  // the time their setup runs is already the NEW series. Without chartStyle
+  // in their deps, their price lines would silently vanish on a style
+  // switch until some unrelated prop change happened to re-trigger them.
+  useEffect(() => {
+    const chart = chartRef.current;
+    const existing = candleSeriesRef.current;
+    if (!chart || !existing) return;
+    if (currentChartStyleRef.current === chartStyle) return; // already correct — covers the mount run and every unrelated re-render
+
+    const priorData = candles.map(toCandlePoint);
+    chart.removeSeries(existing);
+    const next =
+      chartStyle === "bar"
+        ? chart.addBarSeries({ upColor: BULL, downColor: BEAR })
+        : chart.addCandlestickSeries({
+            upColor: BULL,
+            downColor: BEAR,
+            borderVisible: false,
+            wickUpColor: BULL,
+            wickDownColor: BEAR,
+          });
+    next.setData(priorData);
+    candleSeriesRef.current = next;
+    currentChartStyleRef.current = chartStyle;
+    // candles deliberately excluded — this effect only needs to re-run when
+    // chartStyle itself changes (the guard above is what actually decides
+    // whether to do anything); it still reads the current render's candles
+    // from closure for the setData() call above, same pattern the volume-
+    // bar-color effect further below already uses for its own candles read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartStyle]);
 
   // Background + grid line color — applied live via applyOptions rather than
   // folded into chart creation, so changing either (or loading a saved layout
@@ -243,13 +326,6 @@ export function ChartWidget({
     const chart = chartRef.current;
     if (!candleSeries || !volumeSeries || !chart) return;
 
-    const toCandlePoint = (c: Candle) => ({
-      time: c.time as UTCTimestamp,
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-    });
     const toVolumePoint = (c: Candle) => ({
       time: c.time as UTCTimestamp,
       value: c.volume,
@@ -388,7 +464,13 @@ export function ChartWidget({
       priceLines.forEach((line) => series.removePriceLine(line));
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(positionRects);
     };
-  }, [overlays]);
+    // chartStyle included deliberately (decision #73) — not something this
+    // effect's own logic uses, but its cleanup/redraw needs to fire when
+    // the swap effect above hands candleSeriesRef a brand-new series
+    // object, or these price lines/markers would stay orphaned on the old,
+    // now-removed series until some unrelated prop change happened to
+    // re-trigger this effect.
+  }, [overlays, chartStyle]);
 
   // Volume average lines — up to 4 horizontal price lines drawn on the volume
   // pane's own price scale (via createPriceLine, same mechanism the
@@ -450,7 +532,10 @@ export function ChartWidget({
     return () => {
       priceLines.forEach((line) => series.removePriceLine(line));
     };
-  }, [candles, horizontalLevels, horizontalLevelValues]);
+    // chartStyle included deliberately (decision #73) — same reasoning as
+    // the overlays effect above: reattach these price lines to the new
+    // series after a style swap.
+  }, [candles, horizontalLevels, horizontalLevelValues, chartStyle]);
 
   // Daily Levels (confirmed decisions #59-#62) — one price line per
   // backend-clustered zone, filtered by minStrength AND an optional
@@ -489,7 +574,10 @@ export function ChartWidget({
     return () => {
       priceLines.forEach((line) => series.removePriceLine(line));
     };
-  }, [dailyLevels, dailyLevelsConfig]);
+    // chartStyle included deliberately (decision #73) — same reasoning as
+    // the overlays effect above: reattach these price lines to the new
+    // series after a style swap.
+  }, [dailyLevels, dailyLevelsConfig, chartStyle]);
 
   // Indicator line series — created/updated/removed as the sub-window's indicator
   // selection changes. Keyed so toggling one indicator doesn't touch the others.

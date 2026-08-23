@@ -1,77 +1,33 @@
-# TESTING — LiveTickRelay / "Tick" fluidity (decision #72)
+# Chart Style (Candlestick vs. Bar) — decision #73
 
-Unzip this directly at the project root (`agentic-trading-os/`) — every
-path inside mirrors the real repo, so it overwrites the modified files and
-adds the new ones in place.
+## What's in this zip
+Unzip directly into the project root — every path already matches the repo layout, so files land in place:
 
-## Files touched
-
-**New:**
-- `backend/app/services/live_tick_relay.py` — the relay itself
-- `backend/tests/test_live_tick_relay.py` — 6 new tests
-
-**Modified:**
-- `backend/app/schemas/events/envelope.py` — new `EventType.PRICE_SNAPSHOT`
-- `backend/app/schemas/events/market_data.py` — new `PriceSnapshot` model
-- `backend/app/api/websocket/channels.py` — new `market.tick.snapshot` channel
-- `backend/app/api/routes/market.py` — new `POST`/`GET /market/active-symbols`
-- `backend/app/main.py` — wires `LiveTickRelay` into app startup/shutdown
-- `backend/tests/conftest.py` — resets the new singleton between tests
-- `frontend/src/types/workspace.ts` — new `SubWindowConfig.liveTick` field
-- `frontend/src/state/WorkspaceContext.tsx` — `liveTick: false` added to all 9 existing config literals
-- `frontend/src/hooks/useLiveCandles.ts` — new `liveTick` param + `_upsertLast` fix (see decision #72 for why the existing `CandleClosed` handler needed a fix too, not just a new branch)
-- `frontend/src/components/sub-window/SubWindow.tsx` — passes `config.liveTick` through
-- `frontend/src/components/sub-window/SubWindowMenu.tsx` — new "Tick" option in the Timeframe menu
-- `docs/decisions/confirmed-decisions.md` — decision #72, full writeup
-- `docs/architecture/system-design.md` — `PriceSnapshot` added to §10.3's contract table
-
-## Backend
-
-```bash
-cd backend
-pip install -r requirements.txt --break-system-packages   # if not already installed
-pytest tests/test_live_tick_relay.py -v                    # the 6 new tests, isolated
-pytest tests/ -q                                            # full suite against real local Postgres 16
+```
+frontend/src/types/workspace.ts                      (edited)
+frontend/src/state/WorkspaceContext.tsx               (edited)
+frontend/src/components/chart/ChartWidget.tsx         (edited)
+frontend/src/components/sub-window/SubWindow.tsx      (edited)
+frontend/src/components/sub-window/SubWindowMenu.tsx  (edited)
+docs/decisions/confirmed-decisions.md                 (appended — decision #73)
+docs/architecture/system-design.md                    (§4.11 — new Chart Style paragraph)
 ```
 
-Expect all of `test_live_tick_relay.py` to pass. I ran the full suite in a
-sandbox with **no local Postgres available** — 161 passed, 21 failed (all
-21 are the pre-existing DB-dependent tests, e.g. `test_daily_levels.py`,
-`test_feature_engine.py`, failing on `connection to server ... Connection
-refused` — nothing to do with this change). Against your real local
-Postgres those should all pass as before; if anything outside
-`test_live_tick_relay.py` fails there, that's worth flagging back to me.
+Backend untouched — this is a pure frontend rendering feature, no new dependency (uses `lightweight-charts`' existing native `addBarSeries`, already in `package.json`).
 
-## Frontend
+## What it does
+Sub-window menu → **Chart Style** (between Candles and Background) → toggle between **Candlestick** and **Bar (OHLC)**. Defaults to Candlestick for every new sub-window and for any layout saved before this change; per-window choice persists the same way every other display setting already does.
 
-```bash
-cd frontend
-npm install       # if not already installed
-npx tsc -b 2>&1 | grep -v "GridPresetPicker"    # should print nothing
-npx vite build                                    # should complete clean
-```
+## Already verified here (sandboxed, no browser)
+- `npm install && npx tsc -b` — clean, only the known pre-existing `GridPresetPicker.tsx` errors (decision #35) remain.
+- `npx vite build` — clean production build.
+- Confirmed only the 5 frontend files above changed (no backend files touched).
 
-Both ran clean in the sandbox (zero non-`GridPresetPicker` TypeScript
-errors, `vite build` succeeded — 74 modules, no warnings beyond the usual
-chunk-size notice).
-
-## What I could NOT verify (flagging honestly, not glossing over it)
-
-- **No real browser session** — same standing limitation as every other
-  frontend change here. The "Tick" toggle's actual visual behavior against
-  real Finnhub ticks hasn't been seen, only reasoned through against the
-  exact code read from the live repo and proven at the unit-test level.
-- **`POST /market/active-symbols` untested against a real running
-  server** — reasoned correct, not yet exercised live. Try something like:
-  ```bash
-  curl -X POST http://localhost:8000/market/active-symbols \
-    -H "Content-Type: application/json" \
-    -d '{"symbols": ["NVDA", "AAPL"]}'
-  ```
-  then open a chart on one of those symbols, switch it to "Tick" via the
-  Timeframe menu, and watch the last bar during live market hours.
-- **No scanning process exists yet** to call `set_active_symbols`
-  automatically — until Market Scanner is built, you set the active set
-  manually via the endpoint above. A symbol's chart can be switched to
-  "Tick" mode even if it's NOT in the active set; it just won't visibly
-  do anything beyond normal 1m-close updates until it is.
+## Please verify
+1. `cd frontend && npm install` (only if `lightweight-charts` version changed — it didn't, so this is likely a no-op) → `npx tsc -b` (filter `GridPresetPicker`) → `npx vite build`.
+2. Real browser click-through (this sandbox can't do this): open a sub-window, toggle Chart Style back and forth a few times —
+   - Series visually switches between candles and OHLC bars.
+   - Zoom/pan position is preserved across the toggle (not reset).
+   - Any horizontal levels / overlays / Daily Levels lines you have showing reattach correctly and don't vanish after a switch.
+   - "Reset to default" returns it to Candlestick.
+3. Reload the page (or a saved layout from before this change, if you have one) — confirm it still renders Candlestick with no console errors from the missing `chartStyle` field.

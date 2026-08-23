@@ -70,6 +70,7 @@ export function SubWindow({ config }: { config: SubWindowConfig }) {
           horizontalLevels={config.horizontalLevels}
           horizontalLevelValues={featureLevels}
           candleLimit={config.candleLimit}
+          chartStyle={config.chartStyle}
           backgroundColor={config.backgroundColor}
           gridColor={config.gridColor}
           timeframe={config.timeframe}

@@ -166,6 +166,21 @@ export interface HorizontalLevelInstance {
 export type LineStyleOption = "solid" | "dashed" | "dotted";
 export const LINE_STYLE_OPTIONS: LineStyleOption[] = ["solid", "dashed", "dotted"];
 
+// Chart style — which lightweight-charts series type draws the price pane.
+// A plain string union, not a config object, deliberately: unlike
+// VolumeBarsConfig/DailyLevelsConfig (which bundle several related
+// settings), this is one scalar choice, same shape as `backgroundColor`/
+// `gridColor` below rather than the nested-object pattern. Confirmed
+// decision #73 — extensible on purpose: both `addBarSeries` (OHLC bars,
+// matching lightweight-charts' native default styling of thin sticks with
+// visible open/close ticks — no custom renderer needed) and
+// `addCandlestickSeries` are natively supported by the already-installed
+// lightweight-charts version, so this is a pure rendering-layer choice; a
+// future third style is one more union member, not a new mechanism.
+export type ChartStyle = "candlestick" | "bar";
+export const CHART_STYLES: ChartStyle[] = ["candlestick", "bar"];
+export const DEFAULT_CHART_STYLE: ChartStyle = "candlestick";
+
 export const HORIZONTAL_LEVEL_LINE_WIDTH_MIN = 1;
 export const HORIZONTAL_LEVEL_LINE_WIDTH_MAX = 4;
 
@@ -461,6 +476,7 @@ export interface SubWindowConfig {
   priceIndicators: PriceIndicatorInstance[]; // opt-in, starts empty — SMA/EMA/VWAP
   horizontalLevels: HorizontalLevelInstance[]; // opt-in, starts empty — PDH/PDL/Camarilla/VPOC/etc.
   candleLimit: CandleLimit;
+  chartStyle: ChartStyle; // candlestick (default) or bar — confirmed decision #73
   backgroundColor: string; // hex, e.g. "#131720"
   gridColor: string; // hex, e.g. "#1E2530"
   timer: TimerConfig;
