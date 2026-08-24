@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { MAX_GRID_DIM } from "../../types/workspace";
 import { useWorkspace } from "../../state/WorkspaceContext";
+import { useDropdownPlacement } from "../../hooks/useDropdownPlacement";
 
 // Excel/PowerPoint-style hover grid: hovering cell (r,c) previews an (r+1) x
 // (c+1) selection (e.g. hovering the very first cell = 1x1 = sub-window takes
@@ -9,13 +10,15 @@ export function GridPicker() {
   const { gridLayout, setGridLayout } = useWorkspace();
   const [open, setOpen] = useState(false);
   const [hover, setHover] = useState<{ row: number; col: number } | null>(null);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const placement = useDropdownPlacement(open, anchorRef);
 
   const cells = Array.from({ length: MAX_GRID_DIM }).flatMap((_, r) =>
     Array.from({ length: MAX_GRID_DIM }).map((_, c) => ({ r, c }))
   );
 
   return (
-    <div className="relative">
+    <div className="relative" ref={anchorRef}>
       <button
         onClick={() => setOpen((o) => !o)}
         className="rounded border border-base-border px-2 py-1 font-mono text-xs text-text-muted hover:border-signal hover:text-text-primary"
@@ -24,7 +27,10 @@ export function GridPicker() {
       </button>
       {open && (
         <div
-          className="absolute right-0 top-full z-30 mt-1 rounded-md border border-base-border bg-base-panel p-3 shadow-xl"
+          className={`absolute right-0 z-30 overflow-y-auto rounded-md border border-base-border bg-base-panel p-3 shadow-xl ${
+            placement.vertical === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+          style={{ maxHeight: placement.maxHeight }}
           onMouseLeave={() => setHover(null)}
         >
           <div className="mb-2 text-center font-mono text-xs text-text-muted">

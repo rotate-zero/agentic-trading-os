@@ -1,76 +1,96 @@
-# HUD text box + Volume Avg label toggle — corrected, rebuilt on top of the
-# Chart Style patch — TESTING.md
+# Dropdown scrollbar fix + opacity everywhere — TESTING.md
 
-## Important — this replaces BOTH earlier zips from this session
+This is a standalone follow-up on top of your pushed `main` (which
+already has Chart Style #73, plus the HUD box / Volume Avg label toggle
+from `hud-and-label-toggle-v2.zip`, if you've applied that one). It does
+NOT touch anything from those — only adds the two things below.
 
-The two zips sent earlier (`volume-avg-label-toggle.zip` and
-`hud-and-label-toggle.zip`) were built from a repo snapshot fetched
-*before* you pushed the Chart Style (candlestick/bar) patch. Applying
-either of them as-is would have silently deleted that patch's code —
-not just its two doc entries — because it touched the exact same five
-files: `types/workspace.ts`, `WorkspaceContext.tsx`, `ChartWidget.tsx`,
-`SubWindow.tsx`, `SubWindowMenu.tsx`. Its decision-log entry was also
-`#73`, colliding with what would have been my own `#73`.
+## 1. Dropdown panels getting cut off (decision #76)
 
-**Do not apply either of the earlier zips.** This one is a fresh fetch of
-your actual pushed `main`, with the Volume Avg label-toggle fix and the
-HUD box re-applied on top of it — every line of the Chart Style patch
-(the `ChartStyle` type, the live series-swap effect, the three
-overlays/horizontalLevels/dailyLevels effects' `chartStyle` dependency
-fix, the menu screen) is verified byte-for-byte unchanged; see the diff
-notes at the bottom of this file if you want to check that claim
-yourself.
+Root cause: every dropdown panel in the app opens `top-full` below its
+toggle button. The one existing fix (`max-h-[80vh]`) capped the panel's
+own height, but didn't account for WHERE the panel was anchored — a
+sub-window near the bottom of the grid has its toolbar already most of
+the way down the screen, so "80% of viewport" measured from there still
+runs off the bottom, with no scrollbar ever appearing.
 
-## What's in this zip
-1. **Volume Avg price-label toggle** (decision #74) — every Volume Avg
-   line (Day/3-Bar/6-Bar/9-Bar) now has its own "Show price tag" checkbox.
-2. **On-chart HUD text box** (decision #75) — Menu → **HUD**. Up to 3
-   independently-toggleable lines, each a free mix of text + variables
-   (GAP, DAY, ATR, P/L, RVOL, VOL), background hex+opacity, text hex,
-   left/right position. Defaults: Line 1 = GAP + DAY, Line 2 = ATR(14) +
-   P/L, Line 3 = RVOL + VOL. ATR note: you asked for ATR[5]; the backend
-   only computes a single global period (currently 14, `core/config.py`'s
-   `feature_engine_atr_period`) — you chose ATR(14) over a new backend
-   period or an unverified frontend approximation when this was flagged
-   in chat.
-3. **Chart Style** (decision #73, already yours, unmodified) — included
-   only because it lives in the same files; nothing about it changed here.
+Fixed with one shared hook (`useDropdownPlacement.ts`) applied to all 5
+real dropdown panels in the app:
+- `SubWindowMenu`'s main indicator menu (the one in your screenshot)
+- `SubWindowMenu`'s ticker-search suggestion box
+- `LayoutsMenu`
+- `GridPicker`
+- `FeatureEnginePanel`'s symbol search
+
+It measures the toggle button's actual position and flips the panel
+upward with an accurate max-height when there isn't room below, instead
+of a flat viewport fraction. (`GridPresetPicker.tsx` was confirmed dead
+code — not imported anywhere — so it's untouched; it can't be the source
+of a bug nobody can trigger.)
+
+**To verify:** open the HUD menu (or any menu) on a sub-window near the
+bottom of a busy grid layout — the panel should now either fit and scroll
+internally, or flip to open upward, instead of getting cut off with no
+way to see the rest.
+
+## 2. Opacity on every hex color field (decision #77)
+
+Every color-bearing indicator now has an opacity slider next to its
+existing hex picker: SMA/EMA/VWAP lines, horizontal levels (PDH/PDL/
+Camarilla/VPOC/etc.), Timer sweep, Volume Avg lines, **Volume Bars
+up/down/single — your stated priority**, Daily Levels, HUD background +
+text, and the chart's own background/grid lines.
+
+Every opacity defaults to 100 (fully opaque) — nothing looks different
+until you actually move a slider. This delivery doesn't pick an opinion
+about what looks good (e.g. semi-transparent volume bars, a common
+convention elsewhere); it just makes it dial-able everywhere a color
+already was.
+
+**To verify — Volume Bars specifically, since that was the priority:**
+Menu → Volume Bars → pick a color mode → each color (Up/Down or Bar
+color) now has a slider next to its hex field. Drag it down and the
+volume histogram bars should visibly fade.
+
+**Other spots to spot-check:** Indicators (SMA/EMA/VWAP) → each instance
+row now has a small slider after its hex field. Levels → same. Daily
+Levels, Timer, Background, HUD → each `ColorField` row now has a slider
+built in.
 
 ## Files touched
-- `frontend/src/types/workspace.ts` — HUD types + `showPriceLabel` field, alongside the existing `ChartStyle`/`chartStyle`
-- `frontend/src/utils/hud.ts` — new: variable catalog, formatters, `hexWithOpacity`
-- `frontend/src/hooks/useHudFeatures.ts` — new: live values off the existing `/intelligence/state` snapshot
-- `frontend/src/components/chart/HudBox.tsx` — new: the overlay itself
-- `frontend/src/components/chart/ChartWidget.tsx` — HUD render + label-toggle fix; Chart Style's series-swap logic untouched
-- `frontend/src/components/sub-window/SubWindow.tsx` — calls `useHudFeatures`, passes it through; `chartStyle` prop untouched
-- `frontend/src/components/sub-window/SubWindowMenu.tsx` — new HUD menu panel + `HudLineEditor`; Volume Avg checkbox; Chart Style screen untouched
-- `frontend/src/state/WorkspaceContext.tsx` — `hud` wired into every construction site + back-fill; `chartStyle` wiring untouched
-- `docs/decisions/confirmed-decisions.md` — decisions #74 and #75 appended after the real #73 (Chart Style)
-- `docs/architecture/system-design.md` — HUD paragraph appended after the Chart Style paragraph
+- `frontend/src/types/workspace.ts` — `opacity`/`upOpacity`/`downOpacity`/`singleOpacity`/`textOpacity`/`backgroundOpacity`/`gridOpacity` added across every color config, all defaulting to 100
+- `frontend/src/utils/color.ts` — new: `hexWithOpacity()`, moved out of `utils/hud.ts` (no longer HUD-specific)
+- `frontend/src/utils/hud.ts` — re-exports `hexWithOpacity` for backward compat
+- `frontend/src/utils/indicators.ts` — threads `opacity` through `computePriceIndicator`/`computeHorizontalLevel`
+- `frontend/src/hooks/useDropdownPlacement.ts` — new: the shared placement hook
+- `frontend/src/components/chart/ChartWidget.tsx` — applies opacity at every render call site
+- `frontend/src/components/chart/TimerBadge.tsx` — applies opacity to the sweep color
+- `frontend/src/components/chart/HudBox.tsx` — applies the new `textOpacity`
+- `frontend/src/components/sub-window/SubWindowMenu.tsx` — dropdown placement fix (both its dropdowns) + opacity sliders on `ColorField` and all 3 inline per-instance color pickers
+- `frontend/src/components/sub-window/SubWindow.tsx` — untouched by this delivery, included only because it's unaffected (no diff beyond what you already have)
+- `frontend/src/components/workspace/GridPicker.tsx`, `LayoutsMenu.tsx` — dropdown placement fix
+- `frontend/src/components/intelligence/FeatureEnginePanel.tsx` — dropdown placement fix on its symbol search
+- `frontend/src/state/WorkspaceContext.tsx` — back-fill migration for every new opacity field
+- `docs/decisions/confirmed-decisions.md` — decisions #76 and #77
+- `docs/architecture/system-design.md` — unchanged in this delivery (included for completeness/consistency, matches what you already have if you applied the previous zip)
 
 ## How to apply
-Unzip directly into your project root — paths already match
-(`frontend/src/...`, `docs/...`), so it merges into the existing tree; no
-files are deleted or moved. Since this is a full rebuild on top of your
-actual pushed `main`, every file in this zip is safe to overwrite what's
-currently on disk.
+Unzip directly into your project root — merges into the existing tree, no
+files deleted or moved.
 
 ## How to verify
 1. `cd frontend && npm ci` (only if `node_modules` isn't already present)
 2. `npx tsc -b 2>&1 | grep -v "GridPresetPicker"` — clean (already run here)
 3. `npx vite build` — clean (already run here)
-4. `npm run dev` — confirm Chart Style still works exactly as before
-   (Menu → Chart Style → toggle candlestick/bar, zoom/pan should survive
-   the switch, overlays/levels should stay attached)
-5. Menu → **Volume Avg** → each line's "Show price tag" checkbox
-6. Menu → **HUD** → toggle on, confirm the 3 default lines render
-   top-left over the candles; try disabling a line, adding a text/variable
-   segment, changing colors/opacity/alignment
-7. Existing saved sessions should load with HUD off and Chart Style at
-   candlestick by default — both back-filled in `WorkspaceContext.tsx`
+4. `npm run dev` — walk through both checklists above
+5. Existing saved sessions should load with every opacity at 100% (no
+   visual change) and dropdown panels should just work better — no manual
+   migration needed on your end.
 
 ## Not verified
 No live browser click-through was possible in this environment. Verified
-via `tsc`/`vite build` and a manual diff against your actual pushed
-`main` (confirming the Chart Style patch's code is byte-for-byte
-preserved) — not visually confirmed in a running browser.
+via `tsc`/`vite build` and manual diffing against your pushed `main` to
+confirm nothing outside these two changes was touched — not visually
+confirmed in a running browser. The dropdown flip-to-upward behavior in
+particular is worth testing on an actual busy multi-row grid layout,
+since that's the scenario it's specifically fixing.

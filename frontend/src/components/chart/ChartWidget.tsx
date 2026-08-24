@@ -16,6 +16,7 @@ import { DEFAULT_CHART_STYLE, DEFAULT_GRID_COLOR, createDefaultDailyLevelsConfig
 import type { DailyLevelWireShape } from "../../services/api-client";
 import { dayAverageVolume, trailingAverageVolume } from "../../utils/volumeAverages";
 import { computeHorizontalLevel } from "../../utils/indicators";
+import { hexWithOpacity } from "../../utils/color";
 import { TimerBadge } from "./TimerBadge";
 import { HudBox } from "./HudBox";
 
@@ -23,6 +24,8 @@ export interface IndicatorSeries {
   key: string;
   label: string;
   color: string;
+  opacity?: number; // 0-100, see COLOR_OPACITY_DEFAULT — optional (defaults to fully
+  // opaque) for the same "legacy callers" reason lineWidth/showPriceLabel already are
   lineWidth?: number; // px — fractional allowed (e.g. 1.5), see the
   // PRICE_INDICATOR_LINE_WIDTH_STEP comment in types/workspace.ts. Defaults
   // to 2 when omitted (legacy callers).
@@ -62,7 +65,9 @@ interface ChartWidgetProps {
   // see the series-swap effect below for how switching this live works.
   chartStyle?: ChartStyle;
   backgroundColor?: string;
+  backgroundOpacity?: number; // 0-100, see COLOR_OPACITY_DEFAULT
   gridColor?: string;
+  gridOpacity?: number; // 0-100, see COLOR_OPACITY_DEFAULT
   timeframe?: Timeframe;
   timer?: TimerConfig;
   volumeAvg?: VolumeAvgIndicatorConfig;
@@ -99,7 +104,10 @@ const DEFAULT_VOLUME_BARS = createDefaultVolumeBarsConfig();
 const DEFAULT_DAILY_LEVELS_CONFIG = createDefaultDailyLevelsConfig();
 
 function volumeBarColor(candle: Candle, config: VolumeBarsConfig): string {
-  return config.colorMode === "one_color" ? config.singleColor : candle.close >= candle.open ? config.upColor : config.downColor;
+  if (config.colorMode === "one_color") return hexWithOpacity(config.singleColor, config.singleOpacity);
+  return candle.close >= candle.open
+    ? hexWithOpacity(config.upColor, config.upOpacity)
+    : hexWithOpacity(config.downColor, config.downOpacity);
 }
 
 // Shared by the candle/volume data effect AND the chart-style-swap effect
@@ -153,7 +161,9 @@ export function ChartWidget({
   candleLimit = "all",
   chartStyle = DEFAULT_CHART_STYLE,
   backgroundColor = "#131720",
+  backgroundOpacity = 100,
   gridColor = DEFAULT_GRID_COLOR,
+  gridOpacity = 100,
   timeframe,
   timer,
   volumeAvg,
@@ -304,13 +314,13 @@ export function ChartWidget({
   // with different colors) never tears down the chart and loses zoom/pan state.
   useEffect(() => {
     chartRef.current?.applyOptions({
-      layout: { background: { type: ColorType.Solid, color: backgroundColor } },
+      layout: { background: { type: ColorType.Solid, color: hexWithOpacity(backgroundColor, backgroundOpacity) } },
       grid: {
-        vertLines: { color: gridColor },
-        horzLines: { color: gridColor },
+        vertLines: { color: hexWithOpacity(gridColor, gridOpacity) },
+        horzLines: { color: hexWithOpacity(gridColor, gridOpacity) },
       },
     });
-  }, [backgroundColor, gridColor]);
+  }, [backgroundColor, backgroundOpacity, gridColor, gridOpacity]);
 
   // Candle/volume data updates — runs whenever candles or the candle-count
   // limit change (symbol switch, timeframe switch, the "Candles" stepper,
@@ -500,7 +510,7 @@ export function ChartWidget({
         const value = line.adjustable ? trailingAverageVolume(candles, line.barCount) : dayAverageVolume(candles);
         return series.createPriceLine({
           price: value,
-          color: line.color,
+          color: hexWithOpacity(line.color, line.opacity),
           lineWidth: 1,
           lineStyle: 1, // dotted
           axisLabelVisible: line.showPriceLabel,
@@ -532,7 +542,7 @@ export function ChartWidget({
       .map((resolved) =>
         series.createPriceLine({
           price: resolved.price,
-          color: resolved.color,
+          color: hexWithOpacity(resolved.color, resolved.opacity),
           lineWidth: Math.min(4, Math.max(1, Math.round(resolved.lineWidth))) as LineWidth,
           lineStyle: LINE_STYLE_MAP[resolved.lineStyle],
           axisLabelVisible: resolved.showPriceLabel,
@@ -574,7 +584,7 @@ export function ChartWidget({
       .map((level) =>
         series.createPriceLine({
           price: level.price,
-          color: dailyLevelsConfig.color,
+          color: hexWithOpacity(dailyLevelsConfig.color, dailyLevelsConfig.opacity),
           lineWidth: Math.min(4, Math.max(1, Math.round(dailyLevelsConfig.lineWidth))) as LineWidth,
           lineStyle: LineStyle.Solid,
           axisLabelVisible: dailyLevelsConfig.showPriceLabels,
@@ -616,10 +626,11 @@ export function ChartWidget({
       // explanation and the caveat about this being version-coupled.
       const lineWidth = Math.min(4, Math.max(1, ind.lineWidth ?? 2)) as unknown as LineWidth;
       const showPriceLabel = ind.showPriceLabel ?? true;
+      const color = hexWithOpacity(ind.color, ind.opacity ?? 100);
       let series = lineSeriesRef.current.get(ind.key);
       if (!series) {
         series = chart.addLineSeries({
-          color: ind.color,
+          color,
           lineWidth,
           title: ind.label,
           priceLineVisible: false,
@@ -632,7 +643,7 @@ export function ChartWidget({
         // render rather than only at creation, or a color pick / thickness
         // step / checkbox toggle wouldn't show until the series was torn
         // down and recreated.
-        series.applyOptions({ color: ind.color, lineWidth, title: ind.label, lastValueVisible: showPriceLabel });
+        series.applyOptions({ color, lineWidth, title: ind.label, lastValueVisible: showPriceLabel });
       }
       series.setData(ind.data.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }

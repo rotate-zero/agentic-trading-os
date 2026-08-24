@@ -97,17 +97,8 @@ export function resolveHudLine(line: HudLineConfig, values: Partial<Record<HudVa
     .join("");
 }
 
-// Hex + 0-100 opacity -> rgba(...) string, same "hex picker + separate
-// opacity control" split ColorField-adjacent pickers elsewhere in this
-// app could grow later but don't have yet — VolumeAvgLineConfig/
-// DailyLevelsConfig's colors are all opaque hex with no alpha channel,
-// so this is new, self-contained math rather than a shared helper.
-export function hexWithOpacity(hex: string, opacityPct: number): string {
-  const clean = hex.replace("#", "");
-  const full = clean.length === 3 ? clean.split("").map((c) => c + c).join("") : clean;
-  const r = parseInt(full.slice(0, 2), 16) || 0;
-  const g = parseInt(full.slice(2, 4), 16) || 0;
-  const b = parseInt(full.slice(4, 6), 16) || 0;
-  const a = Math.max(0, Math.min(100, opacityPct)) / 100;
-  return `rgba(${r}, ${g}, ${b}, ${a})`;
-}
+// Hex + 0-100 opacity -> rgba(...) string — moved to utils/color.ts
+// (decision #76) once every other indicator's color field grew its own
+// opacity too; re-exported here so nothing that already imports it from
+// this file needs to change.
+export { hexWithOpacity } from "./color";

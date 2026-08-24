@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { currentBarProgressPct } from "../../utils/timerProgress";
+import { hexWithOpacity } from "../../utils/color";
 import type { Timeframe, TimerConfig } from "../../types/workspace";
 
 // Fixed frame chrome — deliberately NOT tied to the sub-window's own
@@ -33,7 +34,7 @@ export function TimerBadge({ timeframe, timer }: { timeframe: Timeframe; timer: 
           // conic-gradient starts at 12 o'clock and sweeps clockwise by
           // default — exactly the "radar" behavior asked for, driven purely
           // by `pct` with no separate rotation transform needed.
-          background: `conic-gradient(${timer.color} ${pct}%, ${TRACK_COLOR} ${pct}% 100%)`,
+          background: `conic-gradient(${hexWithOpacity(timer.color, timer.opacity)} ${pct}%, ${TRACK_COLOR} ${pct}% 100%)`,
         }}
       />
     </div>

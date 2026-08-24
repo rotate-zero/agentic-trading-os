@@ -30,7 +30,7 @@ export function HudBox({
       }`}
       style={{
         backgroundColor: hexWithOpacity(config.backgroundColor, config.backgroundOpacity),
-        color: config.textColor,
+        color: hexWithOpacity(config.textColor, config.textOpacity),
       }}
     >
       {lines.map((text, idx) => (

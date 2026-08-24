@@ -1,11 +1,14 @@
 import { useRef, useState, type ChangeEvent } from "react";
 import { useWorkspace } from "../../state/WorkspaceContext";
+import { useDropdownPlacement } from "../../hooks/useDropdownPlacement";
 
 export function LayoutsMenu() {
   const { savedLayouts, saveCurrentLayout, loadLayout, deleteLayout, exportLayouts, importLayouts } = useWorkspace();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const placement = useDropdownPlacement(open, anchorRef);
 
   const handleSave = () => {
     const trimmed = name.trim();
@@ -24,7 +27,7 @@ export function LayoutsMenu() {
   };
 
   return (
-    <div className="relative">
+    <div className="relative" ref={anchorRef}>
       <button
         onClick={() => setOpen((o) => !o)}
         className="rounded border border-base-border px-2 py-1 font-mono text-xs text-text-muted hover:border-signal hover:text-text-primary"
@@ -32,7 +35,12 @@ export function LayoutsMenu() {
         Layouts
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-30 mt-1 w-64 rounded-md border border-base-border bg-base-panel p-3 shadow-xl">
+        <div
+          className={`absolute right-0 z-30 w-64 overflow-y-auto rounded-md border border-base-border bg-base-panel p-3 shadow-xl ${
+            placement.vertical === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+          style={{ maxHeight: placement.maxHeight }}
+        >
           <div className="mb-2 font-mono text-[11px] uppercase tracking-wide text-text-muted">
             Save current layout
           </div>

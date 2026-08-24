@@ -54,6 +54,10 @@ export const TIMEFRAMES: Timeframe[] = ["1m", "5m", "15m", "1h", "4h", "1d"];
 export type OverlayIndicatorType = "SMA" | "EMA" | "VWAP";
 export const OVERLAY_TYPES_WITH_PERIOD: OverlayIndicatorType[] = ["SMA", "EMA"]; // VWAP is session-anchored, not bar-count-based
 
+export const COLOR_OPACITY_MIN = 0;
+export const COLOR_OPACITY_MAX = 100;
+export const COLOR_OPACITY_DEFAULT = 100; // fully opaque — every existing color's prior, unconfigurable behavior
+
 export interface PriceIndicatorInstance {
   id: string; // stable per-instance id — NOT derived from type/period, since
   // two instances of the same type can coexist (e.g. two SMAs) and an id
@@ -63,6 +67,7 @@ export interface PriceIndicatorInstance {
   enabled: boolean;
   period?: number; // bars considered — SMA/EMA only; unused (undefined) for VWAP
   color: string; // hex
+  opacity: number; // 0-100, applied via hexWithOpacity (utils/hud.ts) at render time — see COLOR_OPACITY_DEFAULT
   lineWidth: number; // px — see PRICE_INDICATOR_LINE_WIDTH_STEP note below
   showPriceLabel: boolean; // last-value tag near the price axis, e.g. "SMA 9 → 22.50"
 }
@@ -110,6 +115,7 @@ export function createPriceIndicatorInstance(
     enabled: true,
     period: type === "VWAP" ? undefined : period,
     color: PRICE_INDICATOR_COLOR_CYCLE[existingCount % PRICE_INDICATOR_COLOR_CYCLE.length],
+    opacity: COLOR_OPACITY_DEFAULT,
     lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
     showPriceLabel: true,
   };
@@ -155,6 +161,7 @@ export interface HorizontalLevelInstance {
   type: HorizontalLevelType;
   enabled: boolean;
   color: string; // hex
+  opacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   lineWidth: number; // px, integer HORIZONTAL_LEVEL_LINE_WIDTH_MIN..MAX — createPriceLine floors
   // fractional widths to an integer physical-pixel count (unlike the overlay
   // line series above), so there's no finer step here; see the
@@ -241,6 +248,7 @@ export function createHorizontalLevelInstance(type: HorizontalLevelType): Horizo
     type,
     enabled: true,
     color: HORIZONTAL_LEVEL_DEFAULT_COLORS[type],
+    opacity: COLOR_OPACITY_DEFAULT,
     lineWidth: 1,
     lineStyle: "dashed",
     showPriceLabel: true,
@@ -285,11 +293,12 @@ export interface TimerConfig {
   color: string; // hex — the round sweep itself; the surrounding badge frame
   // (black border, fixed grey background) is intentionally NOT customizable,
   // since its whole job is to stay legible no matter what backgroundColor is.
+  opacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
 }
 export const DEFAULT_TIMER_COLOR = "#3FB950"; // bull green, round sweep shape
 
 export function createDefaultTimerConfig(): TimerConfig {
-  return { enabled: true, color: DEFAULT_TIMER_COLOR };
+  return { enabled: true, color: DEFAULT_TIMER_COLOR, opacity: COLOR_OPACITY_DEFAULT };
 }
 
 // Up to 4 horizontal average-volume lines drawn on the volume pane. Line 1
@@ -305,6 +314,7 @@ export interface VolumeAvgLineConfig {
   label: string;
   enabled: boolean;
   color: string; // hex
+  opacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   barCount: number; // ignored when adjustable is false
   adjustable: boolean;
   // The price-axis tag (createPriceLine's axisLabelVisible) — same field
@@ -330,10 +340,10 @@ export function createDefaultVolumeAvgConfig(): VolumeAvgIndicatorConfig {
   return {
     enabled: false, // opt-in, same convention as the Indicators list starting empty
     lines: [
-      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", barCount: 0, adjustable: false, showPriceLabel: true },
-      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", barCount: 3, adjustable: true, showPriceLabel: true },
-      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", barCount: 6, adjustable: true, showPriceLabel: true },
-      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", barCount: 9, adjustable: true, showPriceLabel: true },
+      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 0, adjustable: false, showPriceLabel: true },
+      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 3, adjustable: true, showPriceLabel: true },
+      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", opacity: COLOR_OPACITY_DEFAULT, barCount: 6, adjustable: true, showPriceLabel: true },
+      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", opacity: COLOR_OPACITY_DEFAULT, barCount: 9, adjustable: true, showPriceLabel: true },
     ],
   };
 }
@@ -362,8 +372,11 @@ export interface VolumeBarsConfig {
   enabled: boolean; // master on/off — false removes the volume pane entirely
   colorMode: VolumeBarColorMode;
   upColor: string; // hex — two_color mode, bars where close >= open
+  upOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   downColor: string; // hex — two_color mode, bars where close < open
+  downOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   singleColor: string; // hex — one_color mode, every bar
+  singleOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
 }
 
 export const DEFAULT_VOLUME_BAR_UP_COLOR = "#3FB950"; // matches candle BULL color
@@ -375,8 +388,11 @@ export function createDefaultVolumeBarsConfig(): VolumeBarsConfig {
     enabled: true,
     colorMode: "two_color",
     upColor: DEFAULT_VOLUME_BAR_UP_COLOR,
+    upOpacity: COLOR_OPACITY_DEFAULT,
     downColor: DEFAULT_VOLUME_BAR_DOWN_COLOR,
+    downOpacity: COLOR_OPACITY_DEFAULT,
     singleColor: DEFAULT_VOLUME_BAR_SINGLE_COLOR,
+    singleOpacity: COLOR_OPACITY_DEFAULT,
   };
 }
 
@@ -422,6 +438,9 @@ export interface DailyLevelsConfig {
   // truth for what "default" means.
   lookbackDays: number | null;
   color: string; // hex
+  opacity: number; // 0-100, see COLOR_OPACITY_DEFAULT — one opacity for the one shared
+  // color, consistent with the "single uniform color/width for all levels,
+  // not a per-level gradient" decision already made for this indicator
   lineWidth: number; // px, integer DAILY_LEVELS_LINE_WIDTH_MIN..MAX floor, same
   // createPriceLine physical-pixel-rounding note as HorizontalLevelInstance.lineWidth
   showPriceLabels: boolean; // the price-axis tag, same as HorizontalLevelInstance.showPriceLabel
@@ -459,6 +478,7 @@ export function createDefaultDailyLevelsConfig(): DailyLevelsConfig {
     maxPrice: null,
     lookbackDays: null, // server default
     color: DEFAULT_DAILY_LEVELS_COLOR,
+    opacity: COLOR_OPACITY_DEFAULT,
     lineWidth: 1,
     showPriceLabels: false, // off by default — a dense cluster of levels with every
     // axis label showing at once is exactly the "too many things on screen" case
@@ -542,11 +562,11 @@ export interface HudConfig {
   backgroundColor: string; // hex
   backgroundOpacity: number; // 0-100, applied on top of backgroundColor (see hexWithOpacity in utils/hud.ts)
   textColor: string; // hex
+  textOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT — independent of backgroundOpacity,
+  // e.g. a fully-opaque background with slightly faded text, or vice versa
   align: HudAlign; // which corner of the chart pane the box sits in
 }
 
-export const HUD_OPACITY_MIN = 0;
-export const HUD_OPACITY_MAX = 100;
 export const DEFAULT_HUD_BACKGROUND = "#131720"; // matches DEFAULT_CHART_BG — reads as part of the
 // chart's own chrome by default, same "blend in until deliberately changed" choice DEFAULT_GRID_COLOR made
 export const DEFAULT_HUD_TEXT_COLOR = "#E6EDF3"; // matches theme.colors.text.primary, tailwind.config.js
@@ -575,6 +595,7 @@ export function createDefaultHudConfig(): HudConfig {
     backgroundColor: DEFAULT_HUD_BACKGROUND,
     backgroundOpacity: 70,
     textColor: DEFAULT_HUD_TEXT_COLOR,
+    textOpacity: COLOR_OPACITY_DEFAULT,
     align: "left", // TimerBadge already owns the top-right corner; left avoids the two overlapping by default
   };
 }
@@ -597,7 +618,9 @@ export interface SubWindowConfig {
   candleLimit: CandleLimit;
   chartStyle: ChartStyle; // candlestick (default) or bar — confirmed decision #73
   backgroundColor: string; // hex, e.g. "#131720"
+  backgroundOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   gridColor: string; // hex, e.g. "#1E2530"
+  gridOpacity: number; // 0-100, see COLOR_OPACITY_DEFAULT
   timer: TimerConfig;
   volumeAvg: VolumeAvgIndicatorConfig;
   volumeBars: VolumeBarsConfig;

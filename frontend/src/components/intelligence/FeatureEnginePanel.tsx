@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import { useIntelligenceState, type FeatureTimeframe, type FeatureUnit, type FeatureUnitEntry } from "../../hooks/useIntelligenceState";
+import { useDropdownPlacement } from "../../hooks/useDropdownPlacement";
 import { MOCK_TICKERS } from "../../mocks/tickers";
 
 const MIN_WIDTH = 64;
@@ -48,6 +49,8 @@ function SymbolSearch({ current }: { current: string }) {
   const { setFeatureEnginePanelSymbol } = useWorkspace();
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const placement = useDropdownPlacement(focused, anchorRef);
 
   const suggestions = query
     ? MOCK_TICKERS.filter(
@@ -63,7 +66,7 @@ function SymbolSearch({ current }: { current: string }) {
   };
 
   return (
-    <div className="relative shrink-0 border-b border-base-border p-2">
+    <div className="relative shrink-0 border-b border-base-border p-2" ref={anchorRef}>
       <input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
@@ -76,7 +79,12 @@ function SymbolSearch({ current }: { current: string }) {
         className="w-full rounded border border-base-border bg-base-bg px-2 py-1 font-mono text-xs text-text-primary outline-none focus:border-signal"
       />
       {focused && (
-        <div className="absolute left-2 right-2 top-full z-30 mt-1 max-h-40 overflow-y-auto rounded border border-base-border bg-base-panel shadow-xl">
+        <div
+          className={`absolute left-2 right-2 z-30 overflow-y-auto rounded border border-base-border bg-base-panel shadow-xl ${
+            placement.vertical === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+          style={{ maxHeight: Math.min(placement.maxHeight, 160) }}
+        >
           {suggestions.map((t) => (
             <button
               key={t.symbol}

@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useDropdownPlacement } from "../../hooks/useDropdownPlacement";
 import {
   CANDLE_LIMIT_DEFAULT,
   CANDLE_LIMIT_MAX,
@@ -32,8 +33,8 @@ import {
   DAILY_LEVELS_LOOKBACK_PRESETS,
   DAILY_LEVELS_LINE_WIDTH_MIN,
   DAILY_LEVELS_LINE_WIDTH_MAX,
-  HUD_OPACITY_MIN,
-  HUD_OPACITY_MAX,
+  COLOR_OPACITY_MIN,
+  COLOR_OPACITY_MAX,
   HUD_VARIABLE_KEYS,
   createDefaultDailyLevelsConfig,
   createDefaultHudConfig,
@@ -87,6 +88,8 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   const { setSubWindowSymbol } = useWorkspace();
   const [query, setQuery] = useState("");
   const [focused, setFocused] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const placement = useDropdownPlacement(focused, anchorRef);
 
   const suggestions = query
     ? MOCK_TICKERS.filter(
@@ -102,7 +105,7 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
   };
 
   return (
-    <div className="relative shrink-0">
+    <div className="relative shrink-0" ref={anchorRef}>
       <input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
@@ -115,7 +118,12 @@ function TickerSearch({ config, displaySymbol }: { config: SubWindowConfig; disp
         className="w-16 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[11px] text-text-primary outline-none transition-all focus:w-32 focus:border-signal"
       />
       {focused && (
-        <div className="absolute left-0 top-full z-30 mt-1 max-h-40 w-40 overflow-y-auto rounded border border-base-border bg-base-panel shadow-xl">
+        <div
+          className={`absolute left-0 z-30 w-40 overflow-y-auto rounded border border-base-border bg-base-panel shadow-xl ${
+            placement.vertical === "down" ? "top-full mt-1" : "bottom-full mb-1"
+          }`}
+          style={{ maxHeight: Math.min(placement.maxHeight, 160) }}
+        >
           {suggestions.map((t) => (
             <button
               key={t.symbol}
@@ -189,16 +197,26 @@ function ColorField({
   label,
   value,
   onChange,
+  opacity,
+  onOpacityChange,
 }: {
   label?: string;
   value: string;
   onChange: (hex: string) => void;
+  // Optional: when both are given, a compact opacity slider (0-100)
+  // renders after the hex field. Optional rather than required because a
+  // handful of colors in this app genuinely have no opacity companion
+  // (none currently, as of decision #76 — every color field got one —
+  // but kept optional so a future color-only field doesn't need a fake
+  // opacity prop just to satisfy this signature).
+  opacity?: number;
+  onOpacityChange?: (opacity: number) => void;
 }) {
   const [hexDraft, setHexDraft] = useState(value);
   useEffect(() => setHexDraft(value), [value]);
 
   return (
-    <div className="flex items-center gap-2 px-2 py-1">
+    <div className="flex flex-wrap items-center gap-2 px-2 py-1">
       {label && <span className="w-16 shrink-0 font-mono text-[10px] text-text-muted">{label}</span>}
       <input
         type="color"
@@ -218,6 +236,20 @@ function ColorField({
           isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
         }`}
       />
+      {opacity !== undefined && onOpacityChange && (
+        <div className="flex min-w-[100px] flex-1 items-center gap-1.5">
+          <input
+            type="range"
+            min={COLOR_OPACITY_MIN}
+            max={COLOR_OPACITY_MAX}
+            value={opacity}
+            onChange={(e) => onOpacityChange(Number(e.target.value))}
+            className="h-1 flex-1 accent-signal"
+            title="Opacity"
+          />
+          <span className="w-8 shrink-0 text-right font-mono text-[10px] text-text-muted">{opacity}%</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -292,7 +324,7 @@ function VolumeAvgLineRow({
         />
         Show price tag
       </label>
-      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"
           value={line.color}
@@ -311,6 +343,16 @@ function VolumeAvgLineRow({
             isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
           }`}
         />
+        <input
+          type="range"
+          min={COLOR_OPACITY_MIN}
+          max={COLOR_OPACITY_MAX}
+          value={line.opacity}
+          onChange={(e) => patchLine({ opacity: Number(e.target.value) })}
+          className="h-1 w-12 accent-signal"
+          title="Opacity"
+        />
+        <span className="w-7 shrink-0 text-right font-mono text-[10px] text-text-muted">{line.opacity}%</span>
       </div>
     </div>
   );
@@ -541,7 +583,7 @@ function OverlayIndicatorRow({
         />
         Show price tag
       </label>
-      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"
           value={instance.color}
@@ -560,6 +602,16 @@ function OverlayIndicatorRow({
             isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
           }`}
         />
+        <input
+          type="range"
+          min={COLOR_OPACITY_MIN}
+          max={COLOR_OPACITY_MAX}
+          value={instance.opacity}
+          onChange={(e) => patchInstance({ opacity: Number(e.target.value) })}
+          className="h-1 w-12 accent-signal"
+          title="Opacity"
+        />
+        <span className="w-7 shrink-0 text-right font-mono text-[10px] text-text-muted">{instance.opacity}%</span>
       </div>
     </div>
   );
@@ -663,7 +715,7 @@ function HorizontalLevelRow({
         />
         Show price tag
       </label>
-      <div className="mt-1 flex items-center gap-1.5 pl-[18px]">
+      <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"
           value={instance.color}
@@ -682,6 +734,16 @@ function HorizontalLevelRow({
             isValidHex(hexDraft) ? "border-base-border" : "border-bear/60"
           }`}
         />
+        <input
+          type="range"
+          min={COLOR_OPACITY_MIN}
+          max={COLOR_OPACITY_MAX}
+          value={instance.opacity}
+          onChange={(e) => patchInstance({ opacity: Number(e.target.value) })}
+          className="h-1 w-12 accent-signal"
+          title="Opacity"
+        />
+        <span className="w-7 shrink-0 text-right font-mono text-[10px] text-text-muted">{instance.opacity}%</span>
       </div>
     </div>
   );
@@ -691,6 +753,8 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
   const { updateSubWindow } = useWorkspace();
   const [open, setOpen] = useState(false);
   const [level, setLevel] = useState<MenuLevel>("root");
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const placement = useDropdownPlacement(open, anchorRef);
 
   const activeVolumeAvgLines = config.volumeAvg.lines.filter((l) => l.enabled).length;
   const activeOverlayCount = config.priceIndicators.filter((p) => p.enabled).length;
@@ -730,7 +794,7 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
   };
 
   return (
-    <div className="relative">
+    <div className="relative" ref={anchorRef}>
       <div className="flex items-center gap-2 border-b border-base-border bg-base-panel px-2 py-1">
         <TickerSearch config={config} displaySymbol={displaySymbol} />
         {config.connector !== "none" && (
@@ -759,21 +823,26 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
 
       {open && (
         <div
-          className={`absolute right-0 top-full z-20 max-h-[80vh] overflow-y-auto rounded-b-md border border-base-border bg-base-panel p-2 shadow-xl ${
-            level === "volumeAvg" || level === "overlay" || level === "levels" || level === "hud" ? "w-72" : "w-56"
-          }`}
+          className={`absolute right-0 z-20 overflow-y-auto rounded-md border border-base-border bg-base-panel p-2 shadow-xl ${
+            placement.vertical === "down" ? "top-full mt-1 rounded-t-none" : "bottom-full mb-1 rounded-b-none"
+          } ${level === "volumeAvg" || level === "overlay" || level === "levels" || level === "hud" ? "w-72" : "w-56"}`}
+          style={{ maxHeight: placement.maxHeight }}
         >
-          {/* No max-height/overflow existed here before — the panel just
-              grew as tall as its content and got clipped by the viewport
-              with no way to scroll past it, unnoticed until Daily Levels
-              (decision #65) became the longest panel in this menu (enable
-              toggle, min-strength stepper, price-range inputs, lookback
-              presets, color, width, price-label toggle, reset — more
-              stacked sections than any earlier panel had). max-h-[80vh]
-              is viewport-relative rather than a fixed px/rem value
-              specifically because this dropdown can open anywhere
-              vertically on a busy multi-window layout, not just near the
-              top of the screen. */}          {level === "root" && (
+          {/* A flat max-h-[80vh] used to live here — it capped the panel's
+              OWN height, but did nothing about WHERE it was anchored: a
+              sub-window near the bottom of a busy grid has its toolbar
+              already most of the way down the viewport, so "80% of the
+              viewport" measured from there still ran off the bottom of
+              the screen with no scrollbar ever appearing (overflow-y-auto
+              only fires when content exceeds the panel's own max-height
+              box, not when the panel itself sits beyond the visible
+              viewport). useDropdownPlacement (shared with LayoutsMenu,
+              GridPicker, and FeatureEnginePanel's ticker search — same
+              bug, same fix, one hook) measures the anchor's real position
+              and flips the panel to open upward with an accurate
+              max-height when there isn't enough room below, instead of a
+              fixed fraction that assumes the anchor is near the top. */}
+          {level === "root" && (
             <div className="flex flex-col">
               <RootRow label="Timeframe" hint={config.liveTick ? "Tick" : config.timeframe} onClick={() => setLevel("timeframe")} />
               <RootRow
@@ -1073,13 +1142,27 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
               <ColorField
                 value={config.backgroundColor}
                 onChange={(hex) => updateSubWindow(config.id, { backgroundColor: hex })}
+                opacity={config.backgroundOpacity}
+                onOpacityChange={(opacity) => updateSubWindow(config.id, { backgroundOpacity: opacity })}
               />
               <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
                 Grid lines
               </div>
-              <ColorField value={config.gridColor} onChange={(hex) => updateSubWindow(config.id, { gridColor: hex })} />
+              <ColorField
+                value={config.gridColor}
+                onChange={(hex) => updateSubWindow(config.id, { gridColor: hex })}
+                opacity={config.gridOpacity}
+                onOpacityChange={(opacity) => updateSubWindow(config.id, { gridOpacity: opacity })}
+              />
               <button
-                onClick={() => updateSubWindow(config.id, { backgroundColor: DEFAULT_CHART_BG, gridColor: DEFAULT_GRID_COLOR })}
+                onClick={() =>
+                  updateSubWindow(config.id, {
+                    backgroundColor: DEFAULT_CHART_BG,
+                    backgroundOpacity: COLOR_OPACITY_MAX,
+                    gridColor: DEFAULT_GRID_COLOR,
+                    gridOpacity: COLOR_OPACITY_MAX,
+                  })
+                }
                 className="mt-1 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
               >
                 Reset to default
@@ -1102,9 +1185,14 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
               <div className="mb-1 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
                 Sweep color
               </div>
-              <ColorField value={config.timer.color} onChange={(hex) => updateSubWindow(config.id, { timer: { ...config.timer, color: hex } })} />
+              <ColorField
+                value={config.timer.color}
+                onChange={(hex) => updateSubWindow(config.id, { timer: { ...config.timer, color: hex } })}
+                opacity={config.timer.opacity}
+                onOpacityChange={(opacity) => updateSubWindow(config.id, { timer: { ...config.timer, opacity } })}
+              />
               <button
-                onClick={() => updateSubWindow(config.id, { timer: { ...config.timer, color: DEFAULT_TIMER_COLOR } })}
+                onClick={() => updateSubWindow(config.id, { timer: { ...config.timer, color: DEFAULT_TIMER_COLOR, opacity: COLOR_OPACITY_MAX } })}
                 className="mt-1 w-full rounded px-2 py-1 text-left font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-text-primary"
               >
                 Reset color to default
@@ -1176,6 +1264,8 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                       <ColorField
                         value={config.volumeBars.upColor}
                         onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, upColor: hex } })}
+                        opacity={config.volumeBars.upOpacity}
+                        onOpacityChange={(opacity) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, upOpacity: opacity } })}
                       />
                       <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">
                         Down (close &lt; open)
@@ -1183,6 +1273,8 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                       <ColorField
                         value={config.volumeBars.downColor}
                         onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, downColor: hex } })}
+                        opacity={config.volumeBars.downOpacity}
+                        onOpacityChange={(opacity) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, downOpacity: opacity } })}
                       />
                     </>
                   ) : (
@@ -1191,6 +1283,8 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                       <ColorField
                         value={config.volumeBars.singleColor}
                         onChange={(hex) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, singleColor: hex } })}
+                        opacity={config.volumeBars.singleOpacity}
+                        onOpacityChange={(opacity) => updateSubWindow(config.id, { volumeBars: { ...config.volumeBars, singleOpacity: opacity } })}
                       />
                     </>
                   )}
@@ -1327,6 +1421,8 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   <ColorField
                     value={config.dailyLevelsConfig.color}
                     onChange={(hex) => updateSubWindow(config.id, { dailyLevelsConfig: { ...config.dailyLevelsConfig, color: hex } })}
+                    opacity={config.dailyLevelsConfig.opacity}
+                    onOpacityChange={(opacity) => updateSubWindow(config.id, { dailyLevelsConfig: { ...config.dailyLevelsConfig, opacity } })}
                   />
                   <div className="mb-1 mt-2 flex items-center gap-1 px-2">
                     <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Width</span>
@@ -1442,25 +1538,15 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   <ColorField
                     value={config.hud.backgroundColor}
                     onChange={(hex) => updateSubWindow(config.id, { hud: { ...config.hud, backgroundColor: hex } })}
+                    opacity={config.hud.backgroundOpacity}
+                    onOpacityChange={(opacity) => updateSubWindow(config.id, { hud: { ...config.hud, backgroundOpacity: opacity } })}
                   />
-                  <div className="mb-1 mt-2 flex items-center gap-2 px-2">
-                    <span className="font-mono text-[9px] uppercase tracking-wide text-text-muted">Opacity</span>
-                    <input
-                      type="range"
-                      min={HUD_OPACITY_MIN}
-                      max={HUD_OPACITY_MAX}
-                      value={config.hud.backgroundOpacity}
-                      onChange={(e) =>
-                        updateSubWindow(config.id, { hud: { ...config.hud, backgroundOpacity: Number(e.target.value) } })
-                      }
-                      className="h-1 flex-1 accent-signal"
-                    />
-                    <span className="w-8 text-right font-mono text-[10px] text-text-primary">{config.hud.backgroundOpacity}%</span>
-                  </div>
                   <div className="mb-1 mt-2 px-2 font-mono text-[10px] uppercase tracking-wide text-text-muted">Text color</div>
                   <ColorField
                     value={config.hud.textColor}
                     onChange={(hex) => updateSubWindow(config.id, { hud: { ...config.hud, textColor: hex } })}
+                    opacity={config.hud.textOpacity}
+                    onOpacityChange={(opacity) => updateSubWindow(config.id, { hud: { ...config.hud, textOpacity: opacity } })}
                   />
                   <button
                     onClick={() => updateSubWindow(config.id, { hud: createDefaultHudConfig() })}
