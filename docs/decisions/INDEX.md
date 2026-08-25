@@ -1,6 +1,7 @@
 # Decision Index
 
-One line per confirmed decision, #1 through #79, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
+
+One line per confirmed decision, #1 through #80, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
 
 | # | Summary | File |
 |---|---|---|
@@ -64,22 +65,23 @@ One line per confirmed decision, #1 through #79, across every file in this direc
 | 58 | Stage 1 extended to cover all seven horizontal-level types from decisions #56–57 — PDH/PDL/PDC, all… | `archive/001-060.md` |
 | 59 | Daily Levels — concept locked across a three-way review (Saqib + Claude + Grok + ChatGPT),… | `archive/001-060.md` |
 | 60 | Daily Levels Stage 1 built and tested — clustering algorithm, same-candle validity gate,… | `archive/001-060.md` |
-| 61 | Daily Levels Stage 4 built and tested — the indicator is now on the chart. | `confirmed-decisions.md` |
-| 62 | Daily Levels: root-caused Saqib's "no levels showing" report, then shipped a price-range filter, a… | `confirmed-decisions.md` |
-| 63 | Daily Levels Stage 2 built and tested — persistent, price-proximity-reconciled level identity, and… | `confirmed-decisions.md` |
-| 64 | Daily Levels Stage 3 built and tested — LevelInteractionEngine now tracks… | `confirmed-decisions.md` |
-| 65 | Daily Levels menu panel scrollbar fixed, and D1 (the last open item across all four build stages)… | `confirmed-decisions.md` |
-| 66 | Two small standing open items picked up together, deliberately staying off the Trading Intelligence… | `confirmed-decisions.md` |
-| 67 | Feature Engine indicator expansion — direction locked for five new families (ATR, Session % / $… | `confirmed-decisions.md` |
-| 68 | Feature Engine indicator expansion — D1/D2/D3 resolved by Saqib directly (shared daily-candle… | `confirmed-decisions.md` |
-| 69 | Feature Engine indicator expansion — Stage 2 (ATR(1D,14) + ATR%) built and tested against a real… | `confirmed-decisions.md` |
-| 70 | Feature Engine indicator expansion — Stage 3 (Linear Regression) and Stage 4 (KAMA) built together… | `confirmed-decisions.md` |
-| 71 | Relative Volume (RVOL) built and tested against a real local Postgres — a sixth Feature Engine… | `confirmed-decisions.md` |
-| 72 | LiveTickRelay — throttled "tick fluidity" for the chart's currently-forming 1m bar, on a small (max… | `confirmed-decisions.md` |
-| 73 | Chart Style — candlestick vs. | `confirmed-decisions.md` |
-| 74 | Volume Avg lines gained a per-line price-axis label toggle (`showPriceLabel`) — closes the one… | `confirmed-decisions.md` |
-| 75 | On-chart HUD text box — a floating, per-line-configurable Feature Engine readout, pinned to the top… | `confirmed-decisions.md` |
-| 76 | Dropdown-panel clipping fixed for all 5 real panels in the app — a shared placement hook… | `confirmed-decisions.md` |
-| 77 | Opacity added to every hex-color field in the app — SMA/EMA/VWAP lines, horizontal levels, Timer,… | `confirmed-decisions.md` |
-| 78 | Backfilled entry — Saved Layouts (named save/load/delete, JSON export/import) already exists in… | `confirmed-decisions.md` |
-| 79 | `confirmed-decisions.md` split into an open file + frozen archive + index, to keep session-start reading cost bounded | `confirmed-decisions.md` |
+| 61 | Daily Levels Stage 4 built and tested — the indicator is now on the chart. | `archive/061-079.md` |
+| 62 | Daily Levels: root-caused Saqib's "no levels showing" report, then shipped a price-range filter, a… | `archive/061-079.md` |
+| 63 | Daily Levels Stage 2 built and tested — persistent, price-proximity-reconciled level identity, and… | `archive/061-079.md` |
+| 64 | Daily Levels Stage 3 built and tested — LevelInteractionEngine now tracks… | `archive/061-079.md` |
+| 65 | Daily Levels menu panel scrollbar fixed, and D1 (the last open item across all four build stages)… | `archive/061-079.md` |
+| 66 | Two small standing open items picked up together, deliberately staying off the Trading Intelligence… | `archive/061-079.md` |
+| 67 | Feature Engine indicator expansion — direction locked for five new families (ATR, Session % / $… | `archive/061-079.md` |
+| 68 | Feature Engine indicator expansion — D1/D2/D3 resolved by Saqib directly (shared daily-candle… | `archive/061-079.md` |
+| 69 | Feature Engine indicator expansion — Stage 2 (ATR(1D,14) + ATR%) built and tested against a real… | `archive/061-079.md` |
+| 70 | Feature Engine indicator expansion — Stage 3 (Linear Regression) and Stage 4 (KAMA) built together… | `archive/061-079.md` |
+| 71 | Relative Volume (RVOL) built and tested against a real local Postgres — a sixth Feature Engine… | `archive/061-079.md` |
+| 72 | LiveTickRelay — throttled "tick fluidity" for the chart's currently-forming 1m bar, on a small (max… | `archive/061-079.md` |
+| 73 | Chart Style — candlestick vs. | `archive/061-079.md` |
+| 74 | Volume Avg lines gained a per-line price-axis label toggle (`showPriceLabel`) — closes the one… | `archive/061-079.md` |
+| 75 | On-chart HUD text box — a floating, per-line-configurable Feature Engine readout, pinned to the top… | `archive/061-079.md` |
+| 76 | Dropdown-panel clipping fixed for all 5 real panels in the app — a shared placement hook… | `archive/061-079.md` |
+| 77 | Opacity added to every hex-color field in the app — SMA/EMA/VWAP lines, horizontal levels, Timer,… | `archive/061-079.md` |
+| 78 | Backfilled entry — Saved Layouts (named save/load/delete, JSON export/import) already exists in… | `archive/061-079.md` |
+| 79 | `confirmed-decisions.md` split into an open file + frozen archive + index, to keep session-start reading cost bounded | `archive/061-079.md` |
+| 80 | Volume Bars opacity confirmed already shipped (#77); real bug was `useDropdownPlacement` inflating panel max-height past available viewport space on narrow/short screens — fixed in the shared hook for every dropdown panel at once. | `confirmed-decisions.md` |

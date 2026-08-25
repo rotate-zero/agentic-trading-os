@@ -1,96 +1,53 @@
-# Dropdown scrollbar fix + opacity everywhere — TESTING.md
+# TESTING — Decision #80
 
-This is a standalone follow-up on top of your pushed `main` (which
-already has Chart Style #73, plus the HUD box / Volume Avg label toggle
-from `hud-and-label-toggle-v2.zip`, if you've applied that one). It does
-NOT touch anything from those — only adds the two things below.
+## What changed
 
-## 1. Dropdown panels getting cut off (decision #76)
+- `frontend/src/hooks/useDropdownPlacement.ts` — actual code fix.
+- `docs/decisions/confirmed-decisions.md` — replaced with a fresh open file; decision #80 is its first (and currently only) entry.
+- `docs/decisions/archive/061-079.md` — new frozen archive file (decisions #61–#79, moved verbatim from the old `confirmed-decisions.md`).
+- `docs/decisions/INDEX.md` — file-location column updated for #61–#79 → `archive/061-079.md`; new row added for #80.
+- `docs/decisions/README.md` — structure table updated to reflect the second archive file and the fresh open file.
 
-Root cause: every dropdown panel in the app opens `top-full` below its
-toggle button. The one existing fix (`max-h-[80vh]`) capped the panel's
-own height, but didn't account for WHERE the panel was anchored — a
-sub-window near the bottom of the grid has its toolbar already most of
-the way down the screen, so "80% of viewport" measured from there still
-runs off the bottom, with no scrollbar ever appearing.
+No backend files touched.
 
-Fixed with one shared hook (`useDropdownPlacement.ts`) applied to all 5
-real dropdown panels in the app:
-- `SubWindowMenu`'s main indicator menu (the one in your screenshot)
-- `SubWindowMenu`'s ticker-search suggestion box
-- `LayoutsMenu`
-- `GridPicker`
-- `FeatureEnginePanel`'s symbol search
+## How to unzip
 
-It measures the toggle button's actual position and flips the panel
-upward with an accurate max-height when there isn't room below, instead
-of a flat viewport fraction. (`GridPresetPicker.tsx` was confirmed dead
-code — not imported anywhere — so it's untouched; it can't be the source
-of a bug nobody can trigger.)
+From the project root (`agentic-trading-os/`):
 
-**To verify:** open the HUD menu (or any menu) on a sub-window near the
-bottom of a busy grid layout — the panel should now either fit and scroll
-internally, or flip to open upward, instead of getting cut off with no
-way to see the rest.
+```bash
+unzip -o decision-80-dropdown-scroll-fix.zip
+```
 
-## 2. Opacity on every hex color field (decision #77)
+This will:
+- Overwrite `frontend/src/hooks/useDropdownPlacement.ts` with the fix.
+- Overwrite `docs/decisions/confirmed-decisions.md` with the new (short) open file.
+- Add `docs/decisions/archive/061-079.md`.
+- Overwrite `docs/decisions/INDEX.md` and `docs/decisions/README.md`.
 
-Every color-bearing indicator now has an opacity slider next to its
-existing hex picker: SMA/EMA/VWAP lines, horizontal levels (PDH/PDL/
-Camarilla/VPOC/etc.), Timer sweep, Volume Avg lines, **Volume Bars
-up/down/single — your stated priority**, Daily Levels, HUD background +
-text, and the chart's own background/grid lines.
+Nothing else in the repo is touched — no unrelated modules were rewritten.
 
-Every opacity defaults to 100 (fully opaque) — nothing looks different
-until you actually move a slider. This delivery doesn't pick an opinion
-about what looks good (e.g. semi-transparent volume bars, a common
-convention elsewhere); it just makes it dial-able everywhere a color
-already was.
+## What was investigated but NOT changed
 
-**To verify — Volume Bars specifically, since that was the priority:**
-Menu → Volume Bars → pick a color mode → each color (Up/Down or Bar
-color) now has a slider next to its hex field. Drag it down and the
-volume histogram bars should visibly fade.
+**Volume Bars opacity** — already fully implemented (decision #77). `VolumeBarsConfig.upOpacity/downOpacity/singleOpacity` exist, are wired into `SubWindowMenu.tsx`'s "Volume Bars" panel via the same `ColorField` opacity slider every other color field uses, applied at render time via `hexWithOpacity()` in `ChartWidget.tsx`'s `volumeBarColor()`, and backfilled for old saved sessions in `WorkspaceContext.tsx`. Nothing to add here — see decision #80's own text for the full trace.
 
-**Other spots to spot-check:** Indicators (SMA/EMA/VWAP) → each instance
-row now has a small slider after its hex field. Levels → same. Daily
-Levels, Timer, Background, HUD → each `ColorField` row now has a slider
-built in.
+## Root cause of the "config panel too long, no scroll" report
 
-## Files touched
-- `frontend/src/types/workspace.ts` — `opacity`/`upOpacity`/`downOpacity`/`singleOpacity`/`textOpacity`/`backgroundOpacity`/`gridOpacity` added across every color config, all defaulting to 100
-- `frontend/src/utils/color.ts` — new: `hexWithOpacity()`, moved out of `utils/hud.ts` (no longer HUD-specific)
-- `frontend/src/utils/hud.ts` — re-exports `hexWithOpacity` for backward compat
-- `frontend/src/utils/indicators.ts` — threads `opacity` through `computePriceIndicator`/`computeHorizontalLevel`
-- `frontend/src/hooks/useDropdownPlacement.ts` — new: the shared placement hook
-- `frontend/src/components/chart/ChartWidget.tsx` — applies opacity at every render call site
-- `frontend/src/components/chart/TimerBadge.tsx` — applies opacity to the sweep color
-- `frontend/src/components/chart/HudBox.tsx` — applies the new `textOpacity`
-- `frontend/src/components/sub-window/SubWindowMenu.tsx` — dropdown placement fix (both its dropdowns) + opacity sliders on `ColorField` and all 3 inline per-instance color pickers
-- `frontend/src/components/sub-window/SubWindow.tsx` — untouched by this delivery, included only because it's unaffected (no diff beyond what you already have)
-- `frontend/src/components/workspace/GridPicker.tsx`, `LayoutsMenu.tsx` — dropdown placement fix
-- `frontend/src/components/intelligence/FeatureEnginePanel.tsx` — dropdown placement fix on its symbol search
-- `frontend/src/state/WorkspaceContext.tsx` — back-fill migration for every new opacity field
-- `docs/decisions/confirmed-decisions.md` — decisions #76 and #77
-- `docs/architecture/system-design.md` — unchanged in this delivery (included for completeness/consistency, matches what you already have if you applied the previous zip)
+`useDropdownPlacement.ts` already measured the anchor's real position and picked a `maxHeight` for whichever direction (up/down) had more room — this was decision #76's fix for exactly this class of bug. But its floor value, `Math.max(spaceBelow, MIN_USABLE_HEIGHT)` (and the `spaceAbove` equivalent), could hand back a `maxHeight` **larger than the real remaining space** whenever both directions had less than 160px available — e.g. a narrow/short viewport where the anchor sits close to both screen edges at once. When that happens, the panel gets positioned partly beyond the visible viewport; `overflow-y-auto` never engages because the panel's own box never exceeds its (wrongly inflated) max-height — the browser window's edge clips it first, with no scrollbar. This reproduces exactly what the screenshot showed.
 
-## How to apply
-Unzip directly into your project root — merges into the existing tree, no
-files deleted or moved.
+**Fix:** `MIN_USABLE_HEIGHT` now only decides *which direction* to open in. The returned `maxHeight` is always `Math.max(spaceBelow, 0)` or `Math.max(spaceAbove, 0)` — the real measured space, never inflated past it.
 
-## How to verify
-1. `cd frontend && npm ci` (only if `node_modules` isn't already present)
-2. `npx tsc -b 2>&1 | grep -v "GridPresetPicker"` — clean (already run here)
-3. `npx vite build` — clean (already run here)
-4. `npm run dev` — walk through both checklists above
-5. Existing saved sessions should load with every opacity at 100% (no
-   visual change) and dropdown panels should just work better — no manual
-   migration needed on your end.
+This is a **shared hook** — `SubWindowMenu.tsx`, `LayoutsMenu.tsx`, `GridPicker.tsx`, and `FeatureEnginePanel.tsx`'s ticker search all consume it and already wire `maxHeight` into their own `overflow-y-auto` container. So this one change gives every long settings panel in the app (Volume Bars, Daily Levels, and anything added later) a working scrollbar on short/narrow viewports — not a per-panel patch.
 
-## Not verified
-No live browser click-through was possible in this environment. Verified
-via `tsc`/`vite build` and manual diffing against your pushed `main` to
-confirm nothing outside these two changes was touched — not visually
-confirmed in a running browser. The dropdown flip-to-upward behavior in
-particular is worth testing on an actual busy multi-row grid layout,
-since that's the scenario it's specifically fixing.
+## Verification performed
+
+- `npx tsc -b` — clean (filtered for the pre-existing, known-dead `GridPresetPicker.tsx` errors per decision #35).
+- `npx vite build` — clean, 79 modules transformed, no errors.
+- No backend files touched, so no `pytest` run applies to this delivery.
+- **Not verified:** an actual browser at the narrow viewport width shown in the report screenshot. The fix is derived from re-reading `useDropdownPlacement`'s own math against the reported symptom, not from reproducing the clipped view and watching it resolve live. Flagging this per the project's standing "no live browser verification" convention.
+
+## Suggested manual check (since I can't click through a browser)
+
+1. Resize the browser window to something narrow/short (or open on a phone-width viewport) — roughly matching the screenshot's ~362×502.
+2. Open a sub-window's settings menu, drill into **Volume Bars** with two-color mode selected (the tallest panel: color-mode toggle + up color/opacity + down color/opacity + reset button).
+3. Confirm the whole panel is scrollable and every field (including the "Down" color+opacity row and "Reset to default") is reachable, with no content silently clipped by the window edge.
+4. Repeat for **Daily Levels** to confirm the original report screenshot's panel now scrolls too.

@@ -30,14 +30,30 @@ import { useCallback, useLayoutEffect, useState, type RefObject } from "react";
  * only picks the better anchor point and an accurate ceiling; the
  * existing overflow-y-auto class is what turns that ceiling into an
  * actual scrollbar when content still exceeds it.
+ *
+ * Decision #80 fix: MIN_USABLE_HEIGHT was being used as a FLOOR on the
+ * returned maxHeight (`Math.max(spaceBelow, MIN_USABLE_HEIGHT)`), not
+ * just as the threshold for deciding whether flipping direction is worth
+ * it. On a short viewport (a narrow mobile window, or any anchor sitting
+ * close to both the top and bottom of the screen at once) the real space
+ * in the chosen direction can be smaller than MIN_USABLE_HEIGHT — and
+ * flooring the OUTPUT at 160px in that case hands the panel a maxHeight
+ * bigger than the viewport actually has to give in that direction. That
+ * reproduces the exact bug this hook was written to fix: the panel gets
+ * positioned partly beyond the visible viewport, and overflow-y-auto
+ * never engages because the panel's own box never technically exceeds
+ * its (wrongly inflated) max-height — the browser window's edge just
+ * clips it first, with no scrollbar. MIN_USABLE_HEIGHT now only
+ * influences which direction is picked; the height actually handed back
+ * is always clamped to the real measured space, never inflated past it.
  */
 export interface DropdownPlacement {
   vertical: "down" | "up";
-  maxHeight: number; // px — the real remaining space in the chosen direction
+  maxHeight: number; // px — the real remaining space in the chosen direction, never inflated beyond it
 }
 
 const VIEWPORT_MARGIN = 8; // px kept clear from the browser edge
-const MIN_USABLE_HEIGHT = 160; // px — below this, flipping direction stops helping much, so just take what's there
+const MIN_USABLE_HEIGHT = 160; // px — below this, flipping direction stops helping much; a DECISION threshold only, never a floor on the returned height (decision #80)
 
 export function useDropdownPlacement(open: boolean, anchorRef: RefObject<HTMLElement>): DropdownPlacement {
   const [placement, setPlacement] = useState<DropdownPlacement>({ vertical: "down", maxHeight: 400 });
@@ -52,10 +68,14 @@ export function useDropdownPlacement(open: boolean, anchorRef: RefObject<HTMLEle
     // the common case renders identically to before) unless there's
     // genuinely not enough room and "up" offers meaningfully more —
     // avoids flip-flopping right around the screen's midpoint.
+    // Whichever direction is chosen, the resulting maxHeight is clamped
+    // to >=0 and never inflated past the real measured space — that's
+    // what guarantees overflow-y-auto always has a chance to produce an
+    // actual scrollbar instead of the panel silently running off-screen.
     if (spaceBelow < MIN_USABLE_HEIGHT && spaceAbove > spaceBelow) {
-      setPlacement({ vertical: "up", maxHeight: Math.max(spaceAbove, MIN_USABLE_HEIGHT) });
+      setPlacement({ vertical: "up", maxHeight: Math.max(spaceAbove, 0) });
     } else {
-      setPlacement({ vertical: "down", maxHeight: Math.max(spaceBelow, MIN_USABLE_HEIGHT) });
+      setPlacement({ vertical: "down", maxHeight: Math.max(spaceBelow, 0) });
     }
   }, [anchorRef]);
 

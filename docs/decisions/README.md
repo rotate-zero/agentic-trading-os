@@ -9,15 +9,16 @@ Rule of thumb: if you're arguing about whether to build something, it belongs in
 
 ---
 
-## Why this file structure exists (decision #79)
+## Why this file structure exists (decision #79, rolled over once more at #80)
 
-At 78 entries, `confirmed-decisions.md` alone was 260KB (~65,000 tokens). Every Claude session on this project fetches the repo and reads the docs before proposing anything — that's a standing project rule, not incidental — so that cost was paid in full at the start of every session regardless of what the session was actually about. Decision #79 split the growing history into three pieces:
+At 78 entries, `confirmed-decisions.md` alone was 260KB (~65,000 tokens). Every Claude session on this project fetches the repo and reads the docs before proposing anything — that's a standing project rule, not incidental — so that cost was paid in full at the start of every session regardless of what the session was actually about. Decision #79 split the growing history into three pieces; decision #80 performed the first scheduled rollover once the open file crossed the same size trigger again:
 
-| File | What it holds | Size (as of #79) |
+| File | What it holds | Size (as of #80) |
 |---|---|---|
-| `INDEX.md` | One line per decision, #1–latest, mapped to whichever file has the full text | ~9.5KB |
-| `confirmed-decisions.md` | The **open** file — the most recent range of decisions. All new decisions get appended here. | ~25K tokens |
-| `archive/001-060.md` | **Frozen.** Decisions #1–#60, verbatim, never edited again. | ~39K tokens |
+| `INDEX.md` | One line per decision, #1–latest, mapped to whichever file has the full text | ~9.7KB |
+| `confirmed-decisions.md` | The **open** file — the most recent range of decisions (currently #80 onward). All new decisions get appended here. | starts fresh at #80 |
+| `archive/001-060.md` | **Frozen.** Decisions #1–#60, verbatim, never edited again. | ~159KB |
+| `archive/061-079.md` | **Frozen.** Decisions #61–#79, verbatim, never edited again. | ~105KB |
 
 Numbering stays global and strictly sequential across every file — which physical file an entry lives in has no bearing on its number.
 
