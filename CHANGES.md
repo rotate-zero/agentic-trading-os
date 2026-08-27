@@ -1,122 +1,137 @@
-# Self-recorded intraday history (closes the "no history before the first live bar" gap)
+# Axis-label name toggle (all indicators), plus verification on the other two reports
 
-Copy these into your repo root, overwriting the existing paths. Full
-reasoning is in `docs/decisions/confirmed-decisions.md` #43; the
-architecture note is in `docs/architecture/system-design.md` §4.2.
+Copy these into your repo root, overwriting the existing paths — this
+replaces the previous drop entirely (you hadn't applied it yet), so this
+one zip has everything. Full reasoning is in
+`docs/decisions/confirmed-decisions.md` #81 and #82.
 
-**Docs note:** same as last drop — `docs-decision-43.patch` (a unified
-diff of just the two doc files) is included as a safer alternative to
-copying the full files, in case either has moved since this zip was
-built. Apply with `git apply docs-decision-43.patch` from the repo root
-instead, if you'd rather.
+**Merged against your latest push before this drop was built:** your
+`c74f28e` ("Scanner rvol universe v1, premarket accumulator design doc")
+touches `frontend/src/state/WorkspaceContext.tsx` and `frontend/src/
+types/workspace.ts` — two files this drop also touches. Merged clean, no
+conflicts (your scanner changes and mine sit in entirely separate
+sections of both files), and re-verified with `tsc -b`/`vite build`
+after merging, not just before. The copies of those two files in this
+zip already contain both your scanner-universe work and this drop's
+changes together — safe to overwrite, nothing from your push is lost.
 
-## ⚠️ Setup required — this does nothing until you do this once
+## Your 4 screenshots, one at a time
 
-The `candles`/`symbols` tables have existed since Phase 2 but nothing
-ever wrote to them. If you don't already have a local Postgres running
-matching `backend/app/core/config.py`'s defaults (`localhost:5432`,
-db `trading_workspace`, user/password `trading`/`trading`) — WSL Ubuntu,
-so this is the same `apt-get` you'd expect:
+**Screenshot 1 (labels have no on/off option) — fixed, all four
+indicator types, not just the ones in the screenshot.** Real bug, not
+cosmetic: Lightweight Charts renders an indicator series' name (`title`)
+unconditionally whenever it's a non-empty string — it does **not** check
+`lastValueVisible` (your existing "Show price tag" checkbox) first. So
+unchecking that box for SMA 9/20/50 hid the number but left the colored
+name badge floating on the axis with nothing attached to it, exactly as
+your screenshot shows. Confirmed against the library's own issue
+tracker, not guessed.
 
-```bash
-sudo apt-get update
-sudo apt-get install -y postgresql
-sudo service postgresql start
-sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
-sudo -u postgres psql -c "CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;"
-sudo -u postgres psql -c "CREATE DATABASE trading_workspace OWNER trading;"
-```
+A new, independent **"Show label"** checkbox now sits right under "Show
+price tag" on every indicator that has one: Indicators panel (SMA/EMA/
+VWAP), Levels panel (PDH/PDL/PMH/PML/Camarilla/VPOC), Volume Avg lines,
+and Daily Levels (labeled "Show 'DL-N' label" there, matching that
+panel's own button style instead of a checkbox, since Daily Levels
+doesn't use checkboxes anywhere else). One open item below.
 
-Then, from `backend/` (with your venv activated):
+**Screenshot 2 (Volume Bars — no opacity interface) — re-verified by
+actually executing the real code, not just re-reading it.** There's no
+working browser available in this sandbox (confirmed by attempting to
+install one, not assumed), so instead of asking you to trust a second
+read of the source, I ran the real, unmodified `ColorField` component
+and the real `normalizeSubWindow` backfill logic through Node directly.
+Concretely: `upOpacity` comes out as a real number (100) both for a
+brand-new config and for a simulated legacy session missing that field
+entirely (the backfill fills it in correctly), and rendering the actual
+component with those exact values produces real HTML containing
+`<input type="range">` and "100%" — confirmed it only disappears when
+opacity is genuinely `undefined`. So the code, as it exists right now,
+categorically produces this slider given the data the app actually
+generates. If you're still not seeing it: hard-refresh or restart your
+dev server first (this smells like a stale build/cache, not missing
+code); if it's still missing after that, send a fresh screenshot or your
+browser console output and I'll dig further from there — that would be
+real evidence of something my testing didn't catch.
 
-```bash
-alembic upgrade head
-```
+**Screenshots 3/4 (Daily Levels panel cut off, no scrollbar) —
+re-verified against git history, not just the decision doc.** Rather
+than trust `confirmed-decisions.md`'s own claim, I pulled the actual
+`git show` diff of the fix commit (`b9f97a7`, Aug 25 — the `MIN_USABLE_
+HEIGHT` floor that was inflating the panel's max-height past real
+available space, removed) and checked the file's full history to
+confirm nothing since has touched or reverted it. Your screenshot is the
+original evidence that prompted that fix, not new proof the current code
+is still broken — and it's consistent with your own annotation, too:
+you noted the Indicators panel already had a working scrollbar, which
+lines up with that panel having its own separate, always-on inner list
+scroll unrelated to the bug; Daily Levels has no such inner scroll and
+was fully exposed to the outer positioning bug the commit fixed. What I
+genuinely can't do here is re-verify it visually myself — this depends
+on live browser layout (`window.innerHeight`, `getBoundingClientRect`)
+that doesn't exist outside a real browser, and none is available in this
+environment. If you've pulled latest and it's still cut off in an actual
+browser, that's a real signal I haven't been able to test against —
+tell me and I'll dig further rather than assume it's resolved.
 
-If you already have Postgres running with different credentials, either
-match the defaults above or override via env vars
-(`POSTGRES_HOST`/`PORT`/`DB`/`USER`/`PASSWORD` — see `core/config.py`).
+## What changed and why (decisions #81, #82)
 
-**If you skip this:** the app still boots and works exactly as before —
-every DB call is wrapped and soft-fails to "nothing recorded yet," logged
-not raised (verified by literally stopping Postgres and re-running
-everything, see #43's verification note). You just won't get the
-history-persists-across-reconnects behavor until it's set up.
+- `frontend/src/types/workspace.ts` — new `showNameLabel` field (plural
+  `showNameLabels` on `DailyLevelsConfig`, matching its existing plural
+  naming) on all four indicator config types: `PriceIndicatorInstance`,
+  `HorizontalLevelInstance`, `VolumeAvgLineConfig`, `DailyLevelsConfig`.
+  Defaulted `true` everywhere it's created — matches the always-on
+  behavior every existing session was already rendering, so nothing
+  changes for you until you actually uncheck the new box.
+- `frontend/src/utils/indicators.ts` — threaded through
+  `computePriceIndicator` (SMA/EMA/VWAP, backend and local-fallback) and
+  `computeHorizontalLevel`.
+- `frontend/src/components/chart/ChartWidget.tsx` — all four rendering
+  effects (indicator Line-series, horizontal-levels price-line,
+  volume-avg price-line, daily-levels price-line) resolve the actual
+  `title` string from the new flag instead of passing the label straight
+  through unconditionally. This line is the actual bug fix in each case;
+  everything else is plumbing to reach it.
+- `frontend/src/components/sub-window/SubWindowMenu.tsx` — checkbox
+  added to `OverlayIndicatorRow`, `HorizontalLevelRow`, and
+  `VolumeAvgLineRow` (all three: same styling/placement as the existing
+  "Show price tag" checkbox right above it); button added to the Daily
+  Levels panel matching its own highlighted-button style.
+- `frontend/src/state/WorkspaceContext.tsx` — `normalizeSubWindow`
+  backfills the new field(s) to `true` for any workspace saved before
+  they existed, on all four config types, same pattern already used for
+  `showPriceLabel`/opacity backfills — your existing saved layouts won't
+  lose their labels on next load.
+- `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md` —
+  decisions #81 and #82 recorded.
 
-## What changed and why
+**Verified:** `npx tsc -b` (filtered for the pre-existing, unrelated
+`GridPresetPicker.tsx` errors — not touched by this drop) and `npx vite
+build` both clean, after both rounds of edits. No backend files touched,
+so no `pytest` run applies. **Not verified: an actual browser** for the
+label-toggle changes themselves — no browser available in this sandbox;
+derived from Lightweight Charts' own documented `title`/`lastValueVisible`/
+`axisLabelVisible` behavior against your screenshot, not confirmed by
+reproducing the floating badge and watching it resolve on screen. (The
+Volume Bars opacity and Daily Levels scrollbar re-verifications above
+used real code execution and real git history instead, for exactly this
+reason — trying to close that gap wherever the tooling allows it, not
+just re-asserting.)
 
-**The actual bug:** not a bug — a documented, unbuilt piece of the
-architecture. `system-design.md` §4.2 has said "persist candles via a
-write-behind recorder" since it was written; the `candles` table's own
-migration TODO said outright this needed doing "before Market Data
-Engine is actually writing candles." Nothing had ever subscribed to
-`CandleClosed` to do it. Every sub-window's history only ever existed
-for as long as that specific tab had been open and listening live.
+## Known, deliberately deferred / open questions
 
-- `backend/app/services/candle_recorder.py` — **new.** Subscribes to
-  `CandleClosed`, writes every closed `1m` candle to Postgres. Doesn't do
-  the write inside the Event Bus callback itself (would block live price
-  fan-out for every other subscriber — see the file's own docstring for
-  why) — pushes to an in-memory queue instead, a separate background task
-  drains it via `asyncio.to_thread`.
-- `backend/app/db/partitions.py` — **new.** Auto-creates the current +
-  next month's partition before every write. The original migration only
-  seeded July/August 2026 — without this, writes would silently start
-  failing the moment September arrives, which is 3 weeks away.
-- `backend/app/services/candle_store.py` — **new.** Read side —
-  `get_recorded_candles()`, called by the route below.
-- `backend/app/api/routes/market.py` — `GET /market/candles` now checks
-  self-recorded data FIRST, before ever reaching Polygon. For `1m`
-  specifically this is now the primary path, not a fallback — Polygon's
-  free tier structurally can't serve minute-level data at all (see below).
-- `backend/app/main.py` — `CandleRecorder` starts/stops in `lifespan()`,
-  same pattern as last drop's `TickIngestBridge.stop()`.
-- `backend/app/models/market_data.py` — unrelated bug found by this being
-  the first code to ever actually INSERT into `candles`: `Candle.id`
-  didn't declare `Identity()`, even though its own migration does. Fixed
-  to match — SQLAlchemy was warning about it, not silently corrupting
-  anything, but worth fixing now that it's finally exercised.
-- `backend/tests/test_candle_recorder.py` — **new.** Integration tests
-  against a real local Postgres (write → read back, duplicate-close
-  doesn't double-write). Auto-skips (not fails) if Postgres isn't
-  reachable — verified both ways.
-- `backend/tests/test_market_routes.py` — one new test proving the route
-  itself serves self-recorded data with zero provider connected; a couple
-  of existing tests' fixture ticker names shortened to fit
-  `symbols.ticker VARCHAR(16)` (found because my own first draft of the
-  new test tripped over it).
+**A possible correction to #81's own stated limit, surfaced but not
+acted on.** #81 said PDH/PDL-style levels could only get "name + price"
+or "price only," never "name only, no price," because it assumed
+`createPriceLine`'s `title` and `axisLabelVisible` draw as one fused
+tag. Re-reading Lightweight Charts' own shipped type declarations while
+wiring #82, they're documented as two independent things —
+`axisLabelVisible` governs only the price-scale value, `title` is
+described as rendering separately "on the chart pane." If that's
+accurate, "name only, no price" may already work for all three
+`createPriceLine`-based types, not just the version shipped. **Not
+verified in a browser** — flagging this rather than quietly upgrading
+the earlier claim or quietly leaving it as stated. Try unchecking "Show
+price tag" while leaving "Show label" checked on a PDH line and let me
+know what you actually see; that single data point settles it.
 
-  **Verified:** real local PostgreSQL 16, not mocked — installed,
-  migrated, used for every claim above, then torn down. Full suite
-  passes both with Postgres up (69/69) and down (65 pass, 4 skip, nothing
-  fails or crashes). A real `uvicorn` process with the DB down still
-  boots and answers with a clean 400, not a crash. **Not verified:** the
-  live-market-hours version of your original report — today's Sunday,
-  markets closed — so this is real-DB-test-level verification, not a
-  click-through with the market actually open.
-
-## Your two questions, answered
-
-**"Is running 2 APIs at once causing this?"** No — Finnhub/Polygon role
-separation isn't a coordination bug and isn't what this fixes. The gap
-was a capability gap in whichever provider held the historical role:
-Polygon's free tier can't serve `1m` data at any window, full stop
-(confirmed against Polygon's now-Massive.com current docs — they
-rebranded sometime in 2026, after my training cutoff). The fix wasn't
-"run them differently," it's "stop depending on either one for data
-neither can provide, and self-supply it from what's already flowing
-through the pipeline."
-
-**The "2 years vs 1 Day bars" mismatch:** expected, not a bug. Massive's
-free ("Stocks Basic") plan is end-of-day/daily-only. The "2 years" figure
-refers to how far back that DAILY data goes, not that minute bars are
-included.
-
-## Known, deliberately deferred
-
-`polygon_provider.py`'s `if not aggs: raise SymbolNotFoundError` still
-conflates "invalid symbol" with "authorized but zero trades in this
-window" (e.g. a weekend query) — real bug, lower priority now that
-self-recorded data is the primary `1m` path and Polygon's only ever a
-last-resort fallback. Flagged in confirmed-decisions #43, not fixed here
-to keep this drop focused.
+Nothing else deferred from the original four screenshots.

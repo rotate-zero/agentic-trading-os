@@ -30,6 +30,13 @@ export interface IndicatorSeries {
   // PRICE_INDICATOR_LINE_WIDTH_STEP comment in types/workspace.ts. Defaults
   // to 2 when omitted (legacy callers).
   showPriceLabel?: boolean; // last-value tag near the price axis; defaults to true
+  // Name half of that same tag ("SMA 9" on its own) — decision #81,
+  // independent of showPriceLabel above. See PriceIndicatorInstance's own
+  // comment in types/workspace.ts for why this needs to be its own flag
+  // rather than falling out of showPriceLabel automatically. Defaults to
+  // true (current/prior always-on behavior) for the same "legacy callers"
+  // reason showPriceLabel above does.
+  showNameLabel?: boolean;
   data: IndicatorPoint[];
 }
 
@@ -514,7 +521,7 @@ export function ChartWidget({
           lineWidth: 1,
           lineStyle: 1, // dotted
           axisLabelVisible: line.showPriceLabel,
-          title: line.label,
+          title: line.showNameLabel === false ? "" : line.label,
         });
       });
 
@@ -546,7 +553,12 @@ export function ChartWidget({
           lineWidth: Math.min(4, Math.max(1, Math.round(resolved.lineWidth))) as LineWidth,
           lineStyle: LINE_STYLE_MAP[resolved.lineStyle],
           axisLabelVisible: resolved.showPriceLabel,
-          title: resolved.label,
+          // showNameLabel (decision #81) only ever drops the "PDH"-style
+          // prefix from the tag — axisLabelVisible above (showPriceLabel)
+          // still owns whether the tag shows at all, so this can't produce
+          // a name-with-no-price state; see the field's own comment in
+          // types/workspace.ts for why that combination isn't offered.
+          title: resolved.showNameLabel === false ? "" : resolved.label,
         })
       );
 
@@ -588,7 +600,7 @@ export function ChartWidget({
           lineWidth: Math.min(4, Math.max(1, Math.round(dailyLevelsConfig.lineWidth))) as LineWidth,
           lineStyle: LineStyle.Solid,
           axisLabelVisible: dailyLevelsConfig.showPriceLabels,
-          title: `DL-${level.strength}`,
+          title: dailyLevelsConfig.showNameLabels === false ? "" : `DL-${level.strength}`,
         })
       );
 
@@ -626,13 +638,24 @@ export function ChartWidget({
       // explanation and the caveat about this being version-coupled.
       const lineWidth = Math.min(4, Math.max(1, ind.lineWidth ?? 2)) as unknown as LineWidth;
       const showPriceLabel = ind.showPriceLabel ?? true;
+      // Lightweight Charts renders a series' `title` on the price-axis tag
+      // unconditionally whenever it's a non-empty string — it does NOT
+      // check lastValueVisible (showPriceLabel above) before doing so.
+      // That's the exact bug decision #81 closes: unchecking "Show price
+      // tag" alone used to leave the name badge (e.g. "SMA 9") stuck on
+      // screen with no value next to it. Clearing title to "" here is what
+      // actually makes the new "Show label" checkbox do something —
+      // passing ind.label straight through regardless, as this used to,
+      // is what caused the orphaned badge in the first place.
+      const showNameLabel = ind.showNameLabel ?? true;
+      const seriesTitle = showNameLabel ? ind.label : "";
       const color = hexWithOpacity(ind.color, ind.opacity ?? 100);
       let series = lineSeriesRef.current.get(ind.key);
       if (!series) {
         series = chart.addLineSeries({
           color,
           lineWidth,
-          title: ind.label,
+          title: seriesTitle,
           priceLineVisible: false,
           lastValueVisible: showPriceLabel,
         });
@@ -643,7 +666,7 @@ export function ChartWidget({
         // render rather than only at creation, or a color pick / thickness
         // step / checkbox toggle wouldn't show until the series was torn
         // down and recreated.
-        series.applyOptions({ color, lineWidth, title: ind.label, lastValueVisible: showPriceLabel });
+        series.applyOptions({ color, lineWidth, title: seriesTitle, lastValueVisible: showPriceLabel });
       }
       series.setData(ind.data.map((p) => ({ time: p.time as UTCTimestamp, value: p.value })));
     }

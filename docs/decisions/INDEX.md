@@ -1,7 +1,7 @@
 # Decision Index
 
 
-One line per confirmed decision, #1 through #80, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
+One line per confirmed decision, #1 through #82, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
 
 | # | Summary | File |
 |---|---|---|
@@ -85,3 +85,5 @@ One line per confirmed decision, #1 through #80, across every file in this direc
 | 78 | Backfilled entry — Saved Layouts (named save/load/delete, JSON export/import) already exists in… | `archive/061-079.md` |
 | 79 | `confirmed-decisions.md` split into an open file + frozen archive + index, to keep session-start reading cost bounded | `archive/061-079.md` |
 | 80 | Volume Bars opacity confirmed already shipped (#77); real bug was `useDropdownPlacement` inflating panel max-height past available viewport space on narrow/short screens — fixed in the shared hook for every dropdown panel at once. | `confirmed-decisions.md` |
+| 81 | Axis-label name half ("PDH", "SMA 9") gained its own on/off toggle (`showNameLabel`), separate from the existing price-value toggle (`showPriceLabel`) — closes a Lightweight Charts quirk where an indicator's name stayed visible even with the value hidden. | `confirmed-decisions.md` |
+| 82 | #81's `showNameLabel` toggle extended to Volume Avg lines and Daily Levels, the two indicator types it deliberately left out — every label-bearing indicator now follows the same on/off convention. | `confirmed-decisions.md` |

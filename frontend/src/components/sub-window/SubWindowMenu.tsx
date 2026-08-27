@@ -324,6 +324,15 @@ function VolumeAvgLineRow({
         />
         Show price tag
       </label>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={line.showNameLabel}
+          onChange={(e) => patchLine({ showNameLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show label
+      </label>
       <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"
@@ -583,6 +592,15 @@ function OverlayIndicatorRow({
         />
         Show price tag
       </label>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={instance.showNameLabel}
+          onChange={(e) => patchInstance({ showNameLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show label
+      </label>
       <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"
@@ -714,6 +732,15 @@ function HorizontalLevelRow({
           className="h-3 w-3 accent-signal"
         />
         Show price tag
+      </label>
+      <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+        <input
+          type="checkbox"
+          checked={instance.showNameLabel}
+          onChange={(e) => patchInstance({ showNameLabel: e.target.checked })}
+          className="h-3 w-3 accent-signal"
+        />
+        Show label
       </label>
       <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
@@ -1468,6 +1495,19 @@ export function SubWindowMenu({ config, displaySymbol }: { config: SubWindowConf
                   >
                     Show price on axis
                     {config.dailyLevelsConfig.showPriceLabels && <span>&#10003;</span>}
+                  </button>
+                  <button
+                    onClick={() =>
+                      updateSubWindow(config.id, {
+                        dailyLevelsConfig: { ...config.dailyLevelsConfig, showNameLabels: !config.dailyLevelsConfig.showNameLabels },
+                      })
+                    }
+                    className={`mt-1 flex w-full items-center justify-between rounded px-2 py-1 text-left font-mono text-[11px] ${
+                      config.dailyLevelsConfig.showNameLabels ? "bg-signal/20 text-signal" : "text-text-primary hover:bg-base-bg"
+                    }`}
+                  >
+                    Show "DL-N" label
+                    {config.dailyLevelsConfig.showNameLabels && <span>&#10003;</span>}
                   </button>
                   <button
                     onClick={() => updateSubWindow(config.id, { dailyLevelsConfig: createDefaultDailyLevelsConfig() })}

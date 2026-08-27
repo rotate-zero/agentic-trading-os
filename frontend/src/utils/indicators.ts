@@ -44,24 +44,24 @@ export function computePriceIndicator(
   backendSeries?: Record<string, IndicatorPoint[] | undefined>
 ) {
   const label = priceIndicatorLabel(instance);
-  const { color, opacity, lineWidth, showPriceLabel } = instance;
+  const { color, opacity, lineWidth, showPriceLabel, showNameLabel } = instance;
   switch (instance.type) {
     case "SMA": {
       const period = instance.period ?? 20;
       const backend = backendSeries?.[`sma_${period}`];
-      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, data: backend };
-      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, data: sma(candles, period) };
+      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: sma(candles, period) };
     }
     case "EMA": {
       const period = instance.period ?? 20;
       const backend = backendSeries?.[`ema_${period}`];
-      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, data: backend };
-      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, data: ema(candles, period) };
+      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: ema(candles, period) };
     }
     case "VWAP": {
       const backend = backendSeries?.["vwap"];
-      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, data: backend };
-      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, data: vwap(candles) };
+      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: vwap(candles) };
     }
   }
 }
@@ -102,6 +102,7 @@ export function computeHorizontalLevel(
     lineWidth: instance.lineWidth,
     lineStyle: instance.lineStyle,
     showPriceLabel: instance.showPriceLabel,
+    showNameLabel: instance.showNameLabel,
   };
 }
 

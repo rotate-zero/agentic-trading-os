@@ -218,6 +218,7 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
       opacity: COLOR_OPACITY_DEFAULT,
       lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
       showPriceLabel: true,
+      showNameLabel: true,
     }));
 
   const { indicators: _legacyIndicators, ...rest } = sw;
@@ -229,12 +230,19 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
       // but a session persisted before this field existed won't actually
       // have it at runtime — the fallback below is for that real case, not
       // a type-checking exercise. opacity gets the same treatment for the
-      // same reason (added later than showPriceLabel).
-      ...(sw.priceIndicators ?? []).map((p) => ({ showPriceLabel: true, opacity: COLOR_OPACITY_DEFAULT, ...(p as Partial<PriceIndicatorInstance>) }) as PriceIndicatorInstance),
+      // same reason (added later than showPriceLabel). showNameLabel
+      // (decision #81) gets it too now, for sessions saved before that
+      // field existed — true preserves the always-on-name behavior every
+      // prior session was already rendering, so this backfill doesn't
+      // silently change how an old layout looks.
+      ...(sw.priceIndicators ?? []).map((p) => ({ showPriceLabel: true, showNameLabel: true, opacity: COLOR_OPACITY_DEFAULT, ...(p as Partial<PriceIndicatorInstance>) }) as PriceIndicatorInstance),
       ...migratedFromLegacyIndicators,
     ],
+    // showNameLabel (decision #81) back-fill, same reasoning as
+    // priceIndicators' own above — true matches the pre-existing always-on
+    // behavior for sessions saved before this field existed.
     horizontalLevels: (sw.horizontalLevels ?? []).map(
-      (l) => ({ opacity: COLOR_OPACITY_DEFAULT, ...(l as Partial<HorizontalLevelInstance>) }) as HorizontalLevelInstance
+      (l) => ({ opacity: COLOR_OPACITY_DEFAULT, showNameLabel: true, ...(l as Partial<HorizontalLevelInstance>) }) as HorizontalLevelInstance
     ),
     // Back-fill for sessions persisted before chartStyle existed (decision
     // #73) — candlestick is what every prior saved layout was already
@@ -259,12 +267,16 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
           // priceIndicators' own showPriceLabel back-fill above — a session
           // persisted before these fields existed on VolumeAvgLineConfig
           // won't actually have them at runtime even though the type says
-          // they're always present (decisions #74, #76). Only reached when
-          // sw.volumeAvg already exists; a wholly missing volumeAvg still
-          // falls through to createDefaultVolumeAvgConfig() below, whose
-          // lines already carry both.
+          // they're always present (decisions #74, #76). showNameLabel
+          // (decision #82) gets the same treatment now too, true matching
+          // the always-on-name behavior every prior session was already
+          // rendering. Only reached when sw.volumeAvg already exists; a
+          // wholly missing volumeAvg still falls through to
+          // createDefaultVolumeAvgConfig() below, whose lines already
+          // carry all three.
           lines: sw.volumeAvg.lines.map(
-            (l) => ({ showPriceLabel: true, opacity: COLOR_OPACITY_DEFAULT, ...(l as Partial<VolumeAvgLineConfig>) }) as VolumeAvgLineConfig
+            (l) =>
+              ({ showPriceLabel: true, showNameLabel: true, opacity: COLOR_OPACITY_DEFAULT, ...(l as Partial<VolumeAvgLineConfig>) }) as VolumeAvgLineConfig
           ),
         }
       : createDefaultVolumeAvgConfig(),
@@ -287,9 +299,12 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
     // createDefaultDailyLevelsConfig() itself already uses, so an old
     // saved layout doesn't suddenly show a new indicator nobody asked for.
     // Same opacity partial-cast for sessions that have dailyLevelsConfig
-    // but predate its opacity field (decision #76).
+    // but predate its opacity field (decision #76). showNameLabels
+    // (decision #82) back-fills to true — matching the always-on "DL-N"
+    // title every prior session was already rendering, unlike
+    // showPriceLabels above which back-fills to the opt-in false default.
     dailyLevelsConfig: sw.dailyLevelsConfig
-      ? ({ opacity: COLOR_OPACITY_DEFAULT, ...(sw.dailyLevelsConfig as Partial<DailyLevelsConfig>) } as DailyLevelsConfig)
+      ? ({ opacity: COLOR_OPACITY_DEFAULT, showNameLabels: true, ...(sw.dailyLevelsConfig as Partial<DailyLevelsConfig>) } as DailyLevelsConfig)
       : createDefaultDailyLevelsConfig(),
     // Back-fill for sessions persisted before the HUD box existed
     // (decision #75) — defaults to disabled, same opt-in convention as

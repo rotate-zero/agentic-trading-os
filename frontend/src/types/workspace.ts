@@ -70,6 +70,17 @@ export interface PriceIndicatorInstance {
   opacity: number; // 0-100, applied via hexWithOpacity (utils/hud.ts) at render time — see COLOR_OPACITY_DEFAULT
   lineWidth: number; // px — see PRICE_INDICATOR_LINE_WIDTH_STEP note below
   showPriceLabel: boolean; // last-value tag near the price axis, e.g. "SMA 9 → 22.50"
+  // The name portion of that same axis tag ("SMA 9" on its own, independent
+  // of whatever the price-value half shows) — decision #81. Lightweight
+  // Charts' `lastValueVisible` (showPriceLabel above) only ever hides the
+  // VALUE half of a series' price-scale label; its `title` (the name half)
+  // renders unconditionally whenever it's a non-empty string, with no
+  // built-in flag of its own — confirmed against the library's own issue
+  // tracker, not assumed. That gap is exactly what let the name badge stay
+  // stuck on screen even with "Show price tag" unchecked. This field is
+  // the independent on/off ChartWidget.tsx needs to actually clear `title`
+  // to "" rather than leave the library's unconditional behavior showing.
+  showNameLabel: boolean;
 }
 
 export const PRICE_INDICATOR_PERIOD_MIN = 2;
@@ -118,6 +129,7 @@ export function createPriceIndicatorInstance(
     opacity: COLOR_OPACITY_DEFAULT,
     lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
     showPriceLabel: true,
+    showNameLabel: true,
   };
 }
 
@@ -168,6 +180,19 @@ export interface HorizontalLevelInstance {
   // PRICE_INDICATOR_LINE_WIDTH_STEP comment for the source-level detail.
   lineStyle: LineStyleOption;
   showPriceLabel: boolean; // the price-axis tag (createPriceLine's axisLabelVisible)
+  // Whether the name prefix ("PDH") renders ahead of the price value inside
+  // that same tag — decision #81, the createPriceLine counterpart to
+  // PriceIndicatorInstance.showNameLabel above. Unlike a line series'
+  // separate title/lastValueVisible flags, a price line's `title` and
+  // `axisLabelVisible` are already one combined visual unit — there's no
+  // library-level bug here the way there is for overlay indicators — but
+  // there was still no way to drop just the name prefix and keep the bare
+  // price ("494.86" instead of "PDH 494.86"). This only changes what
+  // `title` is passed to createPriceLine when the tag is showing;
+  // showPriceLabel/axisLabelVisible still owns whether the tag shows at
+  // all, so unchecking Show price tag continues to hide the whole thing,
+  // same as before this field existed.
+  showNameLabel: boolean;
 }
 
 export type LineStyleOption = "solid" | "dashed" | "dotted";
@@ -252,6 +277,7 @@ export function createHorizontalLevelInstance(type: HorizontalLevelType): Horizo
     lineWidth: 1,
     lineStyle: "dashed",
     showPriceLabel: true,
+    showNameLabel: true,
   };
 }
 
@@ -325,6 +351,12 @@ export interface VolumeAvgLineConfig {
   // the chart follows the same on/off convention, not just three of the
   // four. See confirmed-decisions.md #74.
   showPriceLabel: boolean;
+  // Name half of that same tag (e.g. "Day Avg") — decision #82, same
+  // createPriceLine name-vs-price split as HorizontalLevelInstance's own
+  // showNameLabel (decision #81). Drops just the label prefix, keeping
+  // the bare number, when off; showPriceLabel above still owns whether
+  // the tag shows at all.
+  showNameLabel: boolean;
 }
 
 export interface VolumeAvgIndicatorConfig {
@@ -340,10 +372,10 @@ export function createDefaultVolumeAvgConfig(): VolumeAvgIndicatorConfig {
   return {
     enabled: false, // opt-in, same convention as the Indicators list starting empty
     lines: [
-      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 0, adjustable: false, showPriceLabel: true },
-      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 3, adjustable: true, showPriceLabel: true },
-      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", opacity: COLOR_OPACITY_DEFAULT, barCount: 6, adjustable: true, showPriceLabel: true },
-      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", opacity: COLOR_OPACITY_DEFAULT, barCount: 9, adjustable: true, showPriceLabel: true },
+      { id: "day", label: "Day Avg", enabled: true, color: "#D2A8FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 0, adjustable: false, showPriceLabel: true, showNameLabel: true },
+      { id: "n1", label: "3-Bar Avg", enabled: true, color: "#58A6FF", opacity: COLOR_OPACITY_DEFAULT, barCount: 3, adjustable: true, showPriceLabel: true, showNameLabel: true },
+      { id: "n2", label: "6-Bar Avg", enabled: true, color: "#FFA657", opacity: COLOR_OPACITY_DEFAULT, barCount: 6, adjustable: true, showPriceLabel: true, showNameLabel: true },
+      { id: "n3", label: "9-Bar Avg", enabled: true, color: "#7EE787", opacity: COLOR_OPACITY_DEFAULT, barCount: 9, adjustable: true, showPriceLabel: true, showNameLabel: true },
     ],
   };
 }
@@ -444,6 +476,16 @@ export interface DailyLevelsConfig {
   lineWidth: number; // px, integer DAILY_LEVELS_LINE_WIDTH_MIN..MAX floor, same
   // createPriceLine physical-pixel-rounding note as HorizontalLevelInstance.lineWidth
   showPriceLabels: boolean; // the price-axis tag, same as HorizontalLevelInstance.showPriceLabel
+  // Name half of that same tag (the "DL-N" strength prefix) — decision
+  // #82, same createPriceLine name-vs-price split as HorizontalLevelInstance
+  // and VolumeAvgLineConfig's own showNameLabel. Off drops just the "DL-N"
+  // prefix and keeps the bare price; showPriceLabels above still owns
+  // whether the tag shows at all. Defaults true (unlike showPriceLabels,
+  // which defaults false) because "DL-N" — not the price — is this
+  // indicator's own documented primary way strength reads visually (see
+  // showPriceLabels' own comment below); turning names off by default
+  // would have silently removed that on every existing session.
+  showNameLabels: boolean;
 }
 
 export const DAILY_LEVELS_MIN_STRENGTH_FLOOR = 2; // matches the backend's own
@@ -485,6 +527,8 @@ export function createDefaultDailyLevelsConfig(): DailyLevelsConfig {
     // Saqib's own filter/toggle plan exists for; the short "DL-N" line title
     // (ChartWidget.tsx) is the primary way strength reads visually, labels are
     // an opt-in on top of that
+    showNameLabels: true, // matches the always-on "DL-N" behavior every
+    // existing session was already rendering — see the field's own comment above
   };
 }
 
