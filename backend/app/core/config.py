@@ -182,6 +182,19 @@ class Settings(BaseSettings):
     # follow-up work if some level types need a different width later.
     trading_intelligence_aura_pct: float = 0.002
 
+    # --- Scanner: Activity Scorer (docs/architecture/scanner-design.md §2/§8) ---
+    # v1 composite score = rvol + ATR-normalized |gap_pct| + ATR-normalized
+    # |session_pct_change|. Spread tightness deliberately absent — needs
+    # live L1 bid/ask, gated on the IBKR market data subscription (§9),
+    # not built yet. Equal-weighted (1.0 each) is a deliberate starting
+    # point, not a tuned result — ship first, tune from observed rankings,
+    # same "don't guess a sophisticated weighting upfront" posture ATR's
+    # own proxy-vs-textbook tradeoff already used. Saqib's call to revise,
+    # not something to re-derive from theory.
+    scanner_weight_rvol: float = 1.0
+    scanner_weight_gap: float = 1.0
+    scanner_weight_session_change: float = 1.0
+
 
 @lru_cache
 def get_settings() -> Settings:
