@@ -216,24 +216,77 @@ export interface ScannerResultWireShape {
 
 export interface ScannerStateWireShape {
   universe: string[];
-  results: ScannerResultWireShape[];
+  results: ScannerResultWireShape[]; // already sliced to top_n by the backend
+  total_scored: number; // how many of `universe` had data at all, before the top_n cut
   skipped: string[]; // cold start (no 1m FeatureSet yet) — not an error
 }
 
 /**
- * GET /scanner/state — v1, on-demand. `symbols` overrides the backend's
- * placeholder TEST_UNIVERSE default (app/scanner/universe.py) — NOT
- * Saqib's real Core-100, which doesn't exist yet. Omit to use whatever
- * the backend defaults to.
+ * GET /scanner/state — v1, on-demand. `symbols` overrides the persisted
+ * universe ad hoc, without changing what's actually stored (use
+ * addScannerUniverseSymbol/removeScannerUniverseSymbol for that).
+ * `topN` defaults to the backend's own default (8) when omitted.
  */
-export async function fetchScannerState(symbols?: string[]): Promise<ScannerStateWireShape> {
-  let url = `${API_BASE_URL}/scanner/state`;
-  if (symbols && symbols.length > 0) {
-    url += `?symbols=${encodeURIComponent(symbols.join(","))}`;
-  }
+export async function fetchScannerState(symbols?: string[], topN?: number): Promise<ScannerStateWireShape> {
+  const params = new URLSearchParams();
+  if (symbols && symbols.length > 0) params.set("symbols", symbols.join(","));
+  if (topN !== undefined) params.set("top_n", String(topN));
+  const query = params.toString();
+  const url = `${API_BASE_URL}/scanner/state${query ? `?${query}` : ""}`;
+
   const res = await fetch(url);
   if (!res.ok) {
     throw new ApiError(await parseErrorDetail(res), res.status);
   }
   return (await res.json()) as ScannerStateWireShape;
+}
+
+export interface ScannerUniverseEntryWireShape {
+  symbol: string;
+  added_at: string;
+}
+
+/** GET /scanner/universe — the persisted universe GET /scanner/state
+ * actually scores by default now (scanner_universe_symbols, migration
+ * 0004), not app/scanner/universe.py's TEST_UNIVERSE constant. */
+export async function fetchScannerUniverse(): Promise<ScannerUniverseEntryWireShape[]> {
+  const res = await fetch(`${API_BASE_URL}/scanner/universe`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  const wire = (await res.json()) as { symbols: ScannerUniverseEntryWireShape[] };
+  return wire.symbols;
+}
+
+/**
+ * POST /scanner/universe — idempotent (re-adding an existing symbol is
+ * a no-op, not an error). Throws ApiError with status 400 if the symbol
+ * doesn't look like a valid ticker — format-only validation, doesn't
+ * confirm the symbol actually trades anywhere (see the backend's own
+ * is_valid_ticker_format docstring for exactly what that does and
+ * doesn't check).
+ */
+export async function addScannerUniverseSymbol(symbol: string): Promise<string> {
+  const res = await fetch(`${API_BASE_URL}/scanner/universe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ symbol }),
+  });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  const wire = (await res.json()) as { symbol: string; added: boolean };
+  return wire.symbol;
+}
+
+/** DELETE /scanner/universe/{symbol} — returns whether a row was
+ * actually removed; not finding the symbol isn't treated as an error
+ * on either end. */
+export async function removeScannerUniverseSymbol(symbol: string): Promise<boolean> {
+  const res = await fetch(`${API_BASE_URL}/scanner/universe/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  const wire = (await res.json()) as { symbol: string; removed: boolean };
+  return wire.removed;
 }

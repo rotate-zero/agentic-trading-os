@@ -186,14 +186,18 @@ class Settings(BaseSettings):
     # v1 composite score = rvol + ATR-normalized |gap_pct| + ATR-normalized
     # |session_pct_change|. Spread tightness deliberately absent — needs
     # live L1 bid/ask, gated on the IBKR market data subscription (§9),
-    # not built yet. Equal-weighted (1.0 each) is a deliberate starting
-    # point, not a tuned result — ship first, tune from observed rankings,
-    # same "don't guess a sophisticated weighting upfront" posture ATR's
-    # own proxy-vs-textbook tradeoff already used. Saqib's call to revise,
-    # not something to re-derive from theory.
+    # not built yet.
+    #
+    # gap/session_change weighted to 0.0 as of 2026-08-27, Saqib's call:
+    # score on RVOL alone for now while testing the pipeline. Both terms
+    # still exist and run in scorer.py — a symbol's `inputs_available`
+    # count still reflects whether gap_pct/session_pct_change actually
+    # had data, even though neither currently moves the score. Flip
+    # these back above 0 to bring them back into the ranking; no code
+    # change needed.
     scanner_weight_rvol: float = 1.0
-    scanner_weight_gap: float = 1.0
-    scanner_weight_session_change: float = 1.0
+    scanner_weight_gap: float = 0.0
+    scanner_weight_session_change: float = 0.0
 
 
 @lru_cache

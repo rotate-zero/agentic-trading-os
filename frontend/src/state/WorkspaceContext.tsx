@@ -50,6 +50,8 @@ interface WorkspaceContextValue {
   featureEngineCollapsed: boolean;
   featureEngineWidthPx: number;
   featureEnginePanelSymbol: string;
+  scannerCollapsed: boolean;
+  scannerWidthPx: number;
 
   // GLOBAL — shared across every Main Window. This is what makes "connector 0
   // in Layout 1" and "connector 0 in Layout 2" the same link group.
@@ -66,6 +68,8 @@ interface WorkspaceContextValue {
   setFeatureEngineCollapsed: (collapsed: boolean) => void;
   setFeatureEngineWidthPx: (width: number) => void;
   setFeatureEnginePanelSymbol: (symbol: string) => void;
+  setScannerCollapsed: (collapsed: boolean) => void;
+  setScannerWidthPx: (width: number) => void;
 
   // No-database save/load — everything lives in localStorage for now. Same
   // JSON shape this produces is what a future workspace_layouts API call
@@ -159,6 +163,8 @@ function makeMainWindow(id: string, label: string, subWindows: SubWindowConfig[]
     featureEngineCollapsed: true, // starts collapsed — a second sidebar shouldn't grab space by default
     featureEngineWidthPx: 300,
     featureEnginePanelSymbol: DEFAULT_SYMBOL,
+    scannerCollapsed: true, // starts collapsed, same reasoning as Feature Engine above — a third sidebar shouldn't grab space by default either
+    scannerWidthPx: 300,
   };
 }
 
@@ -467,6 +473,8 @@ export function WorkspaceProvider({
   const setInfoWidthPx = (width: number) => updateActive({ infoWidthPx: width });
   const setFeatureEngineCollapsed = (collapsed: boolean) => updateActive({ featureEngineCollapsed: collapsed });
   const setFeatureEngineWidthPx = (width: number) => updateActive({ featureEngineWidthPx: width });
+  const setScannerCollapsed = (collapsed: boolean) => updateActive({ scannerCollapsed: collapsed });
+  const setScannerWidthPx = (width: number) => updateActive({ scannerWidthPx: width });
   const setFeatureEnginePanelSymbol = (symbol: string) => updateActive({ featureEnginePanelSymbol: symbol });
 
   const addMainWindow = () => {
@@ -581,6 +589,8 @@ export function WorkspaceProvider({
       featureEngineCollapsed: activeWindow.featureEngineCollapsed,
       featureEngineWidthPx: activeWindow.featureEngineWidthPx,
       featureEnginePanelSymbol: activeWindow.featureEnginePanelSymbol,
+      scannerCollapsed: activeWindow.scannerCollapsed,
+      scannerWidthPx: activeWindow.scannerWidthPx,
 
       connectorSymbols,
 
@@ -595,6 +605,8 @@ export function WorkspaceProvider({
       setFeatureEngineCollapsed,
       setFeatureEngineWidthPx,
       setFeatureEnginePanelSymbol,
+      setScannerCollapsed,
+      setScannerWidthPx,
 
       savedLayouts,
       saveCurrentLayout,

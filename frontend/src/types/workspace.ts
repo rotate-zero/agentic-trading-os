@@ -668,4 +668,10 @@ export interface MainWindowState {
   featureEngineCollapsed: boolean;
   featureEngineWidthPx: number;
   featureEnginePanelSymbol: string;
+  // Scanner panel — same independent-collapsible-sidebar pattern as
+  // Feature Engine above, not reusing its fields (a third, separate
+  // panel). No per-panel "symbol" field the way Feature Engine has one:
+  // Scanner shows a whole ranked universe, not one symbol's detail.
+  scannerCollapsed: boolean;
+  scannerWidthPx: number;
 }

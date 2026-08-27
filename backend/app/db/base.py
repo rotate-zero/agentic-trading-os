@@ -16,3 +16,4 @@ class Base(DeclarativeBase):
 # everything else in system-design.md §4.13 is a later phase).
 from app.models import market_data  # noqa: E402,F401
 from app.models import trading_intelligence  # noqa: E402,F401 — level_interaction_state/events (confirmed decision #46)
+from app.models import scanner  # noqa: E402,F401 — scanner_universe_symbols (Scanner v1 universe management)
