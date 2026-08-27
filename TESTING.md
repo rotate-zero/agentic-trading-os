@@ -1,82 +1,67 @@
-# TESTING — Scanner v1 (ActivityScorer + pipeline test script)
+# TESTING — Scanner v1 frontend (GET /scanner/state + ScannerPanel)
 
-Unzip at project root — this overwrites `backend/app/core/config.py` (adds
-3 new settings, nothing else in that file changed) and adds 5 new files:
-`backend/app/scanner/{__init__.py,scorer.py,universe.py}`,
-`backend/scripts/test_scanner_pipeline.py`, `backend/tests/test_scanner.py`.
+Unzip at project root. This delivery:
+- **Overwrites** `backend/app/main.py` (registers the new `scanner` router — one import line, one `include_router` line, nothing else changed) and `frontend/src/App.tsx` (mounts `<ScannerPanel />` next to `<FeatureEnginePanel />` in both workspace shells) and `frontend/src/services/api-client.ts` (appends `fetchScannerState` + its wire types — nothing existing in that file changed).
+- **Adds** `backend/app/scanner/runner.py`, `backend/app/api/routes/scanner.py`, `backend/tests/test_scanner_runner.py`, `frontend/src/hooks/useScannerState.ts`, `frontend/src/components/scanner/ScannerPanel.tsx`.
+- Builds on the previous scanner delivery (`app/scanner/scorer.py`, `app/scanner/universe.py`, `tests/test_scanner.py`) — this doesn't replace or change any of that.
 
 ## What this is
 
-Per `docs/architecture/scanner-design.md` §2/§9: the v1 composite
-`ActivityScorer` (unusual volume + volatility-relative move — the two
-scan types chosen to test the pipeline on current APIs, ahead of the
-IBKR subscription), plus a script to run it against whatever Feature
-Engine is actually computing live right now for a small placeholder
-universe (`app/scanner/universe.py`'s `TEST_UNIVERSE` — NOT the real
-Core-100, which is still your call).
+An on-demand `GET /scanner/state` route (not the continuous
+`MarketActivityScanner` from `scanner-design.md` §5 — that's still not
+built, see §10/§11 of the doc) plus a real frontend panel that polls it.
+Same v1 `ActivityScorer` (unusual volume + volatility-relative move) as
+before, same 6-symbol placeholder `TEST_UNIVERSE` — this delivery is
+purely "give it a UI," not a scoring change.
 
-No `MarketActivityScanner` orchestrator, `ScanCadenceSchedule`, or
-`LiveTickRelay` wiring yet (§1/§4/§5 of the design doc) — deliberately
-scoped to just the scorer + a way to look at real output, since that's
-what "test the pipeline" needs right now, not the full promotion
-machinery.
-
-## 1. Unit tests (no server, no market data needed)
+## 1. Backend unit tests
 
 ```bash
 cd backend
-pytest tests/test_scanner.py -v
+pytest tests/test_scanner.py tests/test_scanner_runner.py -v
 ```
 
-6 tests, already run against the real `FeatureSet` schema before this
-was sent to you — all passing. Covers: ATR normalization when
-`atr_14_pct` is available, fallback to raw values when it isn't, missing
-`rvol` handled as "skip this term" rather than a fabricated zero, the
-all-missing cold-start case, per-input weighting, and that gap/session
-change use absolute value (a large down move should score the same as
-a large up move).
+9 tests total (6 scorer, already covered in the previous delivery; 3 new
+for `run_scan`'s orchestration — descending rank, skip-not-zero for
+symbols with no snapshot at all, and that display features are filtered
+to only the 4 scan-relevant keys). All passing, run before this was sent.
 
-## 2. Live pipeline test (the actual point of this delivery)
-
-Needs a couple of the `TEST_UNIVERSE` symbols (`AAPL MSFT NVDA AMD TSLA
-SPY`) to have at least one recorded 1m candle already — ideally during
-market hours with live Finnhub ticks flowing, so `rvol`/`gap_pct`/
-`session_pct_change` have actually computed at least once.
+## 2. Backend route, manually
 
 ```bash
-# terminal 1
 cd backend
 uvicorn app.main:app --reload
-
-# terminal 2, same venv
-cd backend
-python scripts/test_scanner_pipeline.py
 ```
 
-Prints a ranked table (`RANK / SYMBOL / SCORE / INPUTS`) plus a `Skipped`
-line for any symbol Feature Engine hasn't computed anything for yet — a
-skip means genuinely no data yet, not a bug. Symbols scored from fewer
-than 2 of the 3 possible inputs get a `(low confidence — few inputs)`
-flag next to them so a thin reading doesn't look as trustworthy as a
-full one.
+```bash
+curl http://127.0.0.1:8000/scanner/state
+curl "http://127.0.0.1:8000/scanner/state?symbols=AAPL,TSLA,NVDA"
+```
 
-Optional: `python scripts/test_scanner_pipeline.py AAPL TSLA NVDA` to
-try a different symbol set without editing `TEST_UNIVERSE`.
+Expect `{"universe": [...], "results": [...], "skipped": [...]}`. A
+symbol shows up in `skipped`, not `results`, until Feature Engine has
+computed at least one 1m `FeatureSet` for it — that's cold start, not a
+bug.
 
-## What to actually look at
+## 3. Frontend, visually
 
-The point of this delivery isn't "does it run" (already verified) — it's
-"do these rankings look right to you." Specifically worth checking:
+```bash
+cd frontend
+npm run dev
+```
 
-- Does the symbol you'd subjectively call "most active right now" land
-  near the top?
-- Do the equal 1.0/1.0/1.0 weights (§8 of the design doc, still an open
-  question in §10) feel right, or does one input dominate/get drowned
-  out in practice?
-- Any symbol stuck at `0/3` or `1/3` inputs for longer than expected —
-  worth checking whether that's genuinely cold-start or something else
-  not computing.
+Open the app — a new **Scanner** panel should appear on the right edge,
+next to the existing Feature Engine panel, showing a ranked list once
+data starts coming in. It polls every 15s; there's also a manual
+**Refresh** button in the panel header. A `X/3` badge next to a score
+means that reading came from fewer than 2 of the 3 possible inputs — low
+confidence, not necessarily low activity.
 
-Nothing here is asserted as "correct" — that's explicitly your call to
-make from watching real output, per the design doc's own "ship
-equal-weighted, tune from observed behavior" stance.
+## Already verified before this was sent (can't be re-verified in this environment)
+
+- `npx tsc -b` — only the known, pre-existing `GridPresetPicker.tsx`
+  errors (decision #35). Nothing new from `ScannerPanel.tsx` or
+  `useScannerState.ts`.
+- `npx vite build` — clean, 81 modules, no errors.
+- No live browser check was possible here — visual layout/spacing next
+  to `FeatureEnginePanel` is worth a look once you run it.

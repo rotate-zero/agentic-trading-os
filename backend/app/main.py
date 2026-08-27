@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import broker, dev, finnhub_data, health, intelligence, market, market_data
+from app.api.routes import broker, dev, finnhub_data, health, intelligence, market, market_data, scanner
 from app.api.routes.finnhub_data import connect_finnhub
 from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
@@ -186,6 +186,7 @@ def create_app() -> FastAPI:
     app.include_router(market_data.router)
     app.include_router(finnhub_data.router)
     app.include_router(intelligence.router)
+    app.include_router(scanner.router)
     app.include_router(channels.router)
 
     return app

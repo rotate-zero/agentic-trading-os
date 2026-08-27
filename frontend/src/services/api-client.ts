@@ -200,3 +200,40 @@ export async function fetchFeatureSeries(
   }
   return (await res.json()) as FeatureSeriesWireShape;
 }
+
+// Matches GET /scanner/state's response shape (v1, on-demand — not the
+// continuous MarketActivityScanner docs/architecture/scanner-design.md
+// §5 describes, not built yet). `features` only ever carries whichever
+// of rvol/gap_pct/session_pct_change/atr_14_pct that symbol actually has
+// right now — same "missing means not-yet, not zero" convention as
+// IntelligenceStateWireShape above.
+export interface ScannerResultWireShape {
+  symbol: string;
+  score: number;
+  inputs_available: number;
+  features: Record<string, number>;
+}
+
+export interface ScannerStateWireShape {
+  universe: string[];
+  results: ScannerResultWireShape[];
+  skipped: string[]; // cold start (no 1m FeatureSet yet) — not an error
+}
+
+/**
+ * GET /scanner/state — v1, on-demand. `symbols` overrides the backend's
+ * placeholder TEST_UNIVERSE default (app/scanner/universe.py) — NOT
+ * Saqib's real Core-100, which doesn't exist yet. Omit to use whatever
+ * the backend defaults to.
+ */
+export async function fetchScannerState(symbols?: string[]): Promise<ScannerStateWireShape> {
+  let url = `${API_BASE_URL}/scanner/state`;
+  if (symbols && symbols.length > 0) {
+    url += `?symbols=${encodeURIComponent(symbols.join(","))}`;
+  }
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ScannerStateWireShape;
+}
