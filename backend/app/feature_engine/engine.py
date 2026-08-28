@@ -178,6 +178,7 @@ from app.feature_engine.indicators import (
     camarilla_pivots,
     cluster_daily_levels,
     ema,
+    ema_slope,
     fold_range,
     gap,
     kama,
@@ -185,6 +186,7 @@ from app.feature_engine.indicators import (
     rvol,
     session_change,
     sma,
+    sma_slope,
     typical_price,
     volume_point_of_control,
     vwap_from_accumulator,
@@ -267,28 +269,42 @@ class FeatureEngine:
             kama_seed_multiplier if kama_seed_multiplier is not None else get_settings().feature_engine_kama_seed_multiplier
         )
         # How many raw closes the rolling window needs to hold — the
-        # LARGEST of all four indicator families' needs (confirmed
-        # decisions #52, #67/#68): SMA's own max period; EMA's max period
-        # times its seed multiplier; Regression's max configured period;
-        # KAMA's max `er_period + slow_period * seed_multiplier` (its own
-        # docstring has the full "why the +er_period" reasoning). One
-        # shared window per (symbol, timeframe) backs ALL FOUR families —
-        # each reads only the trailing slice it actually needs
-        # (sma()/ema()/regression()/kama() all do this internally). A
-        # real, accepted cost: 15m/1h windows now also carry this much
-        # history even though Regression/KAMA are never evaluated for
-        # those timeframes (see _apply_close's own per-timeframe
-        # applicability check below) — the design doc's own §7 already
-        # anticipated and accepted this tradeoff rather than it being an
-        # oversight.
+        # LARGEST of all six indicator families' needs (confirmed
+        # decisions #52, #67/#68, #83): SMA's own max period; EMA's max
+        # period times its seed multiplier; SMA-slope's own
+        # `2*period-1` (indicators/sma.py::sma_slope's docstring); EMA-
+        # slope's own `period*seed_multiplier + period - 1`
+        # (indicators/ema.py::ema_slope's docstring); Regression's max
+        # configured period; KAMA's max `er_period + slow_period *
+        # seed_multiplier` (its own docstring has the full "why the
+        # +er_period" reasoning). One shared window per (symbol,
+        # timeframe) backs ALL SIX families — each reads only the
+        # trailing slice it actually needs
+        # (sma()/ema()/sma_slope()/ema_slope()/regression()/kama() all do
+        # this internally). A real, accepted cost: 15m/1h windows now
+        # also carry this much history even though Regression/KAMA are
+        # never evaluated for those timeframes (see _apply_close's own
+        # per-timeframe applicability check below) — the design doc's own
+        # §7 already anticipated and accepted this tradeoff rather than
+        # it being an oversight. At this system's shipped defaults,
+        # sma_slope_max/ema_slope_max both stay under kama_max (99 and
+        # 119 vs. 159), so decision #83 did not actually grow
+        # `_window_capacity` in practice — both terms are still computed
+        # explicitly below rather than assumed dominated, so a future
+        # change to sma_periods/ema_periods/kama_configs can't silently
+        # under-size the window.
         sma_max = max(self._sma_periods) if self._sma_periods else 0
         ema_max = max(self._ema_periods) * self._ema_seed_multiplier if self._ema_periods else 0
+        sma_slope_max = max((2 * p - 1 for p in self._sma_periods), default=0)
+        ema_slope_max = max(
+            (p * self._ema_seed_multiplier + p - 1 for p in self._ema_periods), default=0
+        )
         regression_max = max((cfg["period"] for cfg in self._regression_configs), default=0)
         kama_max = max(
             (cfg["er_period"] + cfg["slow_period"] * self._kama_seed_multiplier for cfg in self._kama_configs),
             default=0,
         )
-        self._window_capacity = max(sma_max, ema_max, regression_max, kama_max)
+        self._window_capacity = max(sma_max, ema_max, sma_slope_max, ema_slope_max, regression_max, kama_max)
         self._lookback_days = (
             aggregated_lookback_days
             if aggregated_lookback_days is not None
@@ -1125,10 +1141,17 @@ class FeatureEngine:
             value = sma(closes, period)
             if value is not None:
                 features[f"sma_{period}"] = round(value, 6)
+            # Slope/angle (confirmed decision #83) warms up strictly
+            # slower than the SMA itself (2*period-1 closes vs. period)
+            # — computed unconditionally here regardless of whether
+            # `value` was ready; sma_slope() does its own honest-gap
+            # check and returns {} until it has enough history.
+            features.update(sma_slope(closes, period))
         for period in self._ema_periods:
             value = ema(closes, period, self._ema_seed_multiplier)
             if value is not None:
                 features[f"ema_{period}"] = round(value, 6)
+            features.update(ema_slope(closes, period, self._ema_seed_multiplier))
         # Regression / KAMA (confirmed decisions #67/#68) — the FIRST
         # indicator families in this engine where "applies to every
         # timeframe that fires" (SMA/EMA's own assumption above) isn't

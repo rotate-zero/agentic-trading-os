@@ -81,6 +81,23 @@ export interface PriceIndicatorInstance {
   // the independent on/off ChartWidget.tsx needs to actually clear `title`
   // to "" rather than leave the library's unconditional behavior showing.
   showNameLabel: boolean;
+  // SMA(period)/EMA(period) slope, expressed as an angle in degrees,
+  // appended to the name-half tag when both this AND showNameLabel are
+  // on — e.g. "SMA 9 ∠+35.2°" (confirmed decision #83). Feature-Engine-
+  // only: no client-side fallback exists or is computed for this (unlike
+  // the SMA/EMA VALUE itself, which falls back to frontend/src/indicators/
+  // when Feature Engine can't serve a given period/timeframe) — an
+  // absent/still-warming-up backend series simply means no angle suffix
+  // shows, not a "(local)" recomputation. VWAP has no period/slope
+  // concept, so this is meaningless there — see OVERLAY_TYPES_WITH_PERIOD
+  // above, the same SMA/EMA-only boundary this field is gated on in the
+  // menu and in computePriceIndicator (utils/indicators.ts). Defaults
+  // false for every EXISTING saved instance on load (WorkspaceContext.tsx's
+  // back-fill) — unlike showPriceLabel/showNameLabel's true default,
+  // this is genuinely new behavior, not a preserved-unchanged prior
+  // always-on state, so off-by-default is the correct backward-compat
+  // choice here.
+  showSlopeAngle: boolean;
 }
 
 export const PRICE_INDICATOR_PERIOD_MIN = 2;
@@ -130,6 +147,7 @@ export function createPriceIndicatorInstance(
     lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
     showPriceLabel: true,
     showNameLabel: true,
+    showSlopeAngle: false,
   };
 }
 

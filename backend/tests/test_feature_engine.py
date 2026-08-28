@@ -16,6 +16,7 @@ FeatureEngine tests, in three tiers:
 from __future__ import annotations
 
 import asyncio
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -25,7 +26,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.feature_engine.engine import FeatureEngine
-from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, fold_range, gap, kama, regression, rvol, session_change, sma, typical_price, volume_point_of_control, vwap_from_accumulator
+from app.feature_engine.indicators import aggregate_day, atr, camarilla_pivots, ema, ema_slope, fold_range, gap, kama, regression, rvol, session_change, sma, sma_slope, typical_price, volume_point_of_control, vwap_from_accumulator
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services.candle_recorder import CandleRecorder
@@ -103,6 +104,87 @@ def test_ema_rejects_nonpositive_period_or_multiplier():
         ema([1.0, 2.0, 3.0], 0, 5)
     with pytest.raises(ValueError):
         ema([1.0, 2.0, 3.0], 2, 0)
+
+
+# --- sma_slope / ema_slope (confirmed decision #83) -------------------------
+
+
+def test_sma_slope_fits_ols_over_its_own_trailing_values():
+    """
+    period=3 -> needed=2*3-1=5, closes=[1,2,3,4,5]. The three trailing
+    SMA(3) values (worked by hand): mean(1,2,3)=2, mean(2,3,4)=3,
+    mean(3,4,5)=4 -> perfectly linear, slope=1, r2=1.0. current_value=4
+    (matches sma([1,2,3,4,5], 3) independently), so slope_pct =
+    1/4*100 = 25.0, slope_angle = arctan(25.0) in degrees.
+    """
+    result = sma_slope([1.0, 2.0, 3.0, 4.0, 5.0], 3)
+    assert result["sma_3_slope"] == pytest.approx(1.0)
+    assert result["sma_3_r2"] == pytest.approx(1.0)
+    assert result["sma_3_slope_pct"] == pytest.approx(25.0)
+    assert result["sma_3_slope_angle"] == pytest.approx(math.degrees(math.atan(25.0)))
+    assert sma([1.0, 2.0, 3.0, 4.0, 5.0], 3) == 4.0  # cross-check: matches the plain sma() value
+
+
+def test_sma_slope_returns_empty_during_warmup_not_zero_or_error():
+    """period=3 needs 2*3-1=5 closes for the slope even though sma_3 itself is ready at 3."""
+    assert sma_slope([1.0, 2.0, 3.0, 4.0], 3) == {}
+    assert sma([1.0, 2.0, 3.0, 4.0], 3) is not None  # sma_3 itself is already ready here
+
+
+def test_sma_slope_rejects_period_below_two():
+    assert sma_slope([1.0, 2.0, 3.0], 1) == {}
+
+
+def test_sma_slope_flat_window_has_zero_slope_and_r2_of_one():
+    result = sma_slope([5.0, 5.0, 5.0], 2)  # needed = 2*2-1 = 3
+    assert result["sma_2_slope"] == 0.0
+    assert result["sma_2_r2"] == 1.0
+    assert result["sma_2_slope_pct"] == 0.0
+    assert result["sma_2_slope_angle"] == 0.0
+
+
+def test_sma_slope_omits_pct_and_angle_when_current_sma_is_zero():
+    """
+    period=2, closes=[5,1,-1]: sma_series = [mean(5,1)=3, mean(1,-1)=0] —
+    current SMA value is exactly 0, so slope_pct/slope_angle (division by
+    it) are omitted, but slope/r2 (both well-defined regardless) are not.
+    """
+    result = sma_slope([5.0, 1.0, -1.0], 2)
+    assert result == {"sma_2_slope": -3.0, "sma_2_r2": 1.0}
+
+
+def test_ema_slope_matches_hand_computed_series():
+    """
+    period=2, seed_multiplier=3 -> per_point_needed=6, total_needed=7.
+    closes=[0,1,2,3,4,5,6]. The two trailing EMA(2) values:
+    ema([0,1,2,3,4,5], 2, 3) = 4.5 and ema([1,2,3,4,5,6], 2, 3) = 5.5 —
+    the second one is the SAME closes/params as
+    test_ema_matches_hand_computed_recursion above, so it's independently
+    known to be 5.5. Two points are always a perfect line: slope=1.0,
+    r2=1.0, current_value=5.5, slope_pct=1/5.5*100.
+    """
+    closes = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    result = ema_slope(closes, 2, 3)
+    assert result["ema_2_slope"] == pytest.approx(1.0)
+    assert result["ema_2_r2"] == pytest.approx(1.0)
+    assert result["ema_2_slope_pct"] == pytest.approx(1.0 / 5.5 * 100)
+    assert result["ema_2_slope_angle"] == pytest.approx(math.degrees(math.atan(1.0 / 5.5 * 100)))
+    assert ema(closes, 2, 3) == pytest.approx(5.5)  # cross-check: matches the plain ema() value
+
+
+def test_ema_slope_warmup_needs_one_more_bar_than_ema_itself_at_the_same_period():
+    """period * seed_multiplier + period - 1, one bar more than ema()'s own period*seed_multiplier floor."""
+    period, multiplier = 2, 3
+    per_point_needed = period * multiplier
+    total_needed = per_point_needed + period - 1
+    assert ema_slope([1.0] * (total_needed - 1), period, multiplier) == {}
+    assert ema_slope([1.0] * total_needed, period, multiplier) != {}
+    assert ema([1.0] * per_point_needed, period, multiplier) is not None  # ema_2 itself is ready one bar earlier
+
+
+def test_ema_slope_rejects_period_below_two_or_nonpositive_multiplier():
+    assert ema_slope([1.0, 2.0, 3.0], 1, 5) == {}
+    assert ema_slope([1.0, 2.0, 3.0], 2, 0) == {}
 
 
 # --- typical_price / vwap_from_accumulator (confirmed decision #53) --------
@@ -429,6 +511,52 @@ async def test_sma_and_ema_coexist_in_the_same_featureset_with_independent_warmu
         final_features = received[-1].payload["features"]
         assert final_features["sma_2"] == 5.5
         assert final_features["ema_2"] == pytest.approx(5.5)
+    finally:
+        await engine.stop()
+        await bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_sma_slope_warms_up_strictly_after_the_sma_itself():
+    """
+    Confirmed decision #83: sma_{period}_slope needs `2*period-1` closes
+    where sma_{period} itself needs only `period` — proven end-to-end
+    through a real EventBus, not just at the pure-function level
+    (test_sma_slope_* above already covers the math in isolation).
+    """
+    bus = EventBus()
+    await bus.start()
+    engine = FeatureEngine(bus, sma_periods=[2], ema_periods=[])
+    engine.start()
+
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        # Fixed, deterministic Session.CLOSED anchor — same fix/reasoning
+        # as test_feature_engine_publishes_once_warmed_up_and_not_before
+        # (pmh/pml/vwap_ext/premarket_volume_ratio all publish
+        # unconditionally during Session.PRE_MARKET regardless of SMA
+        # warmup, which would break this test's "nothing publishes
+        # before warmup" assumption if it happened to run during that
+        # window).
+        base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
+        closes = [1.0, 2.0, 3.0]  # sma_2 ready at close #2; sma_2_slope needs 2*2-1=3
+        for i, close in enumerate(closes):
+            await _publish_candle(bus, "__TEST_FE_SMA_SLOPE__", base_ts + timedelta(minutes=i), close)
+            await asyncio.sleep(0.05)
+
+        assert len(received) == 2  # 1st candle: not even sma_2 ready yet, nothing to publish at all
+        first = received[0].payload["features"]
+        assert first["sma_2"] == 1.5
+        assert "sma_2_slope" not in first  # slope needs one more close than sma_2 itself
+
+        second = received[1].payload["features"]
+        assert second["sma_2"] == 2.5
+        assert second["sma_2_slope"] == 1.0
+        assert second["sma_2_r2"] == 1.0
+        assert second["sma_2_slope_pct"] == 40.0
+        assert second["sma_2_slope_angle"] == pytest.approx(math.degrees(math.atan(40.0)))
     finally:
         await engine.stop()
         await bus.stop()

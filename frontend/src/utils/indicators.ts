@@ -49,13 +49,17 @@ export function computePriceIndicator(
     case "SMA": {
       const period = instance.period ?? 20;
       const backend = backendSeries?.[`sma_${period}`];
-      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      if (backend && backend.length > 0) {
+        return { label: withSlopeAngle(label, instance, backendSeries, "sma", period), color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      }
       return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: sma(candles, period) };
     }
     case "EMA": {
       const period = instance.period ?? 20;
       const backend = backendSeries?.[`ema_${period}`];
-      if (backend && backend.length > 0) return { label, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      if (backend && backend.length > 0) {
+        return { label: withSlopeAngle(label, instance, backendSeries, "ema", period), color, opacity, lineWidth, showPriceLabel, showNameLabel, data: backend };
+      }
       return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: ema(candles, period) };
     }
     case "VWAP": {
@@ -64,6 +68,34 @@ export function computePriceIndicator(
       return { label: `${label} (local)`, color, opacity, lineWidth, showPriceLabel, showNameLabel, data: vwap(candles) };
     }
   }
+}
+
+// SMA/EMA slope-as-angle suffix (confirmed decision #83) — e.g.
+// "SMA 9 ∠+35.2°". Feature-Engine-only, deliberately: unlike the SMA/EMA
+// VALUE above, there is no client-side fallback computation for this at
+// all (frontend/src/indicators/sma.ts et al. never had slope math and
+// this system doesn't want a second, independently-tuned implementation
+// of it) — so an absent or still-warming-up `{sma,ema}_{period}_slope_angle`
+// series simply means no suffix appears, the same "honest gap, not an
+// error" convention every other backend-only value in this codebase
+// follows. Only called from the BACKEND-sourced branch of each case
+// above on purpose: if Feature Engine can't serve the base sma_N/ema_N
+// value for this period/timeframe, it very likely can't serve its slope
+// either (same underlying window), so there's no separate "(local)"
+// angle story to build.
+function withSlopeAngle(
+  label: string,
+  instance: PriceIndicatorInstance,
+  backendSeries: Record<string, IndicatorPoint[] | undefined> | undefined,
+  prefix: "sma" | "ema",
+  period: number
+): string {
+  if (!instance.showSlopeAngle) return label;
+  const anglePoints = backendSeries?.[`${prefix}_${period}_slope_angle`];
+  if (!anglePoints || anglePoints.length === 0) return label;
+  const angle = anglePoints[anglePoints.length - 1].value; // most recent — a chart-series title shows the CURRENT reading, not history
+  const sign = angle >= 0 ? "+" : "";
+  return `${label} ∠${sign}${angle.toFixed(1)}°`;
 }
 
 // Horizontal level indicators (Previous Day Close/High/Low, Pre-Market

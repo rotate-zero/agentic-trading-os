@@ -48,6 +48,6 @@ class FeatureSet(BaseModel):
     # them — the same class of race feature_engine/engine.py's own module docstring already
     # designed around for CandleRecorder vs. FeatureEngine, applied here one hop further down
     # the chain instead of being reintroduced by a new consumer.
-    features: dict[str, float]  # e.g. {"sma_9": 231.4521, "ema_20": 229.881, "vwap": 230.1} — decisions #45, #52, #53
+    features: dict[str, float]  # e.g. {"sma_9": 231.4521, "sma_9_slope_angle": 12.4, "ema_20": 229.881, "vwap": 230.1} — decisions #45, #52, #53, #83
     daily_levels: list[DailyLevel] = Field(default_factory=list)  # decision #59 — see DailyLevel above
 

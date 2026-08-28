@@ -601,6 +601,23 @@ function OverlayIndicatorRow({
         />
         Show label
       </label>
+      {hasPeriod && (
+        // SMA/EMA only (confirmed decision #83) — VWAP has no period, so
+        // no slope/angle concept applies to it; same hasPeriod gate the
+        // Bars stepper above already uses. Feature-Engine-only, no local
+        // fallback — see withSlopeAngle() in utils/indicators.ts for what
+        // happens when the backend series isn't there yet (nothing shows,
+        // not an error).
+        <label className="mt-1 flex items-center gap-1.5 pl-[18px] font-mono text-[10px] text-text-muted">
+          <input
+            type="checkbox"
+            checked={instance.showSlopeAngle}
+            onChange={(e) => patchInstance({ showSlopeAngle: e.target.checked })}
+            className="h-3 w-3 accent-signal"
+          />
+          Show slope angle
+        </label>
+      )}
       <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-[18px]">
         <input
           type="color"

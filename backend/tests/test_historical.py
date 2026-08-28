@@ -8,6 +8,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from app.feature_engine.historical import compute_series
 from app.services.candle_aggregator import Candle
 
@@ -52,6 +54,43 @@ def test_ema_series_warms_up_later_than_sma_at_the_same_period():
     # Hand-verified in test_feature_engine.py's own
     # test_ema_matches_hand_computed_recursion for the same window shape.
     assert series["ema_2"][0]["value"] == 5.5
+
+
+def test_sma_slope_series_appears_alongside_sma_series_once_warmed_up():
+    """
+    Confirmed decision #83. period=3 -> sma_3 needs 3 closes, sma_3_slope
+    needs 2*3-1=5 — same hand-computed shape as
+    test_sma_slope_fits_ols_over_its_own_trailing_values in
+    test_feature_engine.py: slope=1.0, r2=1.0, current value=4.0 (the 5th
+    candle's sma_3), slope_pct=25.0.
+    """
+    base = _et(2026, 8, 11, 9, 30)
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0]
+    candles = [_candle(base + timedelta(minutes=i), c) for i, c in enumerate(closes)]
+
+    series = compute_series(candles, sma_periods=[3], ema_periods=[], ema_seed_multiplier=5)
+
+    assert len(series["sma_3"]) == 3  # unchanged from the pre-decision-#83 test above
+    assert len(series["sma_3_slope"]) == 1  # only the 5th candle has enough history (needs 5)
+    assert series["sma_3_slope"][0]["value"] == 1.0
+    assert series["sma_3_r2"][0]["value"] == 1.0
+    assert series["sma_3_slope_pct"][0]["value"] == 25.0
+    assert series["sma_3_slope"][0]["candle_ts"] == candles[4].candle_ts.isoformat()  # aligned to the 5th candle
+
+
+def test_ema_slope_series_matches_hand_computed_value():
+    """period=2, seed_multiplier=3 -> ema_2_slope needs 2*3+2-1=7 closes — same
+    hand-computed window as test_ema_slope_matches_hand_computed_series in
+    test_feature_engine.py: slope=1.0, current value=5.5."""
+    base = _et(2026, 8, 11, 9, 30)
+    closes = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    candles = [_candle(base + timedelta(minutes=i), c) for i, c in enumerate(closes)]
+
+    series = compute_series(candles, sma_periods=[], ema_periods=[2], ema_seed_multiplier=3)
+
+    assert len(series["ema_2_slope"]) == 1  # only the 7th candle has enough history
+    assert series["ema_2_slope"][0]["value"] == 1.0
+    assert series["ema_2_slope_pct"][0]["value"] == pytest.approx(1.0 / 5.5 * 100)
 
 
 def test_vwap_series_excludes_pre_market_candles():

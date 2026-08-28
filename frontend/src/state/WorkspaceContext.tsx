@@ -219,6 +219,7 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
       lineWidth: PRICE_INDICATOR_DEFAULT_LINE_WIDTH,
       showPriceLabel: true,
       showNameLabel: true,
+      showSlopeAngle: false, // new field (decision #83), no prior state to preserve for a migrated legacy instance either
     }));
 
   const { indicators: _legacyIndicators, ...rest } = sw;
@@ -234,8 +235,14 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
       // (decision #81) gets it too now, for sessions saved before that
       // field existed — true preserves the always-on-name behavior every
       // prior session was already rendering, so this backfill doesn't
-      // silently change how an old layout looks.
-      ...(sw.priceIndicators ?? []).map((p) => ({ showPriceLabel: true, showNameLabel: true, opacity: COLOR_OPACITY_DEFAULT, ...(p as Partial<PriceIndicatorInstance>) }) as PriceIndicatorInstance),
+      // silently change how an old layout looks. showSlopeAngle (decision
+      // #83) is the one exception to the "backfill to true, preserve prior
+      // behavior" pattern above: it's genuinely NEW functionality with no
+      // prior always-on state to preserve, so it backfills to false — an
+      // old session should look exactly as it always did until the user
+      // opts in from the indicator menu, not suddenly grow a new label
+      // suffix it never had.
+      ...(sw.priceIndicators ?? []).map((p) => ({ showPriceLabel: true, showNameLabel: true, showSlopeAngle: false, opacity: COLOR_OPACITY_DEFAULT, ...(p as Partial<PriceIndicatorInstance>) }) as PriceIndicatorInstance),
       ...migratedFromLegacyIndicators,
     ],
     // showNameLabel (decision #81) back-fill, same reasoning as

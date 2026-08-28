@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # chart presets (WorkspaceContext.tsx's EMA9/EMA20), not copied from
     # feature_engine_sma_periods, since chart usage never included EMA50.
     feature_engine_ema_periods: list[int] = [9, 20]
+
+    # SMA-slope / EMA-slope (confirmed decision #83) — NO separate config
+    # here on purpose. Slope's lookback window is tied 1:1 to each
+    # period in the two lists above (a 9-period SMA fits its slope over
+    # its own last 9 values), not an independently-tunable knob, so it
+    # rides feature_engine_sma_periods/feature_engine_ema_periods
+    # directly — see indicators/sma.py::sma_slope /
+    # indicators/ema.py::ema_slope for the full reasoning.
     # How many periods' worth of history EMA seeds itself over before
     # publishing — see indicators/ema.py::ema()'s own docstring for the
     # convergence math this default is based on.
