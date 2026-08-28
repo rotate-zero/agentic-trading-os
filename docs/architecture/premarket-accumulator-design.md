@@ -73,3 +73,15 @@ This generalizes `_update_vwap`'s existing shape in exactly one way: its reset t
 ## 5. Relationship to the Scanner (future work, not this pass)
 
 Once `premarket_volume_ratio` exists and has been watched against a few real pre-market sessions, the natural next step is a genuinely new scan type — "pre-market movers" — sitting alongside (not replacing) the current RVOL-only Core scan, since the two answer different questions at different times of day: `premarket_volume_ratio` for building an ORB watchlist *before* the bell, today's `rvol`-based score for monitoring activity *after* it. Both could plug into the same `ActivityScorer`/`UniverseProvider` shape scanner-design.md already established — this isn't a new Scanner architecture, just a new input once it exists. Deliberately not designed further here; that's real work for once this doc's Feature Engine side is built and validated.
+
+---
+
+## 6. Build status
+
+**Built and verified (real Postgres 16, real event bus, 245/245 backend tests passing — no regressions):** `vwap_ext`/`session_volume_ext`, exactly per §1's single-accumulator design — `_update_vwap_ext` in `engine.py`, a new `self._vwap_ext_state` dict, fully separate from `_vwap_state`. 6 new tests in `tests/test_vwap_ext.py`, including one that directly demonstrates the fix this doc exists for: a pre-market bar at 50 followed by a regular-open bar at 100 gives `vwap == 100` (unchanged) but `vwap_ext == 75` (pre-market's contribution carried through) — that divergence, at the exact moment `vwap` resets to a single bar, is the discrepancy against other platforms this closes.
+
+One existing test (`test_vwap_publishes_even_while_sma_is_still_warming_up`) needed its exact-equality assertion updated to include the two new keys — expected, not a regression; the same test was already touched once before for `session_volume`'s own addition.
+
+**Not built — still gated on §3's empirical question:** `premarket_volume_ratio`. `scripts/check_premarket_data_availability.py` now exists to actually answer that question against a real Polygon key (checks both whether pre-market 1m bars return real data, and — via its printed guidance — whether the daily bar already folds pre-market volume in). Needs to be run with `POLYGON_API_KEY` set before this feature's code gets written.
+
+**Two bugs caught during this work, both fixed, worth recording:** (1) the new empirical-check script initially referenced a class named `PolygonProvider`, which doesn't exist — the real class is `PolygonAdapter`; caught by actually importing the script rather than trusting it from memory. (2) Both this script and the earlier-delivered `scripts/test_scanner_pipeline.py` failed with `ModuleNotFoundError: No module named 'app'` when run exactly as their own docstrings instructed (`cd backend && python scripts/foo.py`) — Python puts the script's own directory on `sys.path`, not the invoking working directory, so any script importing `app.*` directly (unlike `verify_roundtrip.py`, which only ever talks to a running server over HTTP and never hit this) needs an explicit `sys.path` fix. Both scripts now have it.

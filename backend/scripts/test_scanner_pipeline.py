@@ -28,8 +28,17 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import httpx
+
+# Running this as `python scripts/test_scanner_pipeline.py` (this
+# docstring's own documented usage) does NOT put backend/ on sys.path —
+# Python adds the script's OWN directory (scripts/), not the invoking
+# cwd, so `from app...` below fails with ModuleNotFoundError regardless
+# of which directory you ran it from without this. Bug in the original
+# delivery of this script — fixed here, not caught before shipping.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.config import get_settings
 from app.scanner.scorer import ActivityScore, score_symbol

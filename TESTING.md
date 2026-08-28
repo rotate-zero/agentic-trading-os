@@ -1,90 +1,72 @@
-# TESTING — Scanner: RVOL-only scoring, editable universe, top-8, collapsible panel
+# TESTING — Extended VWAP (vwap_ext) + pre-market data availability check
 
-Unzip at project root. **Requires a new migration** (`alembic upgrade
-head`) — this delivery adds `scanner_universe_symbols` (migration 0004).
+Unzip at project root. No migration needed — this is pure Feature Engine
+logic, no new tables. Overwrites `backend/app/feature_engine/engine.py`
+(adds `_update_vwap_ext` — `_update_vwap`/`vwap`/`session_volume`
+completely untouched) and `backend/tests/test_feature_engine.py` (one
+exact-equality assertion updated to include the two new keys — expected,
+not a regression, same as when `session_volume` was added). Adds
+`backend/tests/test_vwap_ext.py`, `backend/scripts/check_premarket_data_availability.py`,
+`docs/architecture/premarket-accumulator-design.md`. Also fixes a real
+bug in the **already-delivered** `backend/scripts/test_scanner_pipeline.py`
+(see "Bug fixed in a prior delivery" below) — that file is overwritten
+too.
 
-This overwrites: `backend/app/core/config.py` (gap/session-change
-weights now 0.0 — RVOL-only scoring), `backend/app/db/base.py` (registers
-the new model), `backend/app/scanner/universe.py` (adds `DbUniverseProvider`
-+ add/remove/list functions — `StaticUniverseProvider`/`TEST_UNIVERSE`
-unchanged), `backend/app/api/routes/scanner.py` (adds universe endpoints
-+ `top_n`), `frontend/src/types/workspace.ts` + `WorkspaceContext.tsx`
-(adds `scannerCollapsed`/`scannerWidthPx`), `frontend/src/services/api-client.ts`,
-`frontend/src/components/scanner/ScannerPanel.tsx`, `frontend/src/App.tsx`.
-Adds: `backend/app/models/scanner.py`, `backend/alembic/versions/0004_scanner_universe.py`,
-`backend/tests/test_scanner_universe.py`, `frontend/src/hooks/useScannerUniverse.ts`.
-
-## 1. Run the migration first
+## 1. Backend tests
 
 ```bash
 cd backend
-alembic upgrade head
+pytest tests/test_feature_engine.py tests/test_vwap_ext.py -v
 ```
 
-Seeds `scanner_universe_symbols` with the same 6 placeholder symbols
-(`AAPL MSFT NVDA AMD TSLA SPY`) as before — now a real, editable table
-instead of a hardcoded Python list.
-
-## 2. Backend tests
+Already run clean against a real Postgres 16 instance before this was
+sent: **245/245 backend tests passing**, zero regressions. The one test
+worth looking at directly if you want to see the actual fix demonstrated:
 
 ```bash
-pytest tests/test_scanner.py tests/test_scanner_runner.py tests/test_scanner_universe.py -v
+pytest tests/test_vwap_ext.py::test_vwap_ext_continues_across_the_930_boundary_without_resetting -v
 ```
 
-14 tests. The new `test_scanner_universe.py` (5 tests) runs against your
-**real** Postgres — same convention `test_feature_engine.py`'s DB tests
-already use (a distinctively-named test symbol, explicit cleanup, no
-mocking). All 14 already run and passing against a freshly-installed
-Postgres 16 instance before this was sent — including one bug caught and
-fixed in the process: my first draft test ticker didn't satisfy the new
-format-validation rule it was supposed to be testing around. Fixed by
-picking a format-valid placeholder, not by loosening validation.
+Publishes a pre-market bar at price 50, then a regular-open bar at price
+100. `vwap` reads 100 (unchanged — resets at 9:30 same as always).
+`vwap_ext` reads 75 (pre-market's bar is still in the running average).
+That divergence, at the exact moment `vwap` resets, is the discrepancy
+you saw against other platforms.
 
-## 3. Backend routes, manually
+## 2. Pre-market data availability check (needs your real Polygon key)
+
+This is the actual open question blocking `premarket_volume_ratio`
+(the ORB-enabling feature) — not a formality:
 
 ```bash
-uvicorn app.main:app --reload
+cd backend
+python scripts/check_premarket_data_availability.py
+python scripts/check_premarket_data_availability.py TSLA 10   # different symbol/lookback
 ```
 
-```bash
-curl http://127.0.0.1:8000/scanner/universe
-curl -X POST http://127.0.0.1:8000/scanner/universe -H "Content-Type: application/json" -d '{"symbol": "nflx"}'
-curl -X POST http://127.0.0.1:8000/scanner/universe -H "Content-Type: application/json" -d '{"symbol": "toolongname"}'   # expect 400
-curl -X DELETE http://127.0.0.1:8000/scanner/universe/NFLX
-curl "http://127.0.0.1:8000/scanner/state?top_n=3"
-```
+Needs `POLYGON_API_KEY` set (same one your existing `PolygonAdapter`
+already uses). Prints a small table of pre-market 1-minute bar counts
+and volume for the last few weekdays, then a verdict: either Polygon
+genuinely has this data (in which case `premarket_volume_ratio` is
+buildable against it) or it doesn't (in which case that feature is
+gated on the IBKR subscription instead, same as spread tightness
+already was).
 
-All of the above already run against a real server during verification — exact
-same commands, all behaved as shown.
+## 3. Bug fixed in a prior delivery
 
-## 4. Frontend, visually
+Both this new script and the earlier `scripts/test_scanner_pipeline.py`
+failed with `ModuleNotFoundError: No module named 'app'` when run
+exactly as documented (`cd backend && python scripts/foo.py`) — Python
+adds the script's own directory to `sys.path`, not the directory you ran
+it from, so anything importing `app.*` directly needs an explicit fix.
+`verify_roundtrip.py` never hit this because it only talks to a running
+server over HTTP. Caught while verifying the new script; fixed in both.
+If you'd already tried running `test_scanner_pipeline.py` and hit this,
+that's why — not something wrong on your end.
 
-```bash
-cd frontend && npm run dev
-```
+## What's still NOT built
 
-- The Scanner panel now has a **«** / **»** collapse toggle and a
-  drag-resize handle on its left edge — same behavior as the Feature
-  Engine panel next to it.
-- Two tabs inside: **Results** (top 8, ranked — RVOL is the only bolded
-  chip now, since that's the only thing currently driving score; gap/day/ATR
-  still show when available but are muted) and **Universe** (view the
-  current list, remove a symbol with the **×**, add one via the text
-  input at the bottom).
-- Adding an invalid symbol (numbers, >5 letters, etc.) shows the
-  backend's exact rejection reason inline, not a generic error.
-
-`tsc -b` and `vite build` both run clean against the full tree with
-these changes (only the pre-existing `GridPresetPicker` errors, decision
-#35 — nothing new).
-
-## On the RVOL calculation question
-
-Not a testable item, but worth restating here since it came up in the
-same conversation as this delivery: RVOL = `session_volume /
-(avg_daily_volume × elapsed_minutes/total_session_minutes)`, computed
-**only during the regular session** (9:30am–4:00pm ET) — premarket
-volume is not part of `session_volume` at all in the current
-implementation, and RVOL is honestly absent (not zero, not estimated)
-before the 9:30am open. See `app/feature_engine/indicators/rvol.py` and
-`_update_rvol` in `engine.py` for the exact logic.
+`premarket_volume_ratio` itself — correctly still gated on step 2 above.
+Nothing in this delivery lets you rank symbols on pre-market activity
+yet; that's the next piece, once the data-availability question has a
+real answer.

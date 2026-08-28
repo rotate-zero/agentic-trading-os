@@ -208,6 +208,13 @@ SUPPORTED_TIMEFRAME = "1m"
 _AGGREGATED_WIDTHS: list[int] = sorted(candle_aggregator.WIDTH_TO_LABEL)
 _ONE_MINUTE = timedelta(minutes=1)
 
+# Pre-market VWAP/Extended VWAP (docs/architecture/premarket-accumulator-design.md
+# §1) — "in play" for the extended accumulator means pre-market through
+# the regular-session close, deliberately excluding AFTER_HOURS (§4.2 of
+# that doc: thin, illiquid volume that would distort the reference more
+# than help it — easy to widen later if that default turns out wrong).
+_EXTENDED_HOURS_LABELS = {Session.PRE_MARKET, Session.OPEN, Session.LUNCH, Session.POWER_HOUR}
+
 
 class FeatureEngine:
     def __init__(
@@ -324,6 +331,16 @@ class FeatureEngine:
         # "cumulative_volume": int}. Confirmed decision #53.
         self._vwap_state: dict[str, dict[str, Any]] = {}
 
+        # Extended VWAP accumulator (docs/architecture/premarket-accumulator-design.md)
+        # — a SEPARATE, day-spanning sibling of _vwap_state above, not a
+        # modification of it: {"for_day": date, "cumulative_pv": float,
+        # "cumulative_volume": int}. Resets once per trading day (like
+        # _premarket_state below, NOT like _vwap_state's per-regular-session
+        # reset) and accumulates across _EXTENDED_HOURS_LABELS without
+        # resetting again at the 9:30am regular-session boundary — that
+        # continuity through the open is the entire point (§1 of that doc).
+        self._vwap_ext_state: dict[str, dict[str, Any]] = {}
+
         # Per-SYMBOL previous-day levels (PDH/PDL/PDC + Camarilla) and
         # today's premarket range — both confirmed decision #56, both
         # symbol-keyed for the same reason VWAP is (see module docstring):
@@ -395,9 +412,9 @@ class FeatureEngine:
         self._worker_task = asyncio.create_task(self._worker_loop(), name="feature-engine-sma")
         logger.info(
             "FeatureEngine started — computing SMA%s and EMA%s on 1m CandleClosed, VWAP during regular session, "
-            "previous-day PDH/PDL/PDC + Camarilla, pre-market H/L, plus %s on completed bucket boundaries; "
-            "Daily Levels clustered once per (symbol, ET day) from up to %s days of 1D history when a "
-            "historical provider is connected (decision #59)",
+            "Extended VWAP across pre-market + regular session, previous-day PDH/PDL/PDC + Camarilla, pre-market H/L, "
+            "plus %s on completed bucket boundaries; Daily Levels clustered once per (symbol, ET day) from up to %s "
+            "days of 1D history when a historical provider is connected (decision #59)",
             self._sma_periods, self._ema_periods, list(candle_aggregator.WIDTH_TO_LABEL.values()),
             self._daily_levels_lookback_days,
         )
@@ -883,13 +900,15 @@ class FeatureEngine:
             )
             return results
 
-        # VWAP (confirmed decision #53), previous-day levels + Camarilla,
-        # and premarket H/L (both confirmed decision #56) are each
-        # computed ONCE per 1m close, not per timeframe — see module
-        # docstring for why — and attached to every FeatureSet this same
-        # close produces below, 1m and any aggregated ones alike.
+        # VWAP (confirmed decision #53), Extended VWAP
+        # (docs/architecture/premarket-accumulator-design.md), previous-day
+        # levels + Camarilla, and premarket H/L (both confirmed decision
+        # #56) are each computed ONCE per 1m close, not per timeframe —
+        # see module docstring for why — and attached to every FeatureSet
+        # this same close produces below, 1m and any aggregated ones alike.
         vwap_features = self._update_vwap(symbol, candle_ts, high, low, close, volume)
         extra = dict(vwap_features)
+        extra.update(self._update_vwap_ext(symbol, candle_ts, high, low, close, volume))
         extra.update(self._update_previous_day(symbol, candle_ts))
         extra.update(self._update_premarket(symbol, candle_ts, high, low))
         # Session % Change + Gap (confirmed decisions #67/#68,
@@ -1147,6 +1166,77 @@ class FeatureEngine:
         vwap_value = vwap_from_accumulator(state["cumulative_pv"], state["cumulative_volume"])
         if vwap_value is not None:
             result["vwap"] = round(vwap_value, 6)
+        return result
+
+    def _update_vwap_ext(
+        self, symbol: str, candle_ts: datetime, high: float, low: float, close: float, volume: int
+    ) -> dict[str, float]:
+        """
+        Extended VWAP (docs/architecture/premarket-accumulator-design.md
+        §1) — same math as `_update_vwap` (`typical_price`,
+        `vwap_from_accumulator`, the restart-safe backfill-from-`candle_store`
+        shape), deliberately a SEPARATE accumulator and method rather than
+        a modification of `_update_vwap` itself: `vwap`/`session_volume`
+        stay exactly as they are for every existing consumer (Level
+        Interaction Engine, the chart), and this is purely additive.
+
+        The one real structural difference from `_update_vwap`: this
+        accumulates across `_EXTENDED_HOURS_LABELS` (pre-market through
+        regular-session close) rather than regular session alone, and
+        resets once per TRADING DAY (`_update_premarket`'s reset trigger,
+        decision #56 — reused, not reinvented) rather than once per
+        REGULAR SESSION (`_update_vwap`'s own trigger) — because the
+        whole point is NOT resetting again at the 9:30am boundary the way
+        `_update_vwap` does.
+
+        Returns {} outside `_EXTENDED_HOURS_LABELS` (after-hours/closed)
+        — same "simply isn't published outside its window" behavior
+        `_update_vwap` already has, not `_update_premarket`'s
+        freeze-and-keep-returning-the-last-value behavior. `vwap_ext` is
+        meant to be read the same way `vwap` already is (a live line
+        during trading hours), not a frozen end-of-window reference the
+        way `pmh`/`pml` are.
+
+        `session_volume_ext` — this accumulator's cumulative volume,
+        published the same "alongside its VWAP, not purely internal" way
+        `_update_vwap` already publishes `session_volume` — is what a
+        pre-market-volume-ratio feature would read from WHILE
+        `current_session(candle_ts) == Session.PRE_MARKET` specifically
+        (not built in this pass — see that doc's §2/§3 for why: it needs
+        a historical pre-market-volume baseline this method has no
+        opinion about, gated on a still-open empirical check).
+        """
+        clock = get_market_clock()
+        if clock.current_session(candle_ts) not in _EXTENDED_HOURS_LABELS:
+            return {}
+
+        today = clock.trading_day(candle_ts)
+        state = self._vwap_ext_state.get(symbol)
+
+        if state is None or state["for_day"] != today:
+            # Same 24h-lookback + per-row session classification
+            # `_update_premarket` already uses, not `_update_vwap`'s
+            # single session_bounds() range — pre-market and regular
+            # session have DIFFERENT session_bounds() windows, so there's
+            # no single (start, end) tuple spanning both to query against
+            # directly the way _update_vwap can for regular session alone.
+            lookback_start = candle_ts - timedelta(hours=24)
+            rows = candle_store.get_recorded_candles(symbol, "1m", lookback_start, candle_ts - _ONE_MINUTE)
+            todays_extended_rows = [
+                r for r in rows if clock.trading_day(r.candle_ts) == today and clock.current_session(r.candle_ts) in _EXTENDED_HOURS_LABELS
+            ]
+            cumulative_pv = sum(typical_price(r.high, r.low, r.close) * r.volume for r in todays_extended_rows)
+            cumulative_volume = sum(r.volume for r in todays_extended_rows)
+            state = {"for_day": today, "cumulative_pv": cumulative_pv, "cumulative_volume": cumulative_volume}
+
+        state["cumulative_pv"] += typical_price(high, low, close) * volume
+        state["cumulative_volume"] += volume
+        self._vwap_ext_state[symbol] = state
+
+        result: dict[str, float] = {"session_volume_ext": float(state["cumulative_volume"])}
+        vwap_ext_value = vwap_from_accumulator(state["cumulative_pv"], state["cumulative_volume"])
+        if vwap_ext_value is not None:
+            result["vwap_ext"] = round(vwap_ext_value, 6)
         return result
 
     def _update_previous_day(self, symbol: str, candle_ts: datetime) -> dict[str, float]:

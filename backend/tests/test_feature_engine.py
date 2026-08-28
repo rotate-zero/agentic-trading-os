@@ -845,7 +845,14 @@ async def test_vwap_publishes_even_while_sma_is_still_warming_up():
 
         assert len(received) == 1  # published on VWAP alone
         features = received[0].payload["features"]
-        assert features == {"vwap": 100.0, "session_volume": 10.0}  # sma_50 genuinely absent — not warmed up, not silently 0; session_volume (decision #71) now publishes alongside vwap whenever _update_vwap is in regular session
+        # sma_50 genuinely absent — not warmed up, not silently 0.
+        # session_volume (decision #71) and vwap_ext/session_volume_ext
+        # (docs/architecture/premarket-accumulator-design.md) publish
+        # alongside vwap/vwap_ext whenever their own accumulators are in
+        # session — this test's exact-equality shape gets touched each
+        # time a new one joins that set, same as it was for
+        # session_volume's own addition; not a regression.
+        assert features == {"vwap": 100.0, "session_volume": 10.0, "vwap_ext": 100.0, "session_volume_ext": 10.0}
     finally:
         await engine.stop()
         await bus.stop()
