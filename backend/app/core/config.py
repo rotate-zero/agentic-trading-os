@@ -176,6 +176,14 @@ class Settings(BaseSettings):
     # tests to use directly).
     feature_engine_rvol_lookback_days: int = 5
 
+    # --- Pre-market volume ratio (docs/architecture/premarket-accumulator-design.md) ---
+    # Separate from feature_engine_rvol_lookback_days on purpose, even
+    # though both default to 5 — regular-session RVOL and pre-market
+    # volume ratio are DIFFERENT baselines (a symbol's daily volume vs.
+    # its own pre-market volume aren't the same distribution), so tuning
+    # one shouldn't silently move the other.
+    feature_engine_premarket_lookback_days: int = 5
+
     # --- Trading Intelligence: Level Interaction Engine (confirmed decision #46) ---
     # Aura width as a fraction (0.002 = 0.2%), applied uniformly to every
     # level_key FeatureEngine publishes. Per-level-type override is real

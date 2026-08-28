@@ -365,7 +365,19 @@ async def test_feature_engine_publishes_once_warmed_up_and_not_before():
     bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
 
     try:
-        base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        # Fixed, deterministic anchor — a Saturday, unconditionally
+        # Session.CLOSED regardless of hour (MarketClock treats weekends
+        # as CLOSED no matter what). Was `datetime.now(timezone.utc)`
+        # until this test's "nothing publishes before warmup" assumption
+        # broke the moment real wall-clock time crossed into ET
+        # pre-market hours — pmh/pml (decision #56) and vwap_ext
+        # (docs/architecture/premarket-accumulator-design.md) both
+        # publish unconditionally during Session.PRE_MARKET regardless
+        # of SMA warmup, so this test's correctness was ALWAYS silently
+        # dependent on which moment it happened to run — caught here,
+        # not before, only because the sandbox's clock happened to
+        # cross into that window during this work.
+        base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
         closes = [100.0, 102.0, 104.0]  # SMA(3) on the 3rd close = 102.0
         for i, close in enumerate(closes):
             await _publish_candle(bus, "__TEST_FE_MEM__", base_ts + timedelta(minutes=i), close)
@@ -398,7 +410,10 @@ async def test_sma_and_ema_coexist_in_the_same_featureset_with_independent_warmu
     bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
 
     try:
-        base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        # Fixed, deterministic Session.CLOSED anchor — see the identical
+        # fix/reasoning in test_feature_engine_publishes_once_warmed_up_and_not_before
+        # just above.
+        base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
         closes = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
         for i, close in enumerate(closes):
             await _publish_candle(bus, "__TEST_FE_EMA_MIX__", base_ts + timedelta(minutes=i), close)
@@ -485,7 +500,10 @@ async def test_feature_engine_drops_duplicate_candle_closed():
     bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
 
     try:
-        base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        # Fixed, deterministic Session.CLOSED anchor — see the identical
+        # fix/reasoning in test_feature_engine_publishes_once_warmed_up_and_not_before
+        # above.
+        base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
         await _publish_candle(bus, "__TEST_FE_DUP__", base_ts, 100.0)
         await _publish_candle(bus, "__TEST_FE_DUP__", base_ts, 100.0)  # exact duplicate
         await _publish_candle(bus, "__TEST_FE_DUP__", base_ts + timedelta(minutes=1), 102.0)
@@ -1086,17 +1104,20 @@ def test_update_atr_absent_when_shared_cache_not_yet_populated():
 
 class _FakeHistoricalProvider:
     """Duck-typed MarketDataProvider stand-in, same shape as
-    test_daily_levels.py's own — get_historical() only, counting calls so
-    these tests can assert the shared-cache claim directly (ATR must NOT
-    cause a second fetch), not just that both features' numbers come out
-    right independently."""
+    test_daily_levels.py's own — get_historical() only, counting calls
+    PER TIMEFRAME so these tests can assert the shared-cache claim
+    (ATR/RVOL must NOT cause a second 1d fetch) directly, without being
+    thrown off by _maybe_refresh_premarket_baseline's own separate,
+    legitimate "1m" fetch against this same provider on every candle."""
 
     def __init__(self, candles_by_symbol: dict[str, list[CandleClosed]]) -> None:
         self._candles_by_symbol = candles_by_symbol
         self.call_count = 0
+        self.calls_by_timeframe: dict[str, int] = {}
 
     async def get_historical(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[CandleClosed]:
         self.call_count += 1
+        self.calls_by_timeframe[timeframe] = self.calls_by_timeframe.get(timeframe, 0) + 1
         return self._candles_by_symbol.get(symbol, [])
 
 
@@ -1153,7 +1174,7 @@ async def test_atr_reuses_daily_levels_shared_fetch_without_a_second_provider_ca
         await _publish_candle(bus, ticker, now, 130.0)
         await asyncio.sleep(0.2)
 
-        assert fake.call_count == 1  # the shared-cache claim, proven directly
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # the shared-1d-cache claim, proven directly — premarket's own separate 1m fetch is a different, legitimate call
         assert len(received) == 1
         features = received[0].payload["features"]
         assert "atr_14" in features
@@ -1443,7 +1464,7 @@ async def test_rvol_reuses_the_shared_daily_cache_and_published_session_volume()
         await _publish_candle(bus, ticker, now + timedelta(minutes=41), 130.0)
         await asyncio.sleep(0.2)
 
-        assert fake.call_count == 1  # the shared-cache claim, extended to a third consumer
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # the shared-1d-cache claim, extended to a third consumer — premarket's own separate 1m fetch doesn't count against this
         assert len(received) == 1
         features = received[0].payload["features"]
         assert features["rvol"] == pytest.approx(10.0 / (100.0 * 41 / 390))

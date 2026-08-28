@@ -134,17 +134,23 @@ def test_min_distinct_candles_is_configurable():
 class _FakeHistoricalProvider:
     """Duck-typed MarketDataProvider stand-in — get_historical() only,
     since that's the only method _maybe_refresh_daily_levels calls.
-    Counts calls so tests can assert the once-per-day cache/gate
-    actually works, not just that it eventually returns the right data."""
+    Counts calls PER TIMEFRAME (not just a single total) so tests can
+    assert the once-per-day 1d-fetch cache/gate actually works
+    specifically, without being thrown off by _maybe_refresh_premarket_baseline
+    ALSO legitimately calling this same provider for "1m" data on every
+    candle it processes — a real, independent second consumer of this
+    interface, not something these tests were ever asserting about."""
 
     def __init__(self, candles_by_symbol: dict[str, list[CandleClosed]]) -> None:
         self._candles_by_symbol = candles_by_symbol
         self.call_count = 0
         self.calls: list[tuple[str, str, datetime, datetime]] = []
+        self.calls_by_timeframe: dict[str, int] = {}
 
     async def get_historical(self, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[CandleClosed]:
         self.call_count += 1
         self.calls.append((symbol, timeframe, start, end))
+        self.calls_by_timeframe[timeframe] = self.calls_by_timeframe.get(timeframe, 0) + 1
         return self._candles_by_symbol.get(symbol, [])
 
 
@@ -227,7 +233,7 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
         await _publish_1m_candle(bus, "__TEST_DL__", now, 130.0)
         await asyncio.sleep(0.1)
 
-        assert fake.call_count == 1
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # the daily-levels 1d fetch specifically — premarket's own separate 1m fetch also happens now, correctly, and isn't what this assertion is about
         assert len(received) == 1
         daily_levels = received[0].payload["daily_levels"]
         assert len(daily_levels) == 1
@@ -253,7 +259,7 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
         # this IS the caching/gate design doc §2 asked for.
         await _publish_1m_candle(bus, "__TEST_DL__", now + timedelta(minutes=1), 130.5)
         await asyncio.sleep(0.1)
-        assert fake.call_count == 1
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # the daily-levels 1d fetch specifically — premarket's own separate 1m fetch also happens now, correctly, and isn't what this assertion is about
     finally:
         await engine.stop()
         await bus.stop()
@@ -316,7 +322,7 @@ async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lo
     try:
         await _publish_1m_candle(bus, "__TEST_DL_LKBK__", now, 130.0)
         await asyncio.sleep(0.1)
-        assert fake.call_count == 1  # the one and only provider fetch
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # the one and only 1d fetch — premarket's separate 1m fetch is a different, legitimate call
 
         # No lookback override — the full cached default: both clusters.
         default_levels = engine.get_daily_levels("__TEST_DL_LKBK__")
@@ -326,7 +332,7 @@ async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lo
         # candles — just the 100.10/100.20 cluster, the far-away 200.00
         # pair sliced away entirely. Zero additional provider calls.
         short_levels = engine.get_daily_levels("__TEST_DL_LKBK__", lookback_days=2)
-        assert fake.call_count == 1  # still just the one fetch — re-clustering is free
+        assert fake.calls_by_timeframe.get("1d", 0) == 1  # still just the one 1d fetch — re-clustering is free
         assert len(short_levels) == 1
         assert short_levels[0].price == pytest.approx(100.15, abs=0.01)
 
@@ -442,7 +448,7 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
         await asyncio.sleep(0.1)
         original_levels = engine_a.get_daily_levels(ticker)
         assert len(original_levels) == 1
-        assert original_provider.call_count == 1
+        assert original_provider.calls_by_timeframe.get("1d", 0) == 1
     finally:
         await engine_a.stop()
         await bus_a.stop()
@@ -469,7 +475,7 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
         await _publish_1m_candle(bus_b, ticker, now + timedelta(minutes=1), 130.5)
         await asyncio.sleep(0.1)
 
-        assert poisoned_provider.call_count == 0  # never reached — the whole point
+        assert poisoned_provider.calls_by_timeframe.get("1d", 0) == 0  # the 1d fetch is never reached — the whole point; premarket's own unrelated 1m fetch against this provider doesn't affect that claim
         restored_levels = engine_b.get_daily_levels(ticker)
         assert len(restored_levels) == 1
         assert restored_levels[0].level_id == original_levels[0].level_id
@@ -488,10 +494,20 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
     _clean_daily_levels_symbol("__TEST_DL_FLKY__")  # same not-reset-between-runs reasoning as the tests above
 
     class _FlakyProvider:
+        """`self.calls` counts 1d-relevant calls only — premarket's own
+        separate 1m fetch against this same provider (a real, unrelated
+        second consumer now) must not consume this test's carefully
+        sequenced "first call ok, second call fails" 1d-specific budget;
+        it gets an unconditional empty result instead, which is harmless
+        to premarket's own error handling (it just finds no data for
+        this symbol this cycle, same as any other cold start)."""
+
         def __init__(self) -> None:
             self.calls = 0
 
         async def get_historical(self, symbol, timeframe, start, end):
+            if timeframe != "1d":
+                return []
             self.calls += 1
             if self.calls == 1:
                 now_local = end

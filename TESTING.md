@@ -1,72 +1,67 @@
-# TESTING — Extended VWAP (vwap_ext) + pre-market data availability check
+# TESTING — premarket_volume_ratio
 
-Unzip at project root. No migration needed — this is pure Feature Engine
-logic, no new tables. Overwrites `backend/app/feature_engine/engine.py`
-(adds `_update_vwap_ext` — `_update_vwap`/`vwap`/`session_volume`
-completely untouched) and `backend/tests/test_feature_engine.py` (one
-exact-equality assertion updated to include the two new keys — expected,
-not a regression, same as when `session_volume` was added). Adds
-`backend/tests/test_vwap_ext.py`, `backend/scripts/check_premarket_data_availability.py`,
-`docs/architecture/premarket-accumulator-design.md`. Also fixes a real
-bug in the **already-delivered** `backend/scripts/test_scanner_pipeline.py`
-(see "Bug fixed in a prior delivery" below) — that file is overwritten
-too.
+Unzip at project root. No migration needed. Overwrites
+`backend/app/feature_engine/engine.py` (adds `_maybe_refresh_premarket_baseline`
++ `_update_premarket_volume_ratio` — `vwap_ext`/`vwap`/everything else
+untouched), `backend/app/core/config.py` (adds
+`feature_engine_premarket_lookback_days`, default 5), and 3 test files
+(see "Bugs found and fixed" below for why). Adds
+`backend/tests/test_premarket_volume_ratio.py`.
 
-## 1. Backend tests
+## 1. Run the tests
 
 ```bash
 cd backend
-pytest tests/test_feature_engine.py tests/test_vwap_ext.py -v
+pytest tests/test_premarket_volume_ratio.py -v
+pytest   # full suite
 ```
 
-Already run clean against a real Postgres 16 instance before this was
-sent: **245/245 backend tests passing**, zero regressions. The one test
-worth looking at directly if you want to see the actual fix demonstrated:
+**255/255 passing**, confirmed on two consecutive runs while real
+wall-clock time was sitting in ET pre-market hours the whole time — not
+a lucky window, an actual fix (see below).
 
-```bash
-pytest tests/test_vwap_ext.py::test_vwap_ext_continues_across_the_930_boundary_without_resetting -v
-```
+## 2. What premarket_volume_ratio actually is
 
-Publishes a pre-market bar at price 50, then a regular-open bar at price
-100. `vwap` reads 100 (unchanged — resets at 9:30 same as always).
-`vwap_ext` reads 75 (pre-market's bar is still in the running average).
-That divergence, at the exact moment `vwap` resets, is the discrepancy
-you saw against other platforms.
+Same shape as regular-session `rvol`, reusing its exact pure function —
+just against your own symbol's historical pre-market volume instead of
+its daily volume, and only published while still inside the 4:00-9:30am
+window. Needs `feature_engine_premarket_lookback_days` (default 5)
+complete prior pre-market sessions cached before it publishes anything —
+cold start is honest absence, not a guess.
 
-## 2. Pre-market data availability check (needs your real Polygon key)
+The fetch itself (`_maybe_refresh_premarket_baseline`) runs once per
+(symbol, ET day) against whatever's registered as your historical
+provider (Polygon today) — same seam Daily Levels already uses, just
+requesting 1-minute bars instead of 1-day ones, since a single daily bar
+can't tell you how much of it was pre-market.
 
-This is the actual open question blocking `premarket_volume_ratio`
-(the ORB-enabling feature) — not a formality:
+## 3. Bugs found and fixed while building this (not new features)
 
-```bash
-cd backend
-python scripts/check_premarket_data_availability.py
-python scripts/check_premarket_data_availability.py TSLA 10   # different symbol/lookback
-```
+**Six existing tests broke** the moment this feature started making its
+own real fetch calls against the same historical-provider interface
+Daily Levels/ATR/RVOL already share — their fake providers tracked one
+global call count, and this feature's own legitimate second call (1m,
+not 1d) pushed that count from 1 to 2. Fixed by making those fakes count
+calls *per timeframe* instead, so the original claim they protect (the
+1d fetch is shared, not duplicated) is still checked correctly, without
+being tripped up by an unrelated new consumer.
 
-Needs `POLYGON_API_KEY` set (same one your existing `PolygonAdapter`
-already uses). Prints a small table of pre-market 1-minute bar counts
-and volume for the last few weekdays, then a verdict: either Polygon
-genuinely has this data (in which case `premarket_volume_ratio` is
-buildable against it) or it doesn't (in which case that feature is
-gated on the IBKR subscription instead, same as spread tightness
-already was).
+**Four other tests had a latent, pre-existing bug** — they used
+`datetime.now(timezone.utc)` as their base timestamp instead of a fixed
+one. This was always a live risk (pre-market H/L already published
+unconditionally during pre-market hours before any of today's work), but
+only actually broke once the sandbox's real clock happened to cross into
+ET pre-market hours while I was testing this. Fixed by anchoring all
+four to a fixed Saturday — guaranteed `Session.CLOSED` no matter what
+hour they run at, so this can't recur. Worth knowing about since it's a
+pattern (`datetime.now()` in a test) that could bite again wherever else
+it might still exist in the suite — not something I went looking for
+beyond the four that actually failed.
 
-## 3. Bug fixed in a prior delivery
+## What this doesn't do yet
 
-Both this new script and the earlier `scripts/test_scanner_pipeline.py`
-failed with `ModuleNotFoundError: No module named 'app'` when run
-exactly as documented (`cd backend && python scripts/foo.py`) — Python
-adds the script's own directory to `sys.path`, not the directory you ran
-it from, so anything importing `app.*` directly needs an explicit fix.
-`verify_roundtrip.py` never hit this because it only talks to a running
-server over HTTP. Caught while verifying the new script; fixed in both.
-If you'd already tried running `test_scanner_pipeline.py` and hit this,
-that's why — not something wrong on your end.
-
-## What's still NOT built
-
-`premarket_volume_ratio` itself — correctly still gated on step 2 above.
-Nothing in this delivery lets you rank symbols on pre-market activity
-yet; that's the next piece, once the data-availability question has a
-real answer.
+Nothing consumes `premarket_volume_ratio` for actual ORB screening —
+that's Scanner-side work (a "pre-market movers" scan type, per
+`docs/architecture/premarket-accumulator-design.md` §6), deliberately
+not started until this feature itself has been watched against a few
+real pre-market sessions first.

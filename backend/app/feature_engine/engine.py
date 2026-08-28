@@ -310,6 +310,7 @@ class FeatureEngine:
         # Relative Volume (confirmed decision #71) — settings-only, no
         # constructor override, same precedent as _atr_period above.
         self._rvol_lookback_days = get_settings().feature_engine_rvol_lookback_days
+        self._premarket_lookback_days = get_settings().feature_engine_premarket_lookback_days
 
         self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -340,6 +341,16 @@ class FeatureEngine:
         # resetting again at the 9:30am regular-session boundary — that
         # continuity through the open is the entire point (§1 of that doc).
         self._vwap_ext_state: dict[str, dict[str, Any]] = {}
+
+        # Pre-market volume ratio's own once-per-(symbol, ET day) baseline
+        # cache — {"for_day": date, "avg_premarket_volume": float | None}.
+        # NOT the same cache _maybe_refresh_daily_levels populates
+        # (self._daily_candle_cache): that one holds 1-DAY bars, useless
+        # here since a single daily bar doesn't isolate how much of it
+        # was pre-market. This one is built from 1-MINUTE bars filtered
+        # to Session.PRE_MARKET specifically — see
+        # _maybe_refresh_premarket_baseline below.
+        self._premarket_baseline_cache: dict[str, dict[str, Any]] = {}
 
         # Per-SYMBOL previous-day levels (PDH/PDL/PDC + Camarilla) and
         # today's premarket range — both confirmed decision #56, both
@@ -482,6 +493,7 @@ class FeatureEngine:
                 item = await self._queue.get()
                 try:
                     await self._maybe_refresh_daily_levels(item)
+                    await self._maybe_refresh_premarket_baseline(item)
                     results = await asyncio.to_thread(self._compute_one, item)
                     for symbol, payload in results:
                         await self._bus.publish(make_envelope(EventType.FEATURES_UPDATED, payload, symbol=symbol))
@@ -624,6 +636,103 @@ class FeatureEngine:
         # features end up reading its result.
         self._daily_candle_cache[symbol] = prior_candles
         self._daily_levels_state[symbol] = {"for_day": today, "levels": levels}
+
+    async def _maybe_refresh_premarket_baseline(self, item: dict[str, Any]) -> None:
+        """
+        Pre-market volume ratio's baseline (docs/architecture/premarket-accumulator-design.md
+        §3, empirically confirmed available on Polygon's free tier by
+        Saqib directly before this was written) — average pre-market
+        volume over `feature_engine_premarket_lookback_days` prior
+        trading days.
+
+        Deliberately NOT reusing `self._daily_candle_cache`
+        (`_maybe_refresh_daily_levels` above) even though the fetch
+        pattern is nearly identical: that cache holds 1-DAY bars, and a
+        single daily bar doesn't tell you how much of that day's volume
+        happened specifically between 4:00 and 9:30am. This fetches 1m
+        bars over a wide-enough calendar window, then filters to
+        `Session.PRE_MARKET` rows on strictly prior trading days and sums
+        volume PER DAY — genuinely different granularity, so a genuinely
+        separate cache and fetch, same "don't force two different shapes
+        of data through one cache" instinct that kept `_vwap_ext_state`
+        separate from `_vwap_state` rather than folding one into the
+        other.
+
+        Same once-per-(symbol, ET day) gate, same
+        broker_registry.get_historical_provider() seam, same
+        SymbolNotFoundError/HistoricalDataUnavailableError/generic-Exception
+        handling shape as `_maybe_refresh_daily_levels` above — copied
+        deliberately for consistency, not because the two could easily
+        share a helper (the post-fetch filtering/grouping logic differs
+        too much to make that worthwhile).
+        """
+        symbol = item["symbol"]
+        candle_ts = item["candle_ts"]
+        if isinstance(candle_ts, str):
+            candle_ts = datetime.fromisoformat(candle_ts)
+        if candle_ts.tzinfo is None:
+            candle_ts = candle_ts.replace(tzinfo=timezone.utc)
+
+        clock = get_market_clock()
+        today = clock.trading_day(candle_ts)
+        state = self._premarket_baseline_cache.get(symbol)
+        if state is not None and state["for_day"] == today:
+            return  # already fresh for today — no I/O, the common case on every candle
+
+        provider = broker_registry.get_historical_provider()
+        if provider is None:
+            if state is None:
+                logger.info(
+                    "Pre-market volume ratio: no historical provider connected for %s yet — unavailable until one is",
+                    symbol,
+                )
+                self._premarket_baseline_cache[symbol] = {"for_day": today, "avg_premarket_volume": None}
+            return
+
+        # Generous calendar-day window (3x the trading-day lookback) so
+        # weekends/holidays don't starve this of enough actual TRADING
+        # days — same reasoning _maybe_refresh_daily_levels's own
+        # lookback_start uses, wider here since a whole day's worth of
+        # pre-market bars needs to survive the filter below, not just
+        # one bar per day.
+        lookback_start = candle_ts - timedelta(days=self._premarket_lookback_days * 3)
+        try:
+            bars = await provider.get_historical(symbol, "1m", lookback_start, candle_ts)
+        except SymbolNotFoundError:
+            logger.warning("Pre-market volume ratio: %s not resolvable by the historical provider — unavailable", symbol)
+            self._premarket_baseline_cache[symbol] = {"for_day": today, "avg_premarket_volume": None}
+            return
+        except HistoricalDataUnavailableError as exc:
+            logger.warning("Pre-market volume ratio: historical provider can't serve 1m data for %s (%s) — unavailable", symbol, exc)
+            self._premarket_baseline_cache[symbol] = {"for_day": today, "avg_premarket_volume": None}
+            return
+        except Exception:  # noqa: BLE001 — one bad fetch must not stall the worker loop or crash on an unexpected provider error
+            logger.exception("Pre-market volume ratio: fetching 1m history failed for %s — leaving prior baseline in place", symbol)
+            return  # deliberately does NOT overwrite state on an unexpected error — stale is better than silently empty
+
+        # Strictly-prior trading days only, pre-market rows only — same
+        # "already fully elapsed" requirement _maybe_refresh_daily_levels
+        # applies to its own prior_candles filter.
+        by_day: dict[date, int] = {}
+        for bar in bars:
+            if clock.trading_day(bar.candle_ts) >= today:
+                continue
+            if clock.current_session(bar.candle_ts) != Session.PRE_MARKET:
+                continue
+            day = clock.trading_day(bar.candle_ts)
+            by_day[day] = by_day.get(day, 0) + bar.volume
+
+        recent_days = sorted(by_day)[-self._premarket_lookback_days :]
+        if len(recent_days) < self._premarket_lookback_days:
+            # Honest gap — not enough COMPLETE prior pre-market sessions
+            # cached yet, same convention every other feature reading a
+            # lookback-based cache already follows (RVOL's own
+            # `len(prior_candles) < lookback_days` check, one level up).
+            avg_premarket_volume = None
+        else:
+            avg_premarket_volume = sum(by_day[d] for d in recent_days) / self._premarket_lookback_days
+
+        self._premarket_baseline_cache[symbol] = {"for_day": today, "avg_premarket_volume": avg_premarket_volume}
 
     def _cluster_raw(self, prior_candles: list[Any]) -> list[ClusteredLevel]:
         """Shared by every caller that needs raw clustered zones before
@@ -936,6 +1045,14 @@ class FeatureEngine:
         # cache ATR just above reads, for its own average-daily-volume
         # denominator — zero new provider calls, zero new accumulator.
         extra.update(self._update_rvol(symbol, candle_ts, extra.get("session_volume")))
+        # Pre-market volume ratio (docs/architecture/premarket-accumulator-design.md)
+        # — reads `session_volume_ext` off `extra` (published by
+        # _update_vwap_ext above, same "receive already-known values"
+        # shape RVOL just used for `session_volume`) and the SEPARATE
+        # pre-market-specific baseline cache (_maybe_refresh_premarket_baseline,
+        # called earlier in the async worker loop) — zero new provider
+        # calls from THIS thread-offloaded method, same as RVOL.
+        extra.update(self._update_premarket_volume_ratio(symbol, candle_ts, extra.get("session_volume_ext")))
         # Daily Levels (confirmed decision #59) — a pure, already-cached
         # read here (see _maybe_refresh_daily_levels, called earlier in
         # the async worker loop, not this thread-offloaded method).
@@ -1523,6 +1640,63 @@ class FeatureEngine:
         elapsed_minutes = max(1, clock.minutes_since_open(candle_ts))
 
         return rvol(session_volume, avg_daily_volume, elapsed_minutes, total_session_minutes)
+
+    def _update_premarket_volume_ratio(
+        self, symbol: str, candle_ts: datetime, session_volume_ext: float | None
+    ) -> dict[str, float]:
+        """
+        Pre-market volume ratio (docs/architecture/premarket-accumulator-design.md
+        §2) — reuses `indicators/rvol.py`'s `rvol()` function VERBATIM,
+        just against a pre-market-specific baseline instead of
+        `avg_daily_volume` — the same "is right now unusually busy
+        relative to a normal day by this same point" question RVOL
+        already answers, asked about the pre-market window instead of
+        the regular session. The output key is renamed from `rvol`'s own
+        `"rvol"` to `"premarket_volume_ratio"` before merging into
+        `extra` — the two are DIFFERENT numbers (different baseline,
+        different window) and must never collide on one key.
+
+        Only ever published `while candle_ts is still inside
+        Session.PRE_MARKET` — this is deliberately an ORB-screening
+        signal, not something meant to keep updating (or stay frozen)
+        once regular session starts; unlike `vwap_ext`, there's no
+        continuation story here, so this simply doesn't exist outside
+        its one window.
+
+        `session_volume_ext` being None means `_update_vwap_ext`
+        returned {} for this candle (same reasoning `_update_rvol`
+        already applies to `session_volume`/`_update_vwap`) — honestly
+        absent, not the same thing as "not currently in the pre-market
+        gate below" even though both produce {} here.
+
+        §4's open question about linear time-of-day normalization being
+        a weaker fit for pre-market than for regular session applies
+        here unchanged — this reuses `rvol()`'s exact linear assumption
+        as the deliberate starting point, not a claim that it's the
+        right long-term model.
+        """
+        clock = get_market_clock()
+        if clock.current_session(candle_ts) != Session.PRE_MARKET:
+            return {}
+        if session_volume_ext is None:
+            return {}
+
+        baseline = self._premarket_baseline_cache.get(symbol)
+        if baseline is None or baseline["avg_premarket_volume"] is None:
+            return {}
+        avg_premarket_volume = baseline["avg_premarket_volume"]
+
+        bounds = clock.session_bounds(candle_ts)
+        if bounds is None:  # pragma: no cover — Session.PRE_MARKET check above implies bounds exist
+            return {}
+        session_start, session_end = bounds
+        total_premarket_minutes = int((session_end - session_start).total_seconds() // 60)
+        elapsed_minutes = max(1, int((candle_ts - session_start).total_seconds() // 60))
+
+        result = rvol(session_volume_ext, avg_premarket_volume, elapsed_minutes, total_premarket_minutes)
+        if not result:
+            return {}
+        return {"premarket_volume_ratio": result["rvol"]}
 
 
 _feature_engine: FeatureEngine | None = None

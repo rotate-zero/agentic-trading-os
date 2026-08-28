@@ -291,7 +291,15 @@ async def test_intelligence_state_symbol_filter_does_not_leak_between_symbols():
     try:
         async with app.router.lifespan_context(app):
             bus = get_event_bus()
-            base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=20)
+            # Fixed, deterministic Session.CLOSED anchor — was
+            # `datetime.now(timezone.utc)`, which broke (and produced a
+            # ZeroDivisionError logged from LevelInteractionEngine on an
+            # unrelated indicator, gracefully absorbed rather than
+            # crashing the test) the moment real wall-clock time crossed
+            # into ET pre-market hours. Same fix as
+            # test_feature_engine.py's identical issue, found during the
+            # same work.
+            base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=20)
 
             for ticker, close in [(ticker_a, 50.0), (ticker_b, 75.0)]:
                 for i in range(9):
