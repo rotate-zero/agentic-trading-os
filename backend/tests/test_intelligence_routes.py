@@ -611,7 +611,14 @@ async def test_daily_levels_appear_in_intelligence_state():
     try:
         async with app.router.lifespan_context(app):
             bus = get_event_bus()
-            now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+            # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+            # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+            # (hour fixed, but DATE still real/relative) — broke the moment real
+            # wall-clock DATE crossed into a weekend, since MarketClock correctly
+            # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+            # as the datetime.now() fixes elsewhere in this file, just not caught
+            # until real time actually reached a Saturday.
+            now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
             await _publish(bus, ticker, now, 130.0)
 
             transport = httpx.ASGITransport(app=app)
@@ -682,7 +689,14 @@ async def test_daily_levels_carry_level_interaction_once_touched():
     try:
         async with app.router.lifespan_context(app):
             bus = get_event_bus()
-            now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+            # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+            # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+            # (hour fixed, but DATE still real/relative) — broke the moment real
+            # wall-clock DATE crossed into a weekend, since MarketClock correctly
+            # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+            # as the datetime.now() fixes elsewhere in this file, just not caught
+            # until real time actually reached a Saturday.
+            now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
             # First candle: far away, just gets Daily Levels computed.
             await _publish(bus, ticker, now, 130.0)
             # Second candle: close lands right on the clustered level

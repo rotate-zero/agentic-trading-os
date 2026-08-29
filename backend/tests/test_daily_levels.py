@@ -208,7 +208,14 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
     # check would short-circuit past the provider before it's even set up.
     _clean_daily_levels_symbol("__TEST_DL__")
 
-    now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+    # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+    # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+    # (hour fixed, but DATE still real/relative) — broke the moment real
+    # wall-clock DATE crossed into a weekend, since MarketClock correctly
+    # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+    # as the datetime.now() fixes elsewhere in this file, just not caught
+    # until real time actually reached a Saturday.
+    now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
     # Two candles close enough to cluster (0.2% default), one far away —
     # same shape as the isolated-point unit test above, exercised here
     # end-to-end through the engine instead of the pure function directly.
@@ -267,7 +274,14 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
 
 @pytest.mark.asyncio
 async def test_no_historical_provider_connected_yields_empty_daily_levels_not_a_crash():
-    now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+    # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+    # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+    # (hour fixed, but DATE still real/relative) — broke the moment real
+    # wall-clock DATE crossed into a weekend, since MarketClock correctly
+    # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+    # as the datetime.now() fixes elsewhere in this file, just not caught
+    # until real time actually reached a Saturday.
+    now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
     bus = EventBus()
     await bus.start()
     engine = FeatureEngine(bus, sma_periods=[3], ema_periods=[])
@@ -300,7 +314,14 @@ async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lo
     which points are available to cluster, not just re-returning the
     same result with a different label."""
     _clean_daily_levels_symbol("__TEST_DL_LKBK__")  # same not-reset-between-runs reasoning as the test above
-    now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+    # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+    # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+    # (hour fixed, but DATE still real/relative) — broke the moment real
+    # wall-clock DATE crossed into a weekend, since MarketClock correctly
+    # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+    # as the datetime.now() fixes elsewhere in this file, just not caught
+    # until real time actually reached a Saturday.
+    now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
     fake = _FakeHistoricalProvider({
         "__TEST_DL_LKBK__": [
             # Oldest: a pair that only clusters with EACH OTHER, far from
@@ -430,7 +451,14 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
     assert len(ticker) <= 16
     _clean_daily_levels_symbol(ticker)
 
-    now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+    # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+    # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+    # (hour fixed, but DATE still real/relative) — broke the moment real
+    # wall-clock DATE crossed into a weekend, since MarketClock correctly
+    # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+    # as the datetime.now() fixes elsewhere in this file, just not caught
+    # until real time actually reached a Saturday.
+    now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
     original_provider = _FakeHistoricalProvider({
         ticker: [
             _daily_candle(5, 100.10, 100.10, now),
@@ -534,7 +562,14 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
     bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
 
     try:
-        now = datetime.now(timezone.utc).replace(hour=15, minute=0, second=0, microsecond=0)
+        # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
+        # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
+        # (hour fixed, but DATE still real/relative) — broke the moment real
+        # wall-clock DATE crossed into a weekend, since MarketClock correctly
+        # treats Sat/Sun as Session.CLOSED regardless of hour. Same root cause
+        # as the datetime.now() fixes elsewhere in this file, just not caught
+        # until real time actually reached a Saturday.
+        now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
         await _publish_1m_candle(bus, "__TEST_DL_FLKY__", now, 130.0)
         await asyncio.sleep(0.1)
         assert len(received[-1].payload["daily_levels"]) == 1
