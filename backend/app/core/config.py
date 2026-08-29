@@ -215,6 +215,23 @@ class Settings(BaseSettings):
     scanner_weight_gap: float = 0.0
     scanner_weight_session_change: float = 0.0
 
+    # premarket_volume_ratio (docs/architecture/premarket-accumulator-design.md)
+    # shares `rvol`'s conceptual "activity" slot in scorer.py rather than
+    # being a truly independent 4th input — the two are mutually
+    # exclusive by session (rvol only exists in regular session,
+    # premarket_volume_ratio only in pre-market), so this weight only
+    # ever applies during pre-market, when scanner_weight_rvol's own
+    # weight is moot anyway (rvol is absent then). Defaulted to 0.0 —
+    # NOT because the feature is unfinished (it's built and tested), but
+    # because Saqib hasn't watched a single real pre-market session's
+    # worth of actual values yet (missed 2026-08-28's pre-market before
+    # this was wired in; next chance is Monday, weekend has no market at
+    # all). Wiring the code in now rather than waiting out the weekend is
+    # a deliberate, separate decision from trusting its output for
+    # ranking — this default keeps those two decisions apart. Flip above
+    # 0 once real values have actually been looked at, not before.
+    scanner_weight_premarket_volume_ratio: float = 0.0
+
 
 @lru_cache
 def get_settings() -> Settings:

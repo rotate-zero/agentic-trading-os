@@ -34,7 +34,7 @@ _SUPPORTED_TIMEFRAME = "1m"  # only timeframe rvol/gap/session-change/ATR are ev
 # symbol scored the way it did, not just a bare number. Honest-state: a
 # key genuinely absent from a symbol's FeatureSet (cold start) is simply
 # missing from `features` below, never backfilled with a guess.
-_DISPLAY_KEYS = ["rvol", "gap_pct", "session_pct_change", "atr_14_pct"]
+_DISPLAY_KEYS = ["rvol", "premarket_volume_ratio", "gap_pct", "session_pct_change", "atr_14_pct"]
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,7 @@ def run_scan(
     weight_rvol: float,
     weight_gap: float,
     weight_session_change: float,
+    weight_premarket_volume_ratio: float = 0.0,
 ) -> tuple[list[ScanResult], list[str]]:
     """Returns (ranked results descending by score, symbols skipped this
     cycle). A symbol with no 1m FeatureSet computed yet at all (never
@@ -81,6 +82,7 @@ def run_scan(
             weight_rvol=weight_rvol,
             weight_gap=weight_gap,
             weight_session_change=weight_session_change,
+            weight_premarket_volume_ratio=weight_premarket_volume_ratio,
         )
         display_features = {k: v for k, v in tf_data["features"].items() if k in _DISPLAY_KEYS}
         results.append(

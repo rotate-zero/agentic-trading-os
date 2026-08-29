@@ -60,6 +60,7 @@ async def get_scanner_state(
         weight_rvol=settings.scanner_weight_rvol,
         weight_gap=settings.scanner_weight_gap,
         weight_session_change=settings.scanner_weight_session_change,
+        weight_premarket_volume_ratio=settings.scanner_weight_premarket_volume_ratio,
     )
 
     return {

@@ -71,3 +71,35 @@ def test_score_uses_absolute_value_for_gap_and_session_change_not_signed():
     # A large NEGATIVE gap/move is still activity worth surfacing —
     # (|-6|/2) + (|-4|/2) = 3.0 + 2.0 = 5.0, not a negative or near-zero score.
     assert result.score == 5.0
+
+
+def test_score_defaults_premarket_weight_to_zero_when_not_passed():
+    """Backward compatibility: callers written before premarket_volume_ratio
+    existed (scripts/test_scanner_pipeline.py's original form) must keep
+    working unchanged — weight_premarket_volume_ratio is optional."""
+    fs = _feature_set({"premarket_volume_ratio": 5.0})
+    result = score_symbol("AAPL", fs, **_WEIGHTS)  # no weight_premarket_volume_ratio passed at all
+
+    assert result.score == 0.0  # default weight 0.0 — present in features, but inert
+    assert result.inputs_available == 1  # still counted as an available input, just weighted to nothing
+
+
+def test_score_uses_premarket_volume_ratio_when_weighted_on():
+    fs = _feature_set({"premarket_volume_ratio": 4.0})
+    result = score_symbol("AAPL", fs, weight_rvol=1.0, weight_gap=1.0, weight_session_change=1.0, weight_premarket_volume_ratio=2.0)
+
+    assert result.score == 8.0  # 2.0 * 4.0
+    assert result.inputs_available == 1
+
+
+def test_score_rvol_and_premarket_volume_ratio_never_both_count_even_if_somehow_both_present():
+    """Structural protection, not just an assumption: rvol and
+    premarket_volume_ratio share ONE conceptual "activity" slot
+    (mutually exclusive by session in practice — see scorer.py's module
+    docstring) — this proves the `elif` actually enforces that, rather
+    than merely relying on Feature Engine never producing both."""
+    fs = _feature_set({"rvol": 3.0, "premarket_volume_ratio": 100.0})
+    result = score_symbol("AAPL", fs, weight_rvol=1.0, weight_gap=1.0, weight_session_change=1.0, weight_premarket_volume_ratio=1.0)
+
+    assert result.score == 3.0  # rvol wins (checked first) — premarket_volume_ratio's 100.0 never added in
+    assert result.inputs_available == 1  # not 2 — this is one slot, not two independent ones

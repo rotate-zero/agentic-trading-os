@@ -53,7 +53,7 @@ BASE_URL = "http://127.0.0.1:8000"
 # these four qualify, so each survives as a flat top-level unit key
 # rather than being grouped under a period). Confirmed against
 # intelligence.py directly, not assumed.
-_NEEDED_KEYS = ["rvol", "gap_pct", "session_pct_change", "atr_14_pct"]
+_NEEDED_KEYS = ["rvol", "premarket_volume_ratio", "gap_pct", "session_pct_change", "atr_14_pct"]
 
 
 def _extract_1m_features(state: dict) -> tuple[dict[str, float], str | None, float | None]:
@@ -97,6 +97,7 @@ async def _score_one(client: httpx.AsyncClient, symbol: str) -> ActivityScore | 
         weight_rvol=settings.scanner_weight_rvol,
         weight_gap=settings.scanner_weight_gap,
         weight_session_change=settings.scanner_weight_session_change,
+        weight_premarket_volume_ratio=settings.scanner_weight_premarket_volume_ratio,
     )
 
 

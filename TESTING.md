@@ -1,67 +1,62 @@
-# TESTING — premarket_volume_ratio
+# TESTING — Scanner integration for premarket_volume_ratio
 
 Unzip at project root. No migration needed. Overwrites
-`backend/app/feature_engine/engine.py` (adds `_maybe_refresh_premarket_baseline`
-+ `_update_premarket_volume_ratio` — `vwap_ext`/`vwap`/everything else
-untouched), `backend/app/core/config.py` (adds
-`feature_engine_premarket_lookback_days`, default 5), and 3 test files
-(see "Bugs found and fixed" below for why). Adds
-`backend/tests/test_premarket_volume_ratio.py`.
+`backend/app/scanner/{scorer.py,runner.py}`, `backend/app/api/routes/scanner.py`,
+`backend/app/core/config.py` (adds `scanner_weight_premarket_volume_ratio`,
+default 0.0), `backend/scripts/test_scanner_pipeline.py`,
+`backend/tests/test_scanner.py`, `frontend/src/components/scanner/ScannerPanel.tsx`.
 
-## 1. Run the tests
+## What changed
+
+`premarket_volume_ratio` now flows all the way through the Scanner — it
+shares `rvol`'s "activity" slot in the composite score (the two never
+coexist for the same symbol, since one needs regular session and the
+other needs pre-market) rather than becoming a bolt-on 4th input. Its
+weight (`scanner_weight_premarket_volume_ratio`) defaults to **0.0** —
+deliberately inert. You missed today's pre-market and the weekend has no
+market at all, so wiring the code in now (rather than waiting) was the
+right call — but trusting its ranking output is a separate decision that
+still waits on you actually looking at real values, which is why the
+weight stays at 0 until you flip it.
+
+## 1. Tests
 
 ```bash
 cd backend
-pytest tests/test_premarket_volume_ratio.py -v
+pytest tests/test_scanner.py -v
 pytest   # full suite
 ```
 
-**255/255 passing**, confirmed on two consecutive runs while real
-wall-clock time was sitting in ET pre-market hours the whole time — not
-a lucky window, an actual fix (see below).
+9 scanner tests (3 new — mutual exclusivity, weight defaults, weighted-on
+behavior). **268 passed, 1 deselected** — see "A separate, pre-existing
+bug" below for what that one is and why it's not part of this delivery.
 
-## 2. What premarket_volume_ratio actually is
+## 2. What you'll see in the panel
 
-Same shape as regular-session `rvol`, reusing its exact pure function —
-just against your own symbol's historical pre-market volume instead of
-its daily volume, and only published while still inside the 4:00-9:30am
-window. Needs `feature_engine_premarket_lookback_days` (default 5)
-complete prior pre-market sessions cached before it publishes anything —
-cold start is honest absence, not a guess.
+Once Monday's pre-market arrives, the Scanner panel's chip row will show
+a `PM Vol X.XXx` chip (bolded, same treatment as `RVOL`) for any symbol
+in pre-market — informative immediately, even though it won't move the
+ranking yet. The header caption now reads "Ranked by RVOL / PM Vol (v1)"
+to reflect that.
 
-The fetch itself (`_maybe_refresh_premarket_baseline`) runs once per
-(symbol, ET day) against whatever's registered as your historical
-provider (Polygon today) — same seam Daily Levels already uses, just
-requesting 1-minute bars instead of 1-day ones, since a single daily bar
-can't tell you how much of it was pre-market.
+## 3. Turning it on, once you've actually looked
 
-## 3. Bugs found and fixed while building this (not new features)
+```python
+# app/core/config.py
+scanner_weight_premarket_volume_ratio: float = 1.0  # or whatever feels right after watching real values
+```
 
-**Six existing tests broke** the moment this feature started making its
-own real fetch calls against the same historical-provider interface
-Daily Levels/ATR/RVOL already share — their fake providers tracked one
-global call count, and this feature's own legitimate second call (1m,
-not 1d) pushed that count from 1 to 2. Fixed by making those fakes count
-calls *per timeframe* instead, so the original claim they protect (the
-1d fetch is shared, not duplicated) is still checked correctly, without
-being tripped up by an unrelated new consumer.
+No other code changes needed — same pattern as flipping
+`scanner_weight_gap`/`scanner_weight_session_change` back on.
 
-**Four other tests had a latent, pre-existing bug** — they used
-`datetime.now(timezone.utc)` as their base timestamp instead of a fixed
-one. This was always a live risk (pre-market H/L already published
-unconditionally during pre-market hours before any of today's work), but
-only actually broke once the sandbox's real clock happened to cross into
-ET pre-market hours while I was testing this. Fixed by anchoring all
-four to a fixed Saturday — guaranteed `Session.CLOSED` no matter what
-hour they run at, so this can't recur. Worth knowing about since it's a
-pattern (`datetime.now()` in a test) that could bite again wherever else
-it might still exist in the suite — not something I went looking for
-beyond the four that actually failed.
+## 4. A separate, pre-existing bug found during verification — NOT fixed here
 
-## What this doesn't do yet
-
-Nothing consumes `premarket_volume_ratio` for actual ORB screening —
-that's Scanner-side work (a "pre-market movers" scan type, per
-`docs/architecture/premarket-accumulator-design.md` §6), deliberately
-not started until this feature itself has been watched against a few
-real pre-market sessions first.
+`tests/test_intelligence_routes.py::test_intelligence_series_reflects_real_persisted_candles`
+fails intermittently with a foreign-key violation during its own
+teardown — a race between the app's shutdown sequence and
+`LevelInteractionEngine`'s background worker, unrelated to anything in
+this delivery. **Confirmed directly**: this same test fails identically
+on the code as it stood *before* today's Scanner work, proving it
+predates this change entirely. Deliberately left unfixed rather than
+speculatively patched — it needs its own investigation into async
+shutdown ordering. Worth a look separately, not urgent.

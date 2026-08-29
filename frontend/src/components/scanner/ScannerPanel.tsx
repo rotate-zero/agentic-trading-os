@@ -8,24 +8,31 @@ const MIN_WIDTH = 64;
 const MAX_WIDTH = 480;
 const COLLAPSED_WIDTH = 36;
 
-// v1 score = rvol only (Saqib's call, 2026-08-27 — gap/session-change
-// terms exist in scorer.py and still run, but their weights are set to
-// 0.0 in Settings, so they don't currently move the ranking). The chip
-// row below still shows them when present — informative context, even
-// though only the bolded RVOL chip is what's actually driving score
-// right now. Flip the weights back on server-side to bring them back
-// into the ranking; nothing here would need to change to reflect that.
-const SCORE_BASIS_LABEL = "Ranked by RVOL (v1)";
+// v1 score = rvol (regular session) or premarket_volume_ratio
+// (pre-market) only — the two share one "activity" slot, mutually
+// exclusive by session (Saqib's call, 2026-08-27; premarket_volume_ratio
+// wired in 2026-08-28). gap/session-change terms exist in scorer.py and
+// still run, but their weights are 0.0 in Settings, so they don't
+// currently move the ranking; premarket_volume_ratio's own weight is
+// ALSO 0.0 for now — wired in and tested, but inert until Saqib has
+// actually looked at real pre-market values (missed 2026-08-28's
+// session before this landed; next chance is Monday). The chip row
+// below still shows every available reading regardless of weight —
+// informative context even for the currently-inert ones. Flip weights
+// back on server-side to bring any of them into the ranking; nothing
+// here would need to change to reflect that.
+const SCORE_BASIS_LABEL = "Ranked by RVOL / PM Vol (v1)";
 
 function formatFeatureChip(key: string, value: number): { label: string; primary: boolean } {
   if (key === "rvol") return { label: `RVOL ${value.toFixed(2)}x`, primary: true };
+  if (key === "premarket_volume_ratio") return { label: `PM Vol ${value.toFixed(2)}x`, primary: true };
   if (key === "gap_pct") return { label: `Gap ${value >= 0 ? "+" : ""}${value.toFixed(2)}%`, primary: false };
   if (key === "session_pct_change") return { label: `Day ${value >= 0 ? "+" : ""}${value.toFixed(2)}%`, primary: false };
   if (key === "atr_14_pct") return { label: `ATR ${value.toFixed(2)}%`, primary: false };
   return { label: `${key} ${value}`, primary: false };
 }
 
-const FEATURE_DISPLAY_ORDER = ["rvol", "gap_pct", "session_pct_change", "atr_14_pct"];
+const FEATURE_DISPLAY_ORDER = ["rvol", "premarket_volume_ratio", "gap_pct", "session_pct_change", "atr_14_pct"];
 
 function ResultRow({ result, rank }: { result: ScannerResultWireShape; rank: number }) {
   const lowConfidence = result.inputs_available < 2;
