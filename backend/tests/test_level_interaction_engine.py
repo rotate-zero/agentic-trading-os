@@ -17,6 +17,7 @@ one event type.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -605,5 +606,101 @@ async def test_get_snapshot_includes_daily_levels_with_zero_special_casing():
         assert "holding" in entry
     finally:
         await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+# --- stop() shutdown-race regression (confirmed decision #84) ---------------
+
+
+@pytest.mark.asyncio
+async def test_stop_waits_for_an_in_flight_persist_before_returning():
+    """
+    Reproduces the real ForeignKeyViolation-on-teardown race behind
+    decision #84, deterministically rather than by luck of scheduling:
+    `_persist_state` is wrapped with an artificial delay so a write is
+    GUARANTEED to still be running in the executor thread at the exact
+    moment `stop()` is called (no `asyncio.sleep` between publish and
+    stop — that gap is precisely what earlier runs of this suite got
+    away with often enough to look correct).
+
+    Two things prove the fix, not just the absence of a crash:
+    - `stop()` itself must take at least as long as the artificial delay
+      — if it returned quickly, that would mean it went back to
+      cancelling rather than actually waiting for the in-flight thread.
+    - Deleting the symbol row immediately after `stop()` returns (same
+      teardown shape `_clean_test_symbol` uses in this file and in
+      test_intelligence_routes.py) must not raise — proving the write
+      that referenced `symbol_id` had genuinely finished, not just that
+      timing happened to work out this run.
+
+    Feeds `engine._queue` directly rather than publishing through the Bus
+    — found necessary while writing this test, not assumed: `bus.publish`
+    is fire-and-forget onto the BUS's own queue, dispatched to
+    `_on_features_updated` (which is what actually reaches this engine's
+    OWN queue) by the bus's separate `_consume` task on a later loop
+    iteration. Publishing and immediately calling `stop()` raced the
+    sentinel into this engine's queue AHEAD of the real item often enough
+    to make the very first version of this test flaky against the FIXED
+    code — the sentinel got processed first and the worker exited before
+    the real item was ever pulled off the queue at all. Queuing directly
+    removes that unrelated race, isolating this test to the one thing
+    it's meant to prove: cancellation-vs-drain behavior once an item is
+    genuinely in this engine's own queue.
+    """
+    ticker = "__LIE_STOPRACE__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+
+    delay_seconds = 0.3
+    original_persist_state = engine._persist_state
+
+    def _slow_persist_state(*args, **kwargs):
+        time.sleep(delay_seconds)  # runs inside the executor thread — a real blocking delay, not a mock
+        return original_persist_state(*args, **kwargs)
+
+    engine._persist_state = _slow_persist_state  # type: ignore[method-assign]
+    engine.start()
+
+    try:
+        # Fed straight onto the engine's own queue (see docstring above) —
+        # same dict shape _on_features_updated itself would have produced.
+        # First-ever observation for this symbol, so the cold-start branch
+        # in _process_level calls _persist_state unconditionally before
+        # returning (see its own "brand new" comment) — one item is
+        # enough to guarantee a write gets scheduled.
+        engine._queue.put_nowait(
+            {"symbol": ticker, "timeframe": "1m", "close": 100.0, "candle_ts": _DAY1, "features": {"sma_9": 100.0}}
+        )
+        # Give the worker task a real chance to dequeue the item and get
+        # asyncio.to_thread's executor submission actually running (into
+        # the artificial 0.3s sleep) before stop() is called — a bare
+        # `asyncio.sleep(0)` risks yielding only once, before the thread
+        # pool has genuinely started the callable.
+        await asyncio.sleep(0.05)
+
+        t0 = time.monotonic()
+        await engine.stop()  # nothing queued after this — the one item is still mid-persist
+        elapsed = time.monotonic() - t0
+
+        # A generous floor, not delay_seconds itself: ~0.05s of the
+        # artificial delay was already spent during the sleep above,
+        # before stop() was even called. Anything comfortably above
+        # "basically instant" (the old buggy behavior measured ~0.0001s
+        # in this same scenario) is a clean pass/fail signal without
+        # being sensitive to exact scheduling overhead.
+        assert elapsed >= 0.15, (
+            f"stop() returned after {elapsed:.3f}s — expected it to block for close to the "
+            f"remaining {delay_seconds}s artificial persist delay; it isn't actually waiting "
+            "for in-flight work anymore"
+        )
+
+        # The real proof: this must not raise a ForeignKeyViolation. If
+        # stop() let the write land after this DELETE instead of before
+        # it, this call reproduces decision #84's original bug exactly.
+        _clean_test_symbol(ticker)
+    finally:
         await bus.stop()
         _clean_test_symbol(ticker)

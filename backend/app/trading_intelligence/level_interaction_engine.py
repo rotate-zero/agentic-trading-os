@@ -128,6 +128,13 @@ logger = logging.getLogger(__name__)
 
 _EPSILON = 1e-9  # tiny relative tolerance at the Aura's exact edge — see classify_zone()
 
+# Poison-pill used by stop() to drive a graceful worker-loop exit instead
+# of cancelling the task outright — see stop()'s own docstring (confirmed
+# decision #84) for the real, reproduced shutdown race this replaces. A
+# private object identity, never a plain value, so it can never collide
+# with a real FeaturesUpdated-derived queue item (always a dict).
+_STOP_SENTINEL = object()
+
 
 @dataclass
 class _LiveState:
@@ -154,7 +161,7 @@ class LevelInteractionEngine:
         self._bus = bus
         self._aura_pct = aura_pct if aura_pct is not None else get_settings().trading_intelligence_aura_pct
 
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()  # object half is _STOP_SENTINEL only
         self._worker_task: asyncio.Task | None = None
 
         self._state: dict[tuple[str, str, str], _LiveState] = {}
@@ -176,11 +183,70 @@ class LevelInteractionEngine:
         logger.info("LevelInteractionEngine started — aura=%.3f%% on FeaturesUpdated", self._aura_pct * 100)
 
     async def stop(self) -> None:
-        """Awaits actual task completion, not just schedules cancellation
-        — see CandleRecorder.stop()'s docstring for the real bug this
-        fixes (confirmed decision #47)."""
+        """
+        Confirmed decision #84 — replaces a `task.cancel()` + `await task`
+        pattern (the same shape decision #47 introduced for CandleRecorder,
+        copied here) that LOOKS like it waits for real completion but
+        doesn't, for any item still mid-`_process_one` at the moment
+        `stop()` is called.
+
+        Root cause, reproduced with a standalone script before touching
+        this file (not assumed from reading asyncio's docs): the Task
+        here is suspended awaiting the plain `asyncio.Future` that
+        `loop.run_in_executor` (what `asyncio.to_thread` calls internally)
+        hands back. `Future.cancel()` on that object transitions it to
+        CANCELLED synchronously, regardless of whether the real OS thread
+        underneath it — the one actually running `_process_one`, including
+        its own blocking `_persist_state` writes — has finished. Cancelling
+        the wrapped `concurrent.futures.Future` is attempted too, but
+        best-effort only: a `concurrent.futures.Future` that's already
+        RUNNING can't be cancelled and silently keeps executing. Net
+        effect: `task.cancel()` + `await task` can return while a
+        `_persist_state` write for this test's own symbol is still
+        in-flight, fully detached from anything `stop()`'s caller can see
+        or wait on. Measured directly: a `to_thread(slow_fn)` awaiting
+        task, cancelled while `slow_fn` had 500ms left to run, had its
+        `await task` return in ~0ms — `slow_fn` kept running regardless.
+
+        For an engine whose thread-pool work writes rows keyed on
+        `symbol_id`, that orphaned write is exactly what raced a test's
+        post-`stop()` `DELETE FROM symbols` into a real, intermittent
+        ForeignKeyViolation on teardown — reproduced against this file's
+        own `_process_one`/`_persist_state` path (see the new
+        `test_stop_waits_for_an_in_flight_persist_before_returning`
+        below), not hypothetical. `CandleRecorder.stop()` and
+        `FeatureEngine.stop()` share this exact shape and very likely
+        have the identical latent bug — flagged, not fixed here (see
+        decision #84's own write-up for why this stayed scoped to the
+        engine actually implicated by the reported race).
+
+        Fixed with a poison-pill drain, not cancellation: enqueue
+        `_STOP_SENTINEL` and await the worker task with nothing cancelled
+        at all. Because the queue is FIFO and main.py's shutdown already
+        stops the Event Bus before this engine — cutting off any new
+        arrivals here — the sentinel is only ever dequeued after every
+        item genuinely ahead of it, including one already mid-flight
+        inside `to_thread`, has fully finished (`_persist_state` and all).
+        This is what main.py's own shutdown-order comment already
+        claimed ("await engine.stop() actually means what it says") —
+        true for the queued backlog even before this fix, not for an
+        item already running inside `to_thread` at the moment `stop()`
+        was called. Now it's true for that case too.
+
+        Trade-off, made deliberately rather than left implicit: if the DB
+        is genuinely wedged (not just erroring — actually hanging) during
+        shutdown, this can make `stop()` take longer than the old
+        cancel-based version did, since there's no timeout-then-cancel
+        fallback. Not adding one on purpose — a timeout that falls back
+        to cancellation would just reintroduce this exact race at lower
+        probability instead of removing it, which defeats the point.
+        Correctness over shutdown latency is the right call for a
+        DB-writing background worker; a stuck-forever shutdown is a
+        starkly worse failure mode than a slightly slower one, and is
+        already a symptom of a wedged DB regardless of this engine.
+        """
         if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
+            await self._queue.put(_STOP_SENTINEL)
             try:
                 await self._worker_task
             except asyncio.CancelledError:
@@ -271,6 +337,14 @@ class LevelInteractionEngine:
         try:
             while True:
                 item = await self._queue.get()
+                if item is _STOP_SENTINEL:
+                    # Graceful stop() request (confirmed decision #84) —
+                    # not a real FeaturesUpdated payload, nothing to
+                    # process. Everything queued AHEAD of this has
+                    # already been fully processed by the time we see
+                    # it, since this is a plain FIFO queue.
+                    self._queue.task_done()
+                    break
                 try:
                     events = await asyncio.to_thread(self._process_one, item)
                     for symbol, payload in events:
