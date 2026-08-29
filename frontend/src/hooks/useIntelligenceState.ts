@@ -4,6 +4,7 @@ import {
   subscribeSymbol,
   ApiError,
   type DailyLevelWireShape,
+  type FeatureSlopeWireShape,
   type FeatureValueNodeWireShape,
   type IntelligenceStateWireShape,
   type LevelInteractionWireShape,
@@ -15,6 +16,13 @@ export interface FeatureUnitEntry {
   value: number;
   candleTs: string;
   levelInteraction?: LevelInteractionWireShape;
+  // SMA/EMA slope family (confirmed decision #85) — present only on
+  // "sma"/"ema" entries once slope has warmed up (2*period-1 closes for
+  // SMA, more for EMA — see sma_slope()/ema_slope()'s own docstrings).
+  // Deliberately never carries its own `levelInteraction` — these four
+  // values are excluded from Level Interaction tracking entirely (same
+  // decision, LevelInteractionEngine._process_one).
+  slope?: FeatureSlopeWireShape;
 }
 
 export interface FeatureUnit {
@@ -51,6 +59,7 @@ function normalize(wire: IntelligenceStateWireShape): { timeframes: FeatureTimef
               value: unit.value,
               candleTs: unit.candle_ts,
               levelInteraction: unit.level_interaction,
+              slope: unit.slope,
             },
           ],
         };
@@ -61,6 +70,7 @@ function normalize(wire: IntelligenceStateWireShape): { timeframes: FeatureTimef
           value: node.value,
           candleTs: node.candle_ts,
           levelInteraction: node.level_interaction,
+          slope: node.slope,
         }))
         // Numeric sort for SMA/EMA-style periods ("9", "20", ...); for a
         // non-numeric family (Camarilla's "pp"/"r1"-"r4"/"s1"-"s4" — the

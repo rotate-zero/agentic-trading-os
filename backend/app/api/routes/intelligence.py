@@ -7,6 +7,18 @@ Symbol -> Timeframe -> Unit -> Period -> Variables hierarchy discussed and
 confirmed before any of this was built, so the frontend doesn't need to
 stitch two responses together itself.
 
+A Period node gained an optional `slope` sub-object in decision #85 —
+`{slope, r2, slope_pct?, slope_angle?}` — for SMA/EMA entries once
+sma_slope()/ema_slope() (decision #83) have warmed up. This is a fix to
+a gap in #83's own delivery, not a new feature: those four values were
+always being computed and published on `FeatureSet.features`, they just
+weren't being GROUPED under their owning period here (see
+`_parse_slope_key`'s own docstring) — each rendered as its own
+standalone, confusingly-labeled unit instead. The `slope` sub-object
+never carries its own `level_interaction` — those four keys are excluded
+from Level Interaction tracking entirely (same decision,
+`LevelInteractionEngine._process_one`), since none of them is a price.
+
 Also carries a top-level `daily_levels` array (confirmed decision #61,
 Stage 4) — symbol-scoped, not nested under any one timeframe, since the
 same list is attached to every timeframe's FeatureSet on a given close
@@ -98,6 +110,57 @@ def _parse_level_key(level_key: str) -> tuple[str, str | None]:
     return level_key, None
 
 
+# Confirmed decision #85 (a fix to decision #83's own delivery gap, not a
+# new feature) — the four keys sma_slope()/ema_slope()
+# (indicators/sma.py, indicators/ema.py) publish alongside sma_{period}/
+# ema_{period} itself: `_slope` and `_r2` (always), `_slope_pct` and
+# `_slope_angle` (only once the current SMA/EMA value is nonzero — see
+# sma_slope()'s own docstring). None of the four ends in a bare numeric
+# suffix, so `_parse_level_key`'s digit-suffix rule never grouped them —
+# each fell through to the flat "no period" path and rendered as its own
+# standalone accordion row, literally labeled e.g. "sma_9_slope_angle",
+# instead of nesting under the SMA-9 entry the way `sma_9` itself does.
+#
+# `_SMA_EMA_SLOPE_SUFFIXES` is checked with `str.endswith`, an exact
+# suffix match — "_slope" is never a suffix of "..._slope_pct" or
+# "..._slope_angle" (those end in "_pct"/"_angle"), so there's no
+# ordering dependency between the four entries despite "slope" reading
+# like a prefix of the other two.
+_SMA_EMA_SLOPE_SUFFIXES = ("_slope", "_r2", "_slope_pct", "_slope_angle")
+
+
+def _parse_slope_key(level_key: str) -> tuple[str, str, str] | None:
+    """
+    "sma_9_slope_angle" -> ("sma", "9", "slope_angle"); "ema_20_r2" ->
+    ("ema", "20", "r2"); "sma_9" itself, Camarilla's own keys, and
+    Regression/KAMA's own slope-shaped keys (`regression_9_slope`,
+    `kama_9_slope`, ...) -> None.
+
+    Deliberately its own function, not folded into `_parse_level_key`'s
+    generic digit-suffix rule — that rule groups a key under (unit,
+    period) using the value itself as the node; these four keys instead
+    need to attach as SUB-values on the period node `sma_{period}`/
+    `ema_{period}` already owns, which needs the caller to know which of
+    the four slope fields a given key is, not just its unit/period.
+
+    Scoped to `sma_`/`ema_` only, on direct instruction (decision #85).
+    Regression/KAMA (decision #67) publish an analogous slope/r2/dist
+    family with the identical grouping gap — flagged here, not fixed,
+    same "don't make it worse, don't fix it either" boundary decision
+    #85 draws around Camarilla's own already-flagged (decision #56),
+    already-fixed (decision #66) quirk.
+    """
+    for prefix, unit in (("sma_", "sma"), ("ema_", "ema")):
+        if not level_key.startswith(prefix):
+            continue
+        for suffix in _SMA_EMA_SLOPE_SUFFIXES:
+            if level_key.endswith(suffix):
+                period = level_key[len(prefix):-len(suffix)]
+                if period.isdigit():
+                    return unit, period, suffix.lstrip("_")
+    return None
+
+
 @router.get("/state")
 async def get_intelligence_state(
     symbol: str = Query(...),
@@ -134,19 +197,48 @@ async def get_intelligence_state(
         if not daily_levels and tf_data.get("daily_levels"):
             daily_levels = tf_data["daily_levels"]
 
+        # Two passes over the same dict, not one — deliberately, so a
+        # slope-family key (decision #85) can never race the base
+        # sma_{period}/ema_{period} key it attaches to, regardless of
+        # which order `tf_data["features"]` happens to iterate in.
+        # `raw_units[unit][period]` accumulates via setdefault rather
+        # than being assigned wholesale, so a slope key seen before its
+        # base key (or vice versa) can't clobber the other's fields —
+        # the OLD code's `units.setdefault(unit, {})[period] = node`
+        # was a full replace, which would have silently dropped whichever
+        # of the two lost the race once slope keys started sharing a
+        # period with their base key.
+        raw_units: dict[str, dict[str | None, dict[str, Any]]] = {}
+
         for level_key, value in tf_data["features"].items():
+            slope_component = _parse_slope_key(level_key)
+            if slope_component is not None:
+                unit, period, slope_field = slope_component
+                node = raw_units.setdefault(unit, {}).setdefault(period, {"candle_ts": tf_data["candle_ts"]})
+                # No `level_interaction` lookup here, on purpose: these
+                # four keys are excluded from Level Interaction tracking
+                # entirely as of this same decision (see
+                # LevelInteractionEngine._process_one) — they're never in
+                # `level_data_for_tf` to begin with, but the omission is
+                # deliberate either way, not an oversight.
+                node.setdefault("slope", {})[slope_field] = value
+                continue
+
             unit, period = _parse_level_key(level_key)
-            node: dict[str, Any] = {"value": value, "candle_ts": tf_data["candle_ts"]}
+            node = raw_units.setdefault(unit, {}).setdefault(period, {"candle_ts": tf_data["candle_ts"]})
+            node["value"] = value
+            node["candle_ts"] = tf_data["candle_ts"]
             level_interaction = level_data_for_tf.get(level_key)
             if level_interaction is not None:
                 node["level_interaction"] = level_interaction
 
-            if period is not None:
-                units.setdefault(unit, {})[period] = node
+        for unit, periods in raw_units.items():
+            if list(periods.keys()) == [None]:
+                # No numeric period (e.g. "vwap" or "pdh") — the unit
+                # bucket IS the node, no UnitValue level beneath it.
+                units[unit] = periods[None]
             else:
-                # No numeric period (e.g. a future "vwap" or "pdh") — the
-                # unit bucket IS the node, no UnitValue level beneath it.
-                units[unit] = node
+                units[unit] = {period: node for period, node in periods.items() if period is not None}
 
         timeframes[timeframe] = {"close": tf_data["close"], "units": units}
 

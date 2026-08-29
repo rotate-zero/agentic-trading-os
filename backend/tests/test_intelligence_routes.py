@@ -282,6 +282,82 @@ async def test_intelligence_state_merges_feature_and_level_interaction_data():
 
 
 @pytest.mark.asyncio
+async def test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction():
+    """
+    Confirmed decision #85, end-to-end through the real route: sma_9's
+    slope/r2/slope_pct/slope_angle (decision #83) must (a) nest under
+    units["sma"]["9"]["slope"] rather than render as their own
+    standalone units, and (b) never carry level_interaction of their
+    own, since they're excluded from LevelInteractionEngine tracking
+    entirely (see test_level_interaction_engine.py's own direct test of
+    that exclusion). sma_9 itself is untouched by either change.
+
+    Publishes 17 identical closes (2*9-1 — sma_slope()'s own warm-up
+    floor for period=9, indicators/sma.py's docstring) so slope/r2/
+    slope_pct/slope_angle are all deterministic on a perfectly flat
+    line: slope=0.0, r2=1.0 (a constant window is trivially, perfectly
+    explained by its own mean — same degenerate-value convention
+    regression.py's r2 already uses), slope_pct=0.0, slope_angle=0.0.
+    """
+    ticker = "__T_SLOPE_GRP__"
+    _clean_test_symbol(ticker)
+
+    try:
+        async with app.router.lifespan_context(app):
+            bus = get_event_bus()
+            base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=30)
+
+            for i in range(17):
+                payload = CandleClosed(
+                    timeframe="1m", open=100.0, high=100.0, low=100.0, close=100.0, volume=10,
+                    candle_ts=base_ts + timedelta(minutes=i),
+                )
+                await bus.publish(make_envelope(EventType.CANDLE_CLOSED, payload, symbol=ticker))
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                deadline = asyncio.get_event_loop().time() + 8.0
+                body = None
+                while asyncio.get_event_loop().time() < deadline:
+                    resp = await client.get("/intelligence/state", params={"symbol": ticker})
+                    candidate = resp.json()
+                    node = candidate.get("timeframes", {}).get("1m", {}).get("units", {}).get("sma", {}).get("9")
+                    if node is not None and "slope" in node:
+                        body = candidate
+                        break
+                    await asyncio.sleep(0.05)
+                if body is None:
+                    raise AssertionError(f"sma_9's slope sub-object never appeared for {ticker} within 8.0s")
+            await _wait_until_candles_persisted(ticker, expected_count=17)
+
+            units = body["timeframes"]["1m"]["units"]
+            sma9 = units["sma"]["9"]
+
+            # (a) grouping: all four slope fields live under one nested
+            # sub-object on the SAME entry as sma_9's own value.
+            assert sma9["value"] == 100.0
+            assert sma9["slope"] == {"slope": 0.0, "r2": 1.0, "slope_pct": 0.0, "slope_angle": 0.0}
+
+            # None of the four slope-family keys ever appear as their
+            # OWN standalone top-level unit — the bug this decision
+            # fixes ("sma_9_slope_angle" rendering as its own accordion
+            # row instead of nesting).
+            for bogus_key in ("sma_9_slope", "sma_9_r2", "sma_9_slope_pct", "sma_9_slope_angle"):
+                assert bogus_key not in units
+
+            # (b) exclusion: sma_9 itself still gets real
+            # level_interaction (close==100==sma_9's own value the whole
+            # time -> cold-start-unknown-origin touch, same shape as
+            # test_intelligence_state_merges_feature_and_level_interaction_data
+            # above), but the nested "slope" sub-object carries no
+            # level_interaction concept of its own at all.
+            assert sma9["level_interaction"]["zone"] == "inside_aura"
+            assert "level_interaction" not in sma9["slope"]
+    finally:
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
 async def test_intelligence_state_symbol_filter_does_not_leak_between_symbols():
     ticker_a = "__T_INTEL_B__"
     ticker_b = "__T_INTEL_C__"

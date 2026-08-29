@@ -108,10 +108,26 @@ export interface LevelInteractionWireShape {
   holding?: LevelInteractionHoldingWireShape;
 }
 
+// SMA/EMA slope family (confirmed decisions #83, #85) — sma_slope()/
+// ema_slope() (backend indicators/sma.py, indicators/ema.py) publish
+// `slope`/`r2` always, `slope_pct`/`slope_angle` only once the current
+// SMA/EMA value is nonzero (see that function's own docstring). Nested
+// under the OWNING period's FeatureValueNodeWireShape below as of
+// decision #85 — previously each of the four rendered as its own
+// standalone top-level unit (`_parse_level_key`'s digit-suffix rule
+// never grouped them), which is the bug #85 fixes.
+export interface FeatureSlopeWireShape {
+  slope: number;
+  r2: number;
+  slope_pct?: number;
+  slope_angle?: number;
+}
+
 export interface FeatureValueNodeWireShape {
   value: number;
   candle_ts: string;
   level_interaction?: LevelInteractionWireShape;
+  slope?: FeatureSlopeWireShape;
 }
 
 export type FeatureUnitWireShape = FeatureValueNodeWireShape | Record<string, FeatureValueNodeWireShape>;

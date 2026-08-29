@@ -103,6 +103,29 @@ top of that, each level_key within one FeaturesUpdated is processed inside
 its own try/except, so one bad level (or a transient DB hiccup) can't
 block the other configured periods for the same symbol, or the next
 event behind it in this engine's own queue.
+
+SMA/EMA slope-family keys (confirmed decision #85) are the SECOND
+deliberate exception to "zero code changes, tracks every key" above, and
+were flagged as a known gap back in decision #83's own write-up before
+being fixed here: `sma_{period}_slope`/`_r2`/`_slope_pct`/`_slope_angle`
+and the `ema_` equivalents (indicators/sma.py::sma_slope(),
+indicators/ema.py::ema_slope(), confirmed decision #83) are a $/bar rate,
+a 0-1 fit-quality score, a %/bar rate, and a degree angle — none of them
+a price, so running touch/holding/rejected/conquered tracking against
+`close` for any of them (which `_process_one` did unconditionally before
+this fix) produced meaningless classifications and wrote real, persisted
+`level_interaction_state`/`level_interaction_events` rows for numbers
+that were never a level to begin with. Excluded via a small, explicit
+suffix check (`_is_sma_ema_slope_key`, checked ahead of the per-key loop
+in `_process_one`) — deliberately NOT a general-purpose allowlist
+covering every current/future Feature Engine key: `atr_14`, `gap_pct`,
+`rvol`, `regression_*`, `kama_*_slope`, and friends have the identical
+problem (flagged explicitly in decision #83's own write-up), but fixing
+all of them at once is a broader architectural decision still being
+worked out elsewhere, out of scope for this narrow, SMA/EMA-slope-
+specific fix. Original `sma_{period}`/`ema_{period}` values themselves
+are UNCHANGED by this — they're real price levels and keep getting
+tracked exactly as before; only their slope-derived siblings are excluded.
 """
 from __future__ import annotations
 
@@ -145,6 +168,34 @@ class _LiveState:
     touch_anchor_price: float | None = None
     touch_entered_ts: datetime | None = None
     touch_entered_from: str | None = None  # below | above | None (cold-start)
+
+
+# Confirmed decision #85 — see the module docstring's own paragraph on
+# SMA/EMA slope-family exclusion for the full reasoning. Endswith-checked
+# (an exact suffix match), same as `_parse_slope_key`'s identical check in
+# `api/routes/intelligence.py` — the two are deliberately NOT the same
+# shared constant/function despite checking the same four suffixes: this
+# one only needs a yes/no exclusion decision, that one needs to extract
+# which of the four fields a key is, and importing across an
+# API-routes-module <-> trading-intelligence-module boundary for four
+# short strings would be a worse coupling than the small duplication.
+_SMA_EMA_SLOPE_KEY_SUFFIXES = ("_slope", "_r2", "_slope_pct", "_slope_angle")
+
+
+def _is_sma_ema_slope_key(level_key: str) -> bool:
+    """
+    True for "sma_9_slope", "ema_20_r2", "sma_50_slope_pct",
+    "ema_9_slope_angle", etc. False for "sma_9"/"ema_20" themselves
+    (real levels, still tracked), and false for every OTHER family that
+    happens to share a "_slope"/"_r2" suffix (`regression_9_slope`,
+    `kama_9_slope`, ...) — scoped to `sma_`/`ema_` only, on direct
+    instruction (decision #85), even though those other families share
+    the identical underlying problem (flagged, not fixed, in decision
+    #83's own write-up).
+    """
+    if not (level_key.startswith("sma_") or level_key.startswith("ema_")):
+        return False
+    return level_key.endswith(_SMA_EMA_SLOPE_KEY_SUFFIXES)
 
 
 def classify_zone(close: float, level_value: float, aura_pct: float) -> str:
@@ -384,6 +435,11 @@ class LevelInteractionEngine:
 
         results: list[tuple[str, LevelInteractionChanged]] = []
         for level_key, level_value in features.items():
+            if _is_sma_ema_slope_key(level_key):
+                # Confirmed decision #85 — not a price, never tracked as
+                # a level. See module docstring / _is_sma_ema_slope_key's
+                # own docstring for the full reasoning.
+                continue
             try:
                 event = self._process_level(symbol, timeframe, level_key, float(level_value), close, candle_ts)
                 if event is not None:

@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import { useIntelligenceState, type FeatureTimeframe, type FeatureUnit, type FeatureUnitEntry } from "../../hooks/useIntelligenceState";
+import type { FeatureSlopeWireShape } from "../../services/api-client";
 import { useDropdownPlacement } from "../../hooks/useDropdownPlacement";
 import { MOCK_TICKERS } from "../../mocks/tickers";
 
@@ -110,6 +111,39 @@ function VariableRow({ label, value }: { label: string; value: string }) {
   );
 }
 
+// SMA/EMA slope-family sub-values (confirmed decision #85 — closes the
+// gap flagged in decision #83's own write-up, where sma_9_slope/_r2/
+// _slope_pct/_slope_angle each rendered as their OWN standalone
+// accordion row, literally labeled e.g. "sma_9_slope_angle", instead of
+// nesting under the SMA-9 entry the way sma_9's own value does).
+//
+// `slope_pct`/`slope_angle` are the two the backend omits when the
+// current SMA/EMA value is exactly 0 (indicators/sma.py::sma_slope()'s
+// own docstring) — `slope`/`r2` are shown unconditionally since the
+// backend always publishes both. Labeled "slope"/"angle"/"fit quality"
+// per the report's own suggested wording, not the raw key names — a
+// reader of this panel shouldn't need to already know what "r2" means.
+function formatSigned(value: number, decimals: number, suffix: string): string {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(decimals)}${suffix}`;
+}
+
+function SlopeBlock({ slope }: { slope: FeatureSlopeWireShape }) {
+  return (
+    <div className="flex flex-col gap-0.5 border-t border-base-border/40 pt-1">
+      {slope.slope_pct !== undefined ? (
+        <VariableRow label="slope" value={formatSigned(slope.slope_pct, 4, "%/bar")} />
+      ) : (
+        // slope_pct omitted only when the current SMA/EMA value is
+        // exactly 0 — falls back to the raw (unnormalized) $/bar
+        // coefficient rather than showing nothing.
+        <VariableRow label="slope" value={formatSigned(slope.slope, 6, "/bar")} />
+      )}
+      {slope.slope_angle !== undefined && <VariableRow label="angle" value={formatSigned(slope.slope_angle, 1, "°")} />}
+      <VariableRow label="fit quality" value={slope.r2.toFixed(3)} />
+    </div>
+  );
+}
+
 function UnitValueBlock({ entry, timeframeSeconds }: { entry: FeatureUnitEntry; timeframeSeconds: number }) {
   const li = entry.levelInteraction;
   return (
@@ -118,6 +152,7 @@ function UnitValueBlock({ entry, timeframeSeconds }: { entry: FeatureUnitEntry; 
         {entry.period !== null && <span className="font-mono text-xs font-semibold text-text-primary">{entry.period}</span>}
         <span className="font-mono text-xs text-text-primary">{entry.value.toFixed(4)}</span>
       </div>
+      {entry.slope && <SlopeBlock slope={entry.slope} />}
       {li ? (
         <div className="flex flex-col gap-0.5 border-t border-base-border/40 pt-1">
           <VariableRow label="zone" value={li.zone} />

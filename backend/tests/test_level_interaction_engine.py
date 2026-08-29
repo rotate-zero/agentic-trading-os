@@ -28,7 +28,11 @@ from app.event_bus.bus import EventBus
 from app.event_bus.events import make_envelope
 from app.schemas.events.envelope import EventType
 from app.schemas.events.features import FeatureSet
-from app.trading_intelligence.level_interaction_engine import LevelInteractionEngine, classify_zone
+from app.trading_intelligence.level_interaction_engine import (
+    LevelInteractionEngine,
+    _is_sma_ema_slope_key,
+    classify_zone,
+)
 
 # A fixed, DST-unambiguous UTC instant: 2026-08-10 14:00 UTC = 10:00 ET (EDT, UTC-4).
 _DAY1 = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
@@ -90,6 +94,27 @@ def test_classify_zone_boundaries():
     assert classify_zone(100.3, 100.0, aura) == "above"
     assert classify_zone(99.8, 100.0, aura) == "inside_aura"
     assert classify_zone(99.7, 100.0, aura) == "below"
+
+
+def test_is_sma_ema_slope_key_matches_exactly_the_four_published_suffixes():
+    # sma_slope()/ema_slope() (indicators/sma.py, indicators/ema.py,
+    # confirmed decision #83) publish exactly these four suffixes per
+    # period — pinning all four, not just the three ("slope",
+    # "slope_angle", "r2") the original bug report named. "slope_pct"
+    # has the identical problem and was missing from the report.
+    for key in (
+        "sma_9_slope", "sma_9_r2", "sma_9_slope_pct", "sma_9_slope_angle",
+        "ema_20_slope", "ema_20_r2", "ema_20_slope_pct", "ema_20_slope_angle",
+    ):
+        assert _is_sma_ema_slope_key(key), key
+
+
+def test_is_sma_ema_slope_key_false_for_the_base_levels_and_other_families():
+    # sma_9/ema_20 themselves are real levels — still tracked, never
+    # excluded. Regression/KAMA share the identical "_slope"/"_r2"
+    # suffix shape but are deliberately out of scope (decision #85).
+    for key in ("sma_9", "ema_20", "vwap", "pdh", "cam_r1", "regression_9_slope", "regression_9_r2", "kama_9_slope"):
+        assert not _is_sma_ema_slope_key(key), key
 
 
 # --- state machine, against real Postgres -----------------------------------
@@ -303,6 +328,77 @@ async def test_restart_survival_mid_touch():
         finally:
             await engine_b.stop()
     finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_sma_ema_slope_family_keys_excluded_from_level_tracking():
+    """Confirmed decision #85 — before this fix, _process_one walked
+    every features.items() key unconditionally, so sma_9_slope (a $/bar
+    rate), sma_9_r2 (a 0-1 fit-quality score), sma_9_slope_pct (%/bar),
+    sma_9_slope_angle (degrees), and their ema_ equivalents were getting
+    real zone/touch classifications against `close` as if they were
+    price levels.
+
+    Deliberately sets every slope-family value EQUAL to close — exactly
+    the condition that would register a cold-start "inside_aura" touch
+    (and an event on any FUTURE transition) if these were still being
+    tracked — so this proves the exclusion is real, not just untested by
+    accident because the values happened to already be far from close.
+    """
+    ticker = "__LIE_SLOPEX__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {
+        "sma_9": 150.0,  # a real level, deliberately far from close — the control
+        "sma_9_slope": close,
+        "sma_9_r2": close,
+        "sma_9_slope_pct": close,
+        "sma_9_slope_angle": close,
+        "ema_20_slope": close,
+        "ema_20_r2": close,
+        "ema_20_slope_pct": close,
+        "ema_20_slope_angle": close,
+    }
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+
+        # No event for any slope-family key — not even a cold-start
+        # "unclassified" one — despite every one of them numerically
+        # equal to close.
+        assert received == []
+
+        # Only "sma_9" (the real, still-tracked level) ever entered this
+        # engine's in-memory state — the eight slope-family keys never
+        # got so much as a first-ever cold-start observation recorded.
+        snapshot = engine.get_snapshot(ticker)
+        keys_seen = set(snapshot.get(ticker, {}).get("1m", {}).keys())
+        assert keys_seen == {"sma_9"}
+
+        # A second candle that WOULD flip every slope-family key's
+        # classify_zone() result if it were still being evaluated
+        # (close moves from equal-to-level to way outside any aura) —
+        # still produces nothing for any of them. The control DOES fire
+        # here (close=1000 is now far from sma_9=150 — a legitimate,
+        # expected gap-through for the one real level), which is exactly
+        # why this asserts per-level-key rather than an empty list from
+        # here on: proves the slope-family keys stayed silent even while
+        # real tracking was actively happening in the same event.
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
         await bus.stop()
         _clean_test_symbol(ticker)
 
