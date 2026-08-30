@@ -30,6 +30,7 @@ from app.schemas.events.envelope import EventType
 from app.schemas.events.features import FeatureSet
 from app.trading_intelligence.level_interaction_engine import (
     LevelInteractionEngine,
+    _is_excluded_from_level_tracking,
     _is_sma_ema_slope_key,
     classify_zone,
 )
@@ -115,6 +116,102 @@ def test_is_sma_ema_slope_key_false_for_the_base_levels_and_other_families():
     # suffix shape but are deliberately out of scope (decision #85).
     for key in ("sma_9", "ema_20", "vwap", "pdh", "cam_r1", "regression_9_slope", "regression_9_r2", "kama_9_slope"):
         assert not _is_sma_ema_slope_key(key), key
+
+
+# --- _is_excluded_from_level_tracking (confirmed decision #86) --------------
+#
+# Closes the broader gap decisions #83/#85 both flagged and deferred. Every
+# key below is audited directly against the real indicator source
+# (indicators/atr.py, gap.py, session_change.py, rvol.py, regression.py,
+# kama.py) and engine.py's own premarket_volume_ratio/session_volume/
+# session_volume_ext, in the same conversation this exclusion was written,
+# not assumed from the report that requested it.
+
+
+def test_atr_family_excluded_wholesale_both_the_base_value_and_pct():
+    # ATR is the one family excluded ENTIRELY — atr_{period} itself is a
+    # MAGNITUDE (typical daily range), never a price coordinate, unlike
+    # kama_{period}/regression_{period}_value which keep their own base
+    # value tracked. No "base stays, derived goes" split for ATR.
+    for key in ("atr_14", "atr_14_pct", "atr_20", "atr_20_pct"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_gap_family_excluded():
+    for key in ("gap_pct", "gap_dollars"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_session_change_family_excluded():
+    for key in ("session_pct_change", "session_dollar_change"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_rvol_and_premarket_volume_ratio_excluded():
+    # Same underlying rvol() math (rvol.py), two different callers
+    # (engine.py's _update_rvol vs _update_premarket_volume_ratio) —
+    # both a ratio, neither a price.
+    for key in ("rvol", "premarket_volume_ratio"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_session_volume_totals_excluded():
+    # Share counts, not prices — engine.py's _update_vwap/_update_vwap_ext.
+    for key in ("session_volume", "session_volume_ext"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_regression_derived_keys_excluded_but_value_itself_still_tracked():
+    # slope/deviation/r2/slope_norm are all derived byproducts — excluded.
+    for key in (
+        "regression_9_slope", "regression_9_deviation", "regression_9_r2", "regression_9_slope_norm",
+        "regression_20_slope", "regression_20_deviation", "regression_20_r2", "regression_20_slope_norm",
+    ):
+        assert _is_excluded_from_level_tracking(key), key
+    # regression_{period}_value is decision #86's own deliberately-argued
+    # call: it's a fitted price-scale reference line, structurally the
+    # same kind of key as kama_{period}'s own base value (which #85
+    # already kept tracked) — NOT a delta/ratio the way `deviation`
+    # (close - value) right next to it is. Stays tracked.
+    for key in ("regression_9_value", "regression_20_value"):
+        assert not _is_excluded_from_level_tracking(key), key
+
+
+def test_kama_derived_keys_excluded_but_base_value_itself_still_tracked():
+    # slope/dist/dist_pct/slope_norm/er are all derived byproducts —
+    # excluded. kama_{period} itself (the moving average value) is a real
+    # price-scale reference, unaffected — same "base stays, derived goes"
+    # split as regression_{period}_value above, already established for
+    # this family back in decision #85's own write-up.
+    for key in ("kama_9_slope", "kama_9_dist", "kama_9_dist_pct", "kama_9_slope_norm", "kama_9_er"):
+        assert _is_excluded_from_level_tracking(key), key
+    for key in ("kama_9", "kama_20"):
+        assert not _is_excluded_from_level_tracking(key), key
+
+
+def test_excluded_from_level_tracking_checks_sma_ema_slope_family_too():
+    # _is_excluded_from_level_tracking EXTENDS _is_sma_ema_slope_key
+    # (decision #85), it doesn't bypass or duplicate it — this pins that
+    # the combined predicate still catches everything the narrower one
+    # already did.
+    for key in ("sma_9_slope", "sma_9_r2", "sma_9_slope_pct", "sma_9_slope_angle", "ema_20_slope"):
+        assert _is_excluded_from_level_tracking(key), key
+
+
+def test_excluded_from_level_tracking_false_for_every_genuine_price_level():
+    # The full "what stays tracked, unchanged" list from decision #86's
+    # own report, verified together in one place so a future change to
+    # any exclusion rule that accidentally widens its net gets caught
+    # here regardless of which specific family it came from.
+    for key in (
+        "sma_9", "sma_20", "sma_50", "ema_9", "ema_20",
+        "vwap", "vwap_ext",
+        "pdc", "pdh", "pdl", "pmh", "pml", "vpoc",
+        "cam_pp", "cam_r1", "cam_r2", "cam_r3", "cam_r4", "cam_s1", "cam_s2", "cam_s3", "cam_s4",
+        "kama_9", "kama_20",
+        "regression_9_value", "regression_20_value",
+    ):
+        assert not _is_excluded_from_level_tracking(key), key
 
 
 # --- state machine, against real Postgres -----------------------------------
@@ -397,6 +494,278 @@ async def test_sma_ema_slope_family_keys_excluded_from_level_tracking():
         await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
         await asyncio.sleep(0.2)
         assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_atr_family_excluded_from_level_tracking_end_to_end():
+    """Confirmed decision #86 — atr_{period} and atr_{period}_pct
+    (indicators/atr.py) are a MAGNITUDE (typical daily range), never a
+    price coordinate — excluded WHOLESALE, unlike Regression/KAMA where
+    the base value stays tracked. Same "set equal to close" proof shape
+    as decision #85's own regression test above."""
+    ticker = "__LIE_ATR__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {
+        "sma_9": 150.0,  # control — a real level, far from close
+        "atr_14": close,
+        "atr_14_pct": close,
+        "atr_20": close,
+        "atr_20_pct": close,
+    }
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"sma_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_gap_family_excluded_from_level_tracking_end_to_end():
+    """Confirmed decision #86 — gap_pct/gap_dollars (indicators/gap.py)
+    are a percentage and a price DELTA from `pdc`, never a price
+    coordinate themselves."""
+    ticker = "__LIE_GAP__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {"sma_9": 150.0, "gap_pct": close, "gap_dollars": close}
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"sma_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_session_change_family_excluded_from_level_tracking_end_to_end():
+    """Confirmed decision #86 — session_pct_change/session_dollar_change
+    (indicators/session_change.py) are a percentage and a price DELTA
+    from `pdc`, tracked continuously through the session but never a
+    price coordinate themselves."""
+    ticker = "__LIE_SESCH__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {"sma_9": 150.0, "session_pct_change": close, "session_dollar_change": close}
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"sma_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_rvol_and_premarket_volume_ratio_excluded_from_level_tracking_end_to_end():
+    """Confirmed decision #86 — rvol/premarket_volume_ratio (rvol.py,
+    engine.py's two callers of it) are both a ratio, never a price."""
+    ticker = "__LIE_RVOL__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {"sma_9": 150.0, "rvol": close, "premarket_volume_ratio": close}
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"sma_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_session_volume_totals_excluded_from_level_tracking_end_to_end():
+    """Confirmed decision #86 — session_volume/session_volume_ext
+    (engine.py's _update_vwap/_update_vwap_ext) share counts, not prices."""
+    ticker = "__LIE_SESVOL__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {"sma_9": 150.0, "session_volume": close, "session_volume_ext": close}
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"sma_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"sma_9"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_regression_derived_keys_excluded_but_value_still_tracked_end_to_end():
+    """Confirmed decision #86's own deliberately-argued call:
+    regression_{period}_slope/deviation/r2/slope_norm (indicators/
+    regression.py) are derived byproducts, excluded — but
+    regression_{period}_value is a fitted price-scale reference line,
+    structurally the same kind of key as kama_{period}'s own base value
+    (#85 already kept that tracked), so it STAYS tracked here, unlike
+    every other newly-excluded family in this decision.
+    `regression_9_value` plays the same "control" role sma_9 plays in
+    the other tests above — a real, still-tracked level, deliberately
+    far from close — while the four derived keys, set EQUAL to close,
+    are the actual thing being proven excluded."""
+    ticker = "__LIE_REGR__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {
+        "regression_9_value": 150.0,  # a real level, still tracked — the control
+        "regression_9_slope": close,
+        "regression_9_deviation": close,
+        "regression_9_r2": close,
+        "regression_9_slope_norm": close,
+    }
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        # Only regression_9_value ever entered tracking — the four
+        # derived keys, despite being numerically equal to close, never
+        # got so much as a first-ever cold-start observation recorded.
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"regression_9_value"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"regression_9_value"}
+    finally:
+        await engine.stop()
+        await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.asyncio
+async def test_kama_derived_keys_excluded_but_base_value_still_tracked_end_to_end():
+    """Confirmed decision #86 — kama_{period}_slope/dist/dist_pct/
+    slope_norm/er (indicators/kama.py) are derived byproducts, excluded.
+    kama_{period} itself was already explicit about staying tracked back
+    in decision #85's own write-up — this test proves it end-to-end
+    against the real engine, `kama_9` playing the same "control" role
+    sma_9 plays in the other tests above."""
+    ticker = "__LIE_KAMA__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    engine = LevelInteractionEngine(bus, aura_pct=0.002)
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.LEVEL_INTERACTION_CHANGED, lambda e: received.append(e))
+
+    close = 100.0
+    features = {
+        "kama_9": 150.0,  # a real level, still tracked — the control
+        "kama_9_slope": close,
+        "kama_9_dist": close,
+        "kama_9_dist_pct": close,
+        "kama_9_slope_norm": close,
+        "kama_9_er": close,
+    }
+
+    try:
+        await _publish(bus, ticker, _DAY1, close, features)
+        await asyncio.sleep(0.2)
+        assert received == []
+
+        snapshot = engine.get_snapshot(ticker)
+        assert set(snapshot.get(ticker, {}).get("1m", {}).keys()) == {"kama_9"}
+
+        await _publish(bus, ticker, _DAY1 + timedelta(minutes=1), close * 10, features)
+        await asyncio.sleep(0.2)
+        assert {e.payload["level_key"] for e in received} == {"kama_9"}
     finally:
         await engine.stop()
         await bus.stop()

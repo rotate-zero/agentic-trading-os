@@ -1,7 +1,7 @@
 # Decision Index
 
 
-One line per confirmed decision, #1 through #85, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
+One line per confirmed decision, #1 through #86, across every file in this directory. Read this first — it's a fraction of the cost of reading the full history, and points to exactly which file has the full text of anything relevant to the current task. See `README.md` for the full read/write/maintain protocol.
 
 | # | Summary | File |
 |---|---|---|
@@ -90,3 +90,4 @@ One line per confirmed decision, #1 through #85, across every file in this direc
 | 83 | SMA/EMA slope-as-angle, computed in the Feature Engine (live + historical paths), percentage-normalized (not ATR — same cross-timeframe objection as #67), lookback tied to each period, surfaced as a numeric `∠+35.2°` label suffix behind a new per-instance toggle. | `confirmed-decisions.md` |
 | 84 | `LevelInteractionEngine.stop()`'s FK-violation-on-teardown race root-caused to `task.cancel()` not actually stopping an in-flight `to_thread` DB write; fixed with a poison-pill queue drain. `CandleRecorder`/`FeatureEngine` flagged as likely sharing the same latent bug, not yet fixed. | `confirmed-decisions.md` |
 | 85 | Two SMA/EMA slope gaps #83 itself flagged and deferred, fixed together: `sma_9_slope`/`_r2`/`_slope_pct`/`_slope_angle` (and `ema_`) now (a) nest under the owning period's Feature Engine panel entry instead of rendering as their own bogus standalone units, and (b) are excluded from Level Interaction Engine tracking instead of getting real zone/touch classifications against `close`. Regression/KAMA's identical gaps flagged, not fixed — deliberately scoped to SMA/EMA only. | `confirmed-decisions.md` |
+| 86 | Closes the broader Level Interaction Engine tracking gap #83/#85 flagged and deferred: ATR/ATR% (excluded wholesale), Gap, Session Change, RVOL, Premarket Volume Ratio, session volume totals, and Regression/KAMA's own derived slope/deviation/r2/dist/efficiency byproducts are now excluded too. `regression_{period}_value` decided to stay tracked — same "reference line kept, its own delta excluded" split already established for `kama_{period}`. | `confirmed-decisions.md` |

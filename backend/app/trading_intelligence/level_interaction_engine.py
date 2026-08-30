@@ -116,16 +116,33 @@ a price, so running touch/holding/rejected/conquered tracking against
 this fix) produced meaningless classifications and wrote real, persisted
 `level_interaction_state`/`level_interaction_events` rows for numbers
 that were never a level to begin with. Excluded via a small, explicit
-suffix check (`_is_sma_ema_slope_key`, checked ahead of the per-key loop
-in `_process_one`) — deliberately NOT a general-purpose allowlist
-covering every current/future Feature Engine key: `atr_14`, `gap_pct`,
-`rvol`, `regression_*`, `kama_*_slope`, and friends have the identical
-problem (flagged explicitly in decision #83's own write-up), but fixing
-all of them at once is a broader architectural decision still being
-worked out elsewhere, out of scope for this narrow, SMA/EMA-slope-
-specific fix. Original `sma_{period}`/`ema_{period}` values themselves
-are UNCHANGED by this — they're real price levels and keep getting
-tracked exactly as before; only their slope-derived siblings are excluded.
+suffix check (`_is_sma_ema_slope_key`, untouched by decision #86 below,
+still checked first) — deliberately NOT, at the time, a general-purpose
+allowlist covering every current/future Feature Engine key: `atr_14`,
+`gap_pct`, `rvol`, `regression_*`, `kama_*_slope`, and friends had the
+identical problem (flagged explicitly in decision #83's own write-up),
+but fixing all of them at once was a broader architectural decision
+still being worked out elsewhere at the time, out of scope for that
+narrow, SMA/EMA-slope-specific fix.
+
+Confirmed decision #86 closes that broader gap — every remaining
+non-price-coordinate key ATR, Gap, Session Change, RVOL, Premarket
+Volume Ratio, session volume totals, Regression, and KAMA publish is now
+excluded too (`_is_excluded_from_level_tracking`, which checks
+`_is_sma_ema_slope_key` first, then the newer families — the #85
+mechanism EXTENDED, not replaced or duplicated). `sma_{period}`/
+`ema_{period}` themselves, and every other genuine price-scale reference
+this engine tracks (`vwap`/`vwap_ext`, `pdc`/`pdh`/`pdl`/`pmh`/`pml`,
+`vpoc`, Camarilla's nine pivots, `kama_{period}` itself, and — the one
+deliberately-argued call in #86 — `regression_{period}_value`, on the
+grounds that it's structurally the same kind of key as `kama_{period}`
+(a fitted price-scale reference line with its own separate `deviation`/
+`dist` delta feature sitting right next to it, not a delta or ratio
+itself) — remain unchanged, still tracked exactly as before. See decision
+#86's own write-up for the full per-family reasoning, including why ATR
+is the one family excluded WHOLESALE (its base value is a magnitude —
+typical daily RANGE — never a price coordinate at all, unlike KAMA/
+Regression's own base values).
 """
 from __future__ import annotations
 
@@ -196,6 +213,97 @@ def _is_sma_ema_slope_key(level_key: str) -> bool:
     if not (level_key.startswith("sma_") or level_key.startswith("ema_")):
         return False
     return level_key.endswith(_SMA_EMA_SLOPE_KEY_SUFFIXES)
+
+
+# Confirmed decision #86 — closes the broader gap decisions #83 and #85
+# both flagged and deferred ("atr_14, gap_pct, rvol, regression_*,
+# kama_*_slope, and friends have the identical problem... a broader
+# architectural decision still being worked out elsewhere"). Every key
+# below is a ratio, percentage, magnitude, efficiency score, or price
+# DELTA — never a coordinate on the same scale as `close` — audited
+# directly against indicators/atr.py, gap.py, session_change.py,
+# rvol.py, regression.py, kama.py, and engine.py's own
+# premarket_volume_ratio/session_volume/session_volume_ext, not assumed
+# from the report that requested this.
+#
+# Two no-period, single-fixed-name families (Gap, Session Change) plus
+# three no-period single keys Feature Engine publishes directly from
+# engine.py (RVOL, Premarket Volume Ratio, and the two raw session
+# volume totals — share COUNTS, not prices, same reasoning as the
+# dollar-delta keys below) — a flat set, no period/suffix parsing needed
+# since none of these varies by period.
+_EXACT_EXCLUDED_KEYS = frozenset({
+    "gap_pct", "gap_dollars",
+    "session_pct_change", "session_dollar_change",
+    "rvol", "premarket_volume_ratio",
+    "session_volume", "session_volume_ext",
+})
+
+# prefix -> the excluded suffixes for period-keyed families. An empty
+# string "" in a family's tuple means the BARE `{prefix}{period}` key —
+# the family's own base value, with no suffix at all — is excluded too,
+# not just its derived siblings.
+#
+# ATR is the one family excluded WHOLESALE (both `""` and `"_pct"`):
+# `atr_{period}` itself is a MAGNITUDE — how big a typical daily range
+# is — never a price coordinate the way `kama_{period}`/`sma_{period}`/
+# `regression_{period}_value` are, so unlike those, there's no "base
+# value stays, derived siblings go" split to make here; the whole family
+# is off-scale for `close` comparison from the start.
+#
+# Regression and KAMA both keep their own bare `{prefix}{period}`-shaped
+# base value tracked (`kama_{period}` was already explicit about this in
+# decision #85's own write-up; `regression_{period}_value` is decision
+# #86's own deliberately-argued call — see the module docstring's own
+# paragraph on it) — so neither family's tuple includes `""`, only their
+# genuinely derived slope/deviation/r2/dist/efficiency byproducts.
+_PERIOD_KEYED_EXCLUDED_SUFFIXES: dict[str, tuple[str, ...]] = {
+    "atr_": ("", "_pct"),
+    "regression_": ("_slope", "_deviation", "_r2", "_slope_norm"),
+    "kama_": ("_slope", "_dist", "_dist_pct", "_slope_norm", "_er"),
+}
+
+
+def _is_excluded_from_level_tracking(level_key: str) -> bool:
+    """
+    True for every non-price-coordinate key Feature Engine currently
+    publishes — ATR/ATR%, Gap, Session Change, RVOL, Premarket Volume
+    Ratio, the two session volume totals, and Regression/KAMA's own
+    derived slope/deviation/r2/dist/efficiency byproducts. False for
+    every genuine price-scale reference this engine tracks: `sma_*`,
+    `ema_*`, `vwap`/`vwap_ext`, `pdc`/`pdh`/`pdl`/`pmh`/`pml`, `vpoc`,
+    Camarilla's nine pivots, `kama_{period}` itself, and
+    `regression_{period}_value`.
+
+    Checks `_is_sma_ema_slope_key` (decision #85) FIRST, unmodified —
+    this function EXTENDS that decision's exclusion to the remaining
+    families, it doesn't replace, duplicate, or re-derive what #85
+    already built and tested.
+
+    The period-suffix check mirrors `_is_sma_ema_slope_key`'s own
+    endswith-based exact-suffix matching (no ordering dependency between
+    a family's suffixes — see that function's own docstring for why),
+    generalized to data (`_PERIOD_KEYED_EXCLUDED_SUFFIXES`) since three
+    families need the identical shape of check rather than three more
+    copies of the same loop.
+    """
+    if _is_sma_ema_slope_key(level_key):
+        return True
+    if level_key in _EXACT_EXCLUDED_KEYS:
+        return True
+    for prefix, suffixes in _PERIOD_KEYED_EXCLUDED_SUFFIXES.items():
+        if not level_key.startswith(prefix):
+            continue
+        for suffix in suffixes:
+            if suffix:
+                if not level_key.endswith(suffix):
+                    continue
+                candidate_period = level_key[len(prefix):-len(suffix)]
+            else:
+                candidate_period = level_key[len(prefix):]
+            if candidate_period.isdigit():
+                return True
+    return False
 
 
 def classify_zone(close: float, level_value: float, aura_pct: float) -> str:
@@ -435,10 +543,11 @@ class LevelInteractionEngine:
 
         results: list[tuple[str, LevelInteractionChanged]] = []
         for level_key, level_value in features.items():
-            if _is_sma_ema_slope_key(level_key):
-                # Confirmed decision #85 — not a price, never tracked as
-                # a level. See module docstring / _is_sma_ema_slope_key's
-                # own docstring for the full reasoning.
+            if _is_excluded_from_level_tracking(level_key):
+                # Confirmed decisions #85/#86 — not a price coordinate,
+                # never tracked as a level. See module docstring /
+                # _is_excluded_from_level_tracking's own docstring for
+                # the full reasoning.
                 continue
             try:
                 event = self._process_level(symbol, timeframe, level_key, float(level_value), close, candle_ts)
