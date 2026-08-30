@@ -1,6 +1,6 @@
 # Trading Intelligence Architecture
 **Version:** 1.7 — generalized hotkey/action model (Action Categories, Safety Levels, Hotkey Context, action-to-multi-device bindings); `LONG`/`SHORT` intent actions replace `BUY`/`SELL`/`PROPOSE_LONG`/`PROPOSE_SHORT`; `FocusedTile` renamed `TradeTarget`
-**Companion documents:** [`system-design.md`](./system-design.md) — that doc explains *how the system is built* (modules, interfaces, deployment, folder structure). This doc explains *how the system thinks* (market state, context, strategy, decision logic). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) holds concepts raised and deliberately deferred, with the reasoning intact, so they don't need to be re-argued from scratch later. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) is the running settled-decisions log. Keep these separate; a change to trading logic shouldn't require touching WebSocket plumbing, and an idea that isn't ready yet shouldn't clutter a document meant to describe what's actually built. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
+**Companion documents:** [`system-design.md`](./system-design.md) — that doc explains *how the system is built* (modules, interfaces, deployment, folder structure). This doc explains *how the system thinks* (market state, context, strategy, decision logic). [`strategy-engine-design.md`](./strategy-engine-design.md) — §8–14's direction lock (decision #87): Strategy internals, versioned configs, Performance Intelligence's outcome schema, and how Decision Engine/Governor consume it. Concept only, no application code yet. [`../decisions/future-ideas.md`](../decisions/future-ideas.md) holds concepts raised and deliberately deferred, with the reasoning intact, so they don't need to be re-argued from scratch later. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) is the running settled-decisions log. Keep these separate; a change to trading logic shouldn't require touching WebSocket plumbing, and an idea that isn't ready yet shouldn't clutter a document meant to describe what's actually built. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
 
 ---
 
@@ -207,6 +207,8 @@ No trade yet. Only opportunity. Strategies don't run on a shared clock — each 
 
 Planned initial strategy set: ORB, Momentum, First Pullback, VWAP, Gap, Reversal, Volume Spike. News is listed as a future addition, not a v1 strategy.
 
+**Internal design direction-locked, not yet built.** The four-stage `evaluate()` anatomy (GATE/MATCH/SCORE/PROPOSE), the Gate's two layers (per-strategy trigger + declarative environmental conditions), and immutable/versioned `StrategyConfig` (family → configuration, never edited in place) are locked in `strategy-engine-design.md` (decision #87). `strategy_engine/` doesn't exist in code yet — this is Stage 0 only.
+
 ---
 
 ## 9. Opportunity Engine
@@ -220,6 +222,8 @@ Reads every Opportunity Object produced for a symbol across all strategies and r
 Arbitrates when opportunities compete — same symbol, conflicting directions (Momentum says BUY, Reversal says SELL), or multiple symbols competing for the same limited capital. Reads Portfolio State (current exposure, correlation to existing positions) to make that call. Outputs at most one `OpportunitySelected` per available capital slot — everything else is discarded at this stage, not silently overridden later.
 
 This is the layer that resolves: *Opportunity: 95% confidence. Trade Planner: ready. Decision Engine still has to decide whether this opportunity gets acted on at all before planning even starts.*
+
+**Direction-locked, not yet built:** once Performance Intelligence (§14) has real outcome data, context-sliced performance evidence becomes a new arbitration input here — a tie-breaker between competing opportunities, not a replacement for Portfolio State. `strategy-engine-design.md` §6 (decision #87). Whether Decision Engine and Governor (§12) eventually merge into one component is explicitly left open there, not decided.
 
 ---
 
@@ -269,6 +273,8 @@ class GovernorDecision(BaseModel):
 
 **v1 implements `approved` and `rejected` only.** `approved_reduced`, `delayed`, and `watch_only` are real branches in the type but return `NotImplementedError` (or simply never get triggered by v1 rule logic) until there's a concrete rule that needs them. This is a schema decision made now, not a feature built now — the distinction matters.
 
+**The first concrete rule for the unused branches is now direction-locked (not built):** context-sliced Performance Intelligence evidence (§14) derating or delaying a trade whose strategy configuration has weak evidence in the current context — same category as "daily loss limit reached." A hard boundary is written down alongside it: Governor may derate/delay a trade this way; it may **not** retire or modify a `StrategyConfig` — that stays human-only. `strategy-engine-design.md` §6 (decision #87); `future-ideas.md` #11 names `governor/position_sizing.py` as this rule's eventual home.
+
 ---
 
 ## 13. Position Monitor
@@ -306,6 +312,8 @@ Fridays?
 ```
 
 Feeds back into two places: **Strategy Engine** (reweight or retire underperforming strategies) and **Trade Planning Engine** (recalibrate sizing/stop logic based on realized outcomes, not assumptions). This is the seed of an eventual optimization engine, though building that optimization loop itself is out of scope for now.
+
+**Schema direction-locked, not yet built:** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at signal time, realized R/P&L) persists to `strategy_performance` — "rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (a Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5/§7 (decision #87).
 
 ---
 
