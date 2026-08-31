@@ -1,5 +1,5 @@
 # Strategy Engine — Design & Lifecycle
-**Status:** Stage 0 confirmed (`confirmed-decisions.md` #87). Concept locked across a two-round review (Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly — same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59). **No application code has been written yet** — `strategy_engine/` doesn't exist anywhere in the repo; this document and decision #87 are the direction lock, matching decisions #50/#59/#67's own precedent.
+**Status:** Stage 0 confirmed (`confirmed-decisions.md` #87, refined by #88). Concept locked across a two-round review (Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly — same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59); §8's timing model went through a further two-round refinement (ChatGPT's "opportunity lifecycle" critique → Claude's schema-gap findings → ChatGPT's "ACT/WAIT/ABANDON, not bar-close" correction, adopted). **No application code has been written yet** — `strategy_engine/` doesn't exist anywhere in the repo; this document and decisions #87/#88 are the direction lock, matching decisions #50/#59/#67's own precedent.
 **Owner:** Saqib
 **Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) (§8 Strategy Engine, §9 Opportunity Engine, §10 Decision Engine, §11 Trade Planning Engine, §12 Governor, §14 Performance Intelligence — every section this plan extends, not replaces), [`system-design.md`](./system-design.md) (§4.5 Feature Engine — the sole data source every strategy reads; §4.8's `Strategy`/`Opportunity` interfaces, extended in §4 below), [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#5 Replay Engine — the interface §7's Backtest Runner reuses; #7 TimescaleDB trigger — checked, not yet hit; #11 `governor/position_sizing.py` — the eventual home for §6's Governor extension), [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#87 — this plan's own direction lock).
 
@@ -136,6 +136,10 @@ class StrategyConfig(BaseModel):
     version: str                # "orb_v4" — immutable once minted
     params: dict                # {"rvol_threshold": 1.3, "trend_strength_min": "increasing"}
     gate_conditions: dict       # {"vix_min": 20, "session": "regular"} — §2b
+    allows_waiting: bool = False  # §8 — v1 default; every planned v1 strategy acts immediately.
+                                   # A capability flag, not a timeframe-mode: the actual wait
+                                   # reason/duration is decided dynamically by evaluate() itself
+                                   # (§8), never a fixed "wait_for_5m" setting here.
     active_from: datetime
     active_to: datetime | None
     rationale: str              # same discipline as confirmed-decisions.md's own entries
@@ -159,7 +163,17 @@ class Opportunity(BaseModel):
     confidence: float
     structural_invalidation: float        # was suggested_stop — see below
     structural_target: float              # was suggested_target
-    evidence: dict                        # {"conditions": {...}, "reason": "..."}
+    evidence: dict                        # {"conditions": {...}, "reason": "...", "basis": "live"|"closed"} — §8
+    status: Literal["potential", "waiting", "actionable", "expired"] = "actionable"  # §8 —
+                                           # default preserves today's stateless one-shot behavior;
+                                           # "waiting"/"expired" only ever appear once a strategy
+                                           # sets allows_waiting=True (§3)
+    wait_reason: str | None = None        # set only when status == "waiting" — free-form, produced
+                                           # by evaluate() itself, never a fixed enum (§8)
+    wait_expires_at: datetime | None = None
+    setup_detected_at: datetime
+    confirmed_at: datetime | None = None
+    decided_at: datetime | None = None    # set once Decision Engine acts on it
 ```
 
 `reason` stays a human-readable string, generated from `conditions` for display — but `conditions` (the actual values MATCH checked: `relative_volume: 2.14`, `trend: "bullish"`, `vwap_position: "above"`) is what's stored and later queried by Performance Intelligence (§5) to answer "did ORB actually perform better when RVOL was above 2?" A sentence can't answer that; a structured snapshot can.
@@ -178,6 +192,8 @@ class Opportunity(BaseModel):
                                         │ Scaling plan / trailing stop  │
                                         └──────────────────────────────┘
 ```
+
+**`status`, `wait_reason`, `wait_expires_at`, and the three timestamps are new — direction-locked in decision #88, full reasoning in §8.** They exist so a strategy *can* deliberately defer a decision (ACT now vs. WAIT for better evidence vs. ABANDON as the setup decays) without forcing every strategy to. Today, every planned v1 strategy leaves `status` at its default (`"actionable"`) and the rest `None` — nothing changes in practice until a strategy actually sets `allows_waiting=True` (§3). `evidence.basis` (`"live"` or `"closed"`) records whether a condition was read from a still-forming bar or a settled one — see §8 for why that distinction matters and why it isn't a schema change so much as a documented convention on the already-open `evidence` dict.
 
 If Trade Planning's risk-adjusted final stop would sit *inside* the strategy's own invalidation point, that's a real conflict between risk management and the trade's own thesis — worth surfacing, not silently overwritten. Trade Planning Engine's actual sizing/scaling/trailing logic (§11 of `trading-intelligence-architecture.md`) is unchanged; only its required input contract is now explicit.
 
@@ -307,36 +323,107 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 
 ---
 
-## 8. Entry timing & bar-close confirmation — open, continuing
+## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation
 
-**Deliberately not locked in this pass — Saqib has asked to continue this discussion with more structure before it's settled.** Recorded here as the current state of the reasoning, not a final design.
+**Direction-locked (decision #88) — the *model*, not the intelligence.** What ships in v1 is "every strategy acts immediately." What's locked here is the *shape* so that a future strategy can deliberately wait, or abandon a decaying setup, without a schema rework. Two rounds of review corrected the framing before it got here — worth keeping both corrections visible, since each fixes a real mistake, not a style preference.
+
+**Correction 1 — this was never "1m vs. 5m."** The first framing conflated waiting with bar-close specifically. The actual question a strategy needs to answer is:
+
+```
+              Evidence available right now
+                        │
+                        ▼
+          Is it already sufficient to act?
+                        │
+        ┌───────────────┼───────────────────┐
+        ▼                ▼                   ▼
+   SUFFICIENT      NOT YET, BUT          NOT SUFFICIENT,
+                   IMPROVING              AND DECAYING
+        │                ▼                   │
+        ▼              WAIT                  ▼
+       ACT               │                ABANDON
+                          ▼
+                 re-evaluate on the
+                 strategy's own next
+                 trigger fire — §8's
+                 pending-state note
+                 below, not a new engine
+```
+
+A 5m candle closing is *one possible reason* evidence might improve — not the definition of waiting. Tomorrow, "wait" could mean watching participation strengthen, or a different market condition entirely, with no candle involved at all. Locking `confirmation_timeframe: Optional[str]` as the mechanism (an earlier draft of this section) would have quietly baked "waiting = bar close" into the architecture. Rejected for exactly that reason — see §3's `allows_waiting` flag instead, which asserts only *that* a strategy may wait, never *how*.
+
+**Correction 2 — waiting has a value and a cost, and neither is free.** Waiting is an information-gathering decision, not a synonym for confirmation:
+
+```
+                        WAIT
+                         │
+             ┌───────────┴───────────┐
+             ▼                       ▼
+    Evidence improves         Entry quality degrades
+    (hypothesis strengthens,   (price drift, opportunity
+     e.g. a bar closes          decay — the setup you were
+     holding a level)           waiting to confirm moves
+                                 away while you wait)
+             │                       │
+             └───────────┬───────────┘
+                         ▼
+              Is waiting still worth it?
+              (not modeled yet — §10 D5)
+```
+
+Sometimes waiting strengthens the hypothesis. Sometimes it does nothing. Sometimes it costs entry quality faster than it adds confidence. Sometimes it outright invalidates the setup. An architecture that treats "wait for confirmation" as universally superior — waiting by default whenever the data exists — drifts toward what's worth naming and avoiding explicitly: a confirmation fetish, where every strategy waits simply because it can, not because waiting is actually worth it for that setup.
+
+**Two principles, load-bearing, adopted close to verbatim from the review that produced them:**
+
+> A strategy must not be required to wait for a candle close unless its hypothesis specifically depends on information only establishable at that close. The architecture must support both immediate and deliberately delayed entry, without assuming delayed confirmation is universally superior.
+
+> Waiting is an information-gathering decision, not a synonym for confirmation. It has a value (better evidence) and a cost (entry-price drift, opportunity decay) — both eventually measurable by Performance Intelligence (§5), neither modeled today.
 
 **What's already true, confirmed against the real code, not assumed:**
 - Feature Engine never publishes a still-forming higher-timeframe bar as final — 5m/15m/1h `FeaturesUpdated` only fires once `candle_aggregator.completes_bucket()` closes that bucket (system-design.md §4.5). No risk of reading an in-progress bar's OHLC as settled.
-- Nothing computed today is sub-1-minute. Market State Engine (where Participation — buyer/seller control — would live) isn't built. Every Feature Engine indicator, RVOL included, recomputes on 1m close. The only sub-minute feed is `LiveTickRelay`'s `PriceSnapshot` — raw, uninterpreted OHLCV for the forming bar, max 8 actively-relayed symbols, no derived signal on top of it.
+- Nothing computed today is sub-1-minute. Market State Engine (where Participation — buyer/seller control — would live) isn't built. Every Feature Engine indicator, RVOL included, recomputes on 1m close.
 
-**The reframed question:** not "act now vs. wait a minute for fresh data" — the fastest computed signal available today is already the just-closed 1m bar. The real choice is "act on the 1m signal already in hand, or wait for a slower timeframe to also close before trusting it."
-
-**A distinction proposed, not yet fully worked through:**
+**Two genuinely different structure gaps — found by reading the real schemas, not assumed to be one problem:**
 
 ```
-   Level / participation facts              Candle-shape facts
-   (price crossed a level, RVOL       vs.   (this bar closed as a rejection
-    rising, buyer/seller flip)                wick, closed holding above a level)
-              │                                        │
-              ▼                                        ▼
-   true the instant they're true —         NOT a fact until the bar closes —
-   safe to act on as soon as the           acting early isn't faster, it's
-   fastest available bar confirms it       evaluating something not yet real
+   Closed-bar structure                    Live/forming-bar structure
+   (a bar's final OHLC)                    (the currently-forming bar)
+        │                                          │
+        ▼                                          ▼
+   SCHEMA GAP                                WIRING GAP, not a data gap
+   FeatureSet (schemas/events/               PriceSnapshot already carries
+   features.py) carries only `close` —       open/high/low/close/volume for
+   no open/high/low/volume, so a             the forming bar, field-for-field
+   strategy can't compute a wick             identical to CandleClosed
+   ratio or body size today                  (LiveTickRelay, decision #72) —
+                                              but nothing on the backend
+   Fix: add open/high/low/volume             subscribes to it except the
+   to FeatureSet — additive,                 frontend chart. No Strategy or
+   zero new engine logic                     Feature Engine reads it.
+
+                                              Fix (later): evaluate() gains
+                                              an optional live-snapshot input,
+                                              populated only when a strategy's
+                                              trigger fires off a tick event —
+                                              a real interface addition, not
+                                              "just subscribe it"
 ```
 
-Which category a given MATCH condition falls into determines whether waiting is a genuine requirement or a tunable trade-off.
+Both gaps stay bounded by the existing `LiveTickRelay` cap — "observed live structure" can only ever exist for whichever ≤8 symbols are actively relayed, regardless of how far this design goes.
 
-**A mechanism sketched, not committed:** a `confirmation_timeframe: Optional[str]` field on `StrategyConfig` (§3), checked by a small, reusable confirmation gate before an `Opportunity` reaches Decision Engine — centralizing "wait for this timeframe to close" once, rather than duplicating it per strategy, and making "does this config require confirmation, and at what timeframe" a versioned, backtestable question (§7) rather than a hardcoded guess.
+**The observed-live vs. confirmed-closed distinction is the same discipline this codebase already applies to data, extended to time.** §11's "honest state over fabricated state" rule already says an engine never emits a plausible-looking value for something not yet computed. A forming candle's shape is real information but not yet a settled fact — the same rule, applied to *when* a fact becomes true rather than *whether* it exists. `evidence.basis` (§4) is the field that carries this distinction once it's ever wired up: `"live"` for a condition read off `PriceSnapshot`, `"closed"` for one read off a settled `FeatureSet`. Nothing sets `"live"` today — there's no consumer of `PriceSnapshot` yet — but the field exists so a future strategy's evidence is honest about which kind of fact it acted on.
 
-**Deliberately flagged as a real, currently-missing capability rather than assumed to exist:** genuinely intrabar (sub-1m) pattern detection — deriving a live decay/imbalance signal directly off `PriceSnapshot`'s raw feed — doesn't exist today and isn't a side effect of anything already built. If wanted, needs its own design pass and its own `future-ideas.md` entry, not an assumption folded into this one.
+**The mechanism, reshaped from the earlier draft:** no `confirmation_timeframe` enum. Instead, `StrategyConfig.allows_waiting: bool` (§3) is a bare capability flag, default `False`. A strategy with it set to `True` may, inside its own `evaluate()`, return an `Opportunity` with `status="waiting"` and a free-form `wait_reason` instead of `None` or an actionable `Opportunity` — the *reason* for waiting is whatever that strategy's own evidence-sufficiency judgment produces at that moment, never a fixed per-version setting. **Where the pending state lives, since a stateless `evaluate()` has nowhere to keep "still waiting" between one trigger fire and the next:** each `Strategy` instance holds its own small pending set internally, re-checked on its own next trigger fire — not a new shared "Opportunity Tracker" engine. This keeps every strategy independently testable, costs nothing until a strategy actually sets `allows_waiting=True`, and composes cleanly with §7's identical-live/backtest constraint as long as transitions are driven by candle/event timestamps, never wall-clock.
 
-**To be continued** — timing/structure possibilities under the current architecture, and how far to take this now vs. defer, per Saqib's own stated plan to keep discussing before locking further.
+**Deliberately not this document's job to decide whether Decision Engine and Governor should merge.** Waiting happens *before* an Opportunity is even actionable — it never reaches Decision Engine while `status="waiting"`. Decision Engine still only ever arbitrates finalized opportunities; Governor still only ever derates one already-planned trade. This section adds a stage upstream of both, not an argument for merging them — §10 D1 stays exactly as open as it already was.
+
+**Explicitly deferred — real work, not built now:**
+- The waiting-value model itself (is this specific wait worth its cost) — §10 D5.
+- Wiring any consumer to `PriceSnapshot` at all — §10 D6.
+- Reusable candle-shape helper functions (wick ratio, body ratio, position-in-range) — trivial once OHLC exists on `FeatureSet`, not written yet.
+- A candle-pattern library, an automatic confirmation selector, or any dedicated "Timing Engine"/"Confirmation Engine" — premature architecture until a real strategy needs more than the flag above. Same "defer generality until a concrete gap appears" discipline this codebase already applies everywhere else (Redis, Replay, uncertainty propagation, the playbook-as-data rejection in §1).
+
+**This becomes a backtestable question, same as every other tunable in this design.** "ORB v4, `allows_waiting=False`" vs. "ORB v5, `allows_waiting=True`" are two versions (§3); Performance Intelligence (§5) can eventually report not just expectancy per version but entry-quality degradation alongside it — waiting that improves expectancy by degrading median entry price enough to not be worth it is exactly the kind of trade-off §7's backtest report is required to surface, not hide behind a single expectancy number.
 
 ---
 
@@ -392,26 +479,29 @@ Everything above, connected — the learning loop this design is actually buildi
 
 | # | Decision needed | Status |
 |---|---|---|
-| D1 | Merge Decision Engine and Governor into one component, or keep as two | **Open.** Saqib has raised this as a real possibility. §6 states both responsibilities regardless of eventual component boundary; this is a structure question, not a logic question, and doesn't block Strategy Engine work. |
-| D2 | Bar-close confirmation mechanism (§8) — exact scope, which strategies need it, whether `confirmation_timeframe` is the right shape | **Open, by design.** Saqib has asked to continue this discussion with more structure before it's settled — not resolved in this document on purpose. |
+| D1 | Merge Decision Engine and Governor into one component, or keep as two | **Open.** Saqib has raised this as a real possibility. §6 states both responsibilities regardless of eventual component boundary; §8 confirms timing doesn't add a new argument either way. Doesn't block Strategy Engine work. |
+| D2 | Entry timing mechanism (§8) | **Resolved (decision #88):** ACT/WAIT/ABANDON model locked, `confirmation_timeframe` rejected in favor of a bare `allows_waiting` capability flag (§3) plus dynamic, strategy-produced wait reasons (§4/§8). The *model* is locked; the *intelligence* (D5 below) is not. |
 | D3 | When automatic (vs. human-reviewed) reweighting/retirement graduates from future work to real (§5) | **Open, deferred.** Trigger: enough closed trades per `StrategyConfig` version for a reweight to not be noise — no specific count set yet. |
 | D4 | Exact "Candidate Selection Score" formula (Performance × Context Fit × Confidence × Robustness) | **Deliberately not decided.** Agreed directly (Saqib + Claude + the consulted ChatGPT review) not to lock a scoring formula before real outcome data exists to check it against. |
+| D5 | The waiting-value model itself — how a strategy actually decides "is waiting worth it" (§8) | **Open, deferred.** No strategy needs this yet (`allows_waiting` defaults `False` everywhere in v1); build when a real strategy wants to wait, not speculatively. |
+| D6 | Wiring any consumer to `PriceSnapshot` for live/forming-bar structure (§8) | **Open, deferred.** The data already exists (`LiveTickRelay`, decision #72); no Strategy or Feature Engine module reads it. Needs its own design pass — `evaluate()`'s signature would need to change — not assumed as a side effect of anything above. |
 
 ---
 
 ## 11. Guiding constraints carried into this design (standing project principles, not new rules)
 
-- **Honest state over fabricated state** — an outcome record with no data for a field stays `None`/absent; Performance Intelligence never estimates a plausible-looking number for something not yet measured.
+- **Honest state over fabricated state** — an outcome record with no data for a field stays `None`/absent; Performance Intelligence never estimates a plausible-looking number for something not yet measured. Extends to time, not just data (§8): a forming candle's shape is real but not yet settled, and `evidence.basis` exists so a strategy is never ambiguous about which kind of fact it acted on.
 - **Compute once, consume everywhere** — one `StrategyOutcome` schema serves live performance queries and backtest reports alike, distinguished only by `is_backtest`, never duplicated per consumer.
 - **Real Postgres, not mocks**, once `strategy_performance` has real rows to query against — same standard as every other module in this codebase.
 - **Docs updated in the same change as code** — once Strategy Engine code exists, this document and `confirmed-decisions.md` update alongside it, not after.
 - **Architecture questions surfaced before code** — §10's open items get resolved (or explicitly deferred with a trigger condition) before the corresponding code is written, not silently decided mid-implementation.
+- **Defer generality until a concrete gap appears** — no dedicated "Timing Engine" or "Confirmation Engine" (§8), no generic rule engine for MATCH (§1), until a real strategy's needs outgrow the flag/dict-based approach already in place.
 
 ---
 
 ## 12. Staged plan
 
-- [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87.
+- [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model).
 - [ ] **Stage 1 — Not yet started.** Blocked on §10's D1/D2 open items being resolved enough to implement against, and on Saqib's own priority call relative to other in-flight work (IBKR live access, ORB as first live strategy per `trading-intelligence-architecture.md`'s existing plan).
 
 ---
@@ -420,4 +510,4 @@ Everything above, connected — the learning loop this design is actually buildi
 
 1. Read this file in full, then `confirmed-decisions.md`'s most recent entries — check whether §10's open items have moved before re-deciding them.
 2. Do not start any `strategy_engine/` code before §7's "identical live/backtest `evaluate()`" constraint is understood by whoever writes the first strategy — retrofitting it later is real, avoidable cost.
-3. §8 is explicitly unfinished by design — expect more discussion before it's locked, not a gap to quietly fill in.
+3. §8's ACT/WAIT/ABANDON *model* is locked (decision #88) — don't re-litigate whether `confirmation_timeframe` should come back. What's still genuinely open there is D5 (the waiting-value model itself) and D6 (wiring a consumer to `PriceSnapshot`) — build either only when a real strategy needs it, not speculatively.
