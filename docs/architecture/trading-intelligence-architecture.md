@@ -313,7 +313,7 @@ Fridays?
 
 Feeds back into two places: **Strategy Engine** (reweight or retire underperforming strategies) and **Trade Planning Engine** (recalibrate sizing/stop logic based on realized outcomes, not assumptions). This is the seed of an eventual optimization engine, though building that optimization loop itself is out of scope for now.
 
-**Schema direction-locked, not yet built:** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at signal time, realized R/P&L) persists to `strategy_performance` — "rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (a Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5/§7 (decision #87).
+**Schema direction-locked, not yet built:** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — "rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (a Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5/§7 (decisions #87, #89).
 
 ---
 
@@ -358,7 +358,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft); single `plan(TradeRequest)` interface, see §18 |
 | Governor (widened decision schema) | `governor/governor.py`, `risk_rules.py`, `position_sizing.py` → `trades` (approved/rejected) |
 | Position Monitor | `position_monitor/monitor.py` → `positions` |
-| Performance Intelligence | `performance_intelligence/analyzer.py` → `strategy_performance` |
+| Performance Intelligence | `performance_intelligence/analyzer.py` → `strategy_outcomes` |
 | Portfolio State | `portfolio_state/engine.py` |
 | Market Clock | `core/market_clock.py` |
 | Event Bus + event contracts | `event_bus/bus.py`, `events.py` → see `system-design.md` §10; two dispatch lanes (critical vs. normal), see §4.4 |

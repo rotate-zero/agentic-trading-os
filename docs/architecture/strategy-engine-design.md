@@ -178,6 +178,8 @@ class Opportunity(BaseModel):
 
 `reason` stays a human-readable string, generated from `conditions` for display — but `conditions` (the actual values MATCH checked: `relative_volume: 2.14`, `trend: "bullish"`, `vwap_position: "above"`) is what's stored and later queried by Performance Intelligence (§5) to answer "did ORB actually perform better when RVOL was above 2?" A sentence can't answer that; a structured snapshot can.
 
+**Boundary, stated here since this is where `evidence` originates (decision #89, restated in §5/§11):** `conditions` holds the strategy's own reasoning — the specific values its MATCH stage actually checked — never arbitrary market data reached for because it happened to be convenient. Left unstated, this drifts into silently re-storing `FeatureSet` wholesale one key at a time. Anything not part of the strategy's own decision belongs in `feature_snapshots` (system-design.md §4.13), referenced by ID, not copied in here.
+
 **`suggested_stop`/`suggested_target` renamed `structural_invalidation`/`structural_target` — not cosmetic.** "Suggested" implied Trade Planning Engine could freely override the number. "Invalidation" states what it is: the price at which the strategy's own thesis is falsified, not a starting guess. The explicit contract — worth writing down, since §11/§12 never previously stated Trade Planning has to read this at all:
 
 ```
@@ -203,29 +205,83 @@ If Trade Planning's risk-adjusted final stop would sit *inside* the strategy's o
 
 **Central discipline (§0's second correction, made concrete):** never persist `"ORB rank = 3"` as a fact. Persist atomic outcome records instead; compute rank/vectors at query time, sliced by whatever context the asker cares about.
 
+**Schema refined and locked (decision #89), organized around three conceptual pillars — Ledger (what happened), Evidence (what the system saw), Provenance (where/how the record was generated) — expressed as six field groups so identity and timing stay separate from those three:**
+
 ```python
 class StrategyOutcome(BaseModel):
+    # A. Identity & Versioning
+    outcome_id: UUID
     opportunity_id: UUID
+    schema_version: int                   # shape of THIS record — additive optional fields don't bump
+                                           # it (system-design.md §10.2's rule, applied here); removing
+                                           # a field or changing its meaning does. Distinct from
+                                           # strategy_version below — never conflate the two.
     strategy_name: str
     strategy_version: str                 # §3's immutable version — never blended across versions
     symbol: str
-    evidence: dict                        # §4's structured conditions, at signal time
-    confidence_at_signal: float
-    market_state_at_signal: dict          # trend, participation, volatility regime
-    context_at_signal: dict               # gap day?, session type, VIX regime
+    origin: Literal["auto", "manual"]     # mirrors trades.origin (trading-intelligence-architecture.md §18)
+    is_backtest: bool                     # §7 — never blended with live in a live query
+    backtest_run_id: UUID | None          # FK -> backtests, see below
+
+    # B. Timing — all instants UTC; trading_day is the one ET-calendar concession
+    trading_day: date                     # single value covers entry AND exit — day-trading only,
+                                           # no overnight holds, so no entry/exit split is needed
+    setup_detected_at: datetime
+    signal_confirmed_at: datetime | None  # Opportunity.confirmed_at, renamed at the persistence
+                                           # boundary only — Opportunity's own field name is unchanged
+    decided_at: datetime | None           # Decision Engine acted
+    entry_filled_at: datetime
+    exit_filled_at: datetime
+    holding_seconds: int                  # stored convenience, same precedent as realized_r below
+
+    # C. Ledger
+    direction: Literal["BUY", "SELL"]
+    entry_price: float                    # avg/VWAP fill if more than one partial
+    entry_qty: float
+    exit_price: float                     # avg/VWAP fill
+    exit_qty: float                       # INVARIANT: entry_qty == exit_qty for a fully closed row —
+                                           # asserted at write time, not just documented (§11)
+    commission_total: float | None        # None if the broker adapter doesn't surface it yet —
+                                           # honest state, never estimated
+    slippage_entry: float | None          # entry_price - TradePlanned.entry (trading-intelligence-
+                                           # architecture.md §11's event) — separates execution quality
+                                           # from strategy edge; nullable until Execution Engine exists
+    realized_pnl: float                   # NET of commission_total. Stated explicitly because this is
+                                           # exactly the kind of field where an undocumented meaning
+                                           # change later would be a real schema_version bump, not a
+                                           # footnote. gross_pnl may be added later if isolating
+                                           # commission drag from strategy edge becomes useful — not v1.
+    realized_r: float
+    exit_reason: Literal["target", "stop", "time", "eod_flatten", "manual", "reversal"]
+                                           # eod_flatten is new: the day-trading rule forces every
+                                           # position closed by session end regardless of thesis —
+                                           # a materially different signal from a thesis-driven "time"
+                                           # exit, worth distinguishing when Performance Intelligence
+                                           # later asks why a strategy underperforms
+
+    # D. Thesis
     structural_invalidation: float
     structural_target: float
     final_stop: float                     # Trade Planning's actual number, post-refinement
     final_target: float
-    exit_reason: Literal["target", "stop", "time", "manual", "reversal"]
-    realized_r: float
-    realized_pnl: float
-    is_backtest: bool                     # §7 — never blended with live in a live query
-    backtest_run_id: UUID | None
-    closed_at: datetime
+    confidence_at_signal: float
+
+    # E. Evidence — interpretation, not measurement (§11); raw feature values live in
+    #    feature_snapshots (system-design.md §4.13), referenced not duplicated
+    evidence: dict                        # §4's structured conditions — the strategy's own reasoning,
+                                           # never a dumping ground for arbitrary market data (§11)
+    market_state_at_entry: dict           # trend, participation, volatility regime — captured at
+                                           # entry_filled_at, not setup_detected_at (see note below)
+    context_at_entry: dict                # gap day?, session type, VIX regime
+    market_state_at_exit: dict            # same shape as _at_entry, captured at exit_filled_at
+    context_at_exit: dict
+    feature_snapshot_id: UUID | None      # FK -> feature_snapshots, for full traceability back to the
+                                           # exact FeatureSet without duplicating it into this row
 ```
 
-Persists to the already-planned `strategy_performance` table (system-design.md §6). "Rank," "expectancy by regime," "win rate by time-of-day" — every one of these is a `GROUP BY` over this table, computed on demand, never a value stored on the strategy itself:
+**Why `_at_entry`, not `_at_signal`, and why only one snapshot per side.** Signal and entry are the same instant for every v1-planned strategy — `allows_waiting` defaults `False` everywhere (§3, §10 D2/D5). A genuine signal-vs-entry gap only exists once a real waiting-capable strategy ships. Capturing two full duplicate snapshot dicts for a distinction that doesn't bite yet would be exactly the generality §11 already argues against deferring. `evidence.conditions` (captured at signal time, inside `evidence` above) already preserves the thesis snapshot; `market_state_at_entry`/`context_at_entry` capture the moment money was actually on the line, which is the more decision-relevant instant regardless. Revisit — reintroducing a separate `_at_signal` pair — only when D5 (§10) stops being deferred. Tracked as D7 below.
+
+Persists to the `strategy_outcomes` table (renamed from `strategy_performance` — decision #89; system-design.md §4.13), while a record is still atomic, singular, and pre-migration is the cheapest possible time to fix a name that read as an aggregate. "Rank," "expectancy by regime," "win rate by time-of-day" — every one of these is a `GROUP BY` over this table, computed on demand, never a value stored on the strategy itself:
 
 ```
                        StrategyOutcome (one row per closed trade)
@@ -313,6 +369,32 @@ Persists to the already-planned `strategy_performance` table (system-design.md �
               ▼
       Promote (new StrategyConfig,
        active_from = today)  /  Reject
+```
+
+**Run-level metadata — `backtests` table, shape locked (decision #89).** `StrategyOutcome.backtest_run_id` needs somewhere to resolve to, or §7's own "consistency across years/symbols/regimes" and parameter-sensitivity requirements below can't actually be produced from the outcome rows alone. `system-design.md` §4.13 already reserves the table name; this is its shape. One row = one specific `(strategy_version, config_hash)` tested against one walk-forward fold — not one row per whole grid-search sweep, since `walk_forward_fold`/`is_holdout` only mean something at that granularity:
+
+```python
+class BacktestRun(BaseModel):
+    run_id: UUID
+    sweep_id: UUID                        # groups every run belonging to the same grid-search session —
+                                           # a report pulls "all runs in this sweep," not an inline
+                                           # candidate list on one bloated row
+    strategy_name: str
+    strategy_version: str                 # §3's immutable version being tested
+    config_hash: str                      # sub-version identifier for tuning within strategy_version,
+                                           # pre-promotion — never itself a promoted StrategyConfig
+    symbol_universe: list[str]
+    date_range_start: date
+    date_range_end: date
+    data_version: str                     # market-data snapshot/provider version this run read from
+    feature_version: str                  # Feature Engine version this run computed indicators with —
+                                           # without this and data_version, two backtests can look
+                                           # identical and produce different results for reasons that
+                                           # have nothing to do with the strategy being tested — a
+                                           # reproducibility gap worth closing before Stage 1, not after
+    walk_forward_fold: int | None
+    is_holdout: bool                      # in-sample vs. out-of-sample — required, not inferred
+    created_at: datetime
 ```
 
 **Required output, not optional — robustness over raw expectancy.** A single in-sample optimization pass will always find a config that looks best on the exact data it was tuned against; that's not the same as a config that's actually good. The comparison report must include, alongside expectancy: trade count, consistency across years/symbols/regimes/time-of-day, and a parameter-sensitivity curve (expectancy vs. the threshold being tuned, across a range) — a smooth curve suggests a robust setting, a spiky one flags overfitting risk. "Best backtested expectancy" alone is not sufficient evidence for promotion.
@@ -485,6 +567,7 @@ Everything above, connected — the learning loop this design is actually buildi
 | D4 | Exact "Candidate Selection Score" formula (Performance × Context Fit × Confidence × Robustness) | **Deliberately not decided.** Agreed directly (Saqib + Claude + the consulted ChatGPT review) not to lock a scoring formula before real outcome data exists to check it against. |
 | D5 | The waiting-value model itself — how a strategy actually decides "is waiting worth it" (§8) | **Open, deferred.** No strategy needs this yet (`allows_waiting` defaults `False` everywhere in v1); build when a real strategy wants to wait, not speculatively. |
 | D6 | Wiring any consumer to `PriceSnapshot` for live/forming-bar structure (§8) | **Open, deferred.** The data already exists (`LiveTickRelay`, decision #72); no Strategy or Feature Engine module reads it. Needs its own design pass — `evaluate()`'s signature would need to change — not assumed as a side effect of anything above. |
+| D7 | Whether `StrategyOutcome` needs a separate `market_state_at_signal`/`context_at_signal` pair, distinct from `_at_entry` (§5) | **Open, deferred, tied to D5.** Signal and entry are the same instant while `allows_waiting` defaults `False` everywhere — no current strategy makes them diverge. Revisit only once D5 stops being deferred and a real waiting-capable strategy exists. |
 
 ---
 
@@ -492,16 +575,18 @@ Everything above, connected — the learning loop this design is actually buildi
 
 - **Honest state over fabricated state** — an outcome record with no data for a field stays `None`/absent; Performance Intelligence never estimates a plausible-looking number for something not yet measured. Extends to time, not just data (§8): a forming candle's shape is real but not yet settled, and `evidence.basis` exists so a strategy is never ambiguous about which kind of fact it acted on.
 - **Compute once, consume everywhere** — one `StrategyOutcome` schema serves live performance queries and backtest reports alike, distinguished only by `is_backtest`, never duplicated per consumer.
-- **Real Postgres, not mocks**, once `strategy_performance` has real rows to query against — same standard as every other module in this codebase.
+- **Evidence stores interpretation, not measurement (decision #89)** — `evidence` holds the strategy's own reasoning (`conditions`, `reason`, `basis`), never raw indicator values wholesale. Feature Engine measures; Strategy interprets; `StrategyOutcome` records what was observed and what happened; Performance Intelligence aggregates — the same layering already applied to Feature Engine vs. Market State/Context Engine (system-design.md §4.5), carried one stage further downstream. `feature_snapshot_id` is the escape hatch for full traceability without violating it.
+- **Invariants enforced at write time, not just documented (decision #89)** — `entry_qty == exit_qty` for a fully closed `StrategyOutcome` row is asserted before the row is written, same "assertion-guarded, not just narrated" discipline already used for multi-site structural edits elsewhere in this project.
+- **Real Postgres, not mocks**, once `strategy_outcomes` (renamed from `strategy_performance` — decision #89) has real rows to query against — same standard as every other module in this codebase.
 - **Docs updated in the same change as code** — once Strategy Engine code exists, this document and `confirmed-decisions.md` update alongside it, not after.
 - **Architecture questions surfaced before code** — §10's open items get resolved (or explicitly deferred with a trigger condition) before the corresponding code is written, not silently decided mid-implementation.
-- **Defer generality until a concrete gap appears** — no dedicated "Timing Engine" or "Confirmation Engine" (§8), no generic rule engine for MATCH (§1), until a real strategy's needs outgrow the flag/dict-based approach already in place.
+- **Defer generality until a concrete gap appears** — no dedicated "Timing Engine" or "Confirmation Engine" (§8), no generic rule engine for MATCH (§1), until a real strategy's needs outgrow the flag/dict-based approach already in place. Same reasoning kept `_at_signal`/`_at_entry` as one snapshot pair, not two, in §5.
 
 ---
 
 ## 12. Staged plan
 
-- [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model).
+- [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model), refined again by #89 (§5's `StrategyOutcome`/`backtests` schema: field groups, `strategy_outcomes` rename, `eod_flatten`, `slippage_entry`, write-time invariants).
 - [ ] **Stage 1 — Not yet started.** Blocked on §10's D1/D2 open items being resolved enough to implement against, and on Saqib's own priority call relative to other in-flight work (IBKR live access, ORB as first live strategy per `trading-intelligence-architecture.md`'s existing plan).
 
 ---
