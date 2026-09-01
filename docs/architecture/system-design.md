@@ -284,7 +284,7 @@ New in this revision, added to support explainability and Market State's tempora
 - **`market_events`** — a durable log of typed events crossing the Event Bus. This is what makes claims like "momentum has been weakening for 12 minutes" checkable after the fact, not just live.
 - **`market_state_history`** — periodic/on-change snapshots of `MarketState` per symbol, so "what was the market state at 10:14am" is a query.
 
-Deferred, not created in v1 migrations (names reserved so the schema doesn't fight the future): `replay_sessions`, `backtests` (shape locked, not yet created — decision #89; full field list in `strategy-engine-design.md` §7).
+Deferred, not created in v1 migrations (names reserved so the schema doesn't fight the future): `replay_sessions`, `backtests` (shape locked, not yet created — decision #89; full field list in `strategy-engine-design.md` §7), `symbol_fundamentals` (shape locked, not yet created — decision #90; full field list in `trading-intelligence-architecture.md` §5).
 
 `candles` uses Postgres's built-in **declarative partitioning** (no extension needed) from day one — partitioning isn't a "later" concern, it's cheap to set up now and expensive to retrofit onto a live table. See §6.1 for the full reasoning on plain Postgres vs. TimescaleDB.
 

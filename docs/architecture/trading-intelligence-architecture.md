@@ -38,6 +38,8 @@ Every module in this system falls into one of two categories. Naming the categor
 - **Position Monitor** reads state continuously but exists to decide (hold / partial / exit / reverse) — it's best understood as a Decision Engine that runs continuously against one open position instead of once against a new opportunity.
 - **Performance Intelligence** describes the past (pure state, about what already happened) but exists solely to change future decisions — it's State Intelligence whose entire purpose is feeding Decision Intelligence.
 
+**The governing rule for this whole document, worth stating once, plainly (decision #91):** Feature Engine measures. Market State interprets. Context Engine describes the world outside the market. Strategy decides. A new module's placement in the two categories above should be checkable against this sentence before it's checkable against anything else — it's also what settled §4/§5's boundary question once it existed to check against.
+
 ---
 
 ## 3. The Full Pipeline
@@ -101,34 +103,68 @@ Every module in this system falls into one of two categories. Naming the categor
 
 ## 4. Market State — Has Memory, Not a Snapshot
 
+```
+                            Feature Engine
+                     (per-symbol price/volume math —
+                      SPY/QQQ/IWM are symbols here too)
+                                  │
+                    ┌─────────────┴──────────────┐
+                    ▼                             ▼
+             Any traded symbol             Market State Engine
+             (Symbol Features)             ├── per-symbol scores
+                                            └── cross-symbol scores
+                                                (SPY/QQQ/IWM synthesis)
+                                                     │
+                                                     ▼
+                                             MarketStateChanged
+```
+
 The mistake to avoid: treating market state as a single current value.
 
 ```
 Trend:      Bullish
 ```
 
-Instead, every state dimension carries its own trajectory:
+Instead, every state dimension carries its own trajectory — and, as of decision #91, that trajectory is a **number**, not a label:
 
 ```
-Trend:      Bullish
-Duration:   23 minutes
-Strength:   Increasing
-Confidence: 91%
-Previous:   Neutral
-Changed at: 09:52:14
+trend_score: 82
 ```
 
-This is what lets strategies reason about *change*, not just position — "momentum has been weakening for 12 minutes" is a fundamentally different (and more useful) signal than "momentum = 65." A snapshot can't tell you that; a state object with memory can.
+**Scores are normalized state measurements, not probabilities or predictions (decision #91).** `trend_score: 82` doesn't mean "82% chance NVDA goes up" — it means "NVDA's current measured trend state sits at 82 on a 0–100 scale." 0–100 rather than 1–100, deliberately: both ends of the scale need to be real, reachable values, not an awkward off-by-one. Directional dimensions (Trend, VWAP relationship) run bearish→bullish across the full range; magnitude-only dimensions (Volatility, Volume) run quiet→extreme with no bearish pole at all — `50` means something different on each, and any future band mapping has to carry both shapes, not assume one.
 
-**State dimensions tracked (each with the duration/strength/confidence/previous shape above):** Trend, Volatility regime, Volume regime, VWAP relationship, Session type, Market breadth, Participation.
+**v1 ships scores only — no bands, no tags, no duration-in-state, no confidence, no `changed_at` (decision #91).** The duration/strength/confidence/previous shape above is still the eventual destination, not abandoned — but duration specifically can't be defined against a raw score without wobbling on every recompute (82, then 79, then 84, none of it a real "change"). Duration needs to key off a classified band, and bands don't exist yet. Rather than build a half-working memory layer, v1 keeps only the rolling window Market State Engine already needs for its own computation (see Implementation note below) — enough to derive **Acceleration** (a score's own rate of change over that window) as a first-class dimension, without needing bands to do it. The full band/classification system — score ranges, human-readable labels, real duration-in-band — is deliberately deferred; see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #22. **The score is the only thing that's ever a stored fact; a tag is always computed live from whatever the current band config says, never persisted** — a persisted tag would silently go stale the moment a band boundary is retuned, a fourth versioning problem alongside `strategy_version`, `schema_version`, and `data_version`/`feature_version`. Two independent reasons this is the right sequencing, not just the convenient one: band boundaries (`60–79 = Bullish`) are a guess until real score distributions from real market data exist to set them from evidence, not assumption — and a tag throws away exactly the information a score exists to preserve (81 and 89 both round to `Bullish`; nothing downstream can ever tell them apart again once that happens).
 
-**Participation is the observable half of market psychology, not the causal half.** §7's agent-design table already asks "who is in control — buyers or sellers?" as an example question; this is where it gets a real answer. Feature Engine computes a raw, tick-derived signed-volume / uptick-downtick imbalance — an observable, no different in kind from relative volume or gap % — and Market State Engine turns that into a Participation dimension with the same duration/strength/confidence/previous shape as everything else, so "buyers have been in control for 8 minutes and strengthening" is a first-class read. What Participation deliberately does *not* claim is *why*: the same volume imbalance can mean panic, excitement, short covering, or options-hedging flow, and telling those apart needs data (options gamma exposure, short interest) this system has no confirmed source for yet. That causal-inference layer is real, and it's kept visible rather than dropped — see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 — but faking it from data that can't support the distinction would produce a confidently wrong label, not a useful one.
+**Per-symbol dimensions, v1 (decision #91):** Trend, Volatility regime, Volume regime, VWAP relationship, Session type, Acceleration. Each produces one `<dimension>_score`, computed for any tracked symbol — including SPY/QQQ/IWM, which are ordinary symbols to Feature Engine and Market State alike, not a special case. `Market breadth`, previously listed here, is removed — it was never actually a per-symbol property, just mis-filed as one; see Cross-symbol dimensions below for what replaces it in v1, and `future-ideas.md` #23 for full breadth, deferred.
 
-**Implementation note, flagged deliberately because it's easy to get wrong:** this makes the Market State Engine *stateful* — it holds a rolling window per symbol, not just the latest computed value. That raises a real question for Phase 5: on a backend restart mid-session, does the engine rebuild "bullish for 23 minutes" from `market_state_history` / `market_events` (see `system-design.md` §4.13), or does it wake up with duration reset to zero? **Decision: rebuild from persisted history on startup.** The whole point of storing `market_state_history` and `market_events` is to make state survive a restart — an engine that forgets duration every time the process bounces defeats the feature. This should be a concrete Phase 5 task, not an afterthought.
+**Participation is the observable half of market psychology, not the causal half — unaffected by the score-first change.** §7's agent-design table already asks "who is in control — buyers or sellers?" as an example question; this is where it gets a real answer, once it exists. Feature Engine still has no signed-volume/uptick-downtick raw signal to compute it from — an observable, no different in kind from relative volume or gap %, but not built yet. Once that signal exists, Participation joins the per-symbol list above as another `<dimension>_score`, no design change needed. What Participation deliberately does *not* claim, even once built, is *why*: the same volume imbalance can mean panic, excitement, short covering, or options-hedging flow, and telling those apart needs data (options gamma exposure, short interest) this system has no confirmed source for yet. That causal-inference layer is real, and it's kept visible rather than dropped — see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 — but faking it from data that can't support the distinction would produce a confidently wrong label, not a useful one.
 
-**Recompute cadence, decided now for Phase 2 wiring:** Market State Engine doesn't recompute on every tick, and it doesn't run on a fixed timer either — both are wrong for different reasons (every tick is wasteful given how rarely trend/volatility/volume regime actually change; a fixed timer misses fast-moving regime shifts between ticks of the timer). It uses the shared `DebounceScheduler` (`system-design.md` §8, `core/debounce_scheduler.py`): recompute is triggered by relevant upstream events (`FeaturesUpdated`, `ContextChanged`, a volatility spike crossing threshold), floored to no more than once per ~1 second so a burst of ticks doesn't cause redundant recompute, and ceilinged to at least once every ~10 seconds so state can't go stale even in a quiet market. This is the same event-driven-with-bounds shape as Scanner's cadence schedule (`system-design.md` §4.7) and Strategy triggers (§8 below) — a pattern this system already uses twice, extended here rather than reinvented.
+**Cross-symbol dimensions, v1 — SPY/QQQ/IWM pulled forward from "Phase 5 scaffolding" to now (decision #91), kept deliberately small.** SPY, QQQ, and IWM get tracked as always-on subjects — same Feature Engine → Market State pipeline as any other symbol, same `DebounceScheduler`, just a tighter ceiling (~3–5s vs. ~10s) since broad-market state is what everything else gets compared against. Each gets its own full per-symbol score set above; Market State Engine then synthesizes a small, explicit set of cross-symbol scores on top:
 
-**Reference symbols, scaffolding proposed for Phase 5:** Market State Engine is also planned to track QQQ, SPY, and IWM — not as scan candidates, just as always-on subjects through the exact same mechanism as any other tracked symbol (same Feature Engine → Market State pipeline, same `DebounceScheduler`), no separate monitoring path. The one planned difference is a tighter ceiling than an individual stock gets (target ~3–5s vs. ~10s), since broad-market regime is context everything else gets compared against and shouldn't be allowed to lag behind it. This gives each of the three its own per-symbol state (trend, volatility regime, participation, etc.) but does not by itself resolve the `Market breadth` dimension above — breadth is a cross-symbol aggregate, not a property of any one instrument, so closing that gap is separate, later work. Data source confirmation (does the existing Polygon/Finnhub integration actually serve these three cleanly) and implementation are deferred to the Phase 5 build step.
+```python
+class CrossSymbolState(BaseModel):
+    spy_direction_score: float        # SPY's own trend_score, surfaced directly
+    qqq_direction_score: float
+    iwm_direction_score: float
+    trend_alignment_score: float      # how closely the three agree in direction
+    risk_on_score: float              # QQQ/IWM strength relative to SPY —
+                                       # risk-on when growth/small-cap lead, not lag
+    qqq_leadership_score: float       # is tech leading or lagging the broader tape
+    iwm_confirmation_score: float     # does small-cap confirm or diverge from
+                                       # SPY/QQQ's read
+```
+
+No correlation matrices, no full advancing/declining breadth, no sector rotation engine — deliberately not v1. Three symbols is a cheap, good-enough approximation of broad market behavior; a real breadth system is its own data problem (needs a wide symbol universe this platform doesn't track continuously yet) and is tracked separately, deferred, in `future-ideas.md` #23.
+
+**One rule governs where a new comparison-style dimension goes, cross-symbol or not: if it's a comparison between two price/volume series, it's Market State's job, no matter how many symbols are involved.** This is also where sector ETF relative strength belongs once it's built — "is this symbol moving with or against its sector ETF" is structurally identical to what the cross-symbol scores above already do, just at sector-ETF granularity instead of broad-index granularity. Not v1; tracked in `future-ideas.md` #24, revisited once SPY/QQQ/IWM alone prove useful enough to justify the next tier. Sector/industry *membership* (which sector a symbol belongs to, as opposed to how it's trading relative to that sector) is a separate, static, non-price fact — it lives on `symbol_fundamentals` instead (§5), not here.
+
+**Implementation note, flagged deliberately because it's easy to get wrong:** this makes the Market State Engine *stateful* — it holds a rolling window per symbol, not just the latest computed score. In v1, that window's only job is enough score history to compute Acceleration; it does not yet need to reconstruct "how long has this been in a given band," since bands don't exist yet. **This revises the restart-behavior decision below, which was written before score-first existed** — the original question ("does the engine rebuild 'bullish for 23 minutes' from `market_state_history` on a backend restart, or wake up with duration reset to zero — decision: rebuild from persisted history") assumed duration-in-band was already being tracked. v1's rolling window is short enough that a cold start on restart is an acceptable, honest simplification for now, not a silent gap — but the original restart decision deserves a real re-look once bands actually get built, not an assumption that it still applies unchanged as written.
+
+**Recompute cadence, decided now for Phase 2 wiring:** Market State Engine doesn't recompute on every tick, and it doesn't run on a fixed timer either — both are wrong for different reasons (every tick is wasteful given how rarely trend/volatility/volume regime actually change; a fixed timer misses fast-moving regime shifts between ticks of the timer). It uses the shared `DebounceScheduler` (`system-design.md` §8, `core/debounce_scheduler.py`): recompute is triggered by relevant upstream events (`FeaturesUpdated`, `ContextChanged`, a volatility spike crossing threshold), floored to no more than once per ~1 second so a burst of ticks doesn't cause redundant recompute, and ceilinged to at least once every ~10 seconds so state can't go stale even in a quiet market (~3–5s for SPY/QQQ/IWM, per above). This is the same event-driven-with-bounds shape as Scanner's cadence schedule (`system-design.md` §4.7) and Strategy triggers (§8 below) — a pattern this system already uses twice, extended here rather than reinvented.
+
+**Where composite (cross-symbol) state is persisted (decision #91):** no separate table. A synthetic row inside the same `market_state_history` mechanism (sentinel symbol, e.g. `symbol = "__MARKET__"`), computed on the same `DebounceScheduler` cadence as everything else — same reasoning `strategy_outcomes` already applies to live and backtest rows sharing one schema, distinguished by a flag, rather than splitting into two tables for what's structurally the same kind of record.
+
+**Data source confirmation still needed before implementation:** does the existing Polygon/Finnhub integration actually serve SPY/QQQ/IWM cleanly (liquidity, quote quality, any ETF-specific quirks) — the same empirical-before-architectural spike this project already applies elsewhere, not assumed correct just because they're liquid, well-known tickers.
 
 ---
 
@@ -138,7 +174,9 @@ Market State describes the market. Context describes the *situation* — and the
 
 > Bullish trend, first 15 minutes, gap up, near PDH, Fed day, high relative volume, inside yesterday's range — is a completely different trade than the same "Bullish" reading at 1pm on a quiet Tuesday.
 
-Context is going to keep growing — economic calendar, OPEX, breadth, macro regime, sector strength, news, sentiment, seasonality all plausibly belong here eventually. Treating it as one engine with a growing pile of `if` branches would turn it into the least maintainable module in the system within a few months. Instead, Context Engine is a thin **aggregator** over independent, individually-testable **context providers**, each responsible for one question:
+**The boundary rule, settled after catching redundancy directly rather than by design review alone (decision #90): if it's a comparison between two price/volume series, it's Market State's job — no matter how many symbols are involved. Everything else is Context's.** `GapProvider`, `LevelsProvider`, and `VolatilityRegimeProvider` all failed that test — each was a re-label of a number Feature Engine or Daily Levels already computes (Gap%, level proximity), or the same comparison Market State's own Volatility-regime dimension already performs with more memory than a stateless re-check would have. All three are cut from Context Engine entirely, not kept as thin wrappers — a consolidation-only wrapper was considered and rejected: it would mean two delivery paths for the same fact, which defeats "compute once, consume everywhere" as surely as recomputing it would. Strategy reads Gap%/level proximity straight from `FeaturesUpdated`/Daily Levels; it reads Volatility regime from `MarketStateChanged` (§4). `SectorCorrelationProvider` is cut too, via a split rather than outright removal — see below. Context is going to keep growing regardless — economic calendar, OPEX, macro regime, news, sentiment, seasonality all plausibly belong here eventually — so keeping today's boundary strict is what keeps that growth from turning Context into a dumping ground instead of an architecture change every time something new gets added.
+
+Treating Context as one engine with a growing pile of `if` branches would turn it into the least maintainable module in the system within a few months. Instead, Context Engine is a thin **aggregator** over independent, individually-testable **context providers**, each responsible for one question:
 
 ```python
 class ContextProvider(ABC):
@@ -146,9 +184,51 @@ class ContextProvider(ABC):
     async def evaluate(self, market_state: MarketState) -> dict: ...
 ```
 
-v1 providers: `CalendarProvider` (session timing, Fed days, holidays — via Market Clock), `GapProvider` (gap status vs. prior close), `LevelsProvider` (proximity to PDH/PDL/VWAP/round numbers), `VolatilityRegimeProvider` (realized vol vs. recent history), `SectorCorrelationProvider` (is this symbol moving with or against its sector ETF right now — a breakout against a falling sector is a different trade than one moving with it), `NewsFlagProvider` (has a headline hit for this symbol in the last N minutes — a boolean/count, deliberately not sentiment scoring; see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 for why NLP sentiment stays deferred). Context Engine calls each registered provider and merges their output into one `ContextChanged` event (see `system-design.md` §10 for the payload contract). Adding a new context dimension later — OPEX, breadth, fundamentals — means writing one new provider, not touching the aggregator or anything downstream.
+v1 providers: `CalendarProvider` (session timing, Fed days, holidays — via Market Clock), `NewsFlagProvider` (presence/count/recency for a symbol's recent headlines — deliberately not sentiment scoring; see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 for why NLP sentiment stays deferred), `FundamentalsProvider` (sector/industry, TTM revenue/net income/operating cash flow, next earnings date — promoted from `future-ideas.md` #9 now that a data source is confirmed; decision #90). Context Engine calls each registered provider and merges their output into one `ContextChanged` event (see `system-design.md` §10 for the payload contract). Adding a new context dimension later — OPEX, macro, sentiment — means writing one new provider, not touching the aggregator or anything downstream.
 
-**Providers refresh at whatever cadence their underlying reality actually changes at — this was always true of the interface, now made explicit because it matters for what comes next.** `VolatilityRegimeProvider` re-evaluates on the same `DebounceScheduler` rhythm as Market State (§4, seconds-scale). `CalendarProvider` changes on session/day boundaries. Nothing about the `ContextProvider` interface assumes tick-speed refresh — a provider whose underlying reality only changes quarterly (earnings, balance-sheet data) is exactly as valid a provider as one that changes every 10 seconds; it just triggers on a different event (`EarningsReleased` instead of a volatility threshold crossing) and sits idle otherwise. This is what keeps a path open to slower-moving context — fundamentals, macro — without it costing anything today: same abstraction, sparser trigger, no new module. See [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #9–#12 for the specific slow-tier providers this unlocks once their data sources are settled.
+**Sector membership vs. sector relationship — the same boundary rule applied once more, and the pattern to reuse whenever a "sector-adjacent" idea comes up again (decision #90).** Sector/industry *membership* is a static, non-price fact — it's just a field on `symbol_fundamentals` below, no dedicated provider needed. Sector ETF *price-relationship* ("is this symbol moving with or against its sector right now") is a price/volume comparison, so it belongs in Market State's cross-symbol layer (§4) once it's built, not Context — deliberately not v1, tracked in `future-ideas.md` #24. No standalone `SectorCorrelationProvider` either way.
+
+**`NewsFlagProvider`'s output is a compact derived-field group, not a bare boolean, and nothing behind it is ever persisted (decision #90).**
+
+```
+news:
+    present:           true
+    count_15m:         3
+    recency_seconds:   180
+    importance:        "high"
+```
+
+Still computed from a short rolling window per symbol, discardable once evaluated — every field above is derived, none of it is raw headline text, a link, or a source, and a stored `evidence.conditions` value reads `news_flag_active: true`, never the headline that set it. Same "evidence stores interpretation, not measurement" boundary decision #89 already applies to Feature Engine's raw values, applied here to raw news content — storing the actual article would just be re-creating a second, uncontrolled copy of something Context Engine already reduced to a compact signal for exactly this reason. `importance` is a keyword/volume heuristic, explicitly not language understanding — the line between "basic classification" and something closer to reading the article is Hermes' job (below), not this provider's.
+
+**Providers refresh at whatever cadence their underlying reality actually changes at — this was always true of the interface, now made explicit because it matters for what comes next.** `CalendarProvider` changes on session/day boundaries. Nothing about the `ContextProvider` interface assumes tick-speed refresh — a provider whose underlying reality only changes quarterly (earnings, balance-sheet data) is exactly as valid a provider as one that changes daily; it just triggers on a different event and sits idle otherwise. `FundamentalsProvider` is this pattern's first real instance, not just its justification: it reads from `symbol_fundamentals` (decision #90), a table refreshed on its own schedule, not fetched live on every `evaluate()` call — profile fields (sector/industry) on a slow weekly batch, `market_cap` on its own daily refresh since it moves with price rather than staying static, financial-statement fields checked daily against each symbol's `next_earnings_date` and refreshed once a new filing is expected to have landed. This is what keeps a path open to slower-moving context — macro, sentiment — without it costing anything today: same abstraction, sparser trigger, no new module. See [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #10–#12 for the remaining slow-tier providers this unlocks once their own data sources are settled.
+
+**`symbol_fundamentals` table shape, and where it's sourced from (decision #90).** Data source is Finnhub — already the project's real-time provider, so this adds no new third-party account or key, unlike the FMP/Alpha Vantage split an external reference project used. `/stock/profile2` covers sector/industry; `/stock/financials-reported` covers income/balance-sheet/cash-flow; `/calendar/earnings` covers the next earnings date — all confirmed present on Finnhub's free tier as of this decision, though the free-tier limits on each specific endpoint still need the same kind of empirical spike already applied elsewhere in this project (Polygon depth, IBKR access) before being relied on, not assumed from documentation alone:
+
+```python
+class SymbolFundamentals(BaseModel):
+    symbol: str                           # PK
+    sector: str | None
+    industry: str | None
+    profile_updated_at: datetime          # sector/industry — slow weekly batch, rarely changes
+
+    market_cap: float | None
+    market_cap_updated_at: datetime       # moves with price — daily, split from profile above
+
+    revenue_ttm: float | None
+    net_income_ttm: float | None
+    operating_cash_flow_ttm: float | None
+    financials_period: str | None         # e.g. "2026-Q2" — which filing these figures are as-of
+    financials_updated_at: datetime       # refreshed once a new filing is expected to have landed,
+                                           # checked daily against next_earnings_date, not fetched live
+
+    next_earnings_date: date | None
+    earnings_updated_at: datetime         # cheap, refreshed daily
+
+    data_source: str                      # "finnhub" — honest provenance, same discipline as
+                                           # decision #89's data_version/feature_version on backtests
+```
+
+**Reuse verdict on the external reference project (`equity-fundamental-analysis`).** Not reused directly — different stack conventions (in-memory dict cache, no persistence; FMP + Alpha Vantage instead of the already-integrated Finnhub; response shapes built for a UI card, not `ContextProvider.evaluate() -> dict`'s flat convention; two live API keys committed in plaintext in the source, a finding worth acting on independent of this decision). What carried over conceptually: the field list a fundamentals payload actually needs (sector/industry, TTM revenue/net income/cash flow, next earnings date) and the quarterly year-over-year comparison logic, both reflected in the schema above, re-sourced from Finnhub rather than ported as code.
 
 **Hermes — a named, agentic provider, scaffolding proposed for Phase 5:** beyond `NewsFlagProvider`'s deliberately narrow presence/count signal above, Context Engine is planned to host a named agent — Hermes — that reads and analyzes the news reports `NewsFlagProvider` flags, rather than just counting that something fired. This is the system's first LLM-in-the-loop component — everything else in Feature Engine, Market State, and the rest of Context Engine is deterministic numeric computation — which makes it a meaningfully different kind of module, with different failure modes and a different verification approach than the rest of this document assumes. Data source, storage, and analysis method are deliberately left open for the implementation step; this entry only reserves Hermes's place in the pipeline.
 

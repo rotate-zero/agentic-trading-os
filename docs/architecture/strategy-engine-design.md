@@ -270,8 +270,10 @@ class StrategyOutcome(BaseModel):
     #    feature_snapshots (system-design.md §4.13), referenced not duplicated
     evidence: dict                        # §4's structured conditions — the strategy's own reasoning,
                                            # never a dumping ground for arbitrary market data (§11)
-    market_state_at_entry: dict           # trend, participation, volatility regime — captured at
-                                           # entry_filled_at, not setup_detected_at (see note below)
+    market_state_at_entry: dict           # trend_score, volatility_score, etc. — decision #91's
+                                           # per-symbol scores, captured at entry_filled_at, not
+                                           # setup_detected_at (see note below); a dict here, not a
+                                           # typed model, since the dimension set is still growing
     context_at_entry: dict                # gap day?, session type, VIX regime
     market_state_at_exit: dict            # same shape as _at_entry, captured at exit_filled_at
     context_at_exit: dict
@@ -568,6 +570,7 @@ Everything above, connected — the learning loop this design is actually buildi
 | D5 | The waiting-value model itself — how a strategy actually decides "is waiting worth it" (§8) | **Open, deferred.** No strategy needs this yet (`allows_waiting` defaults `False` everywhere in v1); build when a real strategy wants to wait, not speculatively. |
 | D6 | Wiring any consumer to `PriceSnapshot` for live/forming-bar structure (§8) | **Open, deferred.** The data already exists (`LiveTickRelay`, decision #72); no Strategy or Feature Engine module reads it. Needs its own design pass — `evaluate()`'s signature would need to change — not assumed as a side effect of anything above. |
 | D7 | Whether `StrategyOutcome` needs a separate `market_state_at_signal`/`context_at_signal` pair, distinct from `_at_entry` (§5) | **Open, deferred, tied to D5.** Signal and entry are the same instant while `allows_waiting` defaults `False` everywhere — no current strategy makes them diverge. Revisit only once D5 stops being deferred and a real waiting-capable strategy exists. |
+| D8 | Whether `StrategyOutcome.trading_day` (§5, decision #89) stays a single `date` field once swing/overnight holding exists | **Open, flagged not resolved.** The single-value simplification was explicitly justified by "day-trading only, no overnight holds" — Saqib has since clarified the platform is day-trading-*focused* but not day-trading-*limited*. Nothing needs to change today; every real trade is still intraday. The trigger is concrete: the first time a position is intentionally held overnight, `trading_day` needs to split into `entry_trading_day`/`exit_trading_day`, and `exit_reason`'s `eod_flatten` value stops being universal (a forced-by-rule exit only for trades actually subject to the day-trading rule). Caught here so it isn't rediscovered as a bug later. |
 
 ---
 

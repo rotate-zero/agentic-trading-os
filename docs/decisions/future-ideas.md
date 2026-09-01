@@ -102,6 +102,8 @@
 
 ## 9. FundamentalsProvider (Quarterly-Tier Context)
 
+**Status: resolved (decision #90) — promoted to a real v1 provider, `../architecture/trading-intelligence-architecture.md` §5.** Data source confirmed (Finnhub — already the project's real-time data provider, no new third-party dependency), storage decided (`symbol_fundamentals` table). Entry kept below for the original reasoning; superseded, not deleted.
+
 **What it is:** a Context provider surfacing company fundamentals — revenue, profitability, debt, cash, leadership/quality signals — as slow-refresh context, using the same `ContextProvider` interface as `GapProvider` or `VolatilityRegimeProvider` (`../architecture/trading-intelligence-architecture.md` §5), just triggered on filings/earnings events instead of a seconds-scale timer.
 
 **Why deferred:** not because fundamentals don't matter for this system's future — they're explicitly kept out of "don't build at all" territory (see `confirmed-decisions.md` #21) — but because a confirmed structured-data source isn't settled yet. `ib_async` may partially cover this; needs a real spike, not an assumption, before committing to a schema.
@@ -278,3 +280,39 @@ Downstream, this becomes **Hypothesis Health**: Position Monitor compares realiz
 **Trigger to revisit:** once Governor's derate/veto branches are real and can actually initiate an exit, or once the `backtests`/live split (§7) surfaces a case where *why* an exit happened (`exit_reason`) isn't enough to explain a strategy's apparent underperformance without also knowing *who* cut the trade short.
 
 **Where it would plug in:** `StrategyOutcome.exit_trigger` (`strategy-engine-design.md` §5's Ledger group, additive/optional — doesn't bump `schema_version` when it lands, per that field's own versioning rule).
+
+---
+
+## 22. Score → Band/Tag Classification System (Market State)
+
+**What it is:** a configurable mapping layer that turns a Market State `<dimension>_score` (0–100, decision #91) into a human-readable label — e.g. `60–79 → "Bullish"`, `80–100 → "Strong Bullish"` — plus the duration-in-band memory (how long a dimension has held its current label) that Market State's original design assumed as a baseline feature before score-first existed.
+
+**Why deferred:** band boundaries are a guess until real score distributions from real market data exist to set them from evidence — building the classification layer before any score has run against live symbols means tuning against nothing. Raised directly during the Market State score-first redesign (decision #91), deliberately sequenced after shipping the raw scores, not instead of.
+
+**Trigger to revisit:** once v1's per-symbol and cross-symbol scores have run against enough real market days to see what their actual distributions look like — set boundaries from that evidence, not a first guess.
+
+**Where it would plug in:** a `market_state/band_config.py`-style config, read at render/query time only — the resulting tag is never written to `market_state_history`, only the score is (`trading-intelligence-architecture.md` §4). Same reasoning as never persisting a computed rank in `strategy_outcomes` (`strategy-engine-design.md` §5): a tag computed under since-changed boundaries would be silently wrong if stored.
+
+---
+
+## 23. Full Market Breadth (Advancing/Declining)
+
+**What it is:** a proper `Market breadth` signal — advancing vs. declining stock counts, percentage of a universe above its moving averages, new highs/lows — the kind of breadth a discretionary trader would recognize, distinct from the SPY/QQQ/IWM three-symbol cross-symbol approximation Market State Engine tracks in v1 (decision #91).
+
+**Why deferred:** real breadth needs a wide symbol universe this platform doesn't track continuously yet — it's a new data-coverage problem, not a calculation this system is missing. SPY/QQQ/IWM give a cheap, good-enough proxy for broad market direction/risk appetite without that cost.
+
+**Trigger to revisit:** once the platform tracks a broad-enough always-on symbol universe (beyond Scanner's rotating top-8 and the three index proxies) that computing real advancing/declining counts becomes a query, not a new data-ingestion project.
+
+**Where it would plug in:** Market State Engine's cross-symbol layer (`trading-intelligence-architecture.md` §4), alongside the existing `CrossSymbolState` scores — same mechanism, wider input set.
+
+---
+
+## 24. Sector ETF Cross-Symbol Relative Strength
+
+**What it is:** a `sector_relative_strength_score` (or similar) comparing a symbol's price/volume behavior against its own sector ETF, the same way Market State's cross-symbol layer already compares SPY/QQQ/IWM against each other — structurally identical mechanism, just at sector-ETF granularity instead of broad-index granularity.
+
+**Why deferred:** sector *membership* (which sector a symbol belongs to) is already covered — a static field on `symbol_fundamentals` (decision #90), no new mechanism needed. The dynamic, price-derived half was raised directly during the Context Engine boundary cleanup (decision #90) and deliberately not built alongside SPY/QQQ/IWM — prove the three-index approximation useful first, then decide whether sector-level granularity earns its own build.
+
+**Trigger to revisit:** once SPY/QQQ/IWM cross-symbol state (decision #91) is live and actually informing decisions — if a real gap shows up where "moving with the market but against its own sector" would have changed a call, that's the signal to build this, not before.
+
+**Where it would plug in:** Market State Engine's cross-symbol layer (`trading-intelligence-architecture.md` §4), one new score alongside `CrossSymbolState`'s existing fields — needs a symbol→sector-ETF mapping, itself just a derived join off `symbol_fundamentals.sector`, no new provider.
