@@ -1,10 +1,19 @@
 """
 Level Interaction Engine's persisted tables — confirmed decision #46.
 See docs/architecture/trading-intelligence-architecture.md §4 for the
-"has memory, rebuilt from persisted history on startup" pattern these
-follow (same one Market State Engine is specified to use), and
+"has memory, rebuilt from persisted history on startup" pattern
+`level_interaction_state` follows, and
 app/trading_intelligence/level_interaction_engine.py for the engine that
 reads/writes these.
+
+Market State Engine does NOT follow this same restart pattern, despite
+an earlier version of this docstring claiming it was "specified to" —
+decision #91 explicitly revises that for Market State specifically: v1's
+rolling window is short enough that a cold start on restart is an
+accepted simplification, not something its own table
+(`market_state_history`, app/models/market_state.py) needs to help
+reconstruct. Corrected here per decision #93, in the same change that
+built that table.
 
 Two tables, deliberately split by lifecycle, not one:
 - `level_interaction_state` — one row per (symbol, timeframe, level_key),
@@ -16,6 +25,8 @@ Two tables, deliberately split by lifecycle, not one:
   (rejected, conquered, or an unresolved cold-start edge case). This is
   the actual analytical log — what a future Strategy Engine reads, and
   exactly the shape Saqib flagged as useful for training-data purposes.
+  `market_state_history` mirrors this table's role, not
+  `level_interaction_state`'s — see its own module docstring.
 
 No range partitioning here unlike `candles` (app/models/market_data.py) —
 these grow at touch-rate (a handful of zone transitions per symbol per

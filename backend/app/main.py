@@ -11,11 +11,13 @@ from app.api.routes.finnhub_data import connect_finnhub
 from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
 from app.api.websocket.channels import get_gateway
+from app.context_engine.engine import get_context_engine
 from app.core.config import get_settings
 from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
 from app.feature_engine.engine import get_feature_engine
+from app.market_state_engine.engine import get_market_state_engine
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
 from app.services.live_tick_relay import get_live_tick_relay
@@ -64,6 +66,23 @@ async def lifespan(app: FastAPI):
     # whenever ticks start flowing.
     level_interaction_engine = get_level_interaction_engine(bus)
     level_interaction_engine.start()
+
+    # Market State Engine (decision #93) — per-symbol only in this build;
+    # cross-symbol (SPY/QQQ/IWM) is M3, not built here. Subscriber, same
+    # as LevelInteractionEngine above — stops AFTER the bus in shutdown
+    # below, not before like ContextEngine (see that comment for why the
+    # two engines differ on this).
+    market_state_engine = get_market_state_engine(bus)
+    market_state_engine.start()
+
+    # Context Engine's M1 slice (decision #92) — thin aggregator over
+    # ContextProvider instances. Only CalendarProvider is registered so
+    # far; FundamentalsProvider/NewsFlagProvider join once M0's Finnhub
+    # spike results land (M0-SPIKE-NOTES.md). Unconditional start, same
+    # posture as everything else here — CalendarProvider only touches
+    # MarketClock, no external API, so there's nothing to soft-fail on.
+    context_engine = get_context_engine(bus)
+    context_engine.start()
 
     gateway = get_gateway()
     gateway.attach()
@@ -136,6 +155,13 @@ async def lifespan(app: FastAPI):
         for provider in broker_registry.get_all_active_providers():
             await provider.disconnect()
 
+        # ContextEngine stops here, BEFORE the bus — it's a pure
+        # publisher, not a subscriber like the engines below, so decision
+        # #47's "bus stops first" reasoning (bounding a subscriber's
+        # drain to a fixed backlog) doesn't apply to it; see engine.py's
+        # own docstring for the full distinction (decision #92).
+        await context_engine.stop()
+
         # Bus stops FIRST, deliberately, not last — separately confirmed
         # (decision #47) via the same debugging session. With engines
         # stopped before the bus: while CandleRecorder.stop() is still
@@ -154,6 +180,7 @@ async def lifespan(app: FastAPI):
         await tick_relay.stop()
         await feature_engine.stop()
         await level_interaction_engine.stop()
+        await market_state_engine.stop()
         logger.info("%s stopped", settings.app_name)
 
 

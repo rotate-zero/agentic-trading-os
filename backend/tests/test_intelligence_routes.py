@@ -79,6 +79,16 @@ def _clean_test_symbol(ticker: str) -> None:
             text("DELETE FROM daily_levels_state WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"),
             {"t": ticker},
         )
+        # Market State Engine (confirmed decision #93) — market_state_history
+        # also has a FK to symbols, and MarketStateEngine subscribes to
+        # FeaturesUpdated globally once the real app lifespan is running
+        # (this file's own TestClient(app) usage), so any test symbol that
+        # produces a FeaturesUpdated picks up a row here too. Same "found
+        # via the full-suite run" story as daily_levels_state right above.
+        session.execute(
+            text("DELETE FROM market_state_history WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"),
+            {"t": ticker},
+        )
         session.execute(text("DELETE FROM candles WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)"), {"t": ticker})
         session.execute(text("DELETE FROM symbols WHERE ticker = :t"), {"t": ticker})
         session.commit()

@@ -47,19 +47,28 @@ gets written:
    real per-article unix timestamp (needed for recency_seconds/count_15m,
    decision #90's output shape) rather than just a calendar date.
 
-Also runs a real burst of raw HTTP calls against /stock/profile2 (cheapest
-of the four) to observe the ACTUAL rate ceiling and any X-Ratelimit-*
-response headers Finnhub actually sends — same "confirm empirically, don't
-trust documentation alone" discipline already applied to Polygon's plan
-limits (decision #30) and the pre-market 1m-bar check
-(check_premarket_data_availability.py). Uses `requests` directly for this
-part (not the finnhub-python client) specifically to see response headers
-on EVERY call, not just the one that finally fails — finnhub-python only
-attaches `.response` to its exception on failure. `requests` is not a
-direct project dependency, but ships transitively via finnhub-python
-(confirmed by FinnhubAPIException's own use of response.json()/
-.status_code/.text — that's the `requests` Response API) — no new
-dependency added.
+Runs two real bursts of raw HTTP calls to find ACTUAL rate ceilings and any
+X-Ratelimit-* response headers Finnhub actually sends — same "confirm
+empirically, don't trust documentation alone" discipline already applied
+to Polygon's plan limits (decision #30) and the pre-market 1m-bar check
+(check_premarket_data_availability.py):
+  - /stock/profile2: every run so far shows it sharing a 60/min bucket
+    with /stock/financials-reported specifically (confirmed 3 separate
+    times: pre-burst consumption always matches exactly
+    3×profile2 + 3×financials-reported calls, regardless of how many
+    earnings-calendar/company-news calls happened in between).
+  - /company-news: closes a real gap — every run so far only showed this
+    endpoint NOT draining the profile2/financials-reported bucket, never
+    what its OWN ceiling actually is. NewsFlagProvider will poll this on
+    its own cadence, so it gets its own dedicated burst rather than an
+    inferred "probably fine."
+Uses `requests` directly for both (not the finnhub-python client)
+specifically to see response headers on EVERY call, not just the one that
+finally fails — finnhub-python only attaches `.response` to its exception
+on failure. `requests` is not a direct project dependency, but ships
+transitively via finnhub-python (confirmed by FinnhubAPIException's own
+use of response.json()/.status_code/.text — that's the `requests`
+Response API) — no new dependency added.
 
 Test symbols deliberately include SPY: ETFs typically have no
 profile/financials/earnings the way single-name stocks do. If profile2/
@@ -102,6 +111,7 @@ from app.core.config import get_settings  # noqa: E402
 _DEFAULT_SYMBOLS = ["AAPL", "TSLA", "SPY"]
 _BURST_CALLS = 40  # documented general limit is 60/min; enough to find the real ceiling without wasting budget for the rest of the day
 _PROFILE2_URL = "https://finnhub.io/api/v1/stock/profile2"
+_COMPANY_NEWS_URL = "https://finnhub.io/api/v1/company-news"
 _RATELIMIT_HEADERS = ("X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "Retry-After")
 
 _TTM_REPORT_COUNT = 4  # a trailing-twelve-months figure needs exactly 4 quarters — no more, no less
@@ -374,8 +384,8 @@ def _inspect_annual_concepts(symbol: str, quarterly_reports: list[dict], annual_
         )
 
 
-def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
-    _print_header(f"BURST TEST — {_BURST_CALLS} rapid calls to /stock/profile2 (symbol={symbol})")
+def _run_ratelimit_burst(api_key: str, endpoint_url: str, endpoint_label: str, params: dict) -> None:
+    _print_header(f"BURST TEST — {_BURST_CALLS} rapid calls to {endpoint_label}")
     print(
         "Firing calls back-to-back with no throttling to find the REAL ceiling "
         f"(documented general limit: {get_settings().finnhub_max_calls_per_minute}/min). "
@@ -387,7 +397,7 @@ def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
     for i in range(1, _BURST_CALLS + 1):
         call_start = time.monotonic()
         try:
-            resp = requests.get(_PROFILE2_URL, params={"symbol": symbol, "token": api_key}, timeout=10)
+            resp = requests.get(endpoint_url, params={**params, "token": api_key}, timeout=10)
         except requests.RequestException as exc:
             print(f"  call {i:>2}: transport error — {exc}")
             continue
@@ -427,9 +437,9 @@ def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
         rate = (idx - 1) / when if when > 0 else float("inf")
         print(
             f"VERDICT: real ceiling is approximately {idx - 1} calls per {when:.2f}s (~{rate:.1f} calls/sec) "
-            f"for /stock/profile2 specifically — compare against the documented "
+            f"for {endpoint_label} specifically — compare against the documented "
             f"{get_settings().finnhub_max_calls_per_minute}/min general figure before trusting it for "
-            f"FundamentalsProvider's refresh-schedule design."
+            f"the relevant provider's refresh-schedule design."
         )
 
 
@@ -505,7 +515,25 @@ async def main() -> None:
         except finnhub.exceptions.FinnhubAPIException as exc:
             print(f"FAILED: status={exc.status_code} message={exc.message}")
 
-    _run_ratelimit_burst(settings.finnhub_api_key, symbols[0])
+    _run_ratelimit_burst(
+        settings.finnhub_api_key, _PROFILE2_URL, "/stock/profile2", {"symbol": symbols[0]}
+    )
+
+    # Closes the M0 #2 gap: every run so far has shown company-news calls
+    # NOT denting the same X-Ratelimit-Remaining counter profile2 and
+    # financials-reported share (60→53 pattern held across three separate
+    # sessions) — but that only tells us it's not IN that bucket, not what
+    # its own ceiling actually is. NewsFlagProvider will poll this
+    # endpoint on its own cadence, so it deserves its own real number
+    # rather than an inferred "probably fine."
+    news_window_end = date.today()
+    news_window_start = news_window_end - timedelta(days=7)
+    _run_ratelimit_burst(
+        settings.finnhub_api_key,
+        _COMPANY_NEWS_URL,
+        "/company-news",
+        {"symbol": symbols[0], "from": news_window_start.isoformat(), "to": news_window_end.isoformat()},
+    )
 
     _print_header("OVERALL — read the per-symbol sections above before trusting this project-wide")
     print(
