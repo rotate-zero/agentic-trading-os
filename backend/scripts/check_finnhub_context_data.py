@@ -12,23 +12,35 @@ gets written:
    (trading-intelligence-architecture.md §5).
 2. /stock/financials-reported (financials_reported) — income/balance/
    cash-flow, for revenue_ttm/net_income_ttm/operating_cash_flow_ttm.
-   Structure is confirmed against a live key — 'data' is a flat list of
-   per-filing reports, each with report.bs/ic/cf line-item lists shaped
-   {concept, unit, label, value}. Concept-tag consistency across a
-   symbol's own quarters is ALSO confirmed now (AAPL/TSLA both show the
-   same three concepts across 4 straight quarterly reports) — but the
-   first real run surfaced something this script's earlier version got
-   wrong: freq='quarterly' only returns 10-Q filings, and neither AAPL
-   nor TSLA files a 10-Q for their fiscal-year-end quarter (that quarter's
-   numbers live in the 10-K instead). So "last 4 by endDate" silently
-   skips one calendar quarter and pulls in an extra stale one instead of
-   giving 4 contiguous quarters — not a true TTM window. The standard fix
-   is deriving the missing quarter as (annual figure) - (sum of the 3
-   quarters inside that fiscal year); _inspect_annual_concepts() checks
-   whether freq='annual' carries the same concept tags needed to do that,
-   plus a rough magnitude sanity check. The actual period-alignment
-   subtraction logic is real implementation work for FundamentalsProvider
-   itself, not something faked here.
+   Structure is confirmed against a live key, and concept-tag consistency
+   across a symbol's own quarters is ALSO confirmed (AAPL/TSLA both show
+   the same three concepts across 4 straight quarterly reports) — but
+   TWO real problems have surfaced past that point, both caught by
+   running actual numbers rather than trusting the shape alone:
+     (a) freq='quarterly' only returns 10-Q filings; neither AAPL nor
+         TSLA files a 10-Q for their fiscal-year-end quarter (that
+         quarter's numbers live in the 10-K instead), so "last 4 by
+         endDate" silently skips a calendar quarter.
+     (b) More seriously: the annual-vs-quarterly sanity check
+         (_inspect_annual_concepts) caught AAPL's and TSLA's "quarterly"
+         revenues summing to 124% and 62% MORE than their own annual
+         revenue — structurally impossible for 4 genuinely discrete,
+         non-overlapping quarters. TSLA's raw values even show the
+         signature directly: 19.3B -> 41.8B -> 69.9B climbing through
+         calendar 2025, then dropping to 22.4B the moment a new fiscal
+         year starts. That's cumulative year-to-date data, not discrete
+         quarters. The likely cause: a single 10-Q's XBRL data commonly
+         tags BOTH a discrete 'three months ended' figure and a
+         cumulative 'year-to-date' figure under the SAME concept name,
+         and _find_concept's {concept: value} dict silently keeps
+         whichever occurrence comes last, with no warning.
+   _dump_raw_concept_occurrences() now fires automatically when the
+   sum-vs-annual check looks wrong, printing every raw occurrence (not
+   deduped) so the actual duplicate structure is visible directly rather
+   than guessed at. The fix itself — picking the right occurrence, or
+   differencing consecutive cumulative values to recover a true discrete
+   quarter — is real FundamentalsProvider implementation work with tests,
+   not something to bolt onto a spike script.
 3. /calendar/earnings (earnings_calendar) — next_earnings_date.
 4. /company-news (company_news) — candidate NewsFlagProvider source.
    Checked specifically for whether each article's 'datetime' field is a
@@ -174,6 +186,41 @@ def _find_concept(line_items: list[dict], candidates: list[str]) -> tuple[str, f
     return None
 
 
+def _find_all_occurrences(line_items: list[dict], candidates: list[str]) -> list[tuple[str, float]]:
+    """Unlike _find_concept, does NOT dedupe by concept name — returns every
+    matching line item in original list order. Exists because _find_concept's
+    {concept: value} dict silently keeps whichever occurrence comes LAST if a
+    concept appears more than once, with no warning. A single 10-Q commonly
+    tags both a discrete 'three months ended' figure and a cumulative
+    'year-to-date' figure under the SAME us-gaap_ concept — if that's what's
+    happening here, _find_concept could easily be picking the wrong one."""
+    return [(item.get("concept"), item.get("value")) for item in line_items if item.get("concept") in candidates]
+
+
+def _dump_raw_concept_occurrences(symbol: str, report: dict) -> None:
+    """Diagnostic triggered when the annual-vs-quarterly sanity check looks
+    wrong: does this report actually contain MULTIPLE line items under the
+    same concept (discrete-quarter vs cumulative-YTD), or is _find_concept's
+    single result the only one there is? Answers that directly instead of
+    guessing at a fix."""
+    rpt = report.get("report", {})
+    print(f"\n  Raw (non-deduped) concept occurrences in the {report.get('endDate')} ({report.get('form')}) report:")
+    for label, section, candidates in (
+        ("revenue", rpt.get("ic", []), _REVENUE_CONCEPTS),
+        ("net_income", rpt.get("ic", []), _NET_INCOME_CONCEPTS),
+        ("operating_cash_flow", rpt.get("cf", []), _OPERATING_CASH_FLOW_CONCEPTS),
+    ):
+        occurrences = _find_all_occurrences(section, candidates)
+        if not occurrences:
+            print(f"    {label}: no occurrences at all")
+        elif len(occurrences) == 1:
+            print(f"    {label}: 1 occurrence — {occurrences[0][0]}: {occurrences[0][1]:,.0f} (not the source of the discrepancy)")
+        else:
+            print(f"    {label}: {len(occurrences)} occurrences (DUPLICATE — _find_concept only ever saw the LAST one):")
+            for idx, (concept, value) in enumerate(occurrences):
+                print(f"      [{idx}] {concept}: {value:,.0f}")
+
+
 def _inspect_ttm_concepts(symbol: str, reports: list[dict]) -> None:
     """Does the last N quarters' financials-reported data actually support
     revenue_ttm/net_income_ttm/operating_cash_flow_ttm, or does the concept
@@ -276,26 +323,55 @@ def _inspect_annual_concepts(symbol: str, quarterly_reports: list[dict], annual_
         print("VERDICT: at least one metric had no match on the annual report — the derive-missing-quarter plug isn't safely available as-is for this symbol without widening the candidate list.")
         return
 
-    # Rough plausibility check only — full period alignment (matching the
-    # 3 quarters that actually fall inside this specific fiscal year) is
-    # real implementation work, not something to fake here.
-    quarterly_revenues = []
-    for q in quarterly_reports:
+    # Sort explicitly rather than trusting API response order — same fix
+    # already applied in _inspect_ttm_concepts, needed here too since this
+    # function was slicing quarterly_reports[:4] without sorting first.
+    dated_quarters = [q for q in quarterly_reports if q.get("endDate")]
+    dated_quarters.sort(key=lambda q: q["endDate"], reverse=True)
+    recent_quarters = dated_quarters[:_TTM_REPORT_COUNT]
+
+    quarterly_revenues: list[tuple[str, float]] = []
+    for q in recent_quarters:
         q_rev = _find_concept(q.get("report", {}).get("ic", []), _REVENUE_CONCEPTS)
         if q_rev:
-            quarterly_revenues.append(q_rev[1])
-    if quarterly_revenues and rev:
-        avg_quarterly = sum(quarterly_revenues[:4]) / len(quarterly_revenues[:4])
-        ratio = rev[1] / avg_quarterly if avg_quarterly else float("nan")
+            quarterly_revenues.append((q["endDate"], q_rev[1]))
+
+    if not (quarterly_revenues and rev):
+        print("VERDICT: same concept family matched on the annual report — plug-derivation looks structurally available, but no quarterly revenue figures to sanity-check the magnitude against.")
+        return
+
+    quarterly_sum = sum(v for _, v in quarterly_revenues)
+    print(
+        f"\nDirect self-consistency check: sum of the {len(quarterly_revenues)} quarterly revenues just inspected "
+        f"({', '.join(f'{d}: {v:,.0f}' for d, v in quarterly_revenues)}) = {quarterly_sum:,.0f}"
+    )
+    print(f"vs. most recent annual revenue = {rev[1]:,.0f}")
+
+    if quarterly_sum > rev[1] * 1.15:
+        overshoot_pct = (quarterly_sum / rev[1] - 1) * 100
         print(
-            f"VERDICT: same concept family matched on the annual report. Annual revenue is {ratio:.1f}x the "
-            f"average of the last {min(4, len(quarterly_revenues))} quarterly revenues — a ratio near 3.5-4.5x "
-            f"is consistent with 'annual = sum of 4 quarters' (supports the derive-missing-quarter approach); "
-            f"a ratio far outside that range means something about period alignment needs a closer look before "
-            f"building the subtraction logic for real."
+            f"VERDICT: quarters sum to {overshoot_pct:.0f}% MORE than the full year — not explainable by period "
+            f"offset or growth alone. If these were genuinely 4 discrete, non-overlapping quarters, their sum "
+            f"should land close to the annual figure, not nearly double it. Most likely cause: at least one "
+            f"quarterly report tags BOTH a discrete 'three months ended' figure and a cumulative "
+            f"'year-to-date' figure under the same concept name, and _find_concept's dict-based lookup is "
+            f"silently keeping the wrong one. Dumping every raw occurrence for the most recent quarter to "
+            f"confirm directly:"
+        )
+        if recent_quarters:
+            _dump_raw_concept_occurrences(symbol, recent_quarters[0])
+        print(
+            "\nIf duplicates show up above: the fix is picking the discrete-quarter occurrence specifically "
+            "(or, if only a cumulative figure is ever tagged, differencing consecutive cumulative values "
+            "within a fiscal year to recover the discrete quarter) — real work for FundamentalsProvider's "
+            "implementation, not something to guess at here."
         )
     else:
-        print("VERDICT: same concept family matched on the annual report — plug-derivation looks structurally available, but no quarterly revenue figures to sanity-check the magnitude against.")
+        print(
+            f"VERDICT: quarterly sum is within a plausible range of the annual figure "
+            f"({quarterly_sum / rev[1]:.2f}x) — supports treating these as genuinely discrete, "
+            f"non-overlapping quarters safe to sum for TTM."
+        )
 
 
 def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
