@@ -11,12 +11,24 @@ gets written:
    symbol_fundamentals.profile_updated_at fields
    (trading-intelligence-architecture.md §5).
 2. /stock/financials-reported (financials_reported) — income/balance/
-   cash-flow, for revenue_ttm/net_income_ttm/operating_cash_flow_ttm. This
-   endpoint's nested concept/value report shape is NOT hardcoded here —
-   dumped raw (top-level keys + one sample line item) instead, since
-   nobody has confirmed the real shape against a live key yet. TTM
-   requires summing trailing quarters; whether that's cleanly derivable
-   from this response is itself part of what this checks.
+   cash-flow, for revenue_ttm/net_income_ttm/operating_cash_flow_ttm.
+   Structure is confirmed against a live key — 'data' is a flat list of
+   per-filing reports, each with report.bs/ic/cf line-item lists shaped
+   {concept, unit, label, value}. Concept-tag consistency across a
+   symbol's own quarters is ALSO confirmed now (AAPL/TSLA both show the
+   same three concepts across 4 straight quarterly reports) — but the
+   first real run surfaced something this script's earlier version got
+   wrong: freq='quarterly' only returns 10-Q filings, and neither AAPL
+   nor TSLA files a 10-Q for their fiscal-year-end quarter (that quarter's
+   numbers live in the 10-K instead). So "last 4 by endDate" silently
+   skips one calendar quarter and pulls in an extra stale one instead of
+   giving 4 contiguous quarters — not a true TTM window. The standard fix
+   is deriving the missing quarter as (annual figure) - (sum of the 3
+   quarters inside that fiscal year); _inspect_annual_concepts() checks
+   whether freq='annual' carries the same concept tags needed to do that,
+   plus a rough magnitude sanity check. The actual period-alignment
+   subtraction logic is real implementation work for FundamentalsProvider
+   itself, not something faked here.
 3. /calendar/earnings (earnings_calendar) — next_earnings_date.
 4. /company-news (company_news) — candidate NewsFlagProvider source.
    Checked specifically for whether each article's 'datetime' field is a
@@ -61,6 +73,7 @@ import asyncio
 import json
 import sys
 import time
+from collections import Counter
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -78,6 +91,25 @@ _DEFAULT_SYMBOLS = ["AAPL", "TSLA", "SPY"]
 _BURST_CALLS = 40  # documented general limit is 60/min; enough to find the real ceiling without wasting budget for the rest of the day
 _PROFILE2_URL = "https://finnhub.io/api/v1/stock/profile2"
 _RATELIMIT_HEADERS = ("X-Ratelimit-Limit", "X-Ratelimit-Remaining", "X-Ratelimit-Reset", "Retry-After")
+
+_TTM_REPORT_COUNT = 4  # a trailing-twelve-months figure needs exactly 4 quarters — no more, no less
+# Not an exhaustive XBRL taxonomy list — just the handful of concept names
+# companies commonly use for each line item. Listed in rough order of how
+# often real filings use them; first match wins per report.
+_REVENUE_CONCEPTS = [
+    "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax",
+    "us-gaap_RevenueFromContractWithCustomerIncludingAssessedTax",
+    "us-gaap_Revenues",
+    "us-gaap_SalesRevenueNet",
+]
+_NET_INCOME_CONCEPTS = [
+    "us-gaap_NetIncomeLoss",
+    "us-gaap_ProfitLoss",
+]
+_OPERATING_CASH_FLOW_CONCEPTS = [
+    "us-gaap_NetCashProvidedByUsedInOperatingActivities",
+    "us-gaap_NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+]
 
 
 def _print_header(title: str) -> None:
@@ -134,6 +166,138 @@ def _inspect_news_timestamps(articles: list) -> str:
     return f"'datetime' present but doesn't look like a plausible unix-seconds value ({dt_val!r}) — inspect the raw payload above before relying on it"
 
 
+def _find_concept(line_items: list[dict], candidates: list[str]) -> tuple[str, float] | None:
+    by_concept = {item.get("concept"): item.get("value") for item in line_items}
+    for candidate in candidates:
+        if candidate in by_concept:
+            return candidate, by_concept[candidate]
+    return None
+
+
+def _inspect_ttm_concepts(symbol: str, reports: list[dict]) -> None:
+    """Does the last N quarters' financials-reported data actually support
+    revenue_ttm/net_income_ttm/operating_cash_flow_ttm, or does the concept
+    tag drift underneath us between quarters? Reports exactly what matched
+    per quarter rather than assuming consistency from a single sample."""
+    if not reports:
+        return
+
+    forms = Counter(r.get("form") for r in reports)
+    print(f"Form types across all {len(reports)} returned reports: {dict(forms)}")
+
+    # endDate is a 'YYYY-MM-DD' string per Finnhub's own convention — safe to sort lexicographically
+    dated = [r for r in reports if r.get("endDate")]
+    dated.sort(key=lambda r: r["endDate"], reverse=True)
+    recent = dated[:_TTM_REPORT_COUNT]
+
+    if len(recent) < _TTM_REPORT_COUNT:
+        print(f"NOTE: only {len(recent)} dated reports available, fewer than the {_TTM_REPORT_COUNT} needed for a clean TTM sum.")
+
+    print(f"\nInspecting the {len(recent)} most recent reports for {symbol} (newest first):")
+    metric_matches: dict[str, list[str | None]] = {"revenue": [], "net_income": [], "operating_cash_flow": []}
+
+    for report in recent:
+        end_date = report.get("endDate")
+        form = report.get("form")
+        rpt = report.get("report", {})
+        ic = rpt.get("ic", [])
+        cf = rpt.get("cf", [])
+
+        rev = _find_concept(ic, _REVENUE_CONCEPTS)
+        ni = _find_concept(ic, _NET_INCOME_CONCEPTS)
+        ocf = _find_concept(cf, _OPERATING_CASH_FLOW_CONCEPTS)
+
+        metric_matches["revenue"].append(rev[0] if rev else None)
+        metric_matches["net_income"].append(ni[0] if ni else None)
+        metric_matches["operating_cash_flow"].append(ocf[0] if ocf else None)
+
+        def _fmt(match: tuple[str, float] | None) -> str:
+            return f"{match[0]}: {match[1]:,.0f}" if match else "NO MATCH from candidate list"
+
+        print(f"  {end_date} ({form}):")
+        print(f"    revenue             -> {_fmt(rev)}")
+        print(f"    net_income          -> {_fmt(ni)}")
+        print(f"    operating_cash_flow -> {_fmt(ocf)}")
+
+    print(f"\nConcept-tag consistency across these {len(recent)} quarters:")
+    for metric, matches in metric_matches.items():
+        distinct = {m for m in matches if m is not None}
+        none_count = matches.count(None)
+        if none_count:
+            print(f"  {metric}: {none_count}/{len(matches)} quarters had NO match at all — candidate list needs widening before this metric is usable.")
+        elif len(distinct) == 1:
+            print(f"  {metric}: SAME concept ('{distinct.pop()}') matched in all {len(matches)} quarters — safe to sum for TTM.")
+        else:
+            print(f"  {metric}: concept tag CHANGED across quarters ({sorted(distinct)}) — summing these directly would silently mix definitions. Needs a mapping step, not a straight sum.")
+
+
+def _inspect_annual_concepts(symbol: str, quarterly_reports: list[dict], annual_reports: list[dict]) -> None:
+    """Closes the last real unknown from the quarterly check: the fiscal
+    Q4/year-end period never shows up in freq='quarterly' results because
+    that period's numbers get filed via 10-K, not 10-Q. The standard
+    analyst technique for a true TTM is deriving that missing quarter as
+    (annual figure) - (sum of the 3 quarters within that fiscal year) —
+    but that only works if the annual report uses the SAME concept tags.
+    This checks exactly that, without doing the full subtraction/alignment
+    logic itself — that belongs in FundamentalsProvider's real
+    implementation with proper tests, not a disposable spike script."""
+    if not annual_reports:
+        print("No annual (10-K) reports returned at all — the derive-missing-quarter approach isn't available; freq='annual' returns nothing for this symbol.")
+        return
+
+    dated = [r for r in annual_reports if r.get("endDate")]
+    if not dated:
+        print("Annual reports returned but none have a usable endDate — inspect the raw payload before trusting this path.")
+        return
+    dated.sort(key=lambda r: r["endDate"], reverse=True)
+    latest = dated[0]
+
+    rpt = latest.get("report", {})
+    rev = _find_concept(rpt.get("ic", []), _REVENUE_CONCEPTS)
+    ni = _find_concept(rpt.get("ic", []), _NET_INCOME_CONCEPTS)
+    ocf = _find_concept(rpt.get("cf", []), _OPERATING_CASH_FLOW_CONCEPTS)
+
+    print(f"Most recent annual report: form={latest.get('form')} endDate={latest.get('endDate')}")
+
+    def _fmt(match: tuple[str, float] | None) -> str:
+        return f"{match[0]}: {match[1]:,.0f}" if match else "NO MATCH from candidate list"
+
+    print(f"  revenue             -> {_fmt(rev)}")
+    print(f"  net_income          -> {_fmt(ni)}")
+    print(f"  operating_cash_flow -> {_fmt(ocf)}")
+
+    same_tags = (
+        (rev[0] if rev else None) in _REVENUE_CONCEPTS
+        and (ni[0] if ni else None) in _NET_INCOME_CONCEPTS
+        and (ocf[0] if ocf else None) in _OPERATING_CASH_FLOW_CONCEPTS
+        and rev and ni and ocf
+    )
+    if not same_tags:
+        print("VERDICT: at least one metric had no match on the annual report — the derive-missing-quarter plug isn't safely available as-is for this symbol without widening the candidate list.")
+        return
+
+    # Rough plausibility check only — full period alignment (matching the
+    # 3 quarters that actually fall inside this specific fiscal year) is
+    # real implementation work, not something to fake here.
+    quarterly_revenues = []
+    for q in quarterly_reports:
+        q_rev = _find_concept(q.get("report", {}).get("ic", []), _REVENUE_CONCEPTS)
+        if q_rev:
+            quarterly_revenues.append(q_rev[1])
+    if quarterly_revenues and rev:
+        avg_quarterly = sum(quarterly_revenues[:4]) / len(quarterly_revenues[:4])
+        ratio = rev[1] / avg_quarterly if avg_quarterly else float("nan")
+        print(
+            f"VERDICT: same concept family matched on the annual report. Annual revenue is {ratio:.1f}x the "
+            f"average of the last {min(4, len(quarterly_revenues))} quarterly revenues — a ratio near 3.5-4.5x "
+            f"is consistent with 'annual = sum of 4 quarters' (supports the derive-missing-quarter approach); "
+            f"a ratio far outside that range means something about period alignment needs a closer look before "
+            f"building the subtraction logic for real."
+        )
+    else:
+        print("VERDICT: same concept family matched on the annual report — plug-derivation looks structurally available, but no quarterly revenue figures to sanity-check the magnitude against.")
+
+
 def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
     _print_header(f"BURST TEST — {_BURST_CALLS} rapid calls to /stock/profile2 (symbol={symbol})")
     print(
@@ -143,6 +307,7 @@ def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
     )
     start = time.monotonic()
     first_failure_at: tuple[int, float] | None = None
+    remaining_trend: list[int] = []  # tracks X-Ratelimit-Remaining across calls, when Finnhub sends it
     for i in range(1, _BURST_CALLS + 1):
         call_start = time.monotonic()
         try:
@@ -154,16 +319,30 @@ def _run_ratelimit_burst(api_key: str, symbol: str) -> None:
         headers_seen = {h: resp.headers[h] for h in _RATELIMIT_HEADERS if h in resp.headers}
         header_str = f" | headers: {headers_seen}" if headers_seen else ""
         print(f"  call {i:>2}: status={resp.status_code} elapsed={elapsed:.3f}s{header_str}")
+        if "X-Ratelimit-Remaining" in resp.headers:
+            try:
+                remaining_trend.append(int(resp.headers["X-Ratelimit-Remaining"]))
+            except ValueError:
+                pass
         if resp.status_code != 200 and first_failure_at is None:
             first_failure_at = (i, time.monotonic() - start)
             print(f"    -> FIRST FAILURE at call #{i}, {first_failure_at[1]:.2f}s into the burst. Body: {resp.text[:300]}")
 
     total_elapsed = time.monotonic() - start
     print(f"\nBurst finished in {total_elapsed:.2f}s.")
-    if first_failure_at is None:
+    if first_failure_at is None and remaining_trend:
+        print(
+            f"VERDICT: all {_BURST_CALLS} calls succeeded within {total_elapsed:.2f}s. Finnhub DID send "
+            f"X-Ratelimit-Remaining on every call — it dropped from {remaining_trend[0]} to {remaining_trend[-1]} "
+            f"over the burst, so quota tracking is real, it just wasn't exhausted by {_BURST_CALLS} calls in "
+            f"this window. At this drain rate the bucket would hit 0 after roughly "
+            f"{remaining_trend[-1]} more calls before the window resets — widen _BURST_CALLS if you want to "
+            f"actually see the 429 and confirm the documented ceiling directly."
+        )
+    elif first_failure_at is None:
         print(
             f"VERDICT: all {_BURST_CALLS} calls succeeded within {total_elapsed:.2f}s with no rate-limit "
-            f"response and no X-Ratelimit-* headers observed. Either the ceiling is comfortably above "
+            f"response and no X-Ratelimit-* headers observed at all. Either the ceiling is comfortably above "
             f"{_BURST_CALLS} calls in this window, or Finnhub doesn't expose remaining-quota headers on "
             f"this tier/endpoint — widen _BURST_CALLS and rerun if you want a tighter bound."
         )
@@ -200,20 +379,31 @@ async def main() -> None:
             print(f"FAILED: status={exc.status_code} message={exc.message}")
 
         print("\n--- /stock/financials-reported (freq=quarterly) ---")
+        quarterly_data: list = []
         try:
             fin_q = await check_financials_reported(client, symbol, "quarterly")
-            data = fin_q.get("data", []) if isinstance(fin_q, dict) else []
+            quarterly_data = fin_q.get("data", []) if isinstance(fin_q, dict) else []
             print(f"Top-level keys: {list(fin_q.keys()) if isinstance(fin_q, dict) else type(fin_q)}")
-            print(f"Number of quarterly reports returned: {len(data)}")
-            if data:
-                report = data[0]
+            print(f"Number of quarterly reports returned: {len(quarterly_data)}")
+            if quarterly_data:
+                report = quarterly_data[0]
                 print(f"Most recent report's top-level keys: {list(report.keys())}")
-                bs = report.get("report", {}).get("bs", [])
-                if bs:
-                    print(f"Sample balance-sheet line item shape: {_truncate(bs[0], 300)}")
                 print(f"Financial statement sections present: {list(report.get('report', {}).keys())}")
+                _inspect_ttm_concepts(symbol, quarterly_data)
             else:
                 print(f"NOTE: no quarterly reports for {symbol} — expected for ETFs (SPY/QQQ/IWM file no 10-Qs).")
+        except finnhub.exceptions.FinnhubAPIException as exc:
+            print(f"FAILED: status={exc.status_code} message={exc.message}")
+
+        print("\n--- /stock/financials-reported (freq=annual) — closing the missing-Q4 gap ---")
+        try:
+            fin_a = await check_financials_reported(client, symbol, "annual")
+            annual_data = fin_a.get("data", []) if isinstance(fin_a, dict) else []
+            print(f"Number of annual reports returned: {len(annual_data)}")
+            if annual_data:
+                _inspect_annual_concepts(symbol, quarterly_data, annual_data)
+            else:
+                print(f"NOTE: no annual reports for {symbol} — expected for ETFs.")
         except finnhub.exceptions.FinnhubAPIException as exc:
             print(f"FAILED: status={exc.status_code} message={exc.message}")
 
