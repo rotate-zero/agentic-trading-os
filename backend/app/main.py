@@ -68,11 +68,11 @@ async def lifespan(app: FastAPI):
     level_interaction_engine = get_level_interaction_engine(bus)
     level_interaction_engine.start()
 
-    # Market State Engine (decision #93) — per-symbol only in this build;
-    # cross-symbol (SPY/QQQ/IWM) is M3, not built here. Subscriber, same
-    # as LevelInteractionEngine above — stops AFTER the bus in shutdown
-    # below, not before like ContextEngine (see that comment for why the
-    # two engines differ on this).
+    # Market State Engine (decision #93 for per-symbol, decision #97 for
+    # M3's SPY/QQQ/IWM cross-symbol synthesis on top of it). Subscriber,
+    # same as LevelInteractionEngine above — stops AFTER the bus in
+    # shutdown below, not before like ContextEngine (see that comment for
+    # why the two engines differ on this).
     market_state_engine = get_market_state_engine(bus)
     market_state_engine.start()
 

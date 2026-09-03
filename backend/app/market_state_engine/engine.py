@@ -2,11 +2,27 @@
 MarketStateEngine — turns Feature Engine's per-symbol output into scored
 Trend/Volatility regime/Volume regime/VWAP relationship/Acceleration
 state (trading-intelligence-architecture.md §4, decision #91's shape,
-decision #93 for this build). Subscribes to FeaturesUpdated, one
-DebounceScheduler per symbol (§4's cadence: ~1s floor/~10s ceiling per
-symbol — SPY/QQQ/IWM's tighter ~3-5s ceiling is M3, not built here, since
-this engine is generic over any tracked symbol and doesn't yet know which
-three are "always-on").
+decision #93 for this build), and additionally synthesizes SPY/QQQ/IWM's
+own per-symbol Trend scores into the small `CrossSymbolState` composite
+(decision #91 §4, this build M3 — decision #97). Subscribes to
+FeaturesUpdated, one DebounceScheduler per symbol (§4's cadence: ~1s
+floor/~10s ceiling per symbol — SPY/QQQ/IWM get the same ~1s floor but a
+tighter ~3-5s ceiling, `_CROSS_SYMBOL_MAX_INTERVAL_SECONDS`, since
+broad-market state is what everything else gets compared against).
+
+Cross-symbol synthesis, in one sentence: after any of SPY/QQQ/IWM
+completes its own per-symbol compute, the engine checks whether all three
+have now reported at least one trend_score, and if so recomputes and
+republishes `CrossSymbolState` — no separate trigger, no separate
+scheduler; it rides the same worker loop and the same per-symbol
+DebounceScheduler cadence that got it there. Persisted as a `__MARKET__`
+sentinel row in the same `market_state_history` table (decision #91: "no
+separate table"), published via the same `MarketStateChanged` event type
+with `envelope.symbol == "__MARKET__"` (decision #91: "no new EventType
+needed — envelope.symbol distinguishes the two shapes"). No fabricated
+partial state: `_compute_cross_symbol` returns None until all three have
+reported at least once, per the project's honest-state-over-fabricated-
+state principle.
 
 Two deliberate deviations from decision #91's six-dimension list, both
 answered directly rather than guessed at, logged in decision #93:
@@ -46,6 +62,11 @@ explicit that a cold start on restart is an accepted v1 simplification,
 not a gap this table needs to help close. Mutated only from inside the
 single worker task, so no lock is needed the way LevelInteractionEngine's
 own state needs one — one consumer, one queue, strictly serial.
+`_cross_symbol_trend` (M3) is the identical shape one level up — SPY/
+QQQ/IWM's own latest trend_score, no timestamp needed since cross-symbol
+synthesis doesn't compute a rate of change, just a same-moment
+comparison across the three — also mutated only from inside the worker
+task.
 """
 from __future__ import annotations
 
@@ -63,6 +84,10 @@ from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.market_state_engine.scoring import (
     acceleration_score,
+    iwm_confirmation_score,
+    qqq_leadership_score,
+    risk_on_score,
+    trend_alignment_score,
     trend_score,
     volatility_regime_score,
     volume_regime_score,
@@ -71,12 +96,22 @@ from app.market_state_engine.scoring import (
 from app.models.market_data import Symbol
 from app.models.market_state import MarketStateHistory
 from app.schemas.events.envelope import EventEnvelope, EventType
-from app.schemas.events.market_state import MarketState
+from app.schemas.events.market_state import CrossSymbolState, MarketState
 
 logger = logging.getLogger(__name__)
 
 _MIN_INTERVAL_SECONDS = 1.0
 _MAX_INTERVAL_SECONDS = 10.0
+
+# M3 (decision #91 §4, this build #97) — SPY/QQQ/IWM are always-on
+# cross-symbol subjects: same ~1s floor as any other symbol, but a
+# tighter ceiling since broad-market state is what everything else gets
+# compared against. The sentinel row's own ticker never gets a
+# FeaturesUpdated subscription or scheduler — it's synthesized, not
+# Feature-Engine-driven.
+_CROSS_SYMBOL_TICKERS = frozenset({"SPY", "QQQ", "IWM"})
+_CROSS_SYMBOL_MAX_INTERVAL_SECONDS = 4.0
+_CROSS_SYMBOL_SENTINEL = "__MARKET__"
 
 _STOP_SENTINEL = object()
 
@@ -90,6 +125,7 @@ class MarketStateEngine:
         self._schedulers: dict[str, DebounceScheduler] = {}
         self._latest_features: dict[str, dict[str, Any]] = {}  # symbol -> raw FeaturesUpdated payload
         self._prev_trend: dict[str, tuple[float, float]] = {}  # symbol -> (trend_score, time.monotonic() at that score)
+        self._cross_symbol_trend: dict[str, float] = {}  # "SPY"/"QQQ"/"IWM" -> latest trend_score (M3)
 
     def start(self) -> None:
         self._bus.subscribe(EventType.FEATURES_UPDATED, self._on_features_updated)
@@ -126,10 +162,13 @@ class MarketStateEngine:
         self._latest_features[symbol] = envelope.payload
         scheduler = self._schedulers.get(symbol)
         if scheduler is None:
+            max_interval = (
+                _CROSS_SYMBOL_MAX_INTERVAL_SECONDS if symbol in _CROSS_SYMBOL_TICKERS else _MAX_INTERVAL_SECONDS
+            )
             scheduler = DebounceScheduler(
                 callback=lambda s=symbol: self._queue.put_nowait(s),
                 min_interval=_MIN_INTERVAL_SECONDS,
-                max_interval=_MAX_INTERVAL_SECONDS,
+                max_interval=max_interval,
                 name=f"market-state-{symbol}",
             )
             self._schedulers[symbol] = scheduler
@@ -153,6 +192,23 @@ class MarketStateEngine:
                         await self._bus.publish(
                             make_envelope(EventType.MARKET_STATE_CHANGED, state, symbol=symbol)
                         )
+                        if symbol in _CROSS_SYMBOL_TICKERS:
+                            self._cross_symbol_trend[symbol] = state.trend_score
+                            try:
+                                cross_state = self._compute_cross_symbol()
+                                if cross_state is not None:
+                                    await asyncio.to_thread(self._persist_cross_symbol, cross_state)
+                                    await self._bus.publish(
+                                        make_envelope(
+                                            EventType.MARKET_STATE_CHANGED,
+                                            cross_state,
+                                            symbol=_CROSS_SYMBOL_SENTINEL,
+                                        )
+                                    )
+                            except Exception:  # noqa: BLE001 — a cross-symbol failure
+                                # shouldn't read as this symbol's own per-symbol compute
+                                # failing (it just did, successfully, above).
+                                logger.exception("MarketStateEngine failed cross-symbol synthesis (triggered by %s)", symbol)
                 except Exception:  # noqa: BLE001 — one bad symbol must not stall the rest
                     logger.exception("MarketStateEngine failed to process %s", symbol)
                 finally:
@@ -194,27 +250,116 @@ class MarketStateEngine:
             acceleration_score=accel,
         )
 
+    def _compute_cross_symbol(self) -> CrossSymbolState | None:
+        """Pure, in-memory, mirroring `_compute`'s shape — reads
+        `_cross_symbol_trend` (updated by the worker loop right before
+        this is called) and scoring.py's cross-symbol functions; no I/O.
+
+        Returns None until all three of SPY/QQQ/IWM have reported at
+        least one trend_score — no fabricated partial state (honest
+        state over fabricated state, the same principle `acceleration_
+        score` already applies to a symbol's first-ever recompute).
+        Once available, `spy_direction_score`/`qqq_direction_score`/
+        `iwm_direction_score` are a straight passthrough of each
+        symbol's own trend_score (trading-intelligence-architecture.md
+        §4) — no separate function needed for those three, unlike the
+        four synthesized scores.
+
+        `timeframe`/`candle_ts` are borrowed from whichever of the three
+        symbols has the most recent `candle_ts` in `_latest_features` —
+        SPY/QQQ/IWM share a debounce cadence but don't necessarily
+        recompute in perfect lockstep, so this composite's own timestamp
+        should reflect the freshest of the three inputs, not an
+        arbitrary pick."""
+        if not _CROSS_SYMBOL_TICKERS.issubset(self._cross_symbol_trend.keys()):
+            return None
+
+        spy = self._cross_symbol_trend["SPY"]
+        qqq = self._cross_symbol_trend["QQQ"]
+        iwm = self._cross_symbol_trend["IWM"]
+
+        newest_ticker = max(
+            _CROSS_SYMBOL_TICKERS,
+            key=lambda t: self._latest_features[t]["candle_ts"],
+        )
+        newest_payload = self._latest_features[newest_ticker]
+
+        return CrossSymbolState(
+            timeframe=newest_payload["timeframe"],
+            candle_ts=newest_payload["candle_ts"],
+            spy_direction_score=spy,
+            qqq_direction_score=qqq,
+            iwm_direction_score=iwm,
+            trend_alignment_score=trend_alignment_score(spy, qqq, iwm),
+            risk_on_score=risk_on_score(spy, qqq, iwm),
+            qqq_leadership_score=qqq_leadership_score(spy, qqq),
+            iwm_confirmation_score=iwm_confirmation_score(spy, qqq, iwm),
+        )
+
     # --- persistence (runs off-loop via asyncio.to_thread) ----------------------
 
     def _persist(self, symbol: str, state: MarketState) -> None:
         session = SessionLocal()
         try:
             symbol_id = self._get_or_create_symbol_id(session, symbol)
-            session.add(
-                MarketStateHistory(
-                    symbol_id=symbol_id,
-                    timeframe=state.timeframe,
-                    candle_ts=state.candle_ts,
-                    trend_score=state.trend_score,
-                    volatility_regime_score=state.volatility_regime_score,
-                    volume_regime_score=state.volume_regime_score,
-                    vwap_relationship_score=state.vwap_relationship_score,
-                    acceleration_score=state.acceleration_score,
-                )
+            row = MarketStateHistory(
+                symbol_id=symbol_id,
+                timeframe=state.timeframe,
+                candle_ts=state.candle_ts,
+                trend_score=state.trend_score,
+                volatility_regime_score=state.volatility_regime_score,
+                volume_regime_score=state.volume_regime_score,
+                vwap_relationship_score=state.vwap_relationship_score,
+                acceleration_score=state.acceleration_score,
             )
+            # Write-time assertion (M3, decision #89's entry_qty==exit_qty
+            # precedent, application-level not a DB CHECK): a per-symbol
+            # row must populate the per-symbol column group and leave the
+            # cross-symbol group untouched — see models/market_state.py's
+            # docstring for the two mutually exclusive row shapes this
+            # table now holds.
+            assert row.trend_score is not None and row.spy_direction_score is None, (
+                "per-symbol MarketStateHistory row must populate the per-symbol "
+                "score columns and leave the cross-symbol columns NULL"
+            )
+            session.add(row)
             session.commit()
         except Exception:  # noqa: BLE001 — same soft-fail posture as LevelInteractionEngine/CandleRecorder
             logger.exception("MarketStateEngine failed to persist state for %s", symbol)
+            session.rollback()
+        finally:
+            session.close()
+
+    def _persist_cross_symbol(self, state: CrossSymbolState) -> None:
+        """Mirrors `_persist`'s structure/error-handling exactly — same
+        soft-fail posture, same session lifecycle — writing the
+        `__MARKET__` sentinel row instead of a per-symbol one."""
+        session = SessionLocal()
+        try:
+            symbol_id = self._get_or_create_symbol_id(session, _CROSS_SYMBOL_SENTINEL)
+            row = MarketStateHistory(
+                symbol_id=symbol_id,
+                timeframe=state.timeframe,
+                candle_ts=state.candle_ts,
+                spy_direction_score=state.spy_direction_score,
+                qqq_direction_score=state.qqq_direction_score,
+                iwm_direction_score=state.iwm_direction_score,
+                trend_alignment_score=state.trend_alignment_score,
+                risk_on_score=state.risk_on_score,
+                qqq_leadership_score=state.qqq_leadership_score,
+                iwm_confirmation_score=state.iwm_confirmation_score,
+            )
+            # Same write-time assertion as _persist, opposite direction —
+            # the cross-symbol row must populate the cross-symbol group
+            # and leave the per-symbol group NULL.
+            assert row.spy_direction_score is not None and row.trend_score is None, (
+                "cross-symbol MarketStateHistory row must populate the cross-symbol "
+                "score columns and leave the per-symbol columns NULL"
+            )
+            session.add(row)
+            session.commit()
+        except Exception:  # noqa: BLE001 — same soft-fail posture as LevelInteractionEngine/CandleRecorder
+            logger.exception("MarketStateEngine failed to persist cross-symbol state")
             session.rollback()
         finally:
             session.close()

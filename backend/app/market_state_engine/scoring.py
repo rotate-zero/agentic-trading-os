@@ -3,7 +3,9 @@ Pure scoring functions for Market State Engine's per-symbol dimensions
 (trading-intelligence-architecture.md §4, decision #91's dimension list;
 decision #93 for this build's formulas and its two deviations from that
 list — see engine.py's module docstring for both, and the full reasoning
-in confirmed-decisions.md #93).
+in confirmed-decisions.md #93) and its cross-symbol composite (decision
+#91's `CrossSymbolState`, this build #97 — see the "Cross-symbol" section
+below).
 
 Every score is 0-100 (decision #91): 50 is neutral for the directional
 dimensions (Trend, VWAP relationship, Acceleration); there's no neutral
@@ -110,3 +112,63 @@ def acceleration_score(trend_score_now: float, trend_score_prev: float, elapsed_
         return None
     rate = (trend_score_now - trend_score_prev) / elapsed_seconds
     return _clamp(50.0 + rate * (50.0 / ACCELERATION_RATE_CAP))
+
+
+# --- Cross-symbol (CrossSymbolState, decision #91 §4, this build #97) -------
+#
+# All four formulas below take SPY/QQQ/IWM's own trend_score (already
+# 0-100, directional — 50 neutral) as input, not raw price/volume — the
+# per-symbol Trend dimension already did the real normalization work, so
+# cross-symbol synthesis is comparisons between three already-comparable
+# numbers, nothing new to calibrate against price itself. `spy_direction_
+# score`/`qqq_direction_score`/`iwm_direction_score` (CrossSymbolState's
+# other three fields) are a straight passthrough of that same trend_score
+# with no function needed — engine.py assigns them directly.
+#
+# Calibration constants (60, 30) are v1 defaults, explicitly unvalidated
+# against real distributions — same posture as every constant above.
+
+TREND_ALIGNMENT_SPREAD_CAP = 60.0  # spread (max-min) across the three at/beyond this -> fully misaligned (0)
+CROSS_SYMBOL_DIFF_CAP = 30.0       # points of difference that saturates risk_on/qqq_leadership
+IWM_CONFIRMATION_DEVIATION_CAP = 30.0  # |iwm - broad-market avg| at/beyond this -> fully diverged (0)
+
+
+def trend_alignment_score(spy_direction_score: float, qqq_direction_score: float, iwm_direction_score: float) -> float:
+    """How closely SPY/QQQ/IWM's direction scores agree. 100 = identical
+    readings across all three; falls toward 0 as they spread apart,
+    saturating at `TREND_ALIGNMENT_SPREAD_CAP` points of spread — a
+    genuine cross-symbol disagreement (e.g. one bullish, one bearish),
+    not just ordinary noise between three independently-computed
+    scores."""
+    scores = (spy_direction_score, qqq_direction_score, iwm_direction_score)
+    spread = max(scores) - min(scores)
+    return _clamp(100.0 - spread / TREND_ALIGNMENT_SPREAD_CAP * 100.0)
+
+
+def risk_on_score(spy_direction_score: float, qqq_direction_score: float, iwm_direction_score: float) -> float:
+    """QQQ/IWM (growth, small-cap) strength relative to SPY (the broad
+    market). Above 50 = risk-on (growth/small-cap leading); below 50 =
+    risk-off (growth/small-cap lagging the broad tape) — the same
+    directional convention as Trend itself, applied one level up."""
+    growth_avg = (qqq_direction_score + iwm_direction_score) / 2.0
+    return _clamp(50.0 + (growth_avg - spy_direction_score) * (50.0 / CROSS_SYMBOL_DIFF_CAP))
+
+
+def qqq_leadership_score(spy_direction_score: float, qqq_direction_score: float) -> float:
+    """Is tech (QQQ) leading or lagging the broader tape (SPY) —
+    deliberately narrower than risk_on_score (SPY vs. QQQ only, no IWM),
+    since tech leadership specifically is a distinct, commonly-asked
+    question from growth-vs-value broadly."""
+    return _clamp(50.0 + (qqq_direction_score - spy_direction_score) * (50.0 / CROSS_SYMBOL_DIFF_CAP))
+
+
+def iwm_confirmation_score(spy_direction_score: float, qqq_direction_score: float, iwm_direction_score: float) -> float:
+    """Does small-cap (IWM) confirm or diverge from SPY/QQQ's own
+    average read. 100 = IWM matches the SPY/QQQ average exactly; falls
+    toward 0 as IWM diverges, saturating at `IWM_CONFIRMATION_DEVIATION_
+    CAP` points away — small-caps trading against the broad market's
+    signal is the classic confirmation/divergence question this
+    dimension answers."""
+    broad_avg = (spy_direction_score + qqq_direction_score) / 2.0
+    deviation = abs(iwm_direction_score - broad_avg)
+    return _clamp(100.0 - deviation / IWM_CONFIRMATION_DEVIATION_CAP * 100.0)

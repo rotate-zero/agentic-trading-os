@@ -166,7 +166,7 @@ No correlation matrices, no full advancing/declining breadth, no sector rotation
 
 **Where composite (cross-symbol) state is persisted (decision #91):** no separate table. A synthetic row inside the same `market_state_history` mechanism (sentinel symbol, e.g. `symbol = "__MARKET__"`), computed on the same `DebounceScheduler` cadence as everything else — same reasoning `strategy_outcomes` already applies to live and backtest rows sharing one schema, distinguished by a flag, rather than splitting into two tables for what's structurally the same kind of record.
 
-**Data source confirmation still needed before implementation:** does the existing Polygon/Finnhub integration actually serve SPY/QQQ/IWM cleanly (liquidity, quote quality, any ETF-specific quirks) — the same empirical-before-architectural spike this project already applies elsewhere, not assumed correct just because they're liquid, well-known tickers.
+**Data source confirmation — closed by decision #95's M0 spike.** Polygon daily bars for SPY/QQQ/IWM confirmed clean (correct weekday bar counts, no gaps, healthy volume/price ranges, no ETF-specific quirks) — the empirical-before-architectural check this project applies elsewhere, not assumed correct just because they're liquid, well-known tickers. (Finnhub's free-tier WebSocket trade feed was also found to be IEX-only, ~10% of true ETF volume at best — a real constraint, but on tick-level Participation work, not on the Feature Engine's candle-derived `sma_20_slope_angle` that `trend_score` — and so `spy_direction_score`/`qqq_direction_score`/`iwm_direction_score` — is actually computed from. Not a blocker for the cross-symbol synthesis built here, decision #97.)
 
 ---
 
