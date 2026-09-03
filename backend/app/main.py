@@ -12,6 +12,7 @@ from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
 from app.api.websocket.channels import get_gateway
 from app.context_engine.engine import get_context_engine
+from app.context_engine.fundamentals_refresh import get_fundamentals_refresh_jobs
 from app.core.config import get_settings
 from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
@@ -75,14 +76,21 @@ async def lifespan(app: FastAPI):
     market_state_engine = get_market_state_engine(bus)
     market_state_engine.start()
 
-    # Context Engine's M1 slice (decision #92) — thin aggregator over
-    # ContextProvider instances. Only CalendarProvider is registered so
-    # far; FundamentalsProvider/NewsFlagProvider join once M0's Finnhub
-    # spike results land (M0-SPIKE-NOTES.md). Unconditional start, same
-    # posture as everything else here — CalendarProvider only touches
-    # MarketClock, no external API, so there's nothing to soft-fail on.
+    # Context Engine (decision #96 — M1 remainder built): CalendarProvider
+    # (market-wide), FundamentalsProvider + NewsFlagProvider (per-symbol,
+    # decision #96's second aggregation path). Unconditional start —
+    # CalendarProvider needs no external API; Fundamentals/News each
+    # soft-fail internally (empty API key, ETF guard, Finnhub errors) so
+    # there's nothing here worth gating start() on.
     context_engine = get_context_engine(bus)
     context_engine.start()
+
+    # FundamentalsRefreshJobs — the only writer to symbol_fundamentals
+    # (decision #96). Soft-fails its own start() (logs + no-ops) when no
+    # Finnhub key is configured, same posture as the broker
+    # auto-connects below.
+    fundamentals_refresh_jobs = get_fundamentals_refresh_jobs()
+    fundamentals_refresh_jobs.start()
 
     gateway = get_gateway()
     gateway.attach()
@@ -161,6 +169,7 @@ async def lifespan(app: FastAPI):
         # drain to a fixed backlog) doesn't apply to it; see engine.py's
         # own docstring for the full distinction (decision #92).
         await context_engine.stop()
+        await fundamentals_refresh_jobs.stop()
 
         # Bus stops FIRST, deliberately, not last — separately confirmed
         # (decision #47) via the same debugging session. With engines

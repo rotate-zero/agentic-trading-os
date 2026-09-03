@@ -40,6 +40,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.api.websocket.channels as channels_module
     import app.api.websocket.manager as manager_module
     import app.context_engine.engine as context_engine_module
+    import app.context_engine.fundamentals_refresh as fundamentals_refresh_module
     import app.core.config as config_module
     import app.event_bus.bus as bus_module
     import app.feature_engine.engine as feature_engine_module
@@ -66,6 +67,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
         level_interaction_engine_module._level_interaction_engine = None  # ditto
         live_tick_relay_module._live_tick_relay = None  # ditto — decision #72
         context_engine_module._context_engine = None  # ditto — decision #92, missed when that engine was built, fixed here (#93)
+        fundamentals_refresh_module._fundamentals_refresh_jobs = None  # ditto — decision #96
         market_state_engine_module._market_state_engine = None  # ditto — decision #93
         broker_registry.clear_all()
         # market_data.py and finnhub_data.py each keep their own local
