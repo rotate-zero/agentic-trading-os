@@ -127,6 +127,17 @@ class MarketStateEngine:
         self._prev_trend: dict[str, tuple[float, float]] = {}  # symbol -> (trend_score, time.monotonic() at that score)
         self._cross_symbol_trend: dict[str, float] = {}  # "SPY"/"QQQ"/"IWM" -> latest trend_score (M3)
 
+        # Read-side snapshot cache (decision #98, M4) — see get_snapshot()'s
+        # own docstring for why this exists: this engine only ever published
+        # MarketStateChanged onto the bus, with no synchronous way for a
+        # consumer to ask "what do you currently believe about NVDA" without
+        # replaying event history itself. Mutated only from inside the single
+        # worker task (_worker_loop), same single-writer discipline
+        # `_prev_trend`/`_cross_symbol_trend` already follow above — no lock
+        # needed for the same reason.
+        self._latest_market_state: dict[str, MarketState] = {}
+        self._latest_cross_symbol_state: CrossSymbolState | None = None
+
     def start(self) -> None:
         self._bus.subscribe(EventType.FEATURES_UPDATED, self._on_features_updated)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="market-state-engine")
@@ -189,6 +200,11 @@ class MarketStateEngine:
                     state = self._compute(symbol)
                     if state is not None:
                         await asyncio.to_thread(self._persist, symbol, state)
+                        # Cache before publish (decision #98) — a subscriber
+                        # reacting to the event that's about to go out can
+                        # immediately call get_snapshot() and see this exact
+                        # state, never a stale prior value racing the event.
+                        self._latest_market_state[symbol] = state
                         await self._bus.publish(
                             make_envelope(EventType.MARKET_STATE_CHANGED, state, symbol=symbol)
                         )
@@ -198,6 +214,7 @@ class MarketStateEngine:
                                 cross_state = self._compute_cross_symbol()
                                 if cross_state is not None:
                                     await asyncio.to_thread(self._persist_cross_symbol, cross_state)
+                                    self._latest_cross_symbol_state = cross_state
                                     await self._bus.publish(
                                         make_envelope(
                                             EventType.MARKET_STATE_CHANGED,
@@ -215,6 +232,56 @@ class MarketStateEngine:
                     self._queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    # --- read-side snapshot (decision #98, M4) ----------------------------------
+
+    def get_snapshot(self, symbol: str | None = None) -> dict[str, Any]:
+        """
+        Current computed state, synchronous, in-memory — no I/O, safe to
+        call directly from an async route handler or a future Strategy's
+        MATCH stage without asyncio.to_thread. Same "read-side of an
+        event-only engine" pattern FeatureEngine/LevelInteractionEngine
+        already established (decision #47), added here so a consumer
+        doesn't have to reconstruct "current state" by replaying
+        MarketStateChanged history itself.
+
+        Shape: {"symbols": {ticker: {...MarketState fields, "candle_ts":
+        iso str}}, "market": {...CrossSymbolState fields, "candle_ts":
+        iso str} | None}.
+
+        - symbol=None: every per-symbol MarketState this process has
+          computed at least once, plus the cross-symbol composite once
+          it's been synthesized at least once (None until SPY/QQQ/IWM
+          have all reported — see _compute_cross_symbol's own docstring).
+        - symbol="__MARKET__": "symbols" is always {} (the sentinel has
+          no per-symbol row of its own); only "market" is populated.
+        - symbol="<ticker>": "symbols" has at most one entry. "market" is
+          still included whenever available regardless of which symbol
+          was asked for — broad-market state isn't scoped to the request,
+          the same way a strategy reading NVDA's own state would also
+          want to know what SPY/QQQ/IWM are doing without a second call.
+
+        Deliberately NOT pre-populated for the whole configured universe —
+        same "empty means not-yet, not zero" convention as FeatureEngine's
+        own get_snapshot(): a symbol this process hasn't computed a
+        MarketState for yet is simply absent, never a fabricated default
+        (honest state over fabricated state, strategy-engine-design.md §11).
+        """
+        symbols: dict[str, Any] = {}
+        if symbol is None:
+            for sym, state in self._latest_market_state.items():
+                symbols[sym] = state.model_dump(mode="json")
+        elif symbol != _CROSS_SYMBOL_SENTINEL:
+            state = self._latest_market_state.get(symbol)
+            if state is not None:
+                symbols[symbol] = state.model_dump(mode="json")
+
+        market = (
+            self._latest_cross_symbol_state.model_dump(mode="json")
+            if self._latest_cross_symbol_state is not None
+            else None
+        )
+        return {"symbols": symbols, "market": market}
 
     def _compute(self, symbol: str) -> MarketState | None:
         """Pure, in-memory — reads the latest cached FeaturesUpdated

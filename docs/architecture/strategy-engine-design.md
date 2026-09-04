@@ -1,5 +1,5 @@
 # Strategy Engine — Design & Lifecycle
-**Status:** Stage 0 confirmed (`confirmed-decisions.md` #87, refined by #88). Concept locked across a two-round review (Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly — same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59); §8's timing model went through a further two-round refinement (ChatGPT's "opportunity lifecycle" critique → Claude's schema-gap findings → ChatGPT's "ACT/WAIT/ABANDON, not bar-close" correction, adopted). **Stage 1 has begun, split across two concurrent sessions with no visibility between them:** `base_strategy.py`/`orb_strategy.py` in one; `momentum_strategy.py`/`vwap_strategy.py` (decision #98 — §1a below) in the other. §1's ORB snippet stays "illustrative, not final code" until that session's actual file is reconciled against it; §1a's Momentum/VWAP code is real and tested, but unverified against the real `base_strategy.py` — see #98's integration note for the specific open points.
+**Status:** Stage 0 confirmed (`confirmed-decisions.md` #87, refined by #88). Concept locked across a two-round review (Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly — same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59); §8's timing model went through a further two-round refinement (ChatGPT's "opportunity lifecycle" critique → Claude's schema-gap findings → ChatGPT's "ACT/WAIT/ABANDON, not bar-close" correction, adopted). **No application code has been written yet** — `strategy_engine/` doesn't exist anywhere in the repo; this document and decisions #87/#88 are the direction lock, matching decisions #50/#59/#67's own precedent.
 **Owner:** Saqib
 **Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) (§8 Strategy Engine, §9 Opportunity Engine, §10 Decision Engine, §11 Trade Planning Engine, §12 Governor, §14 Performance Intelligence — every section this plan extends, not replaces), [`system-design.md`](./system-design.md) (§4.5 Feature Engine — the sole data source every strategy reads; §4.8's `Strategy`/`Opportunity` interfaces, extended in §4 below), [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#5 Replay Engine — the interface §7's Backtest Runner reuses; #7 TimescaleDB trigger — checked, not yet hit; #11 `governor/position_sizing.py` — the eventual home for §6's Governor extension; #20 Time-to-Target Estimator — the eventual source of a temporal expectation on `Opportunity`/`StrategyConfig` (§3/§4), deferred pending real `StrategyOutcome` data), [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#87 — this plan's own direction lock).
 
@@ -72,105 +72,6 @@ class ORBMomentum(Strategy):
 ```
 
 Planned initial strategy set unchanged from trading-intelligence-architecture.md §8: ORB, Momentum, First Pullback, VWAP, Gap, Reversal, Volume Spike.
-
----
-
-## 1a. Momentum and VWAP — worked examples (decision #98)
-
-ORB above was always illustrative — a shape to write every strategy against, not a locked pattern for any *other* strategy's own MATCH stage. Momentum and VWAP's actual conditions were never decided anywhere until this section. Built and tested (24 tests, pure GATE/MATCH/SCORE functions plus full `evaluate()` orchestration) against a local, spec-conformant stand-in for `base_strategy.py`, since that file didn't exist in the repo yet at the time of writing — see decision #98 for exactly what's verified vs. still open.
-
-**Momentum — "is a trending move accelerating with volume behind it, worth joining now?"** A setup-detector consuming Market State's Trend/Acceleration/Volume-regime dimensions, never recomputing them:
-
-```python
-class MomentumStrategy(Strategy):
-    name = "Momentum"
-    trigger = every_candle(timeframe="5m")
-
-    async def evaluate(self, market_state, features, context) -> Opportunity | None:
-        fast_ma = features.features.get("sma_9")                        # GATE
-        slow_ma = features.features.get("sma_20")                       # (ma_type/periods are
-        if fast_ma is None or slow_ma is None:                          #  StrategyConfig.params —
-            return None                                                 #  a different indicator
-        if market_state.acceleration_score is None:                     #  choice is a new config
-            return None                                                 #  version, not a new class)
-
-        direction = match_direction(                                    # MATCH — crossover direction,
-            fast_ma, slow_ma,                                           # confirmed by trend_score
-            market_state.trend_score, market_state.acceleration_score,  # (>=60/<=40), acceleration_score
-            market_state.volume_regime_score,                           # strengthening not fading
-            trend_score_threshold=60.0,                                 # (>=55/<=45), and a volume
-            acceleration_score_threshold=55.0,                          # floor (>=45, direction-
-            volume_regime_threshold=45.0,                               # agnostic)
-        )
-        if direction is None:
-            return None
-
-        confidence = score_confidence(                                  # SCORE — weighted blend;
-            market_state.trend_score, market_state.acceleration_score,  # regression_9_slope_norm
-            market_state.volume_regime_score,                           # contributes a neutral 50,
-            features.features.get("regression_9_slope_norm"),           # not a penalty, when absent
-        )
-
-        slow_ma_is_invalidation = slow_ma                                # PROPOSE — the crossover
-        target = (                                                       # holding above/below the
-            features.close + 2 * (features.close - slow_ma)             # slow MA IS the thesis; target
-            if direction == "BUY" else                                  # is an R-multiple projection
-            features.close - 2 * (slow_ma - features.close)             # off that same level (same
-        )                                                                 # shape as ORB's own target)
-        return Opportunity(
-            strategy="Momentum", version=self.config.version, direction=direction,
-            confidence=confidence,
-            structural_invalidation=slow_ma_is_invalidation,
-            structural_target=target,
-            evidence={"conditions": {...}, "reason": "...", "basis": "closed"},
-            setup_detected_at=features.candle_ts,
-        )
-```
-
-**VWAP — "is price holding the session VWAP level right now?"** A different question from Momentum on purpose — both can fire together on the same symbol, and that's fine (confluence note below):
-
-```python
-class VWAPStrategy(Strategy):
-    name = "VWAP"
-    trigger = every_candle(timeframe="1m")           # fastest reaction to a level test;
-                                                       # VWAP itself is timeframe-agnostic (§4.5),
-                                                       # so this is a responsiveness choice
-    async def evaluate(self, market_state, features, context) -> Opportunity | None:
-        vwap = features.features.get("vwap")                             # GATE
-        atr = features.features.get("atr_14")
-        if vwap is None or vwap == 0.0 or atr is None:
-            return None
-
-        direction = match_direction(                                     # MATCH — a BAND read
-            market_state.vwap_relationship_score,                        # (52-65 for BUY, mirrored
-            market_state.trend_score, market_state.volume_regime_score,  # for SELL), not just >50/<50:
-            vwap_score_low=52.0, vwap_score_high=65.0,                   # excludes both "sitting right
-            trend_score_threshold=55.0, volume_regime_threshold=40.0,    # at the line" (noise) and
-        )                                                                 # "already extended" (a
-        if direction is None:                                            # different strategy's job)
-            return None
-
-        confidence = score_confidence(...)                               # SCORE
-
-        target = (                                                       # PROPOSE — VWAP itself IS
-            features.close + 2 * atr if direction == "BUY" else          # the invalidation level;
-            features.close - 2 * atr                                     # target is an ATR-multiple
-        )                                                                 # projection
-        return Opportunity(
-            strategy="VWAP", version=self.config.version, direction=direction,
-            confidence=confidence,
-            structural_invalidation=vwap,
-            structural_target=target,
-            evidence={"conditions": {...}, "reason": "...", "basis": "closed"},
-            setup_detected_at=features.candle_ts,
-        )
-```
-
-**Explicitly scoped, stated plainly:** VWAP v1 is a *position* read (has price established itself just above/below the level right now), not a *reclaim event* (just-crossed as of this candle vs. been on this side for an hour). A true event-based reclaim needs per-symbol memory across `evaluate()` calls — real, legitimate state per §8 below (the same shape the pending-Opportunity case already uses), but a bigger step than v1 needs. Flagged here rather than silently built or silently skipped; revisit if the position-based read proves too noisy once real data exists.
-
-**Note — multi-strategy confluence (raised while building this section).** If VWAP and Momentum both fire BUY on the same symbol at the same time, does that make the signal stronger, and where does that get decided? **Not Governor's job** — by the time a trade reaches Governor (§12), Decision Engine has already collapsed the field to one selected opportunity; Governor only ever sees that one already-planned trade, never the raw multi-strategy set, and giving it that visibility would blur the exact "which one wins" (Decision Engine, §10) vs. "should we act on this one" (Governor, §12) split §6 already draws a hard line around. The right home is **Opportunity Engine's ranking (§9) feeding Decision Engine's arbitration (§10)** — but Decision Engine's documented logic today only covers resolving *conflict* (Momentum says BUY, Reversal says SELL); whether/how it extends to *rewarding agreement* (Momentum and VWAP both say BUY) is a real, currently open question, deliberately left for whoever builds Decision Engine rather than decided here. Doesn't block either strategy file: both just need to emit honest, independently-evidenced `Opportunity` objects — confluence assembly is entirely downstream of that, same "Strategy doesn't decide which is best" boundary §0 above already establishes.
-
----
 
 **Playbook as data vs. code — resolved: code, not a generic rule engine, for v1.** A declarative "playbook" format for MATCH's condition tree was considered and rejected. Multi-signal conditions (comparing current vs. prior slope, level proximity, participation flips) get awkward fast as pure data, and this codebase has a consistent pattern of deferring generality until a concrete gap appears (Redis, Replay, uncertainty propagation — all deferred in `future-ideas.md` with "build it when the need shows up"). `Strategy(ABC)` subclasses, per the existing interface (system-design.md §4.8). If per-strategy thresholds need constant hand-tuning, that's the trigger to pull just the thresholds into config (§3) — not the whole condition tree into a rule engine.
 
@@ -381,6 +282,8 @@ class StrategyOutcome(BaseModel):
 ```
 
 **Why `_at_entry`, not `_at_signal`, and why only one snapshot per side.** Signal and entry are the same instant for every v1-planned strategy — `allows_waiting` defaults `False` everywhere (§3, §10 D2/D5). A genuine signal-vs-entry gap only exists once a real waiting-capable strategy ships. Capturing two full duplicate snapshot dicts for a distinction that doesn't bite yet would be exactly the generality §11 already argues against deferring. `evidence.conditions` (captured at signal time, inside `evidence` above) already preserves the thesis snapshot; `market_state_at_entry`/`context_at_entry` capture the moment money was actually on the line, which is the more decision-relevant instant regardless. Revisit — reintroducing a separate `_at_signal` pair — only when D5 (§10) stops being deferred. Tracked as D7 below.
+
+**These four fields have a real capture contract now (decision #98, M4), still no table and no writer.** `app/trading_intelligence/state_snapshot.py`'s `capture_market_state_snapshot`/`capture_context_snapshot`/`capture_strategy_outcome_snapshots` read `MarketStateEngine`/`ContextEngine`'s new `get_snapshot()` accessors and shape the result to match `market_state_at_entry`/`_at_exit`/`context_at_entry`/`_at_exit` exactly. What still doesn't exist: the `strategy_outcomes` migration itself, and whatever future Execution/Position Monitor fill handler actually calls this contract at `entry_filled_at`/`exit_filled_at` — that's real, later work (§10/§12 below), not something M4 built just to exercise this function.
 
 Persists to the `strategy_outcomes` table (renamed from `strategy_performance` — decision #89; system-design.md §4.13), while a record is still atomic, singular, and pre-migration is the cheapest possible time to fix a name that read as an aggregate. "Rank," "expectancy by regime," "win rate by time-of-day" — every one of these is a `GROUP BY` over this table, computed on demand, never a value stored on the strategy itself:
 
@@ -698,3 +601,4 @@ Everything above, connected — the learning loop this design is actually buildi
 1. Read this file in full, then `confirmed-decisions.md`'s most recent entries — check whether §10's open items have moved before re-deciding them.
 2. Do not start any `strategy_engine/` code before §7's "identical live/backtest `evaluate()`" constraint is understood by whoever writes the first strategy — retrofitting it later is real, avoidable cost.
 3. §8's ACT/WAIT/ABANDON *model* is locked (decision #88) — don't re-litigate whether `confirmation_timeframe` should come back. What's still genuinely open there is D5 (the waiting-value model itself) and D6 (wiring a consumer to `PriceSnapshot`) — build either only when a real strategy needs it, not speculatively.
+4. Before building Stage 1, know what M4 (decision #98) already prepared: `MarketStateEngine.get_snapshot()`, `ContextEngine.get_snapshot()`, and `app/trading_intelligence/state_snapshot.py`'s three capture functions all exist and are tested (`backend/tests/test_strategy_integration_contract.py`) — Stage 1's first strategy should call these, not re-derive its own read path against either engine. Also worth knowing before writing ORB specifically: `ContextChanged` has no domain-safe timestamp (§4's providers are timer-triggered, not candle-triggered) — decision #98 left this open rather than inventing one; don't assume it got solved.

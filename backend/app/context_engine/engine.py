@@ -66,7 +66,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import select
 
@@ -106,6 +107,19 @@ class ContextEngine:
         self._symbol_tasks: dict[str, asyncio.Task] = {}
         self._bootstrap_task: asyncio.Task | None = None
 
+        # Read-side snapshot cache (decision #98, M4) — same motivation as
+        # MarketStateEngine's own cache added alongside this one: neither
+        # aggregation path below gave a consumer any synchronous way to ask
+        # "what's the current context" without subscribing and waiting for
+        # the next publish. `_evaluated_at` timestamps are wall-clock,
+        # deliberately NOT presented as a domain/candle-safe timestamp —
+        # see get_snapshot()'s own docstring and decision #98 for why no
+        # such timestamp exists for Context today.
+        self._latest_global: dict[str, dict] = {}
+        self._latest_global_evaluated_at: datetime | None = None
+        self._latest_by_symbol: dict[str, dict[str, dict]] = {}
+        self._latest_symbol_evaluated_at: dict[str, datetime] = {}
+
     # --- global (market-wide) path, unchanged since decision #92 -----------------
 
     async def evaluate_all(self) -> ContextChanged:
@@ -116,6 +130,11 @@ class ContextEngine:
         for provider in self._providers:
             results[provider.name] = await provider.evaluate()
         payload = ContextChanged(providers=results)
+        # Cache before publish (decision #98), same ordering MarketStateEngine
+        # uses — a subscriber reacting to the event about to go out can call
+        # get_snapshot() immediately and see this exact result.
+        self._latest_global = results
+        self._latest_global_evaluated_at = datetime.now(timezone.utc)
         await self._bus.publish(make_envelope(EventType.CONTEXT_CHANGED, payload))
         return payload
 
@@ -128,8 +147,70 @@ class ContextEngine:
         for provider in self._symbol_providers:
             results[provider.name] = await provider.evaluate(symbol)
         payload = ContextChanged(providers=results)
+        self._latest_by_symbol[symbol] = results
+        self._latest_symbol_evaluated_at[symbol] = datetime.now(timezone.utc)
         await self._bus.publish(make_envelope(EventType.CONTEXT_CHANGED, payload, symbol=symbol))
         return payload
+
+    # --- read-side snapshot (decision #98, M4) --------------------------------------
+
+    def get_snapshot(self, symbol: str | None = None) -> dict[str, Any]:
+        """
+        Current computed context, synchronous, in-memory — no I/O. Same
+        motivation and shape-convention as MarketStateEngine.get_snapshot()
+        added alongside this one (decision #98): a consumer gets a
+        point-in-time read without subscribing to ContextChanged and
+        waiting for the next publish.
+
+        Shape: {"global": {"providers": {...}, "evaluated_at": iso str |
+        None}, "symbols": {ticker: {"providers": {...merged...},
+        "evaluated_at": iso str}}}.
+
+        - "global" is always present — the last evaluate_all() result
+          (today: {"calendar": {...}}), even if `symbol` was given.
+        - symbol=None: "symbols" includes every ticker this process has
+          run evaluate_for_symbol() for at least once.
+        - symbol="<ticker>": "symbols" has at most one entry, keyed by
+          that ticker. Its "providers" dict MERGES the global path's own
+          output with that ticker's per-symbol providers — decision #96
+          split evaluate_all()/evaluate_for_symbol() into two internal
+          aggregation paths, but a consumer asking "what's the context
+          for AAPL right now" shouldn't need to know that split exists
+          or make two calls to get one coherent answer. Per-symbol keys
+          win on a name collision against global (defensive only — no
+          provider is currently registered on both paths).
+        - A ticker never evaluated via evaluate_for_symbol() is simply
+          absent from "symbols" — honest state over fabricated state,
+          same convention MarketStateEngine's snapshot follows.
+
+        `evaluated_at` is deliberately wall-clock (`datetime.now(timezone.
+        utc)`), not a domain/candle-safe timestamp — stated explicitly
+        rather than implied otherwise. Context Engine's own cadence is a
+        session-boundary loop (global) plus a 15-minute per-symbol timer
+        (decisions #92/#96), not event/candle-driven, so there is no
+        candle_ts-style domain timestamp for Context the way MarketState
+        has one. See decision #98 for the full reasoning — this is a
+        pre-existing characteristic of Context Engine, not something
+        introduced here, and changing it is out of scope for this build.
+        """
+        global_snapshot = {
+            "providers": dict(self._latest_global),
+            "evaluated_at": (
+                self._latest_global_evaluated_at.isoformat() if self._latest_global_evaluated_at is not None else None
+            ),
+        }
+
+        symbols: dict[str, Any] = {}
+        target_symbols = self._latest_by_symbol.keys() if symbol is None else (
+            [symbol] if symbol in self._latest_by_symbol else []
+        )
+        for sym in target_symbols:
+            symbols[sym] = {
+                "providers": {**self._latest_global, **self._latest_by_symbol[sym]},
+                "evaluated_at": self._latest_symbol_evaluated_at[sym].isoformat(),
+            }
+
+        return {"global": global_snapshot, "symbols": symbols}
 
     def _load_scanner_universe_symbols(self) -> list[str]:
         session = SessionLocal()

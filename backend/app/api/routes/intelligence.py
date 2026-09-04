@@ -62,9 +62,11 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.context_engine.engine import get_context_engine
 from app.core.config import get_settings
 from app.feature_engine.engine import get_feature_engine
 from app.feature_engine.historical import compute_series
+from app.market_state_engine.engine import get_market_state_engine
 from app.services import candle_aggregator, candle_store
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
@@ -274,6 +276,42 @@ async def get_intelligence_state(
         }
 
     return {"symbol": symbol, "timeframes": timeframes, "daily_levels": daily_levels}
+
+
+@router.get("/market-state")
+async def get_market_state_snapshot(symbol: str | None = Query(None)) -> dict[str, Any]:
+    """
+    Confirmed decision #98, M4 task 25 — live observability into
+    MarketStateEngine, the same "point-in-time read, no need to
+    replay MarketStateChanged history" purpose GET /state already
+    serves for Feature Engine/Level Interaction Engine.
+
+    A thin passthrough of `MarketStateEngine.get_snapshot()` — see that
+    method's own docstring for the full shape. `symbol` is optional
+    here (unlike GET /state above, which requires one): this route is
+    also meant for "what does the engine currently know about
+    anything," not only a single symbol's dashboard panel.
+    """
+    return get_market_state_engine().get_snapshot(symbol)
+
+
+@router.get("/context")
+async def get_context_snapshot(symbol: str | None = Query(None)) -> dict[str, Any]:
+    """
+    Confirmed decision #98, M4 task 25 — live observability into
+    ContextEngine, same purpose as GET /market-state above, kept as a
+    separate route rather than merged into one payload: Market State
+    and Context are two independently-owned engines (system-design.md
+    §4.8), and this route's whole job is to expose each one's own
+    current belief honestly, not to pre-assemble a Strategy-shaped
+    composite of the two — that composition is a future consumer's job
+    (`app/trading_intelligence/state_snapshot.py`), not this route's.
+
+    A thin passthrough of `ContextEngine.get_snapshot()` — see that
+    method's own docstring for the full shape, including why
+    `evaluated_at` is wall-clock rather than a domain-safe timestamp.
+    """
+    return get_context_engine().get_snapshot(symbol)
 
 
 @router.get("/series")

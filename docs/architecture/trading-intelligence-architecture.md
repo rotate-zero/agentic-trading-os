@@ -139,6 +139,8 @@ trend_score: 82
 
 **Build note (decision #93) — two deviations from the list above, both flagged rather than silently decided.** `Session type` is dropped from the v1 build entirely: unlike the other four, it doesn't have a natural directional (bearish↔bullish) or magnitude (quiet↔extreme) reading, and rather than invent one, it's left unbuilt and flagged to revisit — `scoring.py` (`app/market_state_engine/scoring.py`) has no `session_type_score` function at all, not a stub returning a placeholder. `Acceleration` ships scoped to Trend's own rate of change specifically, not one value per dimension and not an adaptive pick of whichever dimension moved most this window — the simplest reading of "a score's own rate of change" that still answers the classic momentum-acceleration question, with the other interpretations available to revisit if Trend-only turns out to be too narrow in practice.
 
+**Read-side snapshot access (decision #98, M4).** Everything above describes what gets *published* — `MarketStateEngine.get_snapshot(symbol=None)` is the companion synchronous read added alongside it, for a consumer whose own trigger fires independent of the last publish (a future Strategy's scheduled MATCH stage being the motivating case, not a dependency — Market State Engine has no knowledge Strategy Engine exists). Same shape either way: per-symbol `MarketState`, plus the cross-symbol composite included regardless of which symbol was asked for. `candle_ts` is preserved exactly as published — this is the one property a future Replay Engine will depend on, verified directly (`test_candle_ts_survives_as_domain_time_not_wall_clock`), not assumed.
+
 **Participation is the observable half of market psychology, not the causal half — unaffected by the score-first change.** §7's agent-design table already asks "who is in control — buyers or sellers?" as an example question; this is where it gets a real answer, once it exists. Feature Engine still has no signed-volume/uptick-downtick raw signal to compute it from — an observable, no different in kind from relative volume or gap %, but not built yet. Once that signal exists, Participation joins the per-symbol list above as another `<dimension>_score`, no design change needed. What Participation deliberately does *not* claim, even once built, is *why*: the same volume imbalance can mean panic, excitement, short covering, or options-hedging flow, and telling those apart needs data (options gamma exposure, short interest) this system has no confirmed source for yet. That causal-inference layer is real, and it's kept visible rather than dropped — see [`../decisions/future-ideas.md`](../decisions/future-ideas.md) #13 — but faking it from data that can't support the distinction would produce a confidently wrong label, not a useful one.
 
 **Cross-symbol dimensions, v1 — SPY/QQQ/IWM pulled forward from "Phase 5 scaffolding" to now (decision #91), kept deliberately small.** SPY, QQQ, and IWM get tracked as always-on subjects — same Feature Engine → Market State pipeline as any other symbol, same `DebounceScheduler`, just a tighter ceiling (~3–5s vs. ~10s) since broad-market state is what everything else gets compared against. Each gets its own full per-symbol score set above; Market State Engine then synthesizes a small, explicit set of cross-symbol scores on top:
@@ -238,6 +240,8 @@ class SymbolFundamentals(BaseModel):
 
 **Reuse verdict on the external reference project (`equity-fundamental-analysis`).** Not reused directly — different stack conventions (in-memory dict cache, no persistence; FMP + Alpha Vantage instead of the already-integrated Finnhub; response shapes built for a UI card, not `ContextProvider.evaluate() -> dict`'s flat convention; two live API keys committed in plaintext in the source, a finding worth acting on independent of this decision). What carried over conceptually: the field list a fundamentals payload actually needs (sector/industry, TTM revenue/net income/cash flow, next earnings date) and the quarterly year-over-year comparison logic, both reflected in the schema above, re-sourced from Finnhub rather than ported as code.
 
+**Read-side snapshot access (decision #98, M4) — and the timestamp gap it surfaced, left open on purpose.** `ContextEngine.get_snapshot(symbol=None)` is the synchronous companion to publication above, same motivation and shape-convention as Market State's own (§4) — a per-symbol read transparently merges the global (`evaluate_all()`) and per-symbol (`evaluate_for_symbol()`) paths into one `providers` dict, so a consumer doesn't need to know decision #96 split them internally. Unlike Market State's `candle_ts`, there is no domain-safe timestamp to attach here: `ContextProvider.evaluate()`/`SymbolContextProvider.evaluate()` take no timestamp parameter, and this section's own cadence description above (session-boundary loop, 15-minute per-symbol timer) is timer-driven, not candle-driven — there's no candle to borrow a timestamp from the way Market State's cross-symbol composite borrows one across SPY/QQQ/IWM. `get_snapshot()`'s `evaluated_at` is therefore wall-clock, stated as such rather than implied to be domain-safe — a real property a future Replay Engine will need to reckon with, not solved here since solving it means changing how Context Engine triggers itself, out of scope for what decision #98 set out to do.
+
 **Hermes — a named, agentic provider, scaffolding proposed for Phase 5:** beyond `NewsFlagProvider`'s deliberately narrow presence/count signal above, Context Engine is planned to host a named agent — Hermes — that reads and analyzes the news reports `NewsFlagProvider` flags, rather than just counting that something fired. This is the system's first LLM-in-the-loop component — everything else in Feature Engine, Market State, and the rest of Context Engine is deterministic numeric computation — which makes it a meaningfully different kind of module, with different failure modes and a different verification approach than the rest of this document assumes. Data source, storage, and analysis method are deliberately left open for the implementation step; this entry only reserves Hermes's place in the pipeline.
 
 ---
@@ -296,6 +300,8 @@ No trade yet. Only opportunity. Strategies don't run on a shared clock — each 
 Planned initial strategy set: ORB, Momentum, First Pullback, VWAP, Gap, Reversal, Volume Spike. News is listed as a future addition, not a v1 strategy.
 
 **Internal design direction-locked, not yet built.** The four-stage `evaluate()` anatomy (GATE/MATCH/SCORE/PROPOSE), the Gate's two layers (per-strategy trigger + declarative environmental conditions), immutable/versioned `StrategyConfig` (family → configuration, never edited in place), and an ACT/WAIT/ABANDON entry-timing model (a strategy may act immediately or deliberately defer, never forced to wait for a candle close unless its own hypothesis specifically needs one) are locked in `strategy-engine-design.md` (decisions #87–88). `strategy_engine/` doesn't exist in code yet — this is Stage 0 only.
+
+**What M4 (decision #98) prepared for this, without building any of it.** Both of MATCH's inputs are now readable synchronously — `MarketStateEngine.get_snapshot()` and `ContextEngine.get_snapshot()` (§4/§5 above) — and `StrategyOutcome`'s entry/exit snapshot fields have a real, tested capture contract (`app/trading_intelligence/state_snapshot.py`) waiting for whichever future module closes a trade. Neither engine gained any awareness that Strategy Engine exists; the dependency direction stays Market State/Context → (future) Strategy Engine, never the reverse — decision #98 was explicit about this being the boundary not to cross.
 
 ---
 
@@ -418,6 +424,21 @@ class WorldView:
 ```
 
 Single-writer-per-domain stays fully intact — `WorldView` has no state of its own and no write path. It's purely a read aggregator, the same relationship Context Engine has to its providers (§5). The full "everything writes to it" version is parked in [`../decisions/future-ideas.md`](../decisions/future-ideas.md) in case a genuine need for shared mutable world state emerges later — it hasn't yet.
+
+**Not to be confused with `app/trading_intelligence/state_snapshot.py` (decision #98, M4).** That module is two functions, not a class, reading exactly two sources (Market State + Context, not Portfolio State or Performance Intelligence too), for exactly one purpose (shaping `StrategyOutcome`'s entry/exit snapshot fields) — a narrow, purpose-built read, not a general-purpose facade. `WorldView` above remains "hasn't yet":
+
+```
+MarketStateEngine.get_snapshot()  ──┐
+                                     ├──▶  state_snapshot.py  ──▶  (future) Execution / Position
+ContextEngine.get_snapshot()      ──┘      (2 functions, 1 job)      Monitor → StrategyOutcome
+
+                                     WorldView (still not built)
+                                     would sit here instead, reading
+                                     Market State + Portfolio State +
+                                     Context + Performance Intelligence
+                                     for a different job: one summary
+                                     for a dashboard or LLM prompt.
+```
 
 ---
 
