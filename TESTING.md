@@ -1,90 +1,133 @@
-# TESTING.md — Momentum & VWAP strategies (decision #98)
+# TESTING.md — Strategy Engine Stage 1: base_strategy.py + ORB (decision #99)
+
+## Delete these first — do not just overwrite
+
+This drop **replaces**, not extends, everything currently in
+`backend/app/strategy_engine/` and its tests, including this morning's
+two updates (the Momentum review + the VWAP review). Delete before
+unzipping:
+
+```
+backend/app/strategy_engine/momentum_strategy.py
+backend/app/strategy_engine/vwap_strategy.py
+backend/tests/test_momentum_strategy.py
+backend/tests/test_vwap_strategy.py
+TESTING.md                              (this file replaces it)
+```
+
+**Nothing about the guard fixes or the Market State finding from this
+morning's review is lost** — see "What was reconciled" below. The
+files themselves are being discarded because they depend on a
+`base_strategy.py` that never existed; the *findings* are carried
+forward into decision #99 and, where directly applicable, into
+`orb_strategy.py` itself.
+
+**Not touched, not deleted:** `test_vwap_ext.py`, `test_strategy_integration_contract.py`,
+anything in `feature_engine/` other than the one file listed below,
+`market_state_engine/`, `context_engine/`. This drop's only change
+outside `strategy_engine/` is additive (see next section).
 
 ## What's in this zip
 
 ```
-backend/app/strategy_engine/
-    __init__.py            (new, empty — package marker only)
-    momentum_strategy.py   (new)
-    vwap_strategy.py       (new)
-backend/tests/
-    test_momentum_strategy.py  (new)
-    test_vwap_strategy.py      (new)
-docs/architecture/strategy-engine-design.md   (modified — new §1a + Status line)
-docs/decisions/confirmed-decisions.md         (modified — new #98)
-docs/decisions/INDEX.md                       (modified — new row #98)
+backend/app/schemas/events/features.py     (modified — FeatureSet gains open/high/low/volume)
+backend/app/feature_engine/engine.py       (modified — _apply_close()/_compute_one() thread real OHLCV through the 1m path only)
+backend/app/strategy_engine/base_strategy.py   (new)
+backend/app/strategy_engine/orb_strategy.py    (new)
+backend/tests/test_base_strategy.py            (new — 9 tests)
+backend/tests/test_orb_strategy.py             (new — 18 tests)
+docs/architecture/strategy-engine-design.md    (modified — §8 OHLC gap resolved, §12/§13 updated, new §14)
+docs/architecture/system-design.md             (modified — FeatureSet payload table, Strategy Engine status lines, Opportunity schema sections)
+docs/architecture/trading-intelligence-architecture.md   (modified — §8 status line)
+docs/decisions/confirmed-decisions.md          (modified — new #99)
+docs/decisions/INDEX.md                        (modified — new row #99)
 ```
 
 Unzip directly onto the project root — every path above is relative to it.
 
 ## Read this before running anything
 
-`backend/app/strategy_engine/base_strategy.py` does not exist in the
-repo yet — it's being built in a separate, concurrent session I have
-no visibility into. `momentum_strategy.py`/`vwap_strategy.py` import
-`Strategy`/`StrategyConfig`/`Opportunity`/`every_candle` from it per
-the documented interface (`system-design.md` §4.8, `strategy-engine-
-design.md` §3-4), but **three specific assumptions are unverified
-against the real file** — flagged in both module docstrings and in
-decision #98:
+**`FeatureSet.open`/`.high`/`.low`/`.volume` are populated on 1m only.**
+Any code reading these on a 5m/15m/1h `FeatureSet` will get `None` —
+this is deliberate (see decision #99), not a bug. If you have any other
+in-flight work reading `FeatureSet` fields positionally rather than by
+name, double-check it isn't affected (it shouldn't be — the new fields
+are appended after `close`, all nullable, all keyword-populated at every
+existing call site).
 
-1. `Strategy.__init__(self, config: StrategyConfig)` / `self.config` —
-   no `__init__` is shown in the documented ABC.
-2. `every_candle(timeframe=...)` — the documented signature shows no
-   arguments. Each `evaluate()` defensively re-checks
-   `features.timeframe` regardless, so this is harmless if wrong.
-3. `context: ContextChanged` — the ABC's type hint says `Context`; the
-   real, already-built schema (decision #92) is `ContextChanged`.
+**`Strategy.evaluate()`'s real signature is `(self, symbol, market_state,
+features, context)`** — four arguments, not the three shown in
+`system-design.md` §4.8's illustrative sketch. If you or another session
+write a second strategy against the *old* 3-arg sketch, it will still
+import fine (Python doesn't enforce ABC signature matching) but will
+raise `TypeError` the moment anything actually calls it with 4 arguments.
+See `base_strategy.py`'s own module docstring for why the extra
+parameter is there.
 
-**Until `base_strategy.py` lands, `pytest backend/tests/` will report a
-collection error on these two test files** (import error on the
-not-yet-existing module) — expected, not a bug in either strategy
-file. Every other existing test in the suite is unaffected; pytest
-reports collection failures per-file, not suite-wide.
+**A real bug was found in `MarketStateEngine`, not fixed here.**
+`_latest_features[symbol]` is one shared slot regardless of timeframe —
+any strategy running on a timeframe slower than 1m (i.e. any future
+strategy besides ORB) should know `market_state.trend_score`/etc. can
+transiently reflect a different timeframe's close than the one it's
+evaluating. Full account in decision #99. Worth a direct decision with
+you before Momentum (or anything non-1m) is trusted live.
 
-## What's actually been verified, and how
+## What was reconciled from this morning's two pushes
 
-Since I couldn't import the real `base_strategy.py`, I built a small,
-throwaway, spec-conformant local stand-in for `Strategy`/
-`StrategyConfig`/`Opportunity`/`ScheduleTrigger` in a scratch sandbox —
-**not included in this zip** — purely to exercise both strategy files
-end to end before delivering them. Against that stand-in:
+The Momentum session's review of the (now-discarded) `momentum_strategy.py`/
+`vwap_strategy.py` found three real things while this build was in
+progress. None of it is lost:
 
+1. **Threshold-mirroring guard** — applied directly to `orb_strategy.py`'s
+   `match_direction()` (`trend_score_threshold` must be `> 50.0`, same
+   fix, same reasoning, own test).
+2. **PROPOSE-stage sanity-guard bug** — confirmed NOT to apply to ORB,
+   documented why in `orb_strategy.py`'s module docstring, rather than
+   silently assumed safe.
+3. **The `MarketStateEngine` timeframe race** (above) — genuinely open,
+   flagged for you, not something either review or this build should
+   have picked a fix for unilaterally.
+
+One unrelated thing found and flagged, not fixed: `docs/architecture/premarket-accumulator-design.md`
+still says "DRAFT, no code" — `vwap_ext` is actually already built in
+`feature_engine/engine.py`. Feature Engine's own territory, out of scope
+here.
+
+## How to verify
+
+```bash
+cd backend
+pip install -r requirements.txt   # if not already
+pytest tests/test_base_strategy.py tests/test_orb_strategy.py -v
 ```
-24 passed in 0.10s
-  test_momentum_strategy.py — 13 tests
-  test_vwap_strategy.py     — 11 tests
+
+Expect 27 passed, 0 failed, 0 skipped — no DB required for either file.
+
+Then the full suite, to confirm no regressions from the `FeatureSet`
+change:
+
+```bash
+pytest tests/ -q
 ```
 
-Covers, per strategy: the pure GATE/MATCH/SCORE functions in
-isolation (crossover direction, band membership, mirror-image
-SELL logic, volume-floor rejection, honest-absence-vs-fabricated-zero
-for the optional regression signal, confidence saturation/clamping —
-same style as `backend/tests/test_market_state_scoring.py`), plus a
-full `evaluate()` pass confirming the assembled `Opportunity`'s
-`structural_invalidation`/`structural_target`/`evidence` values are
-arithmetically correct, and the GATE-stage `None` returns (wrong
-timeframe, missing warm-up data, missing `acceleration_score`) fire
-correctly.
+Verified in this session (no local Postgres available in the sandbox):
+identical pass/fail signature before and after this change — same
+pre-existing DB-connectivity failures, same skips, plus these 27 new
+tests passing. **Run this against your real local Postgres before
+treating it as fully clean** — this is the first real DB-backed
+confirmation either way.
 
-**Not verified:** anything touching the real `base_strategy.py`,
-since it doesn't exist yet. Once it lands:
+## Not verified
 
-1. Re-point the imports at the top of both files if the module path or
-   names differ from `app.strategy_engine.base_strategy` /
-   `Strategy`/`StrategyConfig`/`Opportunity`/`every_candle`.
-2. Check the three numbered assumptions above against the real file —
-   fix `MomentumStrategy.__init__`/`VWAPStrategy.__init__` and the
-   `trigger = every_candle(...)` lines first if they don't match.
-3. Run `pytest backend/tests/test_momentum_strategy.py
-   backend/tests/test_vwap_strategy.py -v` — should pass as-is if the
-   real interface matches the documented spec; the pure-function tests
-   (no `Strategy` dependency at all) will pass regardless.
-4. Run the full suite once both strategy files and `base_strategy.py`
-   coexist, to confirm nothing else was disturbed.
+Live, or against any backtest harness — neither exists yet. §7's
+"never `datetime.now()` inside `evaluate()`" constraint was followed by
+construction and is unit-tested via fixed timestamps throughout, but
+"byte-identical live and in backtest" itself has no harness to prove it
+against until a Backtest Runner exists.
 
-## Everything else in this delivery needs no further verification
+## Next
 
-The `docs/` changes are additive — a new §1a section, one new decision
-entry, one new INDEX row — nothing existing was restructured or
-renumbered.
+Momentum, rebuilt fresh against the real `base_strategy.py` (not the
+discarded file), assigned to a separate session per your call. The
+`MarketStateEngine` timeframe race above is worth deciding before that
+session's Momentum is trusted against anything other than 1m.

@@ -1077,7 +1077,10 @@ class FeatureEngine:
         # entry, so threaded through as its own parameter.
         daily_levels = self._daily_levels_state.get(symbol, {}).get("levels", [])
 
-        one_min = self._apply_close(key, candle_ts, close, extra, daily_levels)
+        one_min = self._apply_close(
+            key, candle_ts, close, extra, daily_levels,
+            open_price=open_price, high=high, low=low, volume=volume,
+        )
         if one_min is not None:
             results.append((symbol, one_min))
 
@@ -1104,6 +1107,10 @@ class FeatureEngine:
         close: float,
         extra_features: dict[str, float],
         daily_levels: list[DailyLevel] | None = None,
+        open_price: float | None = None,
+        high: float | None = None,
+        low: float | None = None,
+        volume: int | None = None,
     ) -> FeatureSet | None:
         """The original 1m computation, unchanged in behavior aside from
         `extra_features` — pulled out of _compute_one() so
@@ -1115,7 +1122,13 @@ class FeatureEngine:
         VWAP warms up far faster than a 9-period SMA (one bar of nonzero
         volume vs. nine bars of history), so a symbol whose SMA/EMA are
         still warming up should still publish once VWAP alone is ready,
-        not wait for the slower indicator."""
+        not wait for the slower indicator.
+
+        `open_price`/`high`/`low`/`volume` (decision #99) are optional —
+        the 1m call site in `_compute_one()` passes this candle's real
+        OHLCV; `_compute_aggregated()` below deliberately passes none of
+        them (see FeatureSet's own docstring for why an aggregated bar's
+        OHLC can't just be the last constituent 1m candle's)."""
         symbol, timeframe = key
         window = self._windows.get(key)
         if window is None:
@@ -1178,6 +1191,10 @@ class FeatureEngine:
             timeframe=timeframe,
             candle_ts=candle_ts,
             close=close,
+            open=open_price,
+            high=high,
+            low=low,
+            volume=volume,
             features=features,
             daily_levels=daily_levels or [],
         )

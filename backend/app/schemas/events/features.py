@@ -48,6 +48,30 @@ class FeatureSet(BaseModel):
     # them — the same class of race feature_engine/engine.py's own module docstring already
     # designed around for CandleRecorder vs. FeatureEngine, applied here one hop further down
     # the chain instead of being reintroduced by a new consumer.
+    #
+    # open/high/low/volume — decision #99. Closes the schema gap
+    # strategy-engine-design.md §8 flagged ("FeatureSet carries only
+    # close — no open/high/low/volume, so a strategy can't compute a wick
+    # ratio or body size today"). ORB's opening range is the first real
+    # consumer: a true opening range needs the WICK high/low of each 1m
+    # candle, not the closes, or it silently understates the range and
+    # mis-derives structural_invalidation off it.
+    #
+    # Nullable, not required — honest state over fabricated state (§11).
+    # Correctly populated for the 1m FeatureSet only, where a single
+    # candle's own OHLCV is unambiguous and already available in
+    # _compute_one() (feature_engine/engine.py). Left None for aggregated
+    # 5m/15m/1h FeatureSets: a truthful aggregated open/high/low/volume
+    # needs the WHOLE bucket's constituent 1m candles (open = first bar's
+    # open, high/low = max/min across the bucket, volume = sum) — none of
+    # that is tracked today, and passing through the last constituent 1m
+    # candle's own OHLC would silently misrepresent the aggregated bar.
+    # Real, separate follow-up work if a future aggregated-timeframe
+    # strategy needs it — not assumed as a side effect of this change.
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    volume: int | None = None
     features: dict[str, float]  # e.g. {"sma_9": 231.4521, "sma_9_slope_angle": 12.4, "ema_20": 229.881, "vwap": 230.1} — decisions #45, #52, #53, #83
     daily_levels: list[DailyLevel] = Field(default_factory=list)  # decision #59 — see DailyLevel above
 

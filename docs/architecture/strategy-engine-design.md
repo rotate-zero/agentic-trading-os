@@ -476,16 +476,18 @@ Sometimes waiting strengthens the hypothesis. Sometimes it does nothing. Sometim
    (a bar's final OHLC)                    (the currently-forming bar)
         │                                          │
         ▼                                          ▼
-   SCHEMA GAP                                WIRING GAP, not a data gap
+   SCHEMA GAP — RESOLVED, 1m only            WIRING GAP, not a data gap —
+   (decision #99, ORB's opening range        still open
+   was the first real consumer)
    FeatureSet (schemas/events/               PriceSnapshot already carries
-   features.py) carries only `close` —       open/high/low/close/volume for
-   no open/high/low/volume, so a             the forming bar, field-for-field
-   strategy can't compute a wick             identical to CandleClosed
-   ratio or body size today                  (LiveTickRelay, decision #72) —
-                                              but nothing on the backend
-   Fix: add open/high/low/volume             subscribes to it except the
-   to FeatureSet — additive,                 frontend chart. No Strategy or
-   zero new engine logic                     Feature Engine reads it.
+   features.py) now carries                  open/high/low/close/volume for
+   open/high/low/volume — but ONLY           the forming bar, field-for-field
+   on the 1m FeatureSet. Aggregated          identical to CandleClosed
+   5m/15m/1h FeatureSets still leave         (LiveTickRelay, decision #72) —
+   these `None` — a true aggregated-         but nothing on the backend
+   bucket OHLC needs the whole               subscribes to it except the
+   bucket's constituent 1m candles,          frontend chart. No Strategy or
+   not tracked anywhere yet.                 Feature Engine reads it.
 
                                               Fix (later): evaluate() gains
                                               an optional live-snapshot input,
@@ -506,7 +508,7 @@ Both gaps stay bounded by the existing `LiveTickRelay` cap — "observed live st
 **Explicitly deferred — real work, not built now:**
 - The waiting-value model itself (is this specific wait worth its cost) — §10 D5.
 - Wiring any consumer to `PriceSnapshot` at all — §10 D6.
-- Reusable candle-shape helper functions (wick ratio, body ratio, position-in-range) — trivial once OHLC exists on `FeatureSet`, not written yet.
+- Reusable candle-shape helper functions (wick ratio, body ratio, position-in-range) — OHLC exists on the 1m `FeatureSet` now (decision #99), but no strategy has needed these specific helpers yet; still not written.
 - A candle-pattern library, an automatic confirmation selector, or any dedicated "Timing Engine"/"Confirmation Engine" — premature architecture until a real strategy needs more than the flag above. Same "defer generality until a concrete gap appears" discipline this codebase already applies everywhere else (Redis, Replay, uncertainty propagation, the playbook-as-data rejection in §1).
 
 **This becomes a backtestable question, same as every other tunable in this design.** "ORB v4, `allows_waiting=False`" vs. "ORB v5, `allows_waiting=True`" are two versions (§3); Performance Intelligence (§5) can eventually report not just expectancy per version but entry-quality degradation alongside it — waiting that improves expectancy by degrading median entry price enough to not be worth it is exactly the kind of trade-off §7's backtest report is required to surface, not hide behind a single expectancy number.
@@ -592,13 +594,60 @@ Everything above, connected — the learning loop this design is actually buildi
 ## 12. Staged plan
 
 - [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model), refined again by #89 (§5's `StrategyOutcome`/`backtests` schema: field groups, `strategy_outcomes` rename, `eod_flatten`, `slippage_entry`, write-time invariants).
-- [ ] **Stage 1 — Not yet started.** Blocked on §10's D1/D2 open items being resolved enough to implement against, and on Saqib's own priority call relative to other in-flight work (IBKR live access, ORB as first live strategy per `trading-intelligence-architecture.md`'s existing plan).
+- [x] **Stage 1 — ORB built (decision #99).** `base_strategy.py` (`Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger`) and `orb_strategy.py` — the first concrete strategy. An earlier, undocumented attempt at this stage (`momentum_strategy.py`/`vwap_strategy.py`, built by a concurrent session against a `base_strategy.py` that didn't exist yet, decision-log entry lost to a numbering collision with #98) was found orphaned and discarded rather than built on top of — see decision #99 for the full account. Momentum is next, assigned to a separate session against this now-real interface.
 
 ---
 
 ## 13. How to resume this in a new session
 
 1. Read this file in full, then `confirmed-decisions.md`'s most recent entries — check whether §10's open items have moved before re-deciding them.
-2. Do not start any `strategy_engine/` code before §7's "identical live/backtest `evaluate()`" constraint is understood by whoever writes the first strategy — retrofitting it later is real, avoidable cost.
+2. `strategy_engine/base_strategy.py` now exists (decision #99) — any new strategy should import the real `Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger` from it, not re-guess the interface the way the discarded momentum/vwap attempt had to.
 3. §8's ACT/WAIT/ABANDON *model* is locked (decision #88) — don't re-litigate whether `confirmation_timeframe` should come back. What's still genuinely open there is D5 (the waiting-value model itself) and D6 (wiring a consumer to `PriceSnapshot`) — build either only when a real strategy needs it, not speculatively.
-4. Before building Stage 1, know what M4 (decision #98) already prepared: `MarketStateEngine.get_snapshot()`, `ContextEngine.get_snapshot()`, and `app/trading_intelligence/state_snapshot.py`'s three capture functions all exist and are tested (`backend/tests/test_strategy_integration_contract.py`) — Stage 1's first strategy should call these, not re-derive its own read path against either engine. Also worth knowing before writing ORB specifically: `ContextChanged` has no domain-safe timestamp (§4's providers are timer-triggered, not candle-triggered) — decision #98 left this open rather than inventing one; don't assume it got solved.
+4. Before building on Stage 1, know what M4 (decision #98) already prepared: `MarketStateEngine.get_snapshot()`, `ContextEngine.get_snapshot()`, and `app/trading_intelligence/state_snapshot.py`'s three capture functions all exist and are tested (`backend/tests/test_strategy_integration_contract.py`) — a strategy should call these, not re-derive its own read path against either engine. Also worth knowing: `ContextChanged` has no domain-safe timestamp (§4's providers are timer-triggered, not candle-triggered) — decision #98 left this open rather than inventing one; don't assume it got solved.
+5. `FeatureSet` now carries `open`/`high`/`low`/`volume` (decision #99) — but ONLY on the 1m `FeatureSet`; a 5m/15m/1h `FeatureSet`'s open/high/low/volume are `None` (true aggregated-bucket OHLC isn't tracked anywhere yet — see `schemas/events/features.py`'s `FeatureSet` docstring for why passing through the last constituent 1m candle's OHLC would be dishonest, not just incomplete). A strategy reading these on anything other than a 1m `FeatureSet` needs to handle `None`, not assume they're populated.
+6. `Strategy.evaluate()`'s real signature takes `symbol: str` as its first argument (decision #99) — the illustrative 3-arg sketch (system-design.md §4.8) had no way for a strategy to know which symbol it's being asked about, which only mattered once a strategy needed its own per-symbol memory (ORB's opening range does; the discarded Momentum draft's stateless MATCH logic never hit this gap). Any new strategy's `evaluate()` must match the real 4-arg signature.
+
+---
+
+## 14. ORB — Stage 1's first strategy, and what actually happened getting there (decision #99)
+
+**What was found before any of this was built:** `momentum_strategy.py` and `vwap_strategy.py` already existed in the repo, from an earlier concurrent session — undocumented. Both imported a `base_strategy.py` that didn't exist anywhere. Their own docstrings admitted this and flagged three unverified interface assumptions. A `TESTING.md` at the repo root claimed decision #98 for that work — but the real decision #98 in `confirmed-decisions.md` is the M4 integration milestone, a different piece of work entirely. Two concurrent sessions minted the same decision number; only the M4 session's doc updates actually landed. The momentum/vwap code was orphaned, silently, with no working `pytest` collection possible. Discarded rather than built on top of — see the session's own discussion for the full reasoning. Momentum is being rebuilt fresh, by a separate session, against the now-real interface below.
+
+**GATE/MATCH/SCORE/PROPOSE, applied to ORB's actual state machine** (not the discarded sketch's time-boxed trigger — see `orb_strategy.py`'s module docstring, correction #1):
+
+```
+ every 1m candle, all session long (trigger = every_candle("1m"))
+      │
+      ▼
+ ┌─────────────────────────┐   minutes_since_open      ┌──────────────────────────┐
+ │  FORMING                │ ─────< or_minutes ───────▶│  accumulate this         │
+ │  (0 candles..or_minutes)│                            │  candle's high/low into  │
+ └─────────────────────────┘                            │  the running OR;         │
+      │                                                  │  return None             │
+      │ minutes_since_open >= or_minutes                └──────────────────────────┘
+      ▼
+ ┌─────────────────────────┐   candles_seen < or_minutes
+ │  freeze the range        │──────────────────────────▶ return None, permanently,
+ │  (or_formed = True)      │   (gap / late start)        for the rest of this day
+ └─────────────────────────┘   — honest absence,          (module docstring's
+      │                          not a fabricated range    accepted limitation)
+      │ candles_seen == or_minutes
+      ▼
+ ┌─────────────────────────┐
+ │  GATE passed — MATCH:    │   close > or_high & trend/volume confirm  ──▶ BUY
+ │  breakout test against   │
+ │  the frozen or_high/low  │   close < or_low  & trend/volume confirm  ──▶ SELL
+ └─────────────────────────┘
+      │
+      │ direction not in fired_directions (else: already proposed today, return None)
+      ▼
+ SCORE (trend + volume + breakout-strength blend) → PROPOSE an Opportunity,
+ mark direction as fired for today. Reset entirely at the next trading_day
+ (MarketClock-derived, never wall-clock).
+```
+
+**State is symbol-keyed inside the strategy instance, never published.** One `ORBStrategy` instance serves every symbol (same singleton-with-internal-keying shape `FeatureEngine`/`MarketStateEngine`/`LevelInteractionEngine` already use) — `evaluate()` takes `symbol: str` explicitly so that keying is possible (base_strategy.py's own docstring, assumption #4). The opening range itself is Saqib's explicit call to keep private rather than publish to `FeatureSet` — accepted trade-off: no persistence, no restart-survival mid-day (see `orb_strategy.py`'s module docstring for the full accounting of that limitation).
+
+**Verification:** `backend/tests/test_base_strategy.py` (9 tests) + `backend/tests/test_orb_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus a full multi-day, multi-symbol `evaluate()` simulation (formation → freeze → breakout → fire-once → reversal → day rollover → independent per-symbol state → honest absence on missing OHLC or a missed formation window). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures in a sandbox with no local Postgres, 91 skipped, both unchanged) plus these 27 new tests passing — zero regressions from the `FeatureSet`/`feature_engine/engine.py` OHLC threading.
+
+**A second reconciliation, from an independent set of concurrent-session findings, folded in before this was finalized.** A separate session (assigned Momentum) reviewed the discarded `momentum_strategy.py`/`vwap_strategy.py` in place rather than rebuilding fresh, and found two real bugs plus one Feature Engine documentation gap — see decision #99's full account for all three, and `match_direction()`'s own docstring in `orb_strategy.py` for the one applied directly here (a threshold-mirroring guard). The `MarketStateEngine._latest_features` per-symbol timeframe race those reviews found remains open, flagged for Saqib, not fixed by this build.
