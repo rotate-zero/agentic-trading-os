@@ -100,6 +100,42 @@ def test_match_direction_none_when_volume_floor_fails():
     )
 
 
+def test_match_direction_rejects_trend_threshold_at_or_below_50():
+    with pytest.raises(ValueError):
+        match_direction(
+            vwap_relationship_score=58.0,
+            trend_score=70.0,
+            volume_regime_score=50.0,
+            vwap_score_low=DEFAULT_VWAP_SCORE_LOW,
+            vwap_score_high=DEFAULT_VWAP_SCORE_HIGH,
+            trend_score_threshold=50.0,  # not > 50
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+        )
+
+
+@pytest.mark.parametrize(
+    "low,high",
+    [
+        (50.0, DEFAULT_VWAP_SCORE_HIGH),  # low not > 50
+        (48.0, DEFAULT_VWAP_SCORE_HIGH),  # low dips below neutral entirely
+        (60.0, 55.0),  # inverted band
+        (60.0, 60.0),  # zero-width band
+        (DEFAULT_VWAP_SCORE_LOW, 101.0),  # high beyond 100
+    ],
+)
+def test_match_direction_rejects_invalid_vwap_band(low, high):
+    with pytest.raises(ValueError):
+        match_direction(
+            vwap_relationship_score=58.0,
+            trend_score=70.0,
+            volume_regime_score=50.0,
+            vwap_score_low=low,
+            vwap_score_high=high,
+            trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+        )
+
+
 def test_band_quality_peaks_at_midpoint():
     mid = (DEFAULT_VWAP_SCORE_LOW + DEFAULT_VWAP_SCORE_HIGH) / 2.0
     assert _band_quality(mid, DEFAULT_VWAP_SCORE_LOW, DEFAULT_VWAP_SCORE_HIGH) == 100.0
@@ -162,6 +198,23 @@ async def test_evaluate_end_to_end_buy_opportunity():
     assert opp.structural_invalidation == 100.0  # vwap itself
     assert opp.structural_target == pytest.approx(101.5 + 2.0 * 1.2)
     assert opp.evidence["basis"] == "closed"
+    assert opp.evidence["conditions"]["market_state_timeframe"] == "1m"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_returns_none_when_close_already_falsifies_thesis():
+    # market_state says BUY (vwap_relationship_score in the BUY band), but
+    # the LOCAL close/vwap pair used for PROPOSE's own math has close
+    # actually below vwap — the "holding VWAP as a level" thesis is
+    # already false for the data this Opportunity would be built from.
+    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    strategy = VWAPStrategy(config)
+    opp = await strategy.evaluate(
+        market_state=_make_market_state(),  # vwap_relationship_score=58.0 -> BUY
+        features=_make_features(close=99.5, features={"vwap": 100.0, "atr_14": 1.2}),
+        context=ContextChanged(),
+    )
+    assert opp is None
 
 
 @pytest.mark.asyncio

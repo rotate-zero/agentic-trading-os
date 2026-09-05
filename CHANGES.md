@@ -1,112 +1,108 @@
-# Momentum Strategy — MATCH/SCORE/PROPOSE review (pre-integration)
+# VWAP Strategy — MATCH/SCORE/PROPOSE review (pre-integration)
 
 Copy this into your repo root, overwriting the existing path — replaces
-the previous drop note.
-
-**Scope, exactly as narrowed in our discussion.** Momentum track only,
-no interface work: `base_strategy.py` still doesn't exist in this repo
-(that's the other track's build), and this drop doesn't touch it, wait
-for it, or guess further at its shape than `momentum_strategy.py`
-already had. Everything here is a review of the *logic already in*
-`momentum_strategy.py` — its MATCH/SCORE thresholds and PROPOSE math —
-found by actually tracing the real `market_state_engine/scoring.py` and
-`market_state_engine/engine.py` code its assumptions rest on, not by
-re-reading the module's own comments.
+the previous drop note. Same scope discipline as the Momentum drop:
+`base_strategy.py` still doesn't exist on this track, this doesn't touch
+it or guess further at its shape, everything here is a review of the
+logic already in `vwap_strategy.py`, found by tracing the real
+Feature/Market State Engine code its assumptions rest on.
 
 ## What changed, and why
 
-**1. `match_direction()` now validates its own thresholds.** SELL's
-confirmation mirrors each threshold as `100 - threshold`. That only
-makes sense above 50 — a misconfigured `StrategyConfig` version with,
-say, `trend_score_threshold=40` would let a *bullish* `trend_score` of
-55 satisfy SELL's confirmation (`55 <= 100-40`), producing a
-backwards-confirmed signal with no error anywhere. Now raises
-`ValueError` instead of silently accepting it. Nothing upstream enforces
-this today (no `StrategyConfig` validator exists yet, since
-`StrategyConfig` itself doesn't exist yet) — this is the one place both
-threshold params are guaranteed to pass through regardless of caller.
+**1. `match_direction()` now validates its own parameters.**
+`trend_score_threshold` must be > 50 — exact same mirror-around-50
+failure mode as Momentum's fix (SELL uses `100 - threshold`). Also new:
+`vwap_score_low`/`vwap_score_high` must satisfy `50 < low < high <= 100`
+— the BUY band is documented as "clearly above the line"; nothing
+enforced that a band could dip to 50-or-below, invert, or collapse to
+zero-width. Both raise `ValueError` now instead of silently producing a
+band that no longer means what the docstring says it means.
 
-**2. PROPOSE now refuses to emit a structurally backwards Opportunity.**
-`fast_ma` (9-bar average) can sit above `slow_ma` on a bar where the raw
-`close` has pulled back below it — MATCH still says BUY (it's reading
-the MAs, correctly), but the target/invalidation formulas both silently
-invert when that happens: target lands below entry, invalidation sits
-above it. The module's own stated thesis ("holding above/below the slow
-MA") is already false in that case, so PROPOSE now returns `None`
-instead — honest absence, same convention every other guard in this
-function already uses.
+**2. PROPOSE now refuses to emit a self-contradictory Opportunity.**
+`direction` comes from `market_state.vwap_relationship_score`; the
+target/invalidation math uses the LOCAL `features.close`/`vwap` pair.
+Per the gap below, those aren't guaranteed to agree. If local `close`
+doesn't actually confirm the direction against local `vwap`, this
+strategy's own stated thesis — "holding VWAP as a level" — is already
+false for the exact data the Opportunity would be built from. Now
+returns `None` instead, same convention as every other guard in this
+function and the identical fix already shipped for Momentum.
 
-**3. `market_state.timeframe` now recorded in `evidence.conditions`.**
-Not a behavior change — a visibility one, for the gap below.
+**3. `market_state.timeframe` now recorded in `evidence.conditions`** —
+visibility for the gap below, not a behavior change.
 
-## A real gap found, not fixed here — needs your call
+## A gap found, refined from the Momentum drop — not fixed here
 
-Tracing `MarketStateEngine._on_features_updated` (not just
-`momentum_strategy.py`'s assumptions about it): `_latest_features[symbol]`
-is one shared slot, overwritten by whichever timeframe's
-`FeaturesUpdated` arrives most recently — 1m/5m/15m/1h all write to the
-same slot, no timeframe filter. Since 1m candles close 5x more often
-than 5m, `market_state.timeframe` will very often be `"1m"` at the exact
-moment Momentum evaluates a 5m candle close. That means the
-`trend_score`/`acceleration_score` confirmation MATCH relies on may
-silently reflect a different timeframe than the crossover it's
-confirming.
+`MarketStateEngine`'s shared-slot-per-symbol race (full explanation in
+`momentum_strategy.py`'s own docstring) applies here too, but I want to
+correct rather than just repeat what that note said: it's LESS severe
+for VWAP specifically, because VWAP's own default timeframe is 1m, and
+1m `FeaturesUpdated` fires more often than any other timeframe — it's
+the dominant writer of the shared slot most of the time, not a rare
+visitor the way it is for Momentum's 5m default. Still not zero-risk
+(a 5m/15m/1h close landing in the same debounce window can briefly
+overwrite it), and would become exactly as severe as Momentum's if this
+strategy's `timeframe` param were ever reconfigured away from 1m.
 
-I deliberately did **not** hard-gate `evaluate()` on
-`market_state.timeframe == params["timeframe"]` to "fix" this — given
-the race described, an exact-match gate would make Momentum fail to
-fire almost always, which is worse than today's silent behavior. This
-also isn't Momentum-specific: any future strategy reading
-`market_state.trend_score`/`acceleration_score` (ORB included, once it
-reads Market State rather than raw features) inherits the same gap.
-Likely real fix is Market State Engine tracking latest-features per
-`(symbol, timeframe)` instead of one shared slot — that's a Market State
-Engine change, outside what you scoped me to today. Flagging for a
-decision rather than picking a fix unilaterally.
+## A new gap, more consequential — needs your call, not picked for you
 
-Separately, smaller and already just documented (not fixed, not really
-fixable from this file): `market_state.trend_score`/`acceleration_score`
-are always driven by `sma_20_slope_angle` specifically — hardcoded in
-`scoring.py`, decision #93. Momentum's own `slow_period` config param
-only changes the crossover comparison, not what "trend confirmation"
-measures. A future `StrategyConfig` version with `slow_period != 20`
-would be comparing its own crossover against a trend read anchored to a
-different period. Noted in the module docstring so nobody assumes
-versioning `slow_period` recalibrates both.
+PROPOSE's target is `close + atr_target_multiplier * atr_14`. Traced
+`atr_14` all the way to `feature_engine/indicators/atr.py`:  it's
+Wilder ATR over the last 14 **complete daily bars**, recomputed once
+per `(symbol, ET day)` and frozen — decisions #67/#68 built it as a
+session-level statistic deliberately, "reads identically regardless of
+chart timeframe," same shape as VWAP itself. That means the default
+`atr_target_multiplier=2.0` sizes a **1-minute-chart** level-hold
+target off a **daily** range measure — asking a quick VWAP-hold play to
+capture 2x the stock's entire typical day's range before exit.
+
+I did not pick a fix, because there isn't an unambiguous one available
+from what's already built:
+
+- Keep `atr_14` but use a much smaller multiplier (a fraction of daily
+  ATR, e.g. 0.2-0.4x) — cheapest, but the "right" fraction is a guess
+  same as every other unvalidated threshold in this file, and it's
+  still conceptually a daily statistic standing in for an intraday one.
+- Feature Engine would need a genuinely new indicator — an ATR computed
+  on the strategy's own intraday timeframe — which doesn't exist
+  anywhere in Feature Engine today; every ATR-consuming thing in the
+  codebase (Scanner's activity score, the chart HUD) uses the same
+  daily one, so this isn't an existing-but-undiscovered option.
+- Size the target off something else already available at this
+  timeframe instead of ATR entirely (e.g. distance already implied by
+  the vwap_relationship_score band itself).
+
+Raising this rather than shipping a guess, same principle as the
+Momentum drop's Market State Engine flag — the current test suite and
+default config still use the old math (untouched) until you tell me
+which way to take it.
 
 ## Files changed
 
-- `backend/app/strategy_engine/momentum_strategy.py` — threshold
+- `backend/app/strategy_engine/vwap_strategy.py` — threshold/band
   validation in `match_direction()`, PROPOSE-stage sanity guard,
   `market_state_timeframe` added to evidence, module docstring gained a
   "KNOWN GAPS" section covering both items above.
-- `backend/tests/test_momentum_strategy.py` — 5 new tests: 4
-  parametrized cases for the threshold validation (`ValueError`), 1 for
-  the PROPOSE-stage guard (`close` on the wrong side of `slow_ma`
-  despite a confirmed crossover). Existing BUY end-to-end test gained
-  one assertion (`market_state_timeframe` present in evidence).
+- `backend/tests/test_vwap_strategy.py` — 7 new tests: 1 for the
+  trend-threshold validation, 5 parametrized cases for the band
+  validation, 1 for the PROPOSE-stage guard. Existing BUY end-to-end
+  test gained one assertion (`market_state_timeframe` in evidence).
 
 ## Verified
 
-`base_strategy.py` still doesn't exist on this track, so
-`momentum_strategy.py` can't actually be imported yet — same blocker
-flagged in the module's own INTEGRATION NOTE before this drop. To
-exercise these changes anyway (this codebase's own "run things, don't
-just inspect" principle), I wrote a throwaway local stub of
-`Strategy`/`StrategyConfig`/`Opportunity`/`every_candle` matching
-`strategy-engine-design.md` §1/§3/§4 exactly, ran the full
-`test_momentum_strategy.py` suite against it (18 passed, including the 5
-new tests), sanity-checked `test_vwap_strategy.py` still passed against
-the same stub (11 passed, no collateral damage), then **deleted the
-stub** — it is not part of this drop and not committed anywhere. Real
-verification against the actual `base_strategy.py` is still pending,
-same as before this drop.
+Same throwaway local stub of `Strategy`/`StrategyConfig`/`Opportunity`/
+`every_candle` as the Momentum drop (matching `strategy-engine-
+design.md` §1/§3/§4), not committed anywhere. Full
+`test_vwap_strategy.py` suite: 18 passed (11 pre-existing + 7 new).
+Sanity-checked `test_momentum_strategy.py` still passes against the
+same stub (18 passed, no collateral damage) and
+`test_strategy_integration_contract.py` — 10 skipped, as before, not
+something either strategy file touches. Stub deleted before packaging.
 
 ## Next
 
-Reconcile against the real `base_strategy.py` once that track lands —
-`momentum_strategy.py`'s own INTEGRATION NOTE has the specific
-assumptions to check (`__init__(self, config)`, `every_candle(timeframe=...)`,
-`context: ContextChanged` vs. the doc's `Context`). Your call on the
-Market State Engine timeframe gap above — whether it's worth a decision
-number now or waiting until a strategy actually goes live against it.
+Your call on the ATR target-sizing question above — that's the one
+thing in this drop I'd want an answer on before it's treated as settled
+rather than "logic reviewed, one open question." Same reconciliation-
+against-real-`base_strategy.py` note as the Momentum drop otherwise
+applies here too.

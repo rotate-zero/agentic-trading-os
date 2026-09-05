@@ -46,6 +46,38 @@ hint) are all inferred against the locked spec, not verified against
 the real `base_strategy.py`. `match_direction`/`score_confidence`/
 `_band_quality` below have zero dependency on any of that — testable
 today regardless.
+
+KNOWN GAPS — found tracing the real Feature/Market State Engine code
+during review, same discipline as momentum_strategy.py's own "KNOWN
+GAPS" section:
+
+  - `market_state`'s shared-slot-per-symbol race (momentum_strategy.py's
+    docstring has the full explanation) applies here too, but is
+    LESS severe by default: VWAP's own default `timeframe` is `"1m"`,
+    and 1m `FeaturesUpdated` fires on every close — the highest
+    frequency of any timeframe — so it's the dominant writer of
+    `_latest_features[symbol]` most of the time, not a rare visitor the
+    way it is for Momentum's 5m default. Still not zero-risk (any 5m/
+    15m/1h close landing inside the same debounce window can briefly
+    overwrite it), and would become the SAME severity as Momentum's if
+    this strategy's `timeframe` param were ever reconfigured away from
+    1m. `market_state.timeframe` is now in `evidence["conditions"]`
+    for the same inspectability reason.
+  - More consequential, specific to this file: PROPOSE's target uses
+    `atr_14`, and `atr_14` is Wilder ATR over the last 14 COMPLETE
+    DAILY bars (feature_engine/indicators/atr.py, decisions #67/#68) —
+    a session-level statistic frozen once per day, deliberately the
+    same "reads identically regardless of chart timeframe" shape as
+    VWAP itself (system-design.md §4.5). That means `target = close +
+    atr_target_multiplier * atr_14` sizes a 1-MINUTE-chart level-hold
+    target off a DAILY range measure. `atr_target_multiplier=2.0`
+    against a $2 daily ATR asks a quick 1m VWAP-hold play to capture
+    2x the stock's whole typical DAY's range before exit — not
+    obviously the right unit for this strategy's own timeframe, but
+    picking a replacement (a smaller multiplier against the same
+    daily ATR vs. some intraday-range measure that doesn't currently
+    exist in Feature Engine vs. something else) is a real strategy-
+    design call, not a bug fix — raising it rather than picking one.
 """
 from __future__ import annotations
 
@@ -112,7 +144,24 @@ def match_direction(
 ) -> Literal["BUY", "SELL"] | None:
     """MATCH stage, pure. BUY band is [vwap_score_low, vwap_score_high];
     SELL band is its mirror image around 50. Direction-agnostic volume
-    floor checked once, same shape as momentum_strategy.match_direction."""
+    floor checked once, same shape as momentum_strategy.match_direction.
+
+    `trend_score_threshold` must be > 50.0 (SELL mirrors it as
+    `100 - threshold`, same failure mode momentum_strategy.match_direction
+    guards against) and `vwap_score_low`/`vwap_score_high` must satisfy
+    `50 < vwap_score_low < vwap_score_high <= 100` — the BUY band is
+    documented as "clearly above the line"; a band that dips to 50 or
+    below, or is inverted/zero-width, silently stops meaning that."""
+    if trend_score_threshold <= 50.0:
+        raise ValueError(
+            f"trend_score_threshold must be > 50.0 (got {trend_score_threshold})"
+        )
+    if not (50.0 < vwap_score_low < vwap_score_high <= 100.0):
+        raise ValueError(
+            "vwap_score_low/vwap_score_high must satisfy "
+            f"50 < low < high <= 100 (got low={vwap_score_low}, "
+            f"high={vwap_score_high})"
+        )
     if volume_regime_score < volume_regime_threshold:
         return None
 
@@ -258,6 +307,21 @@ class VWAPStrategy(Strategy):
         invalidation = vwap  # the level itself IS the thesis — a close back
         # through VWAP falsifies it, same "structural, not arbitrary" shape
         # Momentum uses for its own MA-based invalidation.
+        # PROPOSE-stage sanity guard, same reasoning as
+        # momentum_strategy.py's identical check: `direction` came from
+        # `market_state.vwap_relationship_score`, which per this file's
+        # own "KNOWN GAPS" note may not always share the exact same
+        # close/vwap pair as the LOCAL `features.close`/`vwap` used for
+        # the math below. If local `close` doesn't actually confirm the
+        # direction against local `vwap`, the strategy's own stated
+        # thesis ("holding VWAP as a level") is already false for the
+        # data this Opportunity would be built from — honest absence,
+        # not a malformed PROPOSE.
+        if direction == "BUY" and close <= vwap:
+            return None
+        if direction == "SELL" and close >= vwap:
+            return None
+
         if direction == "BUY":
             target = close + target_mult * atr
         else:
@@ -278,6 +342,9 @@ class VWAPStrategy(Strategy):
                     "trend_score": market_state.trend_score,
                     "volume_regime_score": market_state.volume_regime_score,
                     "atr_14": atr,
+                    # Surfaced per this file's "KNOWN GAPS" note — may
+                    # legitimately differ from `features.timeframe`.
+                    "market_state_timeframe": market_state.timeframe,
                 },
                 "reason": (
                     f"VWAP {direction.lower()} — vwap_relationship_score={vwap_score:.1f}, "
