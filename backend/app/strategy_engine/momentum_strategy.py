@@ -58,6 +58,41 @@ Every GATE/MATCH/SCORE function below (`match_direction`,
 `score_confidence`, `ma_key`) is a pure function with zero dependency
 on any of the above — testable today regardless of how those questions
 resolve.
+
+KNOWN GAPS — found by tracing the real Market State/Feature Engine code
+during a MATCH/SCORE review, not fixed here since both live outside
+this file's boundary. Flagged, not silently worked around:
+
+  - `market_state.trend_score`/`acceleration_score` are always driven
+    by `sma_20_slope_angle` specifically (market_state_engine/scoring.py
+    `trend_score()`, decision #93/#83 — hardcoded, not config-driven).
+    This strategy's `slow_period` param only changes which MA the
+    crossover itself compares; it does NOT change what "trend
+    confirmation" measures. A `StrategyConfig` version with
+    `slow_period != 20` is comparing its own crossover against a
+    trend read anchored to a different period than its "slow" MA —
+    a real decoupling, worth knowing before anyone versions one.
+  - More serious: `MarketStateEngine._on_features_updated`
+    (market_state_engine/engine.py) does not filter by timeframe —
+    `_latest_features[symbol]` is one shared slot, overwritten by
+    whichever timeframe's `FeaturesUpdated` arrives most recently (1m/
+    5m/15m/1h all write to it). Since 1m candles close 5x more often
+    than 5m, `market_state.timeframe` will very often be `"1m"` at the
+    moment Momentum evaluates a 5m candle close — meaning the
+    trend/acceleration confirmation MATCH relies on may silently
+    reflect a different timeframe than the crossover it's confirming.
+    Deliberately NOT hard-gated on `market_state.timeframe ==
+    params["timeframe"]` here the way `features.timeframe` is gated:
+    given the race described above, an exact-match gate would make
+    Momentum fail to fire almost always, which is worse than the
+    current silent behavior. `market_state.timeframe` is now surfaced
+    in `evidence["conditions"]` (see PROPOSE below) so this is at
+    least inspectable in backtests rather than invisible. This needs a
+    real decision — most likely Market State Engine tracking
+    latest-features per (symbol, timeframe) instead of one shared slot
+    — before Momentum should be trusted live. Raising with Saqib
+    rather than picking a fix unilaterally, since it crosses into
+    Market State Engine's own territory.
 """
 from __future__ import annotations
 
@@ -142,7 +177,25 @@ def match_direction(
     mirror image around each dimension's neutral 50, not a separately
     hand-tuned rule set. Returns None on no-crossover or any
     confirming condition failing — never a partial/weak signal; that
-    nuance belongs to SCORE, not MATCH."""
+    nuance belongs to SCORE, not MATCH.
+
+    Both thresholds must be > 50.0. The SELL branch mirrors each one as
+    `100 - threshold`; a threshold at or below 50 flips that mirror
+    onto the wrong side of neutral (e.g. threshold=40 would let a
+    mildly *bullish* trend_score of 55 satisfy SELL's confirmation,
+    since 55 <= 100-40). Found while reviewing this function in
+    isolation — nothing upstream (`StrategyConfig`, `default_params()`)
+    currently enforces it, so a misconfigured version would silently
+    produce backwards-confirmed signals rather than erroring. Raises
+    here instead, since MATCH is the one place both threshold params
+    are guaranteed to pass through regardless of caller."""
+    if trend_score_threshold <= 50.0 or acceleration_score_threshold <= 50.0:
+        raise ValueError(
+            "trend_score_threshold and acceleration_score_threshold must be "
+            "> 50.0 for the BUY/SELL mirror-around-neutral logic to hold "
+            f"(got trend={trend_score_threshold}, "
+            f"acceleration={acceleration_score_threshold})"
+        )
     if volume_regime_score < volume_regime_threshold:
         return None  # participation floor — direction-agnostic, checked once
 
@@ -295,6 +348,24 @@ class MomentumStrategy(Strategy):
         # the slow MA — a close back through it falsifies the pattern itself,
         # same "structural, not arbitrary" reasoning as the ORB example's
         # opening_range_low invalidation (strategy-engine-design.md §1).
+        # PROPOSE-stage sanity guard, found while reviewing this math: the
+        # crossover (fast_ma vs. slow_ma) and `close`'s own position
+        # relative to slow_ma are not the same comparison — fast_ma is a
+        # 9-bar average and can sit above slow_ma on a bar where the raw
+        # close has pulled back below it. If that happens on a BUY,
+        # `close - slow_ma` goes negative and both formulas below invert:
+        # target lands *below* entry and invalidation (slow_ma) sits
+        # *above* entry — a structurally backwards Opportunity. The
+        # module docstring itself already frames this thesis as "holding
+        # above/below the slow MA," so a close on the wrong side means
+        # the thesis is already falsified at the moment of signal, not a
+        # weaker version of it — honest absence (None), not a malformed
+        # PROPOSE, same as every other guard in this function.
+        if direction == "BUY" and close <= slow_ma:
+            return None
+        if direction == "SELL" and close >= slow_ma:
+            return None
+
         if direction == "BUY":
             target = close + target_r * (close - slow_ma)
         else:
@@ -320,6 +391,12 @@ class MomentumStrategy(Strategy):
                     "acceleration_score": market_state.acceleration_score,
                     "volume_regime_score": market_state.volume_regime_score,
                     "regression_slope_norm": regression_slope_norm,
+                    # Surfaced per the module docstring's "KNOWN GAPS" note:
+                    # this may legitimately differ from `features.timeframe`
+                    # (Market State Engine's `_latest_features` isn't
+                    # timeframe-scoped) — recorded here so it's inspectable
+                    # in backtests/evidence rather than invisible.
+                    "market_state_timeframe": market_state.timeframe,
                 },
                 "reason": (
                     f"{ma_type.upper()} {fast_period}/{slow_period} crossover "

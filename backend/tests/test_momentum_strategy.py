@@ -110,6 +110,32 @@ def test_match_direction_none_when_volume_floor_fails_regardless_of_direction():
     )
 
 
+@pytest.mark.parametrize(
+    "trend_threshold,accel_threshold",
+    [
+        (50.0, DEFAULT_ACCELERATION_SCORE_THRESHOLD),  # boundary: not > 50
+        (40.0, DEFAULT_ACCELERATION_SCORE_THRESHOLD),  # would flip SELL's mirror
+        (DEFAULT_TREND_SCORE_THRESHOLD, 50.0),
+        (DEFAULT_TREND_SCORE_THRESHOLD, 45.0),
+    ],
+)
+def test_match_direction_rejects_thresholds_at_or_below_50(trend_threshold, accel_threshold):
+    # A threshold <= 50 flips the SELL branch's `100 - threshold` mirror
+    # onto the wrong side of neutral — must fail loud, not produce a
+    # backwards-confirmed signal.
+    with pytest.raises(ValueError):
+        match_direction(
+            fast_ma=101.0,
+            slow_ma=100.0,
+            trend_score=70.0,
+            acceleration_score=60.0,
+            volume_regime_score=50.0,
+            trend_score_threshold=trend_threshold,
+            acceleration_score_threshold=accel_threshold,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+        )
+
+
 def test_score_confidence_neutral_inputs_give_neutral_ish_score():
     # trend/accel exactly at 50 contribute 0 to their components; volume 0;
     # regression None contributes the neutral 50 placeholder at its own weight.
@@ -177,6 +203,7 @@ async def test_evaluate_end_to_end_buy_opportunity():
     assert opp.structural_target == pytest.approx(101.5 + 2.0 * (101.5 - 100.0))
     assert opp.evidence["basis"] == "closed"
     assert opp.evidence["conditions"]["fast_ma"] == 101.0
+    assert opp.evidence["conditions"]["market_state_timeframe"] == "5m"
 
 
 @pytest.mark.asyncio
@@ -210,6 +237,26 @@ async def test_evaluate_returns_none_when_ma_not_warmed_up():
     opp = await strategy.evaluate(
         market_state=_make_market_state(),
         features=_make_features(features={"sma_9": 101.0}),  # sma_20 missing
+        context=ContextChanged(),
+    )
+    assert opp is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_returns_none_when_close_already_falsifies_thesis():
+    # fast_ma (9-bar avg) crossed above slow_ma -> BUY per MATCH, but the
+    # raw close has pulled back below slow_ma on this bar. Per this
+    # strategy's own stated invalidation rule ("thesis IS the crossover
+    # holding above the slow MA"), that thesis is already false at
+    # signal time — PROPOSE must refuse, not emit a backwards target.
+    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    strategy = MomentumStrategy(config)
+    opp = await strategy.evaluate(
+        market_state=_make_market_state(),
+        features=_make_features(
+            close=99.5,  # below slow_ma (100.0) despite fast_ma > slow_ma
+            features={"sma_9": 101.0, "sma_20": 100.0, "regression_9_slope_norm": 0.2},
+        ),
         context=ContextChanged(),
     )
     assert opp is None
