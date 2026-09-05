@@ -67,6 +67,42 @@ QQQ/IWM's own latest trend_score, no timestamp needed since cross-symbol
 synthesis doesn't compute a rate of change, just a same-moment
 comparison across the three — also mutated only from inside the worker
 task.
+
+`_latest_features` is keyed by `(symbol, timeframe)`, not `symbol`
+alone — decision #99's own reconciliation section, and a concurrent
+session's Momentum/VWAP review before it, both independently found the
+real bug the single-key shape had: `FeaturesUpdated` fires for every
+timeframe (1m/5m/15m/1h) a symbol has, all subscribed through the same
+`_on_features_updated` handler, and a bare `dict[str, ...]` keyed by
+symbol alone meant whichever timeframe's payload arrived MOST RECENTLY
+silently overwrote every other timeframe's for that symbol — so
+`_compute()`'s `sma_20_slope_angle`/`atr_14_pct`/`rvol`/`vwap` reads
+could reflect a different timeframe's close than whichever one actually
+triggered a given recompute, with no way to tell from the outside.
+`_compute()` now always reads the `(symbol, "1m")` slot specifically,
+regardless of which timeframe's `FeaturesUpdated` triggered the
+recompute attempt — deterministic, not "whichever arrived last." 1m was
+never an arbitrary pick: decision #99's own finding was that 1m is
+already the dominant, highest-frequency writer for any symbol running
+at 1m-or-slower granularity, and it's the one timeframe every symbol in
+this system always has (5m/15m/1h are aggregated from it, never the
+reverse — `feature_engine/engine.py`'s own module docstring). A symbol
+whose 1m `FeaturesUpdated` hasn't arrived yet returns `None` from
+`_compute()` even if slower timeframes already have — honest absence,
+not a fabricated cross-timeframe substitute.
+
+`_on_features_updated` now only schedules a recompute for 1m arrivals —
+a direct, narrowly-scoped consequence of the fix above, not separate
+scope creep: once `_compute()` always reads the 1m slot regardless of
+which timeframe triggered it, a 5m/15m/1h arrival re-triggering a
+recompute would only ever re-derive the exact same `MarketState` from
+the unchanged 1m payload underneath it — a wasted persist + a duplicate,
+byte-identical `MarketStateChanged` publish, not a new bug, just an
+obvious and avoidable side effect of the fix that would otherwise ship
+if left unexamined. 5m/15m/1h `FeaturesUpdated` payloads are still
+stored in `_latest_features` (their own `(symbol, timeframe)` slot) in
+case a future consumer needs them directly — only the recompute
+trigger, not the storage, is now 1m-only.
 """
 from __future__ import annotations
 
@@ -123,7 +159,7 @@ class MarketStateEngine:
         self._worker_task: asyncio.Task | None = None
 
         self._schedulers: dict[str, DebounceScheduler] = {}
-        self._latest_features: dict[str, dict[str, Any]] = {}  # symbol -> raw FeaturesUpdated payload
+        self._latest_features: dict[tuple[str, str], dict[str, Any]] = {}  # (symbol, timeframe) -> raw FeaturesUpdated payload — decision #99's reconciliation
         self._prev_trend: dict[str, tuple[float, float]] = {}  # symbol -> (trend_score, time.monotonic() at that score)
         self._cross_symbol_trend: dict[str, float] = {}  # "SPY"/"QQQ"/"IWM" -> latest trend_score (M3)
 
@@ -170,7 +206,16 @@ class MarketStateEngine:
         symbol = envelope.symbol
         if symbol is None:
             return
-        self._latest_features[symbol] = envelope.payload
+        timeframe = envelope.payload["timeframe"]
+        self._latest_features[(symbol, timeframe)] = envelope.payload
+        if timeframe != "1m":
+            # Storage only, no recompute trigger — see module docstring's
+            # "`_on_features_updated` now only schedules a recompute for
+            # 1m arrivals" for why: `_compute()` always reads the 1m slot
+            # regardless of which timeframe arrives, so a 5m/15m/1h
+            # trigger here would only re-derive the same MarketState from
+            # the unchanged 1m payload underneath it.
+            return
         scheduler = self._schedulers.get(symbol)
         if scheduler is None:
             max_interval = (
@@ -284,13 +329,18 @@ class MarketStateEngine:
         return {"symbols": symbols, "market": market}
 
     def _compute(self, symbol: str) -> MarketState | None:
-        """Pure, in-memory — reads the latest cached FeaturesUpdated
-        payload for `symbol` and scores.py's functions; no I/O. Returns
-        None if a recompute was triggered before any FeaturesUpdated for
-        this symbol ever arrived (shouldn't happen in practice — the
-        scheduler is only created inside _on_features_updated — kept as
-        a defensive guard, not load-bearing)."""
-        payload = self._latest_features.get(symbol)
+        """Pure, in-memory — reads the latest cached 1m FeaturesUpdated
+        payload for `symbol` and scores.py's functions; no I/O. Always
+        reads the `(symbol, "1m")` slot specifically, never "whichever
+        timeframe's payload happens to be freshest" — see module
+        docstring for why that used to be a real, silent bug. Returns
+        None if this symbol's 1m FeaturesUpdated hasn't arrived yet —
+        either because no FeaturesUpdated for it has arrived at all
+        (the scheduler is only created inside _on_features_updated, so
+        this is defensive, not load-bearing), or, now, because only a
+        slower timeframe has reported so far. Honest absence either
+        way, not a fabricated cross-timeframe substitute."""
+        payload = self._latest_features.get((symbol, "1m"))
         if payload is None:
             return None
 
@@ -333,11 +383,19 @@ class MarketStateEngine:
         four synthesized scores.
 
         `timeframe`/`candle_ts` are borrowed from whichever of the three
-        symbols has the most recent `candle_ts` in `_latest_features` —
-        SPY/QQQ/IWM share a debounce cadence but don't necessarily
-        recompute in perfect lockstep, so this composite's own timestamp
-        should reflect the freshest of the three inputs, not an
-        arbitrary pick."""
+        symbols has the most recent `candle_ts` in `_latest_features`'s
+        own `(ticker, "1m")` slot — SPY/QQQ/IWM share a debounce cadence
+        but don't necessarily recompute in perfect lockstep, so this
+        composite's own timestamp should reflect the freshest of the
+        three inputs, not an arbitrary pick. Always the 1m slot, same
+        reasoning as `_compute()` above — safe to index directly (no
+        `.get()`/KeyError guard needed) because the `issubset` check
+        just above already guarantees each of the three has computed at
+        least once via `_compute()`, which itself requires that ticker's
+        `(ticker, "1m")` slot to have existed at that time — and once
+        written, a 1m slot is only ever replaced by a NEWER 1m payload
+        for that same ticker, never removed or overwritten by another
+        timeframe's, so it can't have disappeared since."""
         if not _CROSS_SYMBOL_TICKERS.issubset(self._cross_symbol_trend.keys()):
             return None
 
@@ -347,9 +405,9 @@ class MarketStateEngine:
 
         newest_ticker = max(
             _CROSS_SYMBOL_TICKERS,
-            key=lambda t: self._latest_features[t]["candle_ts"],
+            key=lambda t: self._latest_features[(t, "1m")]["candle_ts"],
         )
-        newest_payload = self._latest_features[newest_ticker]
+        newest_payload = self._latest_features[(newest_ticker, "1m")]
 
         return CrossSymbolState(
             timeframe=newest_payload["timeframe"],

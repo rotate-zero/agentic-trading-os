@@ -213,7 +213,7 @@ async def test_stop_drains_an_in_flight_worker_cycle_before_returning():
     engine.start()
 
     try:
-        engine._latest_features[ticker] = {
+        engine._latest_features[(ticker, "1m")] = {
             "timeframe": "1m", "candle_ts": _TS, "close": 100.0, "features": {"sma_20_slope_angle": 5.0},
         }
         engine._queue.put_nowait(ticker)
