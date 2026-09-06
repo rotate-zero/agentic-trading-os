@@ -575,6 +575,7 @@ Everything above, connected — the learning loop this design is actually buildi
 | D6 | Wiring any consumer to `PriceSnapshot` for live/forming-bar structure (§8) | **Open, deferred.** The data already exists (`LiveTickRelay`, decision #72); no Strategy or Feature Engine module reads it. Needs its own design pass — `evaluate()`'s signature would need to change — not assumed as a side effect of anything above. |
 | D7 | Whether `StrategyOutcome` needs a separate `market_state_at_signal`/`context_at_signal` pair, distinct from `_at_entry` (§5) | **Open, deferred, tied to D5.** Signal and entry are the same instant while `allows_waiting` defaults `False` everywhere — no current strategy makes them diverge. Revisit only once D5 stops being deferred and a real waiting-capable strategy exists. |
 | D8 | Whether `StrategyOutcome.trading_day` (§5, decision #89) stays a single `date` field once swing/overnight holding exists | **Open, flagged not resolved.** The single-value simplification was explicitly justified by "day-trading only, no overnight holds" — Saqib has since clarified the platform is day-trading-*focused* but not day-trading-*limited*. Nothing needs to change today; every real trade is still intraday. The trigger is concrete: the first time a position is intentionally held overnight, `trading_day` needs to split into `entry_trading_day`/`exit_trading_day`, and `exit_reason`'s `eod_flatten` value stops being universal (a forced-by-rule exit only for trades actually subject to the day-trading rule). Caught here so it isn't rediscovered as a bug later. |
+| D9 | How a `Strategy` reads `LevelInteractionEngine` state (§16, decision #107) | **Resolved for v1, narrowly.** First Pullback/Reversal call `get_level_interaction_engine().get_snapshot(symbol)` directly inside `evaluate()` — same free-function-singleton precedent `orb_strategy.py` already uses for `get_market_clock()` — rather than changing `evaluate()`'s signature or wiring `on_event(LevelInteractionChanged)` through a Scheduler that doesn't exist yet (§13 item 4 / `base_strategy.py`'s own "NOT BUILT HERE" note). `seconds_in_zone` deliberately never read — it's wall-clock `datetime.now()`-derived (`level_interaction_engine.py`'s `get_snapshot()`, decision #47, built for the UI panel), which would violate §7's backtest-safety invariant. **Still open:** a future strategy that genuinely needs the authoritative `status`/`observed_via` fields (gap-through vs. dwell) rather than a one-candle-late zone-transition inference would need real event wiring — not decided here, no strategy has hit that need yet. |
 
 ---
 
@@ -595,7 +596,8 @@ Everything above, connected — the learning loop this design is actually buildi
 
 - [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model), refined again by #89 (§5's `StrategyOutcome`/`backtests` schema: field groups, `strategy_outcomes` rename, `eod_flatten`, `slippage_entry`, write-time invariants).
 - [x] **Stage 1 — ORB built (decision #99).** `base_strategy.py` (`Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger`) and `orb_strategy.py` — the first concrete strategy. An earlier, undocumented attempt at this stage (`momentum_strategy.py`/`vwap_strategy.py`, built by a concurrent session against a `base_strategy.py` that didn't exist yet, decision-log entry lost to a numbering collision with #98) was found orphaned and discarded rather than built on top of — see decision #99 for the full account. Momentum and VWAP are being rebuilt fresh, assigned to a separate session, against this now-real interface.
-- [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see §15 below for both. First Pullback and Reversal remain unbuilt.
+- [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see §15 below for both.
+- [x] **Stage 1 (continued) — First Pullback and Reversal design note locked (decision #107).** GATE/MATCH/SCORE/PROPOSE walkthrough, `LevelInteractionEngine` access pattern (D9), and `allows_waiting` scoping — see §16. Not yet built: `first_pullback_strategy.py`/`reversal_strategy.py` and their tests are the next step on this thread.
 
 ---
 
@@ -607,6 +609,7 @@ Everything above, connected — the learning loop this design is actually buildi
 4. Before building on Stage 1, know what M4 (decision #98) already prepared: `MarketStateEngine.get_snapshot()`, `ContextEngine.get_snapshot()`, and `app/trading_intelligence/state_snapshot.py`'s three capture functions all exist and are tested (`backend/tests/test_strategy_integration_contract.py`) — a strategy should call these, not re-derive its own read path against either engine. Also worth knowing: `ContextChanged` has no domain-safe timestamp (§4's providers are timer-triggered, not candle-triggered) — decision #98 left this open rather than inventing one; don't assume it got solved.
 5. `FeatureSet` now carries `open`/`high`/`low`/`volume` (decision #99) — but ONLY on the 1m `FeatureSet`; a 5m/15m/1h `FeatureSet`'s open/high/low/volume are `None` (true aggregated-bucket OHLC isn't tracked anywhere yet — see `schemas/events/features.py`'s `FeatureSet` docstring for why passing through the last constituent 1m candle's OHLC would be dishonest, not just incomplete). A strategy reading these on anything other than a 1m `FeatureSet` needs to handle `None`, not assume they're populated.
 6. `Strategy.evaluate()`'s real signature takes `symbol: str` as its first argument (decision #99) — the illustrative 3-arg sketch (system-design.md §4.8) had no way for a strategy to know which symbol it's being asked about, which only mattered once a strategy needed its own per-symbol memory (ORB's opening range does; the discarded Momentum draft's stateless MATCH logic never hit this gap). Any new strategy's `evaluate()` must match the real 4-arg signature.
+7. First Pullback and Reversal (§16, decision #107) are design-locked but unbuilt — call `get_level_interaction_engine().get_snapshot(symbol)` directly (D9), never read its `seconds_in_zone` field (wall-clock, not `candle_ts`-derived), and re-derive rejected-vs-conquered one candle late from each strategy's own private per-symbol state rather than assuming `LevelInteractionChanged`'s `status` field is reachable — no Scheduler wires `on_event(...)` triggers to anything yet.
 
 ---
 
@@ -727,3 +730,106 @@ Both built against the real `base_strategy.py`, after decision #103 closed the `
 3. **Volume Spike needed genuinely new per-symbol state (a rolling volume baseline) that no other engine provides — the same "strategy-private state" precedent ORB's own opening range already established, not new territory.** `rvol` (Feature Engine, decision #71) is a day-level, time-of-day-normalized proxy; Market State's `volume_regime_score` already interprets it. Neither answers "was THIS candle anomalous relative to this symbol's own last N bars" — a narrower, single-candle claim nothing else in the codebase computes.
 
 **Verification:** `backend/tests/test_gap_strategy.py` (15 tests) + `backend/tests/test_volume_spike_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus end-to-end multi-day, multi-symbol `evaluate()` simulations for each (session gating, day rollover, independent per-symbol state, honest absence on missing data). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures, 91 skipped, both unchanged) plus these 33 new tests passing — zero regressions.
+
+---
+
+## 16. First Pullback and Reversal — design note before code (decision #107)
+
+The last two strategies from trading-intelligence-architecture.md §8's planned v1 set (ORB, Gap, Volume Spike built; Momentum still assigned elsewhere). **Design-locked here, not yet built** — `first_pullback_strategy.py`/`reversal_strategy.py` are the next step on this thread, per Saqib's own "short design note first, then code" instruction. Both read `LevelInteractionEngine`'s touch/holding/rejected/conquered vocabulary (decision #46) as a settled input — same "consume, don't rebuild" boundary discipline `orb_strategy.py` already applies to `trend_score`/`volume_regime_score`. Neither strategy re-derives zone classification, Aura width, or touch counting — that's `LevelInteractionEngine`'s own job.
+
+**Shared mechanism both strategies build on: private per-symbol touch tracking, one candle late.**
+
+`get_snapshot()` (decision #47) only exposes the CURRENT steady `zone` — by the time a touch resolves and `zone` moves on, the transient `status` ("rejected"/"conquered") that produced it is already gone from the snapshot; it only ever existed on the `LevelInteractionChanged` event itself, which neither strategy can subscribe to yet (see the D9 callout below). Both strategies work around this identically: while `zone == "inside_aura"`, remember `entered_from` in a small private dataclass keyed by symbol; on a later candle, once `zone` is no longer `"inside_aura"`, compare the resolved zone to the remembered `entered_from` — equal means REJECTED (bounced back out the side it came from), different means CONQUERED (broke through) — the exact same rule `level_interaction_engine.py`'s own module docstring defines, just re-derived one candle after the fact instead of read off the authoritative event.
+
+```
+ watching?  (private per-symbol state: level_key, entered_from, trading_day)
+      │
+      no ──▶ zone == "inside_aura" this candle?
+      │            │ no  ──▶ nothing to watch yet, return None
+      │            │ yes ──▶ remember entered_from + trading_day, start watching, return None
+      │
+      yes ──▶ zone still "inside_aura"?
+                   │ yes ──▶ still resolving, return None (no allows_waiting yet — see below)
+                   │ no  ──▶ resolved. compare resolved zone to remembered entered_from:
+                                  equal      → REJECTED (bounced back)
+                                  not equal  → CONQUERED (broke through)
+                              stop watching this touch either way
+```
+
+**First Pullback — is this the trend's first pullback to a key reference level today, and did the level hold?**
+
+```
+ every 1m candle (trigger = every_candle("1m"))
+      │
+      ▼
+ features.timeframe == "1m"?  ── no ──▶ return None
+      │ yes
+      ▼
+ established trend? |trend_score - 50| past trend_score_threshold
+ (mirror-around-50, threshold > 50 — same guard as match_direction(), decision #99)
+      │ no ──▶ return None (no trend, nothing to pull back within)
+      │ yes  →  direction = BUY if trend_score ≥ threshold, SELL if ≤ 100-threshold
+      ▼
+ get_level_interaction_engine().get_snapshot(symbol)
+   .get(timeframe, {}).get(level_key)
+      │ missing ──▶ return None (level not tracked yet — honest absence, not an error)
+      ▼
+ touch_count_today == 1?  (the FIRST pullback specifically — a later touch is a
+      │                     different, not-yet-built strategy family)
+      │ no ──▶ return None
+      ▼
+ [shared touch-tracking mechanism above] → resolved REJECTED, in trend's favor?
+      │ CONQUERED, or not yet resolved ──▶ return None (see mechanism diagram)
+      │ REJECTED
+      ▼
+ already fired today for this symbol?  ── yes ──▶ return None
+      │ no
+      ▼
+ SCORE (trend + volume_regime_score + resolution distance_pct blend) → PROPOSE,
+ invalidation = anchor_price (the level's own value when the touch began —
+ a re-test failing below/above that same value falsifies the thesis),
+ mark fired for today.
+```
+
+**Reversal — has an established trend's key level just been conquered against it?**
+
+Same touch-tracking mechanism, opposite confirming outcome, and deliberately NOT restricted to the first touch — a reversal is often the second or third test that finally breaks, not the first, so `touch_count_today` is read for SCORE but never gates MATCH the way it does for First Pullback.
+
+```
+ every 1m candle (trigger = every_candle("1m"))
+      │
+      ▼
+ features.timeframe == "1m"?  ── no ──▶ return None
+      │ yes
+      ▼
+ trend_score still shows the OLD, about-to-be-tested direction past threshold?
+      │ no ──▶ return None (no established direction left to reverse)
+      │ yes  →  the trend being tested is BUY-side if trend_score ≥ threshold, SELL-side if ≤ 100-threshold
+      ▼
+ get_level_interaction_engine().get_snapshot(symbol).get(timeframe, {}).get(level_key)
+      │ missing ──▶ return None
+      ▼
+ [shared touch-tracking mechanism above] → resolved this candle?
+      │ not yet, or REJECTED (level held, trend intact) ──▶ return None, keep counting touches
+      │ CONQUERED
+      ▼
+ already fired a reversal today for this symbol?  ── yes ──▶ return None
+      │ no
+      ▼
+ MATCH confirmed — direction is the MIRROR of the trend just broken
+ (an established uptrend conquered downward proposes SELL, not BUY)
+      │
+      ▼
+ SCORE (broken-trend strength + volume_regime_score + touch_count_today blend —
+ a break after several prior holds is stronger evidence than a break on the
+ very first test) → PROPOSE,
+ invalidation = anchor_price, mark fired for today.
+```
+
+**`level_key` is a `StrategyConfig.params` value (v1 default `"vwap"`), not a hardcoded constant — same "not its own strategy class" precedent §3 already sets for SMA 9/20.** A second `StrategyConfig` version pointed at `"sma_20"` gives a second First Pullback variant for free, no new code.
+
+**D9 — why neither strategy reads `LevelInteractionChanged`'s `status` field directly, and why `base_strategy.py` doesn't change.** The clean, event-driven design would be `trigger = on_event("LevelInteractionChanged")` with the event payload passed into `evaluate()` — but `base_strategy.py`'s own docstring already flags that no Scheduler exists to wire `on_event(...)` triggers to anything live, and `evaluate()`'s fixed 4-argument signature (`symbol`, `market_state`, `features`, `context`) has no slot for an arbitrary triggering event's payload regardless. Building that wiring for two strategies, ahead of ORB/Gap/Volume Spike ever needing it, would be exactly the kind of speculative generality §11 already argues against. Both strategies instead call `get_level_interaction_engine().get_snapshot(symbol)` directly inside `evaluate()` — the same free-function-singleton pattern `orb_strategy.py` already uses for `get_market_clock()` — and accept the one-candle-late re-derivation described above as the cost of not touching the shared interface. Full open item logged as §10's D9.
+
+**`allows_waiting` stays `False` for both, v1.** First Pullback's "touch just started, not yet resolved" moment (the `watching` state in the mechanism diagram above) is a natural fit for a `status="waiting"` Opportunity under §8's ACT/WAIT/ABANDON model, rather than silently returning `None` until resolution. But D5 (the waiting-value model itself) is explicitly deferred until a real strategy needs it, and `allows_waiting` defaults `False` everywhere in v1 — First Pullback would be the first real trigger for D5, not decided here. Flagged rather than built speculatively, same restraint §11 asks for.
+
+**Not yet decided, deliberately left for whoever builds this next:** the exact SCORE blend weights and `trend_score_threshold` default (v1 guess, unvalidated against real score distributions, same caveat every other strategy's calibration constants already carry).
