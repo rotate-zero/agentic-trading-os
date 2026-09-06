@@ -1,23 +1,36 @@
-# TESTING — First Pullback & Reversal design note (decision #107)
+# TESTING — First Pullback & Reversal built (decisions #108, #109, #110)
 
-**No application code in this change — nothing to run.** Per your "short design note first, then code" instruction, this delivers only:
+## What's in this delivery
 
-- `docs/architecture/strategy-engine-design.md` — new §16 (First Pullback/Reversal GATE/MATCH/SCORE/PROPOSE walkthrough + diagrams), a new D9 row in §10, and updated §12/§13.
-- `docs/decisions/confirmed-decisions.md` — decision #107 appended.
-- `docs/decisions/INDEX.md` — #107 summary row appended.
+**New application code:**
+- `backend/app/strategy_engine/level_touch_tracking.py` — shared, isolated touch-resolution reconstruction (gap-through and cold-start handling, both fixed vs. the original design per the review).
+- `backend/app/strategy_engine/first_pullback_strategy.py`
+- `backend/app/strategy_engine/reversal_strategy.py`
 
-## How to verify this landed correctly
+**Modified application code:**
+- `backend/app/trading_intelligence/level_interaction_engine.py` — one additive field (`last_applied_candle_ts`) on `get_snapshot()`'s per-entry dict. Nothing removed, nothing renamed; existing consumers (the UI panel) are unaffected.
 
-1. Unzip this folder's contents over your project root (paths already match: `docs/architecture/...`, `docs/decisions/...`).
-2. `git diff` should show only additions to those three files — no other files touched, no code files added or changed.
-3. Read `docs/architecture/strategy-engine-design.md` §16 top to bottom — that's the actual design; §10's new D9 row and §12/§13's small updates are cross-references into it.
-4. Decision numbering: `confirmed-decisions.md` should now contain exactly one entry (#107); `INDEX.md`'s last row should read #107 and link to `confirmed-decisions.md` (not an archive file, since it hasn't rolled over).
+**New tests:**
+- `backend/tests/test_level_touch_tracking.py` (13 tests, pure — no DB)
+- `backend/tests/test_first_pullback_strategy.py` (16 tests)
+- `backend/tests/test_reversal_strategy.py` (12 tests)
 
-## What I'd like your call on before I write code
+**Docs:**
+- `docs/architecture/strategy-engine-design.md` — §16 rewritten to cover the design review outcome and the actual build; §10's D9 row updated; §12's checklist updated.
+- `docs/decisions/confirmed-decisions.md` / `INDEX.md` — decisions #108 (review + `get_snapshot()` fix), #109 (First Pullback), #110 (Reversal).
 
-Both flagged inline in §16/decision #107, repeated here since they're the two things most worth a quick yes/no from you rather than me just proceeding:
+## How to verify
 
-1. **`level_key` default.** I picked `"vwap"` as the v1 default reference level for First Pullback (params-driven, easy to override to `"sma_9"`/`"sma_20"` later). Fine as a starting default, or would you rather start with an SMA?
-2. **Reversal's scope.** I designed Reversal to fire on ANY touch count (not just the first), on the theory that real reversals often happen on the 2nd/3rd test. If you'd rather start narrower (e.g. only fire on a level's 2nd+ touch specifically, to avoid overlapping with First Pullback's own first-touch territory on the same level), that's a one-line GATE change, easy to adjust before code is written.
+1. Unzip over your project root — paths already match.
+2. `cd backend && pytest -q` — I ran the full suite against a real, freshly-migrated Postgres 16 in my own sandbox (not mocked, per your verification standard): **486 passed, 0 failed** (445 pre-change baseline + 41 new tests, zero regressions). You should see the same shape locally; if Postgres isn't reachable, the DB-backed tests in the three new files skip as a whole (same posture `test_level_interaction_engine.py` already has) rather than fail, and you'd see the same 445+13 pure-test count passing with the rest skipped.
+3. No frontend files touched — `tsc`/`vite build` not applicable to this change.
+4. No live browser click-through available in my environment, as always — flagged per standing practice, though there's no UI surface in this change to click through anyway (`get_snapshot()`'s new field is additive and the Feature Engine panel that already reads this endpoint doesn't break on an extra key).
 
-Everything else in §16 (the private per-symbol touch-tracking mechanism, the `get_level_interaction_engine().get_snapshot()` access pattern, `allows_waiting=False` for v1) I'm treating as settled unless you say otherwise — happy to start on `first_pullback_strategy.py`/`reversal_strategy.py` next.
+## Worth double-checking on your end
+
+Nothing is blocking, but two things worth a look since they involve judgment calls made during the build, not just mechanical implementation:
+
+1. **The `get_level_interaction_engine()` singleton pattern in tests.** The three new DB-backed test files construct their own `LevelInteractionEngine(bus, aura_pct=0.002)` and assign it directly to the module-level `_level_interaction_engine` global (matching the existing `conftest.py` autouse fixture, which already resets this same global before/after every test — I didn't add new reset logic, just used what's already there). Worth a skim if you want to confirm this doesn't feel like it's fighting the existing fixture.
+2. **Reversal's gap-through invalidation fallback** (`features.features.get(level_key)`, module docstring in `reversal_strategy.py`) is a real, if rare, precision trade-off — flagged explicitly rather than silently accepted. If gap-throughs turn out more common than expected for a given `level_key` once this runs against real data, that fallback's quality is worth revisiting.
+
+Both strategies still need actual live wiring (a Strategy Scheduler) before they run in the real pipeline — same pre-existing gap ORB/Gap/Volume Spike already have, not something this delivery was expected to close.

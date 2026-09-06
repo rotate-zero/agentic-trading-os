@@ -449,6 +449,23 @@ class LevelInteractionEngine:
         `holding` is still present only while `inside_aura`, now
         carrying just the touch-specific extras that don't apply to a
         steady zone: `anchor_price`, `entered_from`, `entered_ts`.
+
+        `last_applied_candle_ts` (added for decision #108, First Pullback/
+        Reversal's strategy-side staleness check) — the `candle_ts` of the
+        most recent `FeaturesUpdated` this engine has actually FINISHED
+        processing for this `(symbol, timeframe)`, i.e. `_last_applied_ts`
+        (§"computation" above), the same value `_process_one`'s own
+        out-of-order guard already uses internally. `None` if this engine
+        has never processed a candle for that `(symbol, timeframe)` at
+        all — honest absence, not a fabricated epoch. This exists because
+        `_on_features_updated` only enqueues (`_worker_loop` computes
+        off-loop via `asyncio.to_thread`, at its own pace) — a caller of
+        `get_snapshot()` right after a `FeaturesUpdated` publish has no
+        other way to tell whether this engine's `zone`/`touch_count_today`
+        for that symbol reflect that same candle yet, or a stale, earlier
+        one still sitting in the queue. Compare against the candle you're
+        currently evaluating (e.g. `features.candle_ts`) and treat a
+        mismatch as "not caught up yet" rather than trusting the zone.
         """
         result: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
         now = datetime.now(timezone.utc)
@@ -457,12 +474,14 @@ class LevelInteractionEngine:
                 continue
 
             latest_close = self._latest_close.get((sym, timeframe))
+            last_applied_ts = self._last_applied_ts.get((sym, timeframe))
             entry: dict[str, Any] = {
                 "zone": state.zone,
                 "touch_count_today": state.touch_count_today,
                 "trading_day": state.trading_day.isoformat(),
                 "seconds_in_zone": int((now - state.zone_entered_ts).total_seconds()),
                 "distance_pct": None,
+                "last_applied_candle_ts": last_applied_ts.isoformat() if last_applied_ts is not None else None,
             }
 
             if state.zone == "inside_aura" and state.touch_anchor_price is not None and state.touch_entered_ts is not None:
