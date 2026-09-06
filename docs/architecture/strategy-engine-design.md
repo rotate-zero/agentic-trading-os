@@ -594,7 +594,8 @@ Everything above, connected — the learning loop this design is actually buildi
 ## 12. Staged plan
 
 - [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model), refined again by #89 (§5's `StrategyOutcome`/`backtests` schema: field groups, `strategy_outcomes` rename, `eod_flatten`, `slippage_entry`, write-time invariants).
-- [x] **Stage 1 — ORB built (decision #99).** `base_strategy.py` (`Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger`) and `orb_strategy.py` — the first concrete strategy. An earlier, undocumented attempt at this stage (`momentum_strategy.py`/`vwap_strategy.py`, built by a concurrent session against a `base_strategy.py` that didn't exist yet, decision-log entry lost to a numbering collision with #98) was found orphaned and discarded rather than built on top of — see decision #99 for the full account. Momentum is next, assigned to a separate session against this now-real interface.
+- [x] **Stage 1 — ORB built (decision #99).** `base_strategy.py` (`Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger`) and `orb_strategy.py` — the first concrete strategy. An earlier, undocumented attempt at this stage (`momentum_strategy.py`/`vwap_strategy.py`, built by a concurrent session against a `base_strategy.py` that didn't exist yet, decision-log entry lost to a numbering collision with #98) was found orphaned and discarded rather than built on top of — see decision #99 for the full account. Momentum and VWAP are being rebuilt fresh, assigned to a separate session, against this now-real interface.
+- [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see §15 below for both. First Pullback and Reversal remain unbuilt.
 
 ---
 
@@ -651,3 +652,78 @@ Everything above, connected — the learning loop this design is actually buildi
 **Verification:** `backend/tests/test_base_strategy.py` (9 tests) + `backend/tests/test_orb_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus a full multi-day, multi-symbol `evaluate()` simulation (formation → freeze → breakout → fire-once → reversal → day rollover → independent per-symbol state → honest absence on missing OHLC or a missed formation window). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures in a sandbox with no local Postgres, 91 skipped, both unchanged) plus these 27 new tests passing — zero regressions from the `FeatureSet`/`feature_engine/engine.py` OHLC threading.
 
 **A second reconciliation, from an independent set of concurrent-session findings, folded in before this was finalized.** A separate session (assigned Momentum) reviewed the discarded `momentum_strategy.py`/`vwap_strategy.py` in place rather than rebuilding fresh, and found two real bugs plus one Feature Engine documentation gap — see decision #99's full account for all three, and `match_direction()`'s own docstring in `orb_strategy.py` for the one applied directly here (a threshold-mirroring guard). The `MarketStateEngine._latest_features` per-symbol timeframe race those reviews found remains open, flagged for Saqib, not fixed by this build.
+
+---
+
+## 15. Gap and Volume Spike — the second and third strategies after ORB (decisions #104, #105)
+
+Both built against the real `base_strategy.py`, after decision #103 closed the `MarketStateEngine` per-symbol timeframe race §14 flagged — neither has the shared-slot exposure ORB/Momentum/VWAP each had to reason about. Full reasoning for every design choice below lives in each module's own docstring (`gap_strategy.py`, `volume_spike_strategy.py`) and decisions #104/#105 — this section is a summary and a diagram, not a duplicate of either.
+
+**Gap — is today's opening gap holding (continuation), or already given back (reversal)?**
+
+```
+ every 1m candle, regular session only (trigger = every_candle("1m"))
+      │
+      ▼
+ gap_pct / gap_dollars / pdc present in features.features?
+      │ no ──▶ return None (no gap yet, or no prior trading day — honest absence)
+      │ yes
+      ▼
+ already fired today for this symbol?
+      │ yes ──▶ return None (gap_pct's sign is frozen for the day — only one
+      │          possible direction, unlike ORB's two-sided range)
+      │ no
+      ▼
+ regular_open = pdc + gap_dollars        (reconstructed, not separately tracked)
+      │
+      ▼
+ MATCH: |gap_pct| >= min_gap_pct  &  volume_regime_score confirms  &
+        gap_pct > 0 → close > regular_open & trend_score confirms   ──▶ BUY
+        gap_pct < 0 → close < regular_open & trend_score confirms   ──▶ SELL
+      │
+      ▼
+ SCORE (trend + volume + gap-size blend) → PROPOSE an Opportunity,
+ invalidation = regular_open (the same level MATCH just tested against),
+ mark fired for today. Reset entirely at the next trading_day.
+```
+
+**Volume Spike — did this candle print unusually heavy volume, and which way did the market move on it?**
+
+```
+ every 1m candle, regular session only (trigger = every_candle("1m"))
+      │
+      ▼
+ open/high/low/volume all present? ── no ──▶ return None (pre-#99 shape,
+      │ yes                                   or an aggregated FeatureSet)
+      ▼
+ rolling baseline has lookback_bars samples yet?
+      │ no ──▶ push this candle's volume, return None (honest warm-up,
+      │         same discipline as ORB's candles_seen < or_minutes)
+      │ yes
+      ▼
+ baseline = mean(prior lookback_bars volumes)   (this candle NOT included)
+ volume_ratio = this candle's volume / baseline
+ push this candle into the window for the NEXT candle's baseline
+      │
+      ▼
+ within cooldown_minutes of the last fire for this symbol?
+      │ yes ──▶ return None (floor against re-firing the same still-elevated move)
+      │ no
+      ▼
+ MATCH: volume_ratio >= spike_ratio_threshold  &  volume_regime_score confirms  &
+        close > open → trend_score confirms   ──▶ BUY
+        close < open → trend_score confirms   ──▶ SELL
+      │
+      ▼
+ SCORE (trend + volume + spike-excess blend) → PROPOSE an Opportunity,
+ invalidation = this candle's own low/high (the same bar MATCH just tested),
+ record last_fired_ts. Reset the whole baseline + cooldown at the next trading_day.
+```
+
+**Three design choices worth naming, since each deliberately diverges from ORB's own precedent rather than copying it wholesale:**
+
+1. **Gap's `_GapState.fired` is a plain `bool`, not ORB's `fired_directions: set`.** A gap's direction is fixed by `gap_pct`'s own sign for the whole day (`_update_gap`, decisions #67/#68) — there is never a second, opposite direction for a reversal to test against the way ORB's fixed range allows both sides.
+2. **Volume Spike uses a per-symbol cooldown timer, not a fired-once-per-day flag.** Unlike Gap (one fixed daily event) or ORB (one fixed daily range), a volume spike is a recurring pattern — a busy session can produce several genuine, independent spikes hours apart, so a once-per-day cap would discard real signal. The cooldown only floors against re-firing the immediate next candle or two of the *same* still-elevated move.
+3. **Volume Spike needed genuinely new per-symbol state (a rolling volume baseline) that no other engine provides — the same "strategy-private state" precedent ORB's own opening range already established, not new territory.** `rvol` (Feature Engine, decision #71) is a day-level, time-of-day-normalized proxy; Market State's `volume_regime_score` already interprets it. Neither answers "was THIS candle anomalous relative to this symbol's own last N bars" — a narrower, single-candle claim nothing else in the codebase computes.
+
+**Verification:** `backend/tests/test_gap_strategy.py` (15 tests) + `backend/tests/test_volume_spike_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus end-to-end multi-day, multi-symbol `evaluate()` simulations for each (session gating, day rollover, independent per-symbol state, honest absence on missing data). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures, 91 skipped, both unchanged) plus these 33 new tests passing — zero regressions.
