@@ -136,6 +136,18 @@ class Opportunity(BaseModel):
     confidence: float
     structural_invalidation: float  # price at which the strategy's own thesis is falsified
     structural_target: float
+    # Decision #107, from the Gap/Volume Spike design review's §5: every
+    # strategy has an implicit expectation of how long its setup should
+    # take to play out (a fast volume spike vs. a session-long gap
+    # continuation are not the same kind of bet) — previously simply
+    # lost the moment evaluate() returned, since nothing on this schema
+    # carried it. Optional, honest-absence default (§11): a strategy
+    # with no informed opinion on horizon leaves this None rather than
+    # guessing. Descriptive metadata for Performance Intelligence / a
+    # future Decision Engine to reason with — deliberately NOT an
+    # expiry mechanism (that's `wait_expires_at`'s job, and only for the
+    # WAITING path); nothing reads this to auto-expire an Opportunity.
+    expected_horizon_minutes: int | None = None
     evidence: dict  # {"conditions": {...MATCH-stage values...}, "reason": "...", "basis": "live"|"closed"}
     status: Literal["potential", "waiting", "actionable", "expired"] = "actionable"
     wait_reason: str | None = None

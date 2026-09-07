@@ -1075,6 +1075,10 @@ async def test_session_change_and_gap_absent_when_no_previous_day_known():
             assert "session_dollar_change" not in features
             assert "gap_pct" not in features
             assert "gap_dollars" not in features
+            # regular_open is published independently of gap_pct/gap_dollars
+            # (decision #111) — known the moment today's regular session has
+            # opened, even without a prior day to compare against yet.
+            assert features["regular_open"] == pytest.approx(100.0)
     finally:
         await engine.stop()
         await bus.stop()
@@ -1124,6 +1128,12 @@ async def test_gap_captures_regular_open_once_and_freezes_through_the_session():
             assert first["gap_dollars"] == pytest.approx(10.0)
             assert second["gap_pct"] == pytest.approx(10.0)
             assert second["gap_dollars"] == pytest.approx(10.0)
+            # regular_open (decision #111) captured on the first regular
+            # candle (110.0) and frozen identically on the second, same
+            # invariant as gap_pct/gap_dollars above — it's the same
+            # internal state, just also published now.
+            assert first["regular_open"] == pytest.approx(110.0)
+            assert second["regular_open"] == pytest.approx(110.0)
 
             # Session % Change, by contrast, tracks `close` continuously.
             assert first["session_pct_change"] == pytest.approx(10.0)
@@ -1178,6 +1188,13 @@ async def test_gap_backfills_regular_open_on_cold_start():
             # directly observed live).
             assert features["gap_pct"] == pytest.approx(8.0)     # (108-100)/100 * 100
             assert features["gap_dollars"] == pytest.approx(8.0)
+            # regular_open (decision #111) reflects the BACKFILLED first
+            # candle's open (108.0), not the second candle this engine
+            # instance directly observed live (150.0) — same backfill
+            # correctness this test's docstring already asserts for
+            # gap_pct/gap_dollars, now also true of the field they're
+            # computed from.
+            assert features["regular_open"] == pytest.approx(108.0)
             # Session % Change is unaffected by the backfill — it still
             # tracks the LIVE close.
             assert features["session_pct_change"] == pytest.approx(50.0)  # (150-100)/100 * 100

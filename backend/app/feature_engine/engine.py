@@ -1549,6 +1549,9 @@ class FeatureEngine:
         computed by _update_previous_day above rather than re-deriving
         it) lives in indicators/gap.py, same split every other file in
         this package keeps.
+
+        Also publishes `regular_open` itself as its own `features` key
+        (decision #111) — see the return statement below for why.
         """
         clock = get_market_clock()
         today = clock.trading_day(candle_ts)
@@ -1572,7 +1575,25 @@ class FeatureEngine:
             # session candle this same run processes leaves it frozen.
             state["regular_open"] = open_price
 
-        return gap(state["regular_open"], pdc)
+        result = gap(state["regular_open"], pdc)
+        if state["regular_open"] is not None:
+            # `regular_open` published as its own key, independently of
+            # `gap_pct`/`gap_dollars` (decision #111, from the Gap
+            # strategy design review's §1). Previously only this
+            # method's own internal `state["regular_open"]` — every
+            # consumer that wanted it (gap_strategy.py's original
+            # approach) had to reconstruct it as `pdc + gap_dollars`
+            # algebra instead of reading it directly, even though it's a
+            # generic market fact (same category as `pdc`/`pdh`/`pdl`
+            # above), not something specific to gap math. Published
+            # whenever known, even without `pdc` (a fresh symbol/
+            # deployment with no prior trading day) — deliberately not
+            # gated behind `gap()`'s own {} result, since `regular_open`
+            # is a fact in its own right the moment today's regular
+            # session has opened, independent of whether a prior-day
+            # comparison is also possible yet.
+            result = {**result, "regular_open": state["regular_open"]}
+        return result
 
     def _update_atr(self, symbol: str, candle_ts: datetime) -> dict[str, float]:
         """

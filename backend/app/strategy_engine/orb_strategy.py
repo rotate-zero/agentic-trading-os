@@ -51,6 +51,27 @@ slope/RVOL — Market State already did that interpretation.
    `volume` to `FeatureSet` (1m only) specifically so this strategy could
    be built correctly rather than against an approximation.
 
+--- `_clamp`/threshold-guard/trend-magnitude extracted to scoring_utils.py ---
+
+Decision #107, following the Gap/Volume Spike design review: `_clamp()`
+and the `trend_score_threshold > 50.0` mirror-guard were, by that point,
+copy-pasted near-verbatim across this file, `gap_strategy.py`, and
+`volume_spike_strategy.py`. Moved to `scoring_utils.py` (`clamp()`,
+`trend_magnitude()`, `validate_mirror_threshold()`) — mechanical,
+domain-free arithmetic, not a "strategy scoring engine." The actual
+MATCH conditions and SCORE weights below are unchanged and stay here,
+where they're genuinely ORB-specific.
+
+--- `expected_horizon_minutes` added to Opportunity (decision #107) ---
+
+The design review's own §5 found that neither ORB, Gap, nor Volume
+Spike encoded how long each expects its setup to take — an implicit
+temporal thesis that was simply lost the moment `evaluate()` returned.
+`Opportunity.expected_horizon_minutes` (base_strategy.py) closes that
+gap. ORB's own default (45 minutes, `DEFAULT_EXPECTED_HORIZON_MINUTES`)
+is a v1 guess, unvalidated against real outcome data, same caveat every
+other calibration constant in this file already carries.
+
 --- Opening range state: private to this strategy, not published ---
 
 Saqib's call: the running opening-range accumulator lives entirely
@@ -153,6 +174,7 @@ from app.strategy_engine.base_strategy import (
     StrategyConfig,
     every_candle,
 )
+from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
 
 # --- v1 defaults — all overridable via StrategyConfig.params (§3); a
 # threshold change is a new StrategyConfig version, never an edit here. ---
@@ -162,6 +184,9 @@ DEFAULT_OR_MINUTES = 15  # Saqib's choice — configurable per StrategyConfig ve
 DEFAULT_TREND_SCORE_THRESHOLD = 60.0  # same convention/value as momentum_strategy.py's DEFAULT_TREND_SCORE_THRESHOLD
 DEFAULT_VOLUME_REGIME_THRESHOLD = 45.0  # same participation floor as momentum_strategy.py (~rvol 1.35)
 DEFAULT_TARGET_R_MULTIPLE = 2.0
+DEFAULT_EXPECTED_HORIZON_MINUTES = 45  # v1 guess, unvalidated — decision #107. A breakout
+# thesis playing out roughly within the session's own morning structure; not modeled
+# against real outcome data yet. See base_strategy.py's Opportunity docstring.
 
 # SCORE blend weights (sum to 1.0) — v1 guess, explicitly NOT validated
 # against real score distributions yet, same caveat every other
@@ -177,10 +202,6 @@ _W_BREAKOUT_STRENGTH = 0.35
 BREAKOUT_STRENGTH_CAP = 0.5
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, value))
-
-
 def default_params() -> dict:
     """v1 StrategyConfig.params — see module docstring for the
     reasoning behind each default."""
@@ -189,6 +210,7 @@ def default_params() -> dict:
         "trend_score_threshold": DEFAULT_TREND_SCORE_THRESHOLD,
         "volume_regime_threshold": DEFAULT_VOLUME_REGIME_THRESHOLD,
         "target_r_multiple": DEFAULT_TARGET_R_MULTIPLE,
+        "expected_horizon_minutes": DEFAULT_EXPECTED_HORIZON_MINUTES,
     }
 
 
@@ -218,12 +240,11 @@ def match_direction(
     *bullish* trend_score of 55 satisfy SELL's confirmation, since
     55 <= 100-40). Raises here rather than silently producing a
     backwards-confirmed signal, applying that review's fix directly
-    rather than rediscovering it independently."""
-    if trend_score_threshold <= 50.0:
-        raise ValueError(
-            f"trend_score_threshold must be > 50.0 for the BUY/SELL "
-            f"mirror-around-neutral logic to hold (got {trend_score_threshold})"
-        )
+    rather than rediscovering it independently. Guard itself now lives
+    in `scoring_utils.validate_mirror_threshold()` (decision #107) —
+    this docstring keeps the full story since it's where the bug was
+    first found."""
+    validate_mirror_threshold(trend_score_threshold)
 
     if volume_regime_score < volume_regime_threshold:
         return None  # participation floor — direction-agnostic, checked once
@@ -250,16 +271,16 @@ def score_confidence(
     `breakout_strength_fraction()` below — kept as a separate pure
     function so it's independently testable against just the four raw
     prices, no score inputs involved."""
-    trend_component = abs(trend_score - 50.0) * 2.0  # 0-100, direction-agnostic magnitude
+    trend_component = trend_magnitude(trend_score)  # 0-100, direction-agnostic magnitude
     volume_component = volume_regime_score  # already 0-100 (Market State's own scale)
-    breakout_component = _clamp(breakout_strength / BREAKOUT_STRENGTH_CAP * 100.0)
+    breakout_component = clamp(breakout_strength / BREAKOUT_STRENGTH_CAP * 100.0)
 
     confidence = (
         _W_TREND * trend_component
         + _W_VOLUME * volume_component
         + _W_BREAKOUT_STRENGTH * breakout_component
     )
-    return round(_clamp(confidence), 2)
+    return round(clamp(confidence), 2)
 
 
 def breakout_strength_fraction(close: float, or_high: float, or_low: float, direction: Literal["BUY", "SELL"]) -> float:
@@ -436,6 +457,7 @@ class ORBStrategy(Strategy):
             confidence=confidence,
             structural_invalidation=invalidation,
             structural_target=target,
+            expected_horizon_minutes=params.get("expected_horizon_minutes", DEFAULT_EXPECTED_HORIZON_MINUTES),
             evidence={
                 # Literal MATCH-stage values only — never a wholesale
                 # FeatureSet dump (strategy-engine-design.md §4/§11 boundary).

@@ -116,6 +116,7 @@ from app.strategy_engine.base_strategy import (
     every_candle,
 )
 from app.strategy_engine.level_touch_tracking import LevelTouchState, observe_resolution
+from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 # --- v1 defaults — all overridable via StrategyConfig.params (§3); a
@@ -142,10 +143,6 @@ _W_REJECTION_STRENGTH = 0.30
 # this is a % distance from a single point level, not a fraction of a
 # multi-tick range. v1 guess, unvalidated.
 REJECTION_STRENGTH_CAP_PCT = 1.0
-
-
-def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, value))
 
 
 def default_params() -> dict:
@@ -175,12 +172,13 @@ def match_direction(
     module docstring establishes.
 
     `trend_score_threshold` must be > 50.0 — identical guard and
-    identical reasoning to `orb_strategy.py`'s `match_direction()`."""
-    if trend_score_threshold <= 50.0:
-        raise ValueError(
-            f"trend_score_threshold must be > 50.0 for the BUY/SELL "
-            f"mirror-around-neutral logic to hold (got {trend_score_threshold})"
-        )
+    identical reasoning to `orb_strategy.py`'s `match_direction()`. Now
+    calls the shared `scoring_utils.validate_mirror_threshold()`
+    (decision #111) rather than its own copy — found duplicated a fourth
+    and fifth time (here and in `reversal_strategy.py`) when that
+    extraction, done for Gap/Volume Spike, was folded in against the
+    then-current repo state."""
+    validate_mirror_threshold(trend_score_threshold)
 
     if entered_from == "above" and trend_score >= trend_score_threshold:
         return "BUY"
@@ -200,16 +198,16 @@ def score_confidence(
     already signed relative to the live level — see
     `rejection_strength_fraction()` below for the direction-aware
     normalization), not re-derived here."""
-    trend_component = abs(trend_score - 50.0) * 2.0  # 0-100, direction-agnostic magnitude
+    trend_component = trend_magnitude(trend_score)  # 0-100, direction-agnostic magnitude
     volume_component = volume_regime_score  # already 0-100 (Market State's own scale)
-    rejection_component = _clamp(resolution_distance_pct / REJECTION_STRENGTH_CAP_PCT * 100.0)
+    rejection_component = clamp(resolution_distance_pct / REJECTION_STRENGTH_CAP_PCT * 100.0)
 
     confidence = (
         _W_TREND * trend_component
         + _W_VOLUME * volume_component
         + _W_REJECTION_STRENGTH * rejection_component
     )
-    return round(_clamp(confidence), 2)
+    return round(clamp(confidence), 2)
 
 
 def rejection_strength_fraction(distance_pct: float, direction: Literal["BUY", "SELL"]) -> float:

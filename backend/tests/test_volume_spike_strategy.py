@@ -5,8 +5,9 @@
 2. End-to-end evaluate() across a simulated trading day, using real
    MarketClock-anchored ET timestamps (same `_et()` convention as
    test_orb_strategy.py/test_gap_strategy.py) — proves the GATE-stage
-   rolling-baseline warm-up, cooldown, and day-rollover state machine,
-   not just the pure MATCH/SCORE math.
+   rolling-baseline warm-up, cooldown, absolute-volume floor,
+   body-ratio check, and day-rollover state machine, not just the pure
+   MATCH/SCORE math.
 """
 from __future__ import annotations
 
@@ -20,6 +21,8 @@ from app.schemas.events.features import FeatureSet
 from app.schemas.events.market_state import MarketState
 from app.strategy_engine.volume_spike_strategy import (
     DEFAULT_LOOKBACK_BARS,
+    DEFAULT_MIN_ABSOLUTE_VOLUME,
+    DEFAULT_MIN_BODY_RATIO,
     DEFAULT_SPIKE_RATIO_THRESHOLD,
     DEFAULT_TREND_SCORE_THRESHOLD,
     DEFAULT_VOLUME_REGIME_THRESHOLD,
@@ -36,16 +39,23 @@ def _et(y: int, m: int, d: int, hh: int, mm: int) -> datetime:
 
 
 # --- Tier 1: pure functions -------------------------------------------------
+# candle_high/candle_low chosen so body_ratio comfortably clears
+# DEFAULT_MIN_BODY_RATIO (0.3) unless a test is specifically checking that
+# gate; candle_volume comfortably clears DEFAULT_MIN_ABSOLUTE_VOLUME (500)
+# unless a test is specifically checking that gate.
 
 
 def test_match_direction_buy_on_bullish_spike_candle():
     assert (
         match_direction(
-            volume_ratio=4.0, candle_open=100.0, candle_close=101.0,
+            volume_ratio=4.0, candle_open=100.0, candle_high=101.2, candle_low=99.8,
+            candle_close=101.0, candle_volume=5000,
             trend_score=70.0, volume_regime_score=60.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
         == "BUY"
     )
@@ -54,11 +64,14 @@ def test_match_direction_buy_on_bullish_spike_candle():
 def test_match_direction_sell_on_bearish_spike_candle():
     assert (
         match_direction(
-            volume_ratio=4.0, candle_open=100.0, candle_close=99.0,
+            volume_ratio=4.0, candle_open=100.0, candle_high=100.2, candle_low=98.8,
+            candle_close=99.0, candle_volume=5000,
             trend_score=30.0, volume_regime_score=60.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
         == "SELL"
     )
@@ -67,11 +80,14 @@ def test_match_direction_sell_on_bearish_spike_candle():
 def test_match_direction_none_on_doji_no_net_direction():
     assert (
         match_direction(
-            volume_ratio=4.0, candle_open=100.0, candle_close=100.0,
+            volume_ratio=4.0, candle_open=100.0, candle_high=100.5, candle_low=99.5,
+            candle_close=100.0, candle_volume=5000,
             trend_score=90.0, volume_regime_score=90.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
         is None
     )
@@ -80,26 +96,75 @@ def test_match_direction_none_on_doji_no_net_direction():
 def test_match_direction_none_when_not_actually_a_spike():
     assert (
         match_direction(
-            volume_ratio=1.2, candle_open=100.0, candle_close=101.0,  # below DEFAULT_SPIKE_RATIO_THRESHOLD (3.0)
+            volume_ratio=1.2, candle_open=100.0, candle_high=101.2, candle_low=99.8,  # below DEFAULT_SPIKE_RATIO_THRESHOLD (3.0)
+            candle_close=101.0, candle_volume=5000,
             trend_score=90.0, volume_regime_score=90.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
         is None
     )
 
 
 def test_match_direction_none_when_volume_floor_fails():
-    """Participation floor is checked once, direction-agnostic — same
-    convention orb_strategy.py's/gap_strategy.py's own volume floor uses."""
+    """Participation floor (Market State's volume_regime_score) is
+    checked once, direction-agnostic — same convention orb_strategy.py's/
+    gap_strategy.py's own volume floor uses. Distinct from the new
+    absolute-volume-in-shares floor below."""
     assert (
         match_direction(
-            volume_ratio=4.0, candle_open=100.0, candle_close=101.0,
+            volume_ratio=4.0, candle_open=100.0, candle_high=101.2, candle_low=99.8,
+            candle_close=101.0, candle_volume=5000,
             trend_score=90.0, volume_regime_score=0.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
+        )
+        is None
+    )
+
+
+def test_match_direction_none_when_absolute_volume_floor_fails():
+    """Decision #111, design review §3 — a ratio can look like a spike
+    on a thin baseline even when the absolute size is economically
+    meaningless. candle_volume below DEFAULT_MIN_ABSOLUTE_VOLUME (500)
+    refuses regardless of how strong the ratio is."""
+    assert (
+        match_direction(
+            volume_ratio=10.0, candle_open=100.0, candle_high=101.2, candle_low=99.8,
+            candle_close=101.0, candle_volume=200,  # below DEFAULT_MIN_ABSOLUTE_VOLUME (500)
+            trend_score=90.0, volume_regime_score=90.0,
+            spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
+            trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
+        )
+        is None
+    )
+
+
+def test_match_direction_none_when_body_ratio_too_thin():
+    """Decision #111, design review §3 — a huge-volume, razor-thin-body
+    candle (net displacement a tiny fraction of its own range) is closer
+    to indecision than conviction, even though close != open technically
+    holds. body_ratio = 0.05 / 6.0 ≈ 0.0083, well below
+    DEFAULT_MIN_BODY_RATIO (0.3)."""
+    assert (
+        match_direction(
+            volume_ratio=5.0, candle_open=100.0, candle_high=103.0, candle_low=97.0,
+            candle_close=100.05, candle_volume=5000,
+            trend_score=90.0, volume_regime_score=90.0,
+            spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
+            trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
         is None
     )
@@ -107,14 +172,18 @@ def test_match_direction_none_when_volume_floor_fails():
 
 def test_match_direction_rejects_threshold_at_or_below_50():
     """Same guard as orb_strategy.py's/gap_strategy.py's match_direction()
-    — decision #99's fix, applied directly here."""
+    — decision #99's fix, now via the shared
+    scoring_utils.validate_mirror_threshold()."""
     with pytest.raises(ValueError):
         match_direction(
-            volume_ratio=4.0, candle_open=100.0, candle_close=99.0,
+            volume_ratio=4.0, candle_open=100.0, candle_high=100.2, candle_low=98.8,
+            candle_close=99.0, candle_volume=5000,
             trend_score=55.0, volume_regime_score=90.0,
             spike_ratio_threshold=DEFAULT_SPIKE_RATIO_THRESHOLD,
             trend_score_threshold=40.0,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            min_absolute_volume=DEFAULT_MIN_ABSOLUTE_VOLUME,
+            min_body_ratio=DEFAULT_MIN_BODY_RATIO,
         )
 
 
@@ -209,6 +278,7 @@ async def test_spike_after_warmup_fires_buy_then_respects_cooldown():
     assert opp.direction == "BUY"
     assert opp.structural_invalidation == pytest.approx(99.9)  # this candle's own low
     assert opp.structural_target == pytest.approx(101.0 + 2.0 * (101.0 - 99.9))
+    assert opp.expected_horizon_minutes == 15  # decision #111 default
     assert opp.evidence["conditions"]["volume_ratio"] == pytest.approx(5.0)
 
     # Next candle, still elevated volume, same direction: cooldown withholds it.
@@ -262,6 +332,46 @@ async def test_missing_volume_returns_none_honest_absence():
     ts = _et(2026, 8, 17, 9, 30)
     fs = FeatureSet(timeframe="1m", candle_ts=ts, close=100.0, features={})  # no open/high/low/volume
     opp = await strategy.evaluate("TEST", _make_market_state(ts), fs, ContextChanged())
+    assert opp is None
+
+
+@pytest.mark.asyncio
+async def test_thin_illiquid_baseline_never_fires_despite_strong_ratio():
+    """Decision #111, design review §3 — the review's central worked
+    example: an illiquid symbol/quiet stretch where the rolling baseline
+    itself is tiny (50 shares/minute), so even a small absolute order
+    (200 shares) computes as a strong ratio (4x). Without the absolute
+    floor this would previously have fired; with it, it correctly
+    doesn't."""
+    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    strategy = VolumeSpikeStrategy(config)
+    session_open = _et(2026, 8, 17, 9, 30)
+    await _run_warmup(strategy, "TEST", session_open, baseline_volume=50)
+
+    spike_ts = session_open + timedelta(minutes=DEFAULT_LOOKBACK_BARS)
+    fs = _make_features(spike_ts, close=101.0, open_=100.0, volume=200)  # ratio=4.0, but only 200 shares absolute
+    opp = await strategy.evaluate("TEST", _make_market_state(spike_ts), fs, ContextChanged())
+    assert opp is None
+
+
+@pytest.mark.asyncio
+async def test_wide_range_thin_body_large_volume_never_fires():
+    """Decision #111, design review §3 — a huge-volume candle with a
+    razor-thin net body (most of the range is wick, not net
+    displacement) is closer to indecision than conviction. Without the
+    body-ratio check this would previously have fired on
+    close != open alone; with it, it correctly doesn't."""
+    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    strategy = VolumeSpikeStrategy(config)
+    session_open = _et(2026, 8, 17, 9, 30)
+    await _run_warmup(strategy, "TEST", session_open, baseline_volume=1000)
+
+    spike_ts = session_open + timedelta(minutes=DEFAULT_LOOKBACK_BARS)
+    fs = _make_features(
+        spike_ts, close=100.05, open_=100.0, volume=5000,  # ratio=5.0, but body_ratio ~ 0.008
+        high=103.0, low=97.0,
+    )
+    opp = await strategy.evaluate("TEST", _make_market_state(spike_ts), fs, ContextChanged())
     assert opp is None
 
 

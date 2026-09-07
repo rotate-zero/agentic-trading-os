@@ -92,6 +92,7 @@ from app.strategy_engine.base_strategy import (
     every_candle,
 )
 from app.strategy_engine.level_touch_tracking import LevelTouchState, observe_resolution
+from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 # --- v1 defaults — all overridable via StrategyConfig.params (§3); a
@@ -116,10 +117,6 @@ _W_TOUCH_COUNT = 0.30
 # unbounded — a level tested 20 times isn't 20x more significant than
 # one tested 5 times). v1 guess, unvalidated.
 TOUCH_COUNT_CAP = 4
-
-
-def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, value))
 
 
 def default_params() -> dict:
@@ -149,12 +146,13 @@ def match_direction(
     against `trend_score` for a rejection).
 
     `trend_score_threshold` must be > 50.0 — identical guard and
-    identical reasoning to `orb_strategy.py`'s `match_direction()`."""
-    if trend_score_threshold <= 50.0:
-        raise ValueError(
-            f"trend_score_threshold must be > 50.0 for the BUY/SELL "
-            f"mirror-around-neutral logic to hold (got {trend_score_threshold})"
-        )
+    identical reasoning to `orb_strategy.py`'s `match_direction()`. Now
+    calls the shared `scoring_utils.validate_mirror_threshold()`
+    (decision #111) rather than its own copy — found duplicated a fourth
+    and fifth time (here and in `first_pullback_strategy.py`) when that
+    extraction, done for Gap/Volume Spike, was folded in against the
+    then-current repo state."""
+    validate_mirror_threshold(trend_score_threshold)
 
     if trend_score >= trend_score_threshold:
         return "SELL"  # established uptrend just conquered downward — bet against it
@@ -174,16 +172,16 @@ def score_confidence(
     engine-provided) rewards a level that held multiple times before
     finally breaking — module docstring's "third time's the charm"
     reasoning."""
-    broken_trend_component = abs(trend_score - 50.0) * 2.0  # 0-100, direction-agnostic magnitude
+    broken_trend_component = trend_magnitude(trend_score)  # 0-100, direction-agnostic magnitude
     volume_component = volume_regime_score  # already 0-100 (Market State's own scale)
-    touch_count_component = _clamp((touch_count_today - 1) / (TOUCH_COUNT_CAP - 1) * 100.0) if TOUCH_COUNT_CAP > 1 else 0.0
+    touch_count_component = clamp((touch_count_today - 1) / (TOUCH_COUNT_CAP - 1) * 100.0) if TOUCH_COUNT_CAP > 1 else 0.0
 
     confidence = (
         _W_BROKEN_TREND_STRENGTH * broken_trend_component
         + _W_VOLUME * volume_component
         + _W_TOUCH_COUNT * touch_count_component
     )
-    return round(_clamp(confidence), 2)
+    return round(clamp(confidence), 2)
 
 
 def default_config(active_from: datetime, version: str = "reversal_v1") -> StrategyConfig:

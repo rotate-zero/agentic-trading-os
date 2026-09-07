@@ -213,6 +213,7 @@ async def test_breakout_after_formation_fires_once_then_stays_silent():
     assert opp.direction == "BUY"
     assert opp.structural_invalidation == 100.0  # or_low
     assert opp.structural_target == pytest.approx(102.0 + 2.0 * (102.0 - 100.0))
+    assert opp.expected_horizon_minutes == 45  # decision #107/#111 default
     assert opp.evidence["conditions"]["or_high"] == 101.0
     assert opp.evidence["conditions"]["or_low"] == 100.0
 

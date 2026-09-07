@@ -86,6 +86,26 @@ def test_opportunity_construction_round_trips():
     assert opp.status == "actionable"  # v1 default (§8)
     assert opp.wait_reason is None
     assert opp.confirmed_at is None
+    assert opp.expected_horizon_minutes is None  # decision #107/#111 — honest absence by default
+
+
+def test_opportunity_can_declare_an_expected_horizon():
+    """decision #107/#111, from the Gap/Volume Spike design review's §5
+    — a strategy with an informed opinion on setup duration can now
+    state it as a first-class field, not lose it in free-text evidence."""
+    now = datetime(2026, 8, 17, 13, 45, tzinfo=timezone.utc)
+    opp = Opportunity(
+        strategy="Volume Spike",
+        version="volume_spike_v1",
+        direction="BUY",
+        confidence=67.0,
+        structural_invalidation=100.0,
+        structural_target=106.0,
+        expected_horizon_minutes=15,
+        evidence={"conditions": {}, "reason": "test", "basis": "closed"},
+        setup_detected_at=now,
+    )
+    assert opp.expected_horizon_minutes == 15
 
 
 def test_strategy_is_abstract():

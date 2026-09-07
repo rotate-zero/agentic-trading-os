@@ -145,6 +145,51 @@ of regular-hours turnover), so a "3x the recent baseline" test means
 something different, and less reliably, outside regular hours. Kept
 simple for v1 rather than inventing a session-specific threshold scheme.
 
+--- Absolute volume floor and body/displacement check (decision #111) ---
+
+The design review's §3 found two real, concrete MATCH-stage gaps, both
+closed here.
+
+**No absolute floor.** `volume_ratio` is purely relative to this
+symbol's own trailing baseline — on an illiquid symbol, or during a
+quiet stretch, that baseline can shrink small enough that a genuinely
+tiny order looks like a "3x spike." `volume_regime_score` doesn't
+protect against this either, since it's a day-level, per-symbol-
+normalized read, not an absolute-liquidity check. `min_absolute_volume`
+(v1 default 500 shares, unvalidated) requires real, absolute size before
+the ratio test even runs.
+
+**No displacement/body check.** MATCH previously only checked
+`candle_close != candle_open` — a candle with huge volume and a
+razor-thin body (open and close a cent apart) passed as a directional
+signal, even though a huge-volume, tiny-body bar is closer to a
+classic indecision/climax signature than a confident directional print.
+`min_body_ratio` (v1 default 0.3, unvalidated) requires the candle's net
+body to span at least that fraction of its own high-low range —
+computable from the same OHLC already on this candle, no new data
+needed. Zero-range risk doesn't apply: `candle_close != candle_open`
+(already checked first) guarantees `high > low` for any valid bar
+(`high >= max(open, close) > min(open, close) >= low`), so the division
+is always safe by construction.
+
+Deliberately NOT addressed here, both flagged by the review as needing
+real outcome data rather than a guessed fix: whether a high-volume
+directional candle actually means continuation, as opposed to
+exhaustion/climax (trend_score can't distinguish "healthy early trend"
+from "already-extended trend"); and whether sizing the stop off the same
+spike candle's own wick can produce an impractically wide risk/target,
+since spike candles are often unusually wide-range by construction. Both
+are real, open questions this change does not attempt to resolve.
+
+--- `expected_horizon_minutes` (decision #111) ---
+
+The design review's §5 found this strategy's implicit time horizon —
+almost certainly much shorter than Gap's, since a spike's whole premise
+is fast, near-term follow-through — was being lost the moment
+`evaluate()` returned. `DEFAULT_EXPECTED_HORIZON_MINUTES = 15` is a v1
+guess (a handful of 1m/5m candles), unvalidated against real outcome
+data. See `base_strategy.py`'s `Opportunity` docstring.
+
 --- MarketStateEngine race: not a caveat here, unlike ORB/Momentum/VWAP ---
 
 Same note as `gap_strategy.py`'s own module docstring: decision #103
@@ -173,6 +218,7 @@ from app.strategy_engine.base_strategy import (
     StrategyConfig,
     every_candle,
 )
+from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
 
 DEFAULT_TIMEFRAME = "1m"  # a per-candle spike test is meaningless at any coarser aggregation — not configurable per-instance
 DEFAULT_LOOKBACK_BARS = 20  # v1 guess, unvalidated — how many prior 1m candles form the rolling baseline
@@ -181,6 +227,15 @@ DEFAULT_TREND_SCORE_THRESHOLD = 60.0  # same convention/value as orb_strategy.py
 DEFAULT_VOLUME_REGIME_THRESHOLD = 45.0  # same participation floor as orb_strategy.py (~rvol 1.35)
 DEFAULT_TARGET_R_MULTIPLE = 2.0
 DEFAULT_COOLDOWN_MINUTES = 5  # v1 guess, unvalidated — see module docstring's "Cooldown" section
+DEFAULT_MIN_ABSOLUTE_VOLUME = 500  # v1 guess, unvalidated — decision #111, design review §3.
+# Shares in this one candle, independent of the ratio — protects against a
+# thin-baseline/illiquid-symbol false positive the ratio alone can't catch.
+DEFAULT_MIN_BODY_RATIO = 0.3  # v1 guess, unvalidated — decision #111, design review §3.
+# Net body as a fraction of the candle's own high-low range — a huge-volume,
+# razor-thin-body candle is closer to indecision than conviction.
+DEFAULT_EXPECTED_HORIZON_MINUTES = 15  # v1 guess, unvalidated — decision #111. A fast,
+# near-term follow-through thesis, not modeled against real outcome data yet. See
+# base_strategy.py's Opportunity docstring.
 
 # SCORE blend weights (sum to 1.0) — v1 guess, explicitly NOT validated
 # against real score distributions yet, same caveat orb_strategy.py states
@@ -198,10 +253,6 @@ _W_SPIKE = 0.45
 SPIKE_STRENGTH_CAP = 2.0
 
 
-def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, value))
-
-
 def default_params() -> dict:
     """v1 StrategyConfig.params — see module docstring for the
     reasoning behind each default."""
@@ -212,39 +263,49 @@ def default_params() -> dict:
         "volume_regime_threshold": DEFAULT_VOLUME_REGIME_THRESHOLD,
         "target_r_multiple": DEFAULT_TARGET_R_MULTIPLE,
         "cooldown_minutes": DEFAULT_COOLDOWN_MINUTES,
+        "min_absolute_volume": DEFAULT_MIN_ABSOLUTE_VOLUME,
+        "min_body_ratio": DEFAULT_MIN_BODY_RATIO,
+        "expected_horizon_minutes": DEFAULT_EXPECTED_HORIZON_MINUTES,
     }
 
 
 def match_direction(
     volume_ratio: float,
     candle_open: float,
+    candle_high: float,
+    candle_low: float,
     candle_close: float,
+    candle_volume: int,
     trend_score: float,
     volume_regime_score: float,
     *,
     spike_ratio_threshold: float,
     trend_score_threshold: float,
     volume_regime_threshold: float,
+    min_absolute_volume: int,
+    min_body_ratio: float,
 ) -> Literal["BUY", "SELL"] | None:
     """MATCH stage, pure. Direction-symmetric on purpose, same shape
     orb_strategy.py's/gap_strategy.py's match_direction() already
     established: SELL is BUY's mirror image around each dimension's
     neutral 50, not a separately hand-tuned rule set. Returns None on
-    "not actually a spike", "no participation", or a doji with no net
-    direction of its own — never a partial/weak signal; that nuance
-    belongs to SCORE, not MATCH.
+    "not enough absolute volume to trust the ratio", "not actually a
+    spike", "no participation", "a doji with no net direction", "too
+    little real displacement for the volume to represent conviction", or
+    any confirming condition failing — never a partial/weak signal; that
+    nuance belongs to SCORE, not MATCH.
 
     `trend_score_threshold` must be > 50.0 — same guard, same reasoning,
     as orb_strategy.py's/gap_strategy.py's own match_direction() (decision
-    #99's fix, applied directly here rather than risking a third
-    rediscovery of the identical bug): SELL mirrors the threshold as
-    `100 - threshold`, so a threshold at or below 50 flips onto the wrong
-    side of neutral."""
-    if trend_score_threshold <= 50.0:
-        raise ValueError(
-            f"trend_score_threshold must be > 50.0 for the BUY/SELL "
-            f"mirror-around-neutral logic to hold (got {trend_score_threshold})"
-        )
+    #99's fix, applied via the shared
+    `scoring_utils.validate_mirror_threshold()`, decision #107/#111,
+    rather than risking a third rediscovery of the identical bug): SELL
+    mirrors the threshold as `100 - threshold`, so a threshold at or
+    below 50 flips onto the wrong side of neutral."""
+    validate_mirror_threshold(trend_score_threshold)
+
+    if candle_volume < min_absolute_volume:
+        return None  # too little real volume in absolute terms for the ratio to mean anything — module docstring
 
     if volume_ratio < spike_ratio_threshold:
         return None  # not a spike by this strategy's own definition
@@ -252,15 +313,23 @@ def match_direction(
     if volume_regime_score < volume_regime_threshold:
         return None  # participation floor — direction-agnostic, checked once
 
+    if candle_close == candle_open:
+        return None  # doji — a spike with no net direction of its own, nothing to match
+
+    # Safe by construction: candle_close != candle_open (just checked)
+    # guarantees high > low for any valid bar (high >= max(open, close) >
+    # min(open, close) >= low) — module docstring.
+    body_ratio = abs(candle_close - candle_open) / (candle_high - candle_low)
+    if body_ratio < min_body_ratio:
+        return None  # large volume, but too little of the bar's own range was net displacement — module docstring
+
     if candle_close > candle_open:
         if trend_score >= trend_score_threshold:
             return "BUY"
         return None
-    if candle_close < candle_open:
-        if trend_score <= (100.0 - trend_score_threshold):
-            return "SELL"
-        return None
-    return None  # doji — a spike with no net direction of its own, nothing to match
+    if trend_score <= (100.0 - trend_score_threshold):
+        return "SELL"
+    return None
 
 
 def score_confidence(
@@ -274,16 +343,16 @@ def score_confidence(
     from `spike_strength_fraction()` below — kept as a separate pure
     function so it's independently testable against just the raw ratio,
     no score inputs involved."""
-    trend_component = abs(trend_score - 50.0) * 2.0  # 0-100, direction-agnostic magnitude
+    trend_component = trend_magnitude(trend_score)  # 0-100, direction-agnostic magnitude
     volume_component = volume_regime_score  # already 0-100 (Market State's own scale)
-    spike_component = _clamp(spike_strength / SPIKE_STRENGTH_CAP * 100.0)
+    spike_component = clamp(spike_strength / SPIKE_STRENGTH_CAP * 100.0)
 
     confidence = (
         _W_TREND * trend_component
         + _W_VOLUME * volume_component
         + _W_SPIKE * spike_component
     )
-    return round(_clamp(confidence), 2)
+    return round(clamp(confidence), 2)
 
 
 def spike_strength_fraction(volume_ratio: float, spike_ratio_threshold: float) -> float:
@@ -321,11 +390,12 @@ def default_config(active_from, version: str = "volume_spike_v1") -> StrategyCon
         active_to=None,
         rationale=(
             "v1 Volume Spike: a 1m candle printing >= 3x its own symbol's "
-            "trailing 20-bar average volume, confirmed by that candle's own "
-            "bar direction and Market State's trend_score/volume_regime_score. "
-            "Rolling baseline and thresholds are v1 defaults, unvalidated "
-            "against real score distributions — see volume_spike_strategy.py "
-            "module docstring."
+            "trailing 20-bar average volume (min 500 shares absolute, min 30% "
+            "body-to-range ratio — decision #111 additions), confirmed by that "
+            "candle's own bar direction and Market State's trend_score/"
+            "volume_regime_score. Rolling baseline and thresholds are v1 "
+            "defaults, unvalidated against real score distributions — see "
+            "volume_spike_strategy.py module docstring."
         ),
     )
 
@@ -418,11 +488,13 @@ class VolumeSpikeStrategy(Strategy):
         # --- MATCH ---
         spike_ratio_threshold = params.get("spike_ratio_threshold", DEFAULT_SPIKE_RATIO_THRESHOLD)
         direction = match_direction(
-            volume_ratio, features.open, features.close,
+            volume_ratio, features.open, features.high, features.low, features.close, features.volume,
             market_state.trend_score, market_state.volume_regime_score,
             spike_ratio_threshold=spike_ratio_threshold,
             trend_score_threshold=params.get("trend_score_threshold", DEFAULT_TREND_SCORE_THRESHOLD),
             volume_regime_threshold=params.get("volume_regime_threshold", DEFAULT_VOLUME_REGIME_THRESHOLD),
+            min_absolute_volume=params.get("min_absolute_volume", DEFAULT_MIN_ABSOLUTE_VOLUME),
+            min_body_ratio=params.get("min_body_ratio", DEFAULT_MIN_BODY_RATIO),
         )
         if direction is None:
             return None
@@ -449,6 +521,7 @@ class VolumeSpikeStrategy(Strategy):
             confidence=confidence,
             structural_invalidation=invalidation,
             structural_target=target,
+            expected_horizon_minutes=params.get("expected_horizon_minutes", DEFAULT_EXPECTED_HORIZON_MINUTES),
             evidence={
                 # Literal MATCH-stage values only — never a wholesale
                 # FeatureSet dump (strategy-engine-design.md §4/§11 boundary).

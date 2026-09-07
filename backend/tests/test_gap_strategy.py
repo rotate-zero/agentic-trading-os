@@ -6,7 +6,7 @@
    MarketClock-anchored ET timestamps (same `_et()` convention as
    test_orb_strategy.py) — proves the GATE-stage day-scoped state
    machine (session gate, gap-availability gate, fire-once, day
-   rollover), not just the pure MATCH/SCORE math.
+   rollover, max-age window), not just the pure MATCH/SCORE math.
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from app.schemas.events.context import ContextChanged
 from app.schemas.events.features import FeatureSet
 from app.schemas.events.market_state import MarketState
 from app.strategy_engine.gap_strategy import (
+    DEFAULT_MAX_MINUTES_SINCE_OPEN,
     DEFAULT_MIN_GAP_PCT,
     DEFAULT_TREND_SCORE_THRESHOLD,
     DEFAULT_VOLUME_REGIME_THRESHOLD,
@@ -42,9 +43,11 @@ def test_match_direction_buy_on_gap_up_holding_above_open():
         match_direction(
             close=101.5, regular_open=100.0, gap_pct=3.0,
             trend_score=70.0, volume_regime_score=60.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
         == "BUY"
     )
@@ -55,9 +58,11 @@ def test_match_direction_sell_on_gap_down_holding_below_open():
         match_direction(
             close=98.5, regular_open=100.0, gap_pct=-3.0,
             trend_score=30.0, volume_regime_score=60.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
         == "SELL"
     )
@@ -70,9 +75,11 @@ def test_match_direction_none_when_gap_up_already_given_back():
         match_direction(
             close=99.5, regular_open=100.0, gap_pct=3.0,
             trend_score=90.0, volume_regime_score=90.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
         is None
     )
@@ -83,9 +90,11 @@ def test_match_direction_none_when_gap_too_small():
         match_direction(
             close=100.5, regular_open=100.0, gap_pct=0.5,  # below DEFAULT_MIN_GAP_PCT (2.0)
             trend_score=90.0, volume_regime_score=90.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
         is None
     )
@@ -98,24 +107,64 @@ def test_match_direction_none_when_volume_floor_fails():
         match_direction(
             close=101.5, regular_open=100.0, gap_pct=3.0,
             trend_score=90.0, volume_regime_score=0.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
         is None
     )
 
 
+def test_match_direction_none_when_past_max_window():
+    """Decision #111 — a gap that would otherwise clearly match is
+    refused once minutes_since_open exceeds the configured window,
+    regardless of how confirming everything else is."""
+    assert (
+        match_direction(
+            close=101.5, regular_open=100.0, gap_pct=3.0,
+            trend_score=90.0, volume_regime_score=90.0,
+            minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN + 1,
+            min_gap_pct=DEFAULT_MIN_GAP_PCT,
+            trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
+        )
+        is None
+    )
+
+
+def test_match_direction_fires_at_exactly_the_window_boundary():
+    """minutes_since_open == max_minutes_since_open is still inside the
+    window (the check is strictly-greater-than) — a boundary worth
+    pinning explicitly rather than leaving to chance."""
+    assert (
+        match_direction(
+            close=101.5, regular_open=100.0, gap_pct=3.0,
+            trend_score=90.0, volume_regime_score=90.0,
+            minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
+            min_gap_pct=DEFAULT_MIN_GAP_PCT,
+            trend_score_threshold=DEFAULT_TREND_SCORE_THRESHOLD,
+            volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
+        )
+        == "BUY"
+    )
+
+
 def test_match_direction_rejects_threshold_at_or_below_50():
     """Same guard as orb_strategy.py's match_direction() — decision #99's
-    fix, applied directly here."""
+    fix, now via the shared scoring_utils.validate_mirror_threshold()."""
     with pytest.raises(ValueError):
         match_direction(
             close=101.5, regular_open=100.0, gap_pct=3.0,
             trend_score=55.0, volume_regime_score=90.0,
+            minutes_since_open=5,
             min_gap_pct=DEFAULT_MIN_GAP_PCT,
             trend_score_threshold=40.0,
             volume_regime_threshold=DEFAULT_VOLUME_REGIME_THRESHOLD,
+            max_minutes_since_open=DEFAULT_MAX_MINUTES_SINCE_OPEN,
         )
 
 
@@ -163,9 +212,12 @@ def _make_features(candle_ts: datetime, close: float, **overrides) -> FeatureSet
 
 
 def _gap_features(candle_ts: datetime, close: float, *, pdc: float, gap_dollars: float, gap_pct: float, **overrides) -> FeatureSet:
+    # regular_open included directly (decision #111) — Feature Engine
+    # publishes it as its own key now, this test helper mirrors that
+    # rather than making evaluate() reconstruct it.
     return _make_features(
         candle_ts, close,
-        features={"pdc": pdc, "gap_dollars": gap_dollars, "gap_pct": gap_pct},
+        features={"pdc": pdc, "gap_dollars": gap_dollars, "gap_pct": gap_pct, "regular_open": pdc + gap_dollars},
         **overrides,
     )
 
@@ -173,7 +225,8 @@ def _gap_features(candle_ts: datetime, close: float, *, pdc: float, gap_dollars:
 @pytest.mark.asyncio
 async def test_no_signal_before_gap_is_established():
     """Pre-market, or a fresh symbol/deployment with no prior trading
-    day — gap_pct/gap_dollars/pdc aren't in `features.features` yet."""
+    day — gap_pct/gap_dollars/pdc/regular_open aren't in
+    `features.features` yet."""
     config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
     strategy = GapStrategy(config)
     ts = _et(2026, 8, 17, 9, 30)
@@ -194,8 +247,9 @@ async def test_gap_up_continuation_fires_buy():
     assert opp is not None
     assert opp.strategy == "Gap"
     assert opp.direction == "BUY"
-    assert opp.structural_invalidation == pytest.approx(103.0)  # reconstructed regular_open
+    assert opp.structural_invalidation == pytest.approx(103.0)  # regular_open, read directly
     assert opp.structural_target == pytest.approx(104.0 + 2.0 * (104.0 - 103.0))
+    assert opp.expected_horizon_minutes == 60  # decision #111 default
     assert opp.evidence["conditions"]["gap_pct"] == 3.0
     assert opp.evidence["conditions"]["regular_open"] == pytest.approx(103.0)
 
@@ -245,6 +299,21 @@ async def test_outside_regular_session_never_fires():
     after_hours_ts = _et(2026, 8, 17, 17, 0)
     fs = _gap_features(after_hours_ts, close=104.0, pdc=100.0, gap_dollars=3.0, gap_pct=3.0)
     opp = await strategy.evaluate("TEST", _make_market_state(after_hours_ts), fs, ContextChanged())
+    assert opp is None
+
+
+@pytest.mark.asyncio
+async def test_past_max_window_never_fires_even_though_gap_still_holds():
+    """Decision #111, design review §2. Same clean gap-up setup as
+    test_gap_up_continuation_fires_buy, but evaluated well past the
+    configured max_minutes_since_open — refused even though the gap is
+    still holding by every other measure, since the thesis is now
+    considered stale rather than a fresh continuation."""
+    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    strategy = GapStrategy(config)
+    stale_ts = _et(2026, 8, 17, 9, 30) + timedelta(minutes=DEFAULT_MAX_MINUTES_SINCE_OPEN + 5)
+    fs = _gap_features(stale_ts, close=104.0, pdc=100.0, gap_dollars=3.0, gap_pct=3.0)
+    opp = await strategy.evaluate("TEST", _make_market_state(stale_ts), fs, ContextChanged())
     assert opp is None
 
 
