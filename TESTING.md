@@ -1,20 +1,37 @@
-# TESTING.md — decision-111-strategy-scheduler-sequencing-locked
+# TESTING.md — decision-112-stage2-sequencing-reconciled
 
-Docs-only change. No application code touched, so no test suite to run.
+Docs-only change. No application code touched.
+
+## Why this exists
+The Stage 2 (Scheduler/wiring) sequencing-and-scope decision from the prior
+session was drafted for slot #111 but never actually applied to git. In the
+meantime Saqib committed different, unrelated work (the Gap/Volume Spike
+design review + `scoring_utils.py`) as the real #111. Same category of
+collision decision #99 already documents once, with #98.
 
 ## What changed
 - `docs/architecture/strategy-engine-design.md`
-  - §10: new row **D10** — locks Stage 2 (Strategy Scheduler/wiring) sequencing (blocked until Momentum/VWAP land) and scope (wiring + `OpportunityCreated` + read-side snapshot only; Gate enforcement and Opportunity Engine ranking explicitly out of scope).
-  - §12: new unchecked **Stage 2** row in the staged plan, marked BLOCKED.
-  - §13: point 7 corrected — it previously said First Pullback/Reversal were "design-locked but unbuilt," which was stale as of decisions #109/#110 (they're built). New point 8 added noting the Momentum/VWAP block on Stage 2.
-- `docs/decisions/confirmed-decisions.md` — new entry **#111** recording the above, Stage 0 (no code).
-- `docs/decisions/INDEX.md` — row added for #111.
+  - §10: new row **D10** (renumbered to reference decision #112) — locks
+    Stage 2 sequencing (blocked until Momentum/VWAP land) and scope
+    (wiring + `OpportunityCreated` + read-side snapshot only).
+  - §12: new row for the real #111 (Gap/Volume Spike review + scoring_utils),
+    plus a new unchecked **Stage 2** row, marked BLOCKED, referencing #112.
+  - §13: point 7 corrected (First Pullback/Reversal are built, not
+    "design-locked but unbuilt"); new point 8 (Momentum/VWAP block on Stage
+    2); new point 9 recording the #111 collision itself.
+- `docs/decisions/confirmed-decisions.md` — new entry **#112** (the
+  renumbered Stage 2 lock), explicitly noting the collision with the real
+  #111 above it.
+- `docs/decisions/INDEX.md` — row added for #112.
 
 ## How to verify
-- `grep -n "D10" docs/architecture/strategy-engine-design.md` — confirms the new row exists in §10.
-- `grep -n "^111\." docs/decisions/confirmed-decisions.md` — confirms the new entry.
-- `grep -n "| 111 |" docs/decisions/INDEX.md` — confirms the index row.
-- Read §13 point 7 directly — should now say First Pullback/Reversal are built, not unbuilt.
+- `grep -n "^11[0-9]\." docs/decisions/confirmed-decisions.md` — confirms
+  #111 (Gap/Volume Spike review) and #112 (Stage 2 lock) both exist, in
+  order, no gaps or dupes.
+- `grep -n "| 11[0-9] |" docs/decisions/INDEX.md` — same check on the index.
+- Read §13 points 7-9 directly for the corrected status + collision note.
 
 ## Unzip instructions
-Unzip directly at the project root — the `docs/` paths inside line up with the existing tree, so this only overwrites the three files listed above.
+Unzip directly at the project root — overwrites the same three files as
+before. Confirmed against your current `main` (the tree that already has
+real decision #111 in it) before this zip was built.
