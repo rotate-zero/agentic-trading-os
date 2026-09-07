@@ -75,6 +75,24 @@ reset by trading-day rollover, unaffected.
 Same reasoning as `first_pullback_strategy.py` — D5 (the waiting-value
 model) is explicitly deferred, First Pullback already flagged as its
 natural first trigger; not duplicated here.
+
+--- `DEFAULT_TREND_SCORE_THRESHOLD` promoted to a shared constant (decision #113) ---
+
+Previously this file's own module-level `60.0`. Now reads
+`scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` — `vwap_strategy.py`
+needs the identical number for the complementary condition (VWAP fires
+only when trend is NOT established; Reversal fires only when it IS), and
+two independently-hardcoded 60.0/40.0 pairs would let the strategies'
+firing conditions silently drift apart the moment either one's threshold
+is retuned in a future `StrategyConfig` version. `match_direction()`
+below now calls the shared `scoring_utils.trend_established_side()`
+rather than its own inline `>=`/`<=` branching — behavior unchanged
+(same two comparisons, same guard), just no longer a private copy of a
+classification `vwap_strategy.py` also needs verbatim. See
+`scoring_utils.py`'s own module docstring and `strategy-engine-design.md`
+§10 (D11) for the still-open caveat: nothing structurally stops the two
+`StrategyConfig.params` from being overridden to different values later
+— only the DEFAULT is guaranteed to match.
 """
 from __future__ import annotations
 
@@ -92,7 +110,12 @@ from app.strategy_engine.base_strategy import (
     every_candle,
 )
 from app.strategy_engine.level_touch_tracking import LevelTouchState, observe_resolution
-from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
+from app.strategy_engine.scoring_utils import (
+    ESTABLISHED_TREND_SCORE_THRESHOLD,
+    clamp,
+    trend_established_side,
+    trend_magnitude,
+)
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 # --- v1 defaults — all overridable via StrategyConfig.params (§3); a
@@ -100,7 +123,7 @@ from app.trading_intelligence.level_interaction_engine import get_level_interact
 
 DEFAULT_TIMEFRAME = "1m"  # touch/resolution needs candle-close granularity — not configurable per-instance
 DEFAULT_LEVEL_KEY = "vwap"  # design review point 7 — params-driven, not a separate strategy class
-DEFAULT_TREND_SCORE_THRESHOLD = 60.0  # same convention/value as orb_strategy.py / first_pullback_strategy.py
+DEFAULT_TREND_SCORE_THRESHOLD = ESTABLISHED_TREND_SCORE_THRESHOLD  # shared with vwap_strategy.py — decision #113, see module docstring
 DEFAULT_TARGET_R_MULTIPLE = 2.0
 
 # SCORE blend weights (sum to 1.0) — v1 guess, explicitly NOT validated
@@ -147,16 +170,16 @@ def match_direction(
 
     `trend_score_threshold` must be > 50.0 — identical guard and
     identical reasoning to `orb_strategy.py`'s `match_direction()`. Now
-    calls the shared `scoring_utils.validate_mirror_threshold()`
-    (decision #111) rather than its own copy — found duplicated a fourth
-    and fifth time (here and in `first_pullback_strategy.py`) when that
-    extraction, done for Gap/Volume Spike, was folded in against the
-    then-current repo state."""
-    validate_mirror_threshold(trend_score_threshold)
-
-    if trend_score >= trend_score_threshold:
+    delegates the classification itself to the shared
+    `scoring_utils.trend_established_side()` (decision #113, which also
+    carries the `validate_mirror_threshold()` guard internally) rather
+    than its own inline `>=`/`<=` branching — behavior unchanged, just no
+    longer a private copy of a classification `vwap_strategy.py` also
+    needs verbatim for the opposite condition."""
+    side = trend_established_side(trend_score, trend_score_threshold)
+    if side == "bullish":
         return "SELL"  # established uptrend just conquered downward — bet against it
-    if trend_score <= (100.0 - trend_score_threshold):
+    if side == "bearish":
         return "BUY"  # established downtrend just conquered upward — bet against it
     return None  # no established trend to reverse
 

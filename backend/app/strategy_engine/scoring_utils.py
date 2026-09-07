@@ -26,8 +26,37 @@ strategy's own weights and its own strategy-specific third component
 straightforward lines of arithmetic for more ceremony than it saves.
 Same "what should NOT be abstracted" discipline the review itself
 applied — see strategy-engine-design.md §15.
+
+--- `ESTABLISHED_TREND_SCORE_THRESHOLD` / `trend_established_side()`
+added (decision #113) ---
+
+Promoted out of `reversal_strategy.py`'s own module-level
+`DEFAULT_TREND_SCORE_THRESHOLD` the moment a second strategy
+(`vwap_strategy.py`) needed the exact same number for the opposite
+purpose: Reversal fires only WITH an established trend, VWAP fires only
+WITHOUT one, and the two are only genuine complements — no gap, no
+overlap — if both read one authoritative value rather than two
+independently-configurable `StrategyConfig.params` entries that happen
+to start out equal. Saqib's own explicit call: "avoid creating a second
+hardcoded 60/40 pair."
+
+Still genuinely two separate configs underneath (`StrategyConfig` stays
+per-strategy and versioned, §3 — this module doesn't change that), so
+this only guarantees the DEFAULTS match, not that they stay matched
+forever: nothing here stops Reversal's or VWAP's `StrategyConfig.params`
+from being independently overridden to different values in a later
+version. Flagged explicitly in both strategies' own docstrings — see
+`strategy-engine-design.md` §10, D11.
 """
 from __future__ import annotations
+
+from typing import Literal
+
+# trend_score >= this = established bullish; <= (100 - this) = established
+# bearish; strictly between = neutral / no established trend. Single source
+# of truth for "what counts as an established trend" across every strategy
+# that needs that specific reading (see module docstring above).
+ESTABLISHED_TREND_SCORE_THRESHOLD = 60.0
 
 
 def clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
@@ -57,3 +86,27 @@ def validate_mirror_threshold(threshold: float, *, param_name: str = "trend_scor
             f"{param_name} must be > 50.0 for the BUY/SELL mirror-around-"
             f"neutral logic to hold (got {threshold})"
         )
+
+
+def trend_established_side(
+    trend_score: float,
+    threshold: float = ESTABLISHED_TREND_SCORE_THRESHOLD,
+) -> Literal["bullish", "bearish"] | None:
+    """Classifies `trend_score` against the shared established-trend
+    threshold (decision #113). Returns `"bullish"` if `trend_score >=
+    threshold`, `"bearish"` if `trend_score <= (100 - threshold)`, `None`
+    for the neutral band in between — the exact classification
+    `reversal_strategy.py`'s own `match_direction()` computed inline
+    before this extraction, now also `vwap_strategy.py`'s own gate for
+    the opposite condition (fires only when this returns `None`).
+
+    Calls `validate_mirror_threshold()` first — `threshold` must be
+    > 50.0 for the two branches to stay non-overlapping and jointly
+    exhaustive-minus-the-neutral-band, same guard every mirror-around-50
+    `match_direction()` in this codebase already needs."""
+    validate_mirror_threshold(threshold)
+    if trend_score >= threshold:
+        return "bullish"
+    if trend_score <= (100.0 - threshold):
+        return "bearish"
+    return None

@@ -13,7 +13,13 @@ from __future__ import annotations
 
 import pytest
 
-from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_mirror_threshold
+from app.strategy_engine.scoring_utils import (
+    ESTABLISHED_TREND_SCORE_THRESHOLD,
+    clamp,
+    trend_established_side,
+    trend_magnitude,
+    validate_mirror_threshold,
+)
 
 
 def test_clamp_passes_through_in_range_values():
@@ -67,3 +73,38 @@ def test_validate_mirror_threshold_message_includes_param_name():
     threshold) shows up in the error, not a hardcoded generic name."""
     with pytest.raises(ValueError, match="my_custom_threshold"):
         validate_mirror_threshold(40.0, param_name="my_custom_threshold")
+
+
+# --- trend_established_side (decision #113) ---------------------------------
+
+
+def test_trend_established_side_bullish_at_and_above_threshold():
+    assert trend_established_side(60.0, threshold=60.0) == "bullish"
+    assert trend_established_side(85.0, threshold=60.0) == "bullish"
+
+
+def test_trend_established_side_bearish_at_and_below_mirror():
+    assert trend_established_side(40.0, threshold=60.0) == "bearish"
+    assert trend_established_side(15.0, threshold=60.0) == "bearish"
+
+
+def test_trend_established_side_neutral_strictly_between():
+    assert trend_established_side(50.0, threshold=60.0) is None
+    assert trend_established_side(40.1, threshold=60.0) is None
+    assert trend_established_side(59.9, threshold=60.0) is None
+
+
+def test_trend_established_side_uses_default_threshold():
+    assert trend_established_side(ESTABLISHED_TREND_SCORE_THRESHOLD) == "bullish"
+
+
+def test_trend_established_side_rejects_invalid_threshold():
+    with pytest.raises(ValueError):
+        trend_established_side(70.0, threshold=40.0)
+
+
+def test_established_trend_score_threshold_is_a_valid_mirror_threshold():
+    """The shared constant itself must satisfy its own guard — a
+    regression here would silently break both reversal_strategy.py and
+    vwap_strategy.py's defaults at once."""
+    validate_mirror_threshold(ESTABLISHED_TREND_SCORE_THRESHOLD)  # does not raise

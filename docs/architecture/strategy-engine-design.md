@@ -576,7 +576,8 @@ Everything above, connected — the learning loop this design is actually buildi
 | D7 | Whether `StrategyOutcome` needs a separate `market_state_at_signal`/`context_at_signal` pair, distinct from `_at_entry` (§5) | **Open, deferred, tied to D5.** Signal and entry are the same instant while `allows_waiting` defaults `False` everywhere — no current strategy makes them diverge. Revisit only once D5 stops being deferred and a real waiting-capable strategy exists. |
 | D8 | Whether `StrategyOutcome.trading_day` (§5, decision #89) stays a single `date` field once swing/overnight holding exists | **Open, flagged not resolved.** The single-value simplification was explicitly justified by "day-trading only, no overnight holds" — Saqib has since clarified the platform is day-trading-*focused* but not day-trading-*limited*. Nothing needs to change today; every real trade is still intraday. The trigger is concrete: the first time a position is intentionally held overnight, `trading_day` needs to split into `entry_trading_day`/`exit_trading_day`, and `exit_reason`'s `eod_flatten` value stops being universal (a forced-by-rule exit only for trades actually subject to the day-trading rule). Caught here so it isn't rediscovered as a bug later. |
 | D9 | How a `Strategy` reads `LevelInteractionEngine` state (§16, decisions #107/#108) | **Resolved for v1, narrowly.** First Pullback/Reversal call `get_level_interaction_engine().get_snapshot(symbol)` directly inside `evaluate()` — same free-function-singleton precedent `orb_strategy.py` already uses for `get_market_clock()` — rather than changing `evaluate()`'s signature or wiring `on_event(LevelInteractionChanged)` through a Scheduler that doesn't exist yet (§13 item 4 / `base_strategy.py`'s own "NOT BUILT HERE" note). `seconds_in_zone` deliberately never read — it's wall-clock `datetime.now()`-derived (`level_interaction_engine.py`'s `get_snapshot()`, decision #47, built for the UI panel), which would violate §7's backtest-safety invariant. Staleness (a design review finding, decision #108): `get_snapshot()` is fed by an async queue/worker, with no built-in guarantee it reflects the candle a strategy is currently evaluating — resolved by exposing `last_applied_candle_ts` per entry, checked before either strategy calls into the resolution-reconstruction logic. **Still open:** a future strategy that genuinely needs the authoritative `status`/`observed_via` fields (gap-through vs. dwell) rather than a one-candle-late zone-transition inference would need real event wiring — not decided here, no strategy has hit that need yet. |
-| D10 | Sequencing and scope for Stage 2 — the Strategy Scheduler/wiring milestone (decision #112, renumbered from a collision at #111 — see §13 item 9) | **Resolved.** Two calls made directly by Saqib during a status review, prompted by "this thread's strategies are built — what's next": (1) **wait for Momentum/VWAP to land** before starting Stage 2, rather than building the Scheduler against 5 strategies and retrofitting the other 2 in later; (2) **Stage 2's scope is wiring only** — instantiate built strategies against their `StrategyConfig`s, read each one's `ScheduleTrigger` and subscribe it to the live event bus, call `evaluate()` with real `MarketStateEngine`/`ContextEngine` snapshots (M4, decision #98) plus the triggering `FeatureSet`, and publish the result as a new `OpportunityCreated` event with a `get_snapshot()` read-side — same shape as every other engine's read pattern (decision #47). Two adjacent pieces explicitly did NOT get pulled into this scope: **declarative `gate_conditions` enforcement (§2b)** — every v1 strategy still does its own inline GATE check, so `StrategyConfig.gate_conditions` (e.g. ORB's `{"session": "regular"}`) stays set-but-unenforced by any shared code for now — and **Opportunity Engine's cross-strategy ranking (§9)** — a separate, later consumer of whatever `OpportunityCreated` starts publishing, not part of getting strategies running live in the first place. **Still blocking as of decision #112:** Momentum/VWAP not yet confirmed merged — Stage 2 code should not start until that's verified directly against the repo, not assumed. |
+| D10 | Sequencing and scope for Stage 2 — the Strategy Scheduler/wiring milestone (decision #112, renumbered from a collision at #111 — see §13 item 9) | **Resolved.** Two calls made directly by Saqib during a status review, prompted by "this thread's strategies are built — what's next": (1) **wait for Momentum/VWAP to land** before starting Stage 2, rather than building the Scheduler against 5 strategies and retrofitting the other 2 in later; (2) **Stage 2's scope is wiring only** — instantiate built strategies against their `StrategyConfig`s, read each one's `ScheduleTrigger` and subscribe it to the live event bus, call `evaluate()` with real `MarketStateEngine`/`ContextEngine` snapshots (M4, decision #98) plus the triggering `FeatureSet`, and publish the result as a new `OpportunityCreated` event with a `get_snapshot()` read-side — same shape as every other engine's read pattern (decision #47). Two adjacent pieces explicitly did NOT get pulled into this scope: **declarative `gate_conditions` enforcement (§2b)** — every v1 strategy still does its own inline GATE check, so `StrategyConfig.gate_conditions` (e.g. ORB's `{"session": "regular"}`) stays set-but-unenforced by any shared code for now — and **Opportunity Engine's cross-strategy ranking (§9)** — a separate, later consumer of whatever `OpportunityCreated` starts publishing, not part of getting strategies running live in the first place. **Resolved as of decision #113:** Momentum/VWAP are now confirmed merged — Stage 2 is unblocked, next session's work on this thread. |
+| D11 | `ESTABLISHED_TREND_SCORE_THRESHOLD` (`scoring_utils.py`) is one authoritative constant shared by `reversal_strategy.py` (fires when established) and `vwap_strategy.py` (fires when NOT) so the two partition every `trend_score` reading with no gap and no overlap (§18, decision #113) | **Open.** The shared constant only guarantees the two strategies' DEFAULTS match — `StrategyConfig.params` stays independently overridable per strategy, per its own versioning (§3), and nothing structurally stops Reversal's or VWAP's `trend_score_threshold` from being retuned to different values in a later config version, silently reopening either a gap or an overlap between them. No cross-strategy-config validation mechanism exists anywhere else in this codebase either — not decided here whether one is worth building, or whether "don't retune one without the other" stays a documentation-only discipline until a concrete incident makes the case for more. |
 
 ---
 
@@ -600,7 +601,8 @@ Everything above, connected — the learning loop this design is actually buildi
 - [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see §15 below for both.
 - [x] **Stage 1 (continued) — First Pullback and Reversal built (decisions #107-#110).** Design-reviewed before code (decision #108: gap-through/cold-start handling, `get_snapshot()`'s new `last_applied_candle_ts` staleness field, MATCH/SCORE boundary tightened). `first_pullback_strategy.py`, `reversal_strategy.py`, and shared `level_touch_tracking.py` — see §16 for the full walkthrough. All 7 v1 strategies from trading-intelligence-architecture.md §8 are now either built (ORB, Gap, Volume Spike, First Pullback, Reversal) or assigned (Momentum, VWAP — a separate session's thread).
 - [x] **Stage 1 (continued) — Gap/Volume Spike design review's six changes made, `scoring_utils.py` extracted (decision #111).** `regular_open` moved to Feature Engine, Gap bounded to `max_minutes_since_open`, Volume Spike gained `min_absolute_volume`/`min_body_ratio`, shared `clamp`/`trend_magnitude`/`validate_mirror_threshold` adopted by all 5 built strategies, `Opportunity.expected_horizon_minutes` added.
-- [ ] **Stage 2 — Strategy Scheduler / wiring (decision #112). BLOCKED on Momentum/VWAP landing — do not start early (D10).** Scope once unblocked: instantiate all 7 built strategies against their configs, wire each `ScheduleTrigger` to the live event bus, call `evaluate()` with real `MarketStateEngine`/`ContextEngine` snapshots, publish `OpportunityCreated`, add a `get_snapshot()` read-side. Declarative `gate_conditions` enforcement (§2b) and Opportunity Engine's ranking (§9) are deliberately OUT of this stage's scope — see D10.
+- [x] **Stage 1 complete — Momentum and VWAP built (decision #113).** `momentum_strategy.py`, `vwap_strategy.py` — the sixth and seventh, and last, v1 strategies. Externally reviewed before code (same practice as #107/#108); `ESTABLISHED_TREND_SCORE_THRESHOLD` extracted to `scoring_utils.py`, `reversal_strategy.py` refactored onto it. See §18 for the full walkthrough. **All 7 v1 strategies from `trading-intelligence-architecture.md` §8 are now built.**
+- [ ] **Stage 2 — Strategy Scheduler / wiring (decision #112, D10). UNBLOCKED as of decision #113 — next session's work on this thread.** Scope: instantiate all 7 built strategies against their configs, wire each `ScheduleTrigger` to the live event bus, call `evaluate()` with real `MarketStateEngine`/`ContextEngine` snapshots, publish `OpportunityCreated`, add a `get_snapshot()` read-side. Declarative `gate_conditions` enforcement (§2b) and Opportunity Engine's ranking (§9) are deliberately OUT of this stage's scope — see D10.
 
 ---
 
@@ -613,14 +615,15 @@ Everything above, connected — the learning loop this design is actually buildi
 5. `FeatureSet` now carries `open`/`high`/`low`/`volume` (decision #99) — but ONLY on the 1m `FeatureSet`; a 5m/15m/1h `FeatureSet`'s open/high/low/volume are `None` (true aggregated-bucket OHLC isn't tracked anywhere yet — see `schemas/events/features.py`'s `FeatureSet` docstring for why passing through the last constituent 1m candle's OHLC would be dishonest, not just incomplete). A strategy reading these on anything other than a 1m `FeatureSet` needs to handle `None`, not assume they're populated.
 6. `Strategy.evaluate()`'s real signature takes `symbol: str` as its first argument (decision #99) — the illustrative 3-arg sketch (system-design.md §4.8) had no way for a strategy to know which symbol it's being asked about, which only mattered once a strategy needed its own per-symbol memory (ORB's opening range does; the discarded Momentum draft's stateless MATCH logic never hit this gap). Any new strategy's `evaluate()` must match the real 4-arg signature.
 7. First Pullback and Reversal (§16, decisions #107-#110) are now built — `first_pullback_strategy.py`/`reversal_strategy.py` call `get_level_interaction_engine().get_snapshot(symbol)` directly (D9), never read its `seconds_in_zone` field (wall-clock, not `candle_ts`-derived), and re-derive rejected-vs-conquered one candle late from each strategy's own private per-symbol state rather than assuming `LevelInteractionChanged`'s `status` field is reachable — no Scheduler wires `on_event(...)` triggers to anything yet. *(Corrected — this point previously said "design-locked but unbuilt," stale as of decision #109/#110; caught during a status review, decision #112.)*
-8. All 7 v1 strategies are now built (ORB, Gap, Volume Spike, First Pullback, Reversal, and — per decision #111 — Momentum/VWAP status should be re-checked directly, not assumed from this note). **Do not start Stage 2 (the Scheduler/wiring milestone, decision #112) until Momentum and VWAP are confirmed merged** — Saqib's explicit call, so the wiring layer is built once against all 7 strategies rather than retrofitted twice.
+8. **All 7 v1 strategies are now built** (ORB, Gap, Volume Spike, First Pullback, Reversal, Momentum, VWAP — decision #113 closed out the last two). **Stage 2 (the Scheduler/wiring milestone, decision #112/D10) is now unblocked** and is this thread's next work — nothing further needs to land in Strategy Engine itself first.
 9. A numbering collision happened at #111: a docs-only decision drafted in an earlier session (Stage 2 sequencing/scope, D10) was queued but never actually applied to git before Saqib separately committed different, unrelated work (the Gap/Volume Spike design-review changes) as #111. Same category of collision decision #99 already documents happening once before with #98 — resolved the same way: the queued content wasn't discarded, just renumbered and re-applied as #112, with this note as the record of what happened. If a THIRD such collision is ever found, it's worth asking whether the decision-log's queue/apply handoff between sessions needs an actual fix rather than another one-off renumbering.
+10. Momentum and VWAP (§18, decisions #113) are now built — `momentum_strategy.py`/`vwap_strategy.py`. `reversal_strategy.py` was touched too (refactored onto `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD`, no behavior change). A local Postgres was actually provisioned for this session's own verification (`apt-get install postgresql`, `alembic upgrade head`) rather than relying on DB-free tests alone — worth doing again for any future session touching `LevelInteractionEngine`-dependent strategies, since the two most logically intricate VWAP tests (the same-zone-repeat suppression, the day-rollover reset) would otherwise only be trace-verified by hand.
 
 ---
 
 ## 14. ORB — Stage 1's first strategy, and what actually happened getting there (decision #99)
 
-**What was found before any of this was built:** `momentum_strategy.py` and `vwap_strategy.py` already existed in the repo, from an earlier concurrent session — undocumented. Both imported a `base_strategy.py` that didn't exist anywhere. Their own docstrings admitted this and flagged three unverified interface assumptions. A `TESTING.md` at the repo root claimed decision #98 for that work — but the real decision #98 in `confirmed-decisions.md` is the M4 integration milestone, a different piece of work entirely. Two concurrent sessions minted the same decision number; only the M4 session's doc updates actually landed. The momentum/vwap code was orphaned, silently, with no working `pytest` collection possible. Discarded rather than built on top of — see the session's own discussion for the full reasoning. Momentum is being rebuilt fresh, by a separate session, against the now-real interface below.
+**What was found before any of this was built:** `momentum_strategy.py` and `vwap_strategy.py` already existed in the repo, from an earlier concurrent session — undocumented. Both imported a `base_strategy.py` that didn't exist anywhere. Their own docstrings admitted this and flagged three unverified interface assumptions. A `TESTING.md` at the repo root claimed decision #98 for that work — but the real decision #98 in `confirmed-decisions.md` is the M4 integration milestone, a different piece of work entirely. Two concurrent sessions minted the same decision number; only the M4 session's doc updates actually landed. The momentum/vwap code was orphaned, silently, with no working `pytest` collection possible. Discarded rather than built on top of — see the session's own discussion for the full reasoning. *(Historical note, as of decision #99: Momentum was assigned to be rebuilt fresh, by a separate session, against the now-real interface below. Both it and VWAP are since built — decision #113, §18 — against this same interface, discarded draft not consulted.)*
 
 **GATE/MATCH/SCORE/PROPOSE, applied to ORB's actual state machine** (not the discarded sketch's time-boxed trigger — see `orb_strategy.py`'s module docstring, correction #1):
 
@@ -886,3 +889,118 @@ A structured design-level review of decisions #104/#105 (not a code/test review 
 6. Renumbering only — this was drafted as decision #107 before the concurrent First Pullback/Reversal work (which claimed #107–#110) was pulled; became #111 with no content change.
 
 **Verification:** `backend/tests/test_scoring_utils.py` (new, 11 tests), plus 8 new tests across `test_gap_strategy.py` (18, was 15) and `test_volume_spike_strategy.py` (22, was 18) pinning the two new Volume Spike checks and the Gap window against the exact failure modes the review described, plus one new `test_base_strategy.py` test for the schema addition. Full suite: 346 passed, 40 pre-existing DB failures (unchanged), 119 skipped (unchanged) — 327-passed baseline + these 19 new tests, zero regressions, including confirmation that the `scoring_utils.py` fold-in left First Pullback/Reversal's own (skipped, DB-gated) suites unaffected.
+
+---
+
+## 18. Momentum and VWAP — design, external review, and build (decision #113)
+
+The sixth and seventh, and last, v1 strategies from `trading-intelligence-architecture.md` §8's planned set. Went through an external (ChatGPT) design review before any code was written — same "design note first, then code" practice §16 already documents for First Pullback/Reversal. Full review transcript isn't reproduced here; this section covers what was decided and built.
+
+### Momentum
+
+**Question:** is an existing directional move accelerating, right now, regardless of time of day or any specific price level? Deliberately not time-boxed or level-based — that distinction is what keeps this genuinely different from ORB (§14), not a restatement of it. First real consumer of `MarketState.acceleration_score` — checked directly against `market_state_engine/scoring.py` rather than assumed from the field's name: it's `trend_score`'s own rate of change, no volume folded in.
+
+```
+ every 1m candle, all regular session
+      │
+      ▼
+ ┌───────────────────────────┐
+ │ 1. GATE                   │  regular session, high/low present,
+ │    is it worth checking?  │  acceleration_score not null, swing
+ │                           │  window warmed up, not in cooldown
+ └─────────────┬─────────────┘
+               │ pass
+               ▼
+ ┌───────────────────────────┐
+ │ 2. MATCH                  │  volume floor (participation) →
+ │    accelerating +         │  acceleration off-neutral in one
+ │    directional + backed   │  direction (PRIMARY) → trend_score
+ │                           │  leaning the same way (lighter
+ │                           │  CONTEXT bar, not "established")
+ └─────────────┬─────────────┘
+               │ true
+               ▼
+ ┌───────────────────────────┐
+ │ 3. SCORE                  │  0.45×acceleration + 0.25×trend
+ │    → confidence           │  + 0.30×volume — same hierarchy
+ │                           │  as MATCH, numerically
+ └─────────────┬─────────────┘
+               │
+               ▼
+ ┌───────────────────────────┐
+ │ 4. PROPOSE                │  invalidation = prior N-bar swing
+ │    → Opportunity          │  low/high (own private state);
+ │                           │  target = mechanical R-multiple
+ └───────────────────────────┘
+```
+
+Trend's MATCH-stage threshold (`DEFAULT_TREND_CONTEXT_THRESHOLD = 55.0`, own params key `trend_context_threshold`) is deliberately NOT `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` — a lighter, distinct question ("at least leaning the right way") from Reversal/VWAP's "established" claim; reusing the shared 60/40 bar here would filter out exactly the earliest, most valuable part of a fresh move, where `trend_score` is still crossing the low-50s while `acceleration_score` is already extreme.
+
+Invalidation is a new private rolling swing lookback (`DEFAULT_LOOKBACK_BARS = 10`), not ATR, not `LevelInteractionEngine` — the review's own preferred framing ("the structure supporting the move failed" vs. "price moved X against me"). `FeatureSet` publishes no swing-high/low, so this needed genuinely new per-symbol state, same category as ORB's opening range / Volume Spike's rolling baseline. During the first `lookback_bars` minutes of each trading day per symbol, this file simply doesn't fire — honest-absence, same precedent Volume Spike's own baseline warm-up already set, deliberately not the review's suggested ATR-during-warm-up fallback (one fewer code path, and the warm-up window is small enough that "don't fire yet" is a fully acceptable v1 answer).
+
+Cadence is `volume_spike_strategy.py`'s exact cooldown precedent (`DEFAULT_COOLDOWN_MINUTES = 5`), not once-per-day (ORB/Gap) — Momentum's whole point is catching multiple genuinely independent acceleration phases across a session. The review's further refinement (recognizing "still the same episode" rather than treating every cooldown-cleared candle as brand new) was explicitly NOT built — acceptable for v1 per the review's own conclusion, deferred until real live behavior shows the plain cooldown is insufficient.
+
+**Momentum vs. ORB — co-firing accepted directly, no arbitration added.** Confirmed by both Saqib and the review: the two ask genuinely different questions (a specific morning-range level breaking vs. the market already moving and gaining force, independent of any level), and nothing in either file or `base_strategy.py` should arbitrate between them — matching `base_strategy.py`'s own framing that strategy competition is downstream (Opportunity/Decision Engine's job), not this layer's.
+
+### VWAP
+
+**Question:** has intraday VWAP-side control transitioned, before an established trend exists? Two candidate designs were considered and rejected first:
+
+- **Relationship persistence** (`vwap_relationship_score` confirming strength + trend agreeing, no `LevelInteractionEngine`) — rejected: risked being "Momentum with a different gating field," not a genuinely different trading question.
+- **Naive two-candle cross** (`close` vs. `vwap`, no engine) — rejected as too primitive: would false-trigger on exactly the chop `LevelInteractionEngine`'s Aura band already exists to absorb, and would be a second, cruder, silently-drifting definition of "meaningful move" alongside the engine's own authoritative one.
+
+What shipped instead — a genuine `conquered` resolution, reused verbatim from `level_touch_tracking.observe_resolution()` (decisions #107/#108, zero new touch/cross-detection code), gated to `trend_score`'s neutral band:
+
+```
+ every 1m candle
+      │
+      ▼
+ ┌───────────────────────────┐
+ │ 1. GATE                   │  snapshot fresh (last_applied_
+ │    is it worth checking?  │  candle_ts staleness guard, D9),
+ │                           │  resolution == "conquered"
+ └─────────────┬─────────────┘
+               │ pass
+               ▼
+ ┌───────────────────────────┐
+ │ 2. MATCH                  │  trend_score in the NEUTRAL band
+ │    control transitioned,  │  only (D11's shared constant,
+ │    no established trend   │  Reversal's exact complement) →
+ │                           │  direction = the RESOLVED zone
+ │                           │  itself, never a mirror of trend
+ └─────────────┬─────────────┘
+               │ true
+               ▼
+ ┌───────────────────────────┐
+ │ 3. SCORE                  │  0.55×distance_pct (transition
+ │    → confidence           │  strength) + 0.45×volume;
+ │                           │  touch_count logged, not scored
+ └─────────────┬─────────────┘
+               │
+               ▼
+ ┌───────────────────────────┐
+ │ 4. PROPOSE                │  invalidation = anchor_price
+ │    → Opportunity          │  (live level value if gap-through);
+ │                           │  target = mechanical R-multiple
+ └───────────────────────────┘
+```
+
+**Direction is the structural opposite of Reversal's own `match_direction()`.** Reversal bets against whichever trend is established — its direction comes from mirroring `trend_score`, never from which way the conquest itself moved. VWAP has no established trend to mirror against by construction (the neutral-band gate guarantees that), so direction comes from the conquest's own resolved `zone` instead. This is the strongest evidence the two strategies ask genuinely different questions rather than the same one with a relabeled gate.
+
+**Disjoint from Reversal by construction, not left to downstream arbitration — Saqib's explicit call**, made directly rather than "co-firing is fine" (the accepted answer for Momentum/ORB above): VWAP and Reversal read the exact same underlying event and would otherwise near-duplicate each other on almost every candle with opposite direction conventions, which is a meaningfully higher correlation than the Momentum/ORB case and worth a real gate. `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` (promoted out of Reversal's own former private constant) is the single number both strategies read, so the neutral-band/established-band partition has no gap and no overlap by construction — see D11 for what this does NOT guarantee (the two configs can still drift if retuned independently later).
+
+**Cadence — fires on a genuine control transition, via `_VWAPState.last_fired_zone`.** Checked directly against `level_touch_tracking.py`'s own classification rule (`"rejected" if current_zone == entered_from else "conquered"`): two consecutive `conquered` resolutions in the engine's own unbroken stream always alternate zones by construction, so raw same-zone-twice-in-a-row can't happen there. The real, reachable repeat case is more specific: VWAP only sees the conquests that land in the neutral band, so it never observes the conquests that happen while trend is established (Reversal's window) — the zone can drift back to a value VWAP already fired for while VWAP wasn't watching. `last_fired_zone` catches exactly that; `test_vwap_strategy.py` proves both directions — the repeat is suppressed, and a genuinely new zone immediately afterward still fires.
+
+**SCORE uses `distance_pct`, not `touch_count_today`.** `get_snapshot()`'s `distance_pct`, on a resolved zone, was confirmed (by reading `level_interaction_engine.py` directly) to be computed from `_latest_close`/`_latest_level_value` — candle-derived, not `seconds_in_zone`'s wall-clock `datetime.now()` — so it's backtest-safe per §7's invariant. `touch_count_today` is logged for future calibration but not weighted: unlike Reversal, where more prior touches before a break is straightforwardly stronger evidence, the sign of that relationship for a VWAP conquest isn't obvious (could mean a well-tested level finally giving way, or an already-choppy session) — flagged rather than guessed.
+
+### `structural_target` — a schema constraint both strategies hit the same way
+
+The review's recommendation for both strategies was "don't force a strategy-specific projection; Trade Planning decides target/risk/sizing downstream." `Opportunity.structural_target: float` is currently REQUIRED (not `Optional`) on `base_strategy.py` — changing that schema would be a bigger, cross-cutting change touching all 5 other built strategies, out of scope for this build. Reconciled by using the same mechanical R-multiple (`close ± target_r_multiple * risk`, default 2.0) every other v1 strategy already computes — a schema-completeness value, not a claim that the number is meaningful trading advice.
+
+### The build itself
+
+`momentum_strategy.py` and `vwap_strategy.py`, both following `orb_strategy.py`'s GATE → MATCH → SCORE → PROPOSE shape exactly. `scoring_utils.py` gained `ESTABLISHED_TREND_SCORE_THRESHOLD` and `trend_established_side()` (D11); `reversal_strategy.py` refactored onto both — behavior unchanged, its own `match_direction()` now delegates to the shared helper rather than repeating the same `>=`/`<=` classification a second file also needed verbatim. One stale comment in `orb_strategy.py` corrected in the same change — it cited the discarded draft's momentum threshold value (decision #99) as precedent for a number this rebuild deliberately doesn't reuse.
+
+**Verification — against a real local Postgres, not DB-free-only.** Unlike most entries in this log, this session provisioned PostgreSQL 16 directly and ran `alembic upgrade head`, so every DB-gated test in this delivery actually ran rather than being skipped — including the two most logically intricate VWAP scenarios (the same-zone-repeat suppression across an established-trend window, the day-rollover reset) that would otherwise only be trace-verified by hand. `backend/tests/test_momentum_strategy.py` (new, 18 tests, no DB dependency), `backend/tests/test_vwap_strategy.py` (new, 19 tests, DB-gated, all run and passed), `backend/tests/test_scoring_utils.py` (+6, now 17), `backend/tests/test_reversal_strategy.py` (all 11 re-run unchanged, confirming the refactor is behavior-neutral). Full suite: 546 passed; 2 pre-existing failures (`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`, `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`) confirmed identical against a completely untouched second clone of `main` — pre-existing, unrelated to this change, not investigated further here.
+
+**Stage 2 (decision #112/D10) is now unblocked** — see §12.

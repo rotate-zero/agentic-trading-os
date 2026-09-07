@@ -181,8 +181,14 @@ from app.strategy_engine.scoring_utils import clamp, trend_magnitude, validate_m
 
 DEFAULT_TIMEFRAME = "1m"  # opening range formation needs 1m granularity — not configurable per-instance
 DEFAULT_OR_MINUTES = 15  # Saqib's choice — configurable per StrategyConfig version
-DEFAULT_TREND_SCORE_THRESHOLD = 60.0  # same convention/value as momentum_strategy.py's DEFAULT_TREND_SCORE_THRESHOLD
-DEFAULT_VOLUME_REGIME_THRESHOLD = 45.0  # same participation floor as momentum_strategy.py (~rvol 1.35)
+DEFAULT_TREND_SCORE_THRESHOLD = 60.0  # same value as the discarded draft's DEFAULT_TREND_SCORE_THRESHOLD (decision #99) —
+# now also scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD (decision #113), though ORB doesn't import that constant
+# itself: this is ORB's own MATCH-stage confirmation floor, not the "established trend" question Reversal/VWAP
+# specifically ask, and the two happening to share a number is coincidence, not a dependency worth introducing.
+# momentum_strategy.py's REBUILT (not discarded-draft) version deliberately does NOT reuse this same 60.0 for its
+# own trend-context check — see that file's module docstring for why a lighter, distinct threshold was chosen.
+DEFAULT_VOLUME_REGIME_THRESHOLD = 45.0  # same participation floor as momentum_strategy.py's rebuilt version (~rvol 1.35) — one of the few
+# numbers carried over unchanged from the discarded draft's own reviewed value (decision #99's reconciliation)
 DEFAULT_TARGET_R_MULTIPLE = 2.0
 DEFAULT_EXPECTED_HORIZON_MINUTES = 45  # v1 guess, unvalidated — decision #107. A breakout
 # thesis playing out roughly within the session's own morning structure; not modeled
