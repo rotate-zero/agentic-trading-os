@@ -68,6 +68,23 @@ async def lifespan(app: FastAPI):
     level_interaction_engine = get_level_interaction_engine(bus)
     level_interaction_engine.start()
 
+    # --- Track B: OpportunityCache (decision #112/D10, #114) --------------
+    # Passive read-side cache for OpportunityCreated — see
+    # app/trading_intelligence/opportunity_cache.py's own module docstring
+    # for full scope (NOT the Opportunity Engine, §9, which doesn't exist
+    # yet). A bus subscriber like LevelInteractionEngine/MarketStateEngine
+    # here, so it follows the same unconditional-start, stop-after-bus
+    # posture as those two. Local import (not hoisted to this file's
+    # top-of-file import block) so this whole addition stays a single,
+    # self-contained, easily-merged insertion — see TESTING.md for the
+    # exact insertion points (this block, plus its matching stop() call in
+    # the shutdown `finally` block below).
+    from app.trading_intelligence.opportunity_cache import get_opportunity_cache
+
+    opportunity_cache = get_opportunity_cache(bus)
+    opportunity_cache.start()
+    # --- end Track B startup block ------------------------------------------
+
     # Market State Engine (decision #93 for per-symbol, decision #97 for
     # M3's SPY/QQQ/IWM cross-symbol synthesis on top of it). Subscriber,
     # same as LevelInteractionEngine above — stops AFTER the bus in
@@ -190,6 +207,16 @@ async def lifespan(app: FastAPI):
         await feature_engine.stop()
         await level_interaction_engine.stop()
         await market_state_engine.stop()
+        # --- Track B: OpportunityCache shutdown (decision #112/D10, #114) ---
+        # Matches the startup block above — a bus subscriber, so it stops
+        # AFTER the bus, alongside feature_engine/level_interaction_engine/
+        # market_state_engine just above (same reasoning, decision #47).
+        # In practice this is a no-op (see opportunity_cache.py's own
+        # docstring — no background task, nothing to drain), but it's
+        # called anyway for lifecycle-interface consistency with every
+        # other engine here.
+        await opportunity_cache.stop()
+        # --- end Track B shutdown block ------------------------------------
         logger.info("%s stopped", settings.app_name)
 
 

@@ -348,3 +348,32 @@ async def get_intelligence_series(
         ema_seed_multiplier=settings.feature_engine_ema_seed_multiplier,
     )
     return {"symbol": symbol, "timeframe": timeframe, "series": series}
+
+
+@router.get("/opportunities")
+async def get_opportunities_snapshot(symbol: str | None = Query(None)) -> dict[str, Any]:
+    """
+    Decision #114 (Stage 2, D10) — live observability into
+    OpportunityCache, same "point-in-time read, no need to replay event
+    history" purpose GET /market-state and GET /context already serve
+    for their own engines above.
+
+    A thin passthrough of OpportunityCache.get_snapshot() — see that
+    method's own docstring for the full shape. `symbol` is optional
+    here, same convention as GET /market-state/GET /context: this route
+    is also meant for "what has this process cached about anything,"
+    not only a single symbol's dashboard panel.
+
+    Import is local to this function, not hoisted to this file's
+    top-of-file import block — deliberate, so this entire addition (this
+    route is the only thing Track B of the Strategy Scheduler/wiring
+    split, decision #112/D10, touches in this file) stays a single,
+    purely-additive block appended at the end of the file, with zero
+    risk of colliding with any other concurrent edit to this file's
+    existing import lines. Harmless to hoist to the top during a future
+    cleanup pass if preferred — nothing about it depends on staying
+    local.
+    """
+    from app.trading_intelligence.opportunity_cache import get_opportunity_cache
+
+    return get_opportunity_cache().get_snapshot(symbol)
