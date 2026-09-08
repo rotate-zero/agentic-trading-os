@@ -22,6 +22,7 @@ from app.market_state_engine.engine import get_market_state_engine
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
 from app.services.live_tick_relay import get_live_tick_relay
+from app.strategy_engine.scheduler import get_strategy_scheduler
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 logger = logging.getLogger(__name__)
@@ -68,23 +69,6 @@ async def lifespan(app: FastAPI):
     level_interaction_engine = get_level_interaction_engine(bus)
     level_interaction_engine.start()
 
-    # --- Track B: OpportunityCache (decision #112/D10, #114) --------------
-    # Passive read-side cache for OpportunityCreated — see
-    # app/trading_intelligence/opportunity_cache.py's own module docstring
-    # for full scope (NOT the Opportunity Engine, §9, which doesn't exist
-    # yet). A bus subscriber like LevelInteractionEngine/MarketStateEngine
-    # here, so it follows the same unconditional-start, stop-after-bus
-    # posture as those two. Local import (not hoisted to this file's
-    # top-of-file import block) so this whole addition stays a single,
-    # self-contained, easily-merged insertion — see TESTING.md for the
-    # exact insertion points (this block, plus its matching stop() call in
-    # the shutdown `finally` block below).
-    from app.trading_intelligence.opportunity_cache import get_opportunity_cache
-
-    opportunity_cache = get_opportunity_cache(bus)
-    opportunity_cache.start()
-    # --- end Track B startup block ------------------------------------------
-
     # Market State Engine (decision #93 for per-symbol, decision #97 for
     # M3's SPY/QQQ/IWM cross-symbol synthesis on top of it). Subscriber,
     # same as LevelInteractionEngine above — stops AFTER the bus in
@@ -101,6 +85,26 @@ async def lifespan(app: FastAPI):
     # there's nothing here worth gating start() on.
     context_engine = get_context_engine(bus)
     context_engine.start()
+
+    # Strategy Scheduler (decision #112/#114, strategy-engine-design.md
+    # §10 D10) — Stage 2. Subscriber (FeaturesUpdated for caching,
+    # MarketStateChanged as the actual evaluate() trigger — see
+    # scheduler.py's module docstring for why the split), so stops AFTER
+    # the bus in shutdown below, same category as MarketStateEngine
+    # above, not before like ContextEngine. Placed after both
+    # MarketStateEngine and ContextEngine start — not load-bearing at
+    # startup time itself (both are read lazily, per-event), but this is
+    # the last piece of the intelligence pipeline in start order, which
+    # is the more readable place for it.
+    #
+    # MANUAL MERGE NOTE (concurrent-session touch to this file, same
+    # category as decisions #98/#112's file-level collisions): a parallel
+    # session ("Track B") is independently adding its own separate
+    # OpportunityCache start()/stop() block to this same file, for the
+    # OpportunityCreated read-side. That block is NOT added here — merge
+    # both additions by hand when combining the two deliveries.
+    strategy_scheduler = get_strategy_scheduler(bus)
+    strategy_scheduler.start()
 
     # FundamentalsRefreshJobs — the only writer to symbol_fundamentals
     # (decision #96). Soft-fails its own start() (logs + no-ops) when no
@@ -207,16 +211,11 @@ async def lifespan(app: FastAPI):
         await feature_engine.stop()
         await level_interaction_engine.stop()
         await market_state_engine.stop()
-        # --- Track B: OpportunityCache shutdown (decision #112/D10, #114) ---
-        # Matches the startup block above — a bus subscriber, so it stops
-        # AFTER the bus, alongside feature_engine/level_interaction_engine/
-        # market_state_engine just above (same reasoning, decision #47).
-        # In practice this is a no-op (see opportunity_cache.py's own
-        # docstring — no background task, nothing to drain), but it's
-        # called anyway for lifecycle-interface consistency with every
-        # other engine here.
-        await opportunity_cache.stop()
-        # --- end Track B shutdown block ------------------------------------
+        # Subscriber (see startup comment above) — stops after the bus,
+        # same category as market_state_engine/level_interaction_engine
+        # just above. Trivial in practice (scheduler.py's module
+        # docstring: no queue, no background task to drain).
+        await strategy_scheduler.stop()
         logger.info("%s stopped", settings.app_name)
 
 
