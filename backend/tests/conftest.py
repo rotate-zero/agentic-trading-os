@@ -48,6 +48,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.services.live_tick_relay as live_tick_relay_module
     import app.strategy_engine.scheduler as strategy_scheduler_module
     import app.trading_intelligence.level_interaction_engine as level_interaction_engine_module
+    import app.trading_intelligence.opportunity_cache as opportunity_cache_module
     from app.services import broker_registry
 
     # Explicit empty string, not delenv: pydantic-settings' BaseSettings
@@ -71,6 +72,7 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
         fundamentals_refresh_module._fundamentals_refresh_jobs = None  # ditto — decision #96
         market_state_engine_module._market_state_engine = None  # ditto — decision #93
         strategy_scheduler_module._strategy_scheduler = None  # ditto — decision #112/#114
+        opportunity_cache_module._opportunity_cache = None  # ditto — decision #114/#115 (Track B, restored)
         broker_registry.clear_all()
         # market_data.py and finnhub_data.py each keep their own local
         # provider reference (see their module docstrings for why) —

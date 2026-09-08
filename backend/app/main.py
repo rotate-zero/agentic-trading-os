@@ -96,15 +96,24 @@ async def lifespan(app: FastAPI):
     # startup time itself (both are read lazily, per-event), but this is
     # the last piece of the intelligence pipeline in start order, which
     # is the more readable place for it.
-    #
-    # MANUAL MERGE NOTE (concurrent-session touch to this file, same
-    # category as decisions #98/#112's file-level collisions): a parallel
-    # session ("Track B") is independently adding its own separate
-    # OpportunityCache start()/stop() block to this same file, for the
-    # OpportunityCreated read-side. That block is NOT added here — merge
-    # both additions by hand when combining the two deliveries.
     strategy_scheduler = get_strategy_scheduler(bus)
     strategy_scheduler.start()
+
+    # OpportunityCache (Track B, decision #114 original/#115 restored —
+    # see confirmed-decisions.md for the collision note) — the
+    # OpportunityCreated read-side this Scheduler's own publish above now
+    # actually feeds. This completes the manual merge Track A's own
+    # session flagged but didn't finish (its comment here said "merge
+    # both additions by hand" — this push never did, so this cache was
+    # built and tested but never actually subscribed in the live app
+    # until now). A bus subscriber like StrategyScheduler just above, so
+    # it follows the same unconditional-start, stop-after-bus posture.
+    # Local import (not hoisted to this file's top-of-file import block)
+    # so this whole addition stays a single, self-contained block.
+    from app.trading_intelligence.opportunity_cache import get_opportunity_cache
+
+    opportunity_cache = get_opportunity_cache(bus)
+    opportunity_cache.start()
 
     # FundamentalsRefreshJobs — the only writer to symbol_fundamentals
     # (decision #96). Soft-fails its own start() (logs + no-ops) when no
@@ -216,6 +225,11 @@ async def lifespan(app: FastAPI):
         # just above. Trivial in practice (scheduler.py's module
         # docstring: no queue, no background task to drain).
         await strategy_scheduler.stop()
+        # OpportunityCache (Track B) — same subscriber posture, stops
+        # after the bus alongside strategy_scheduler just above. Also
+        # trivial in practice (opportunity_cache.py's own docstring: no
+        # queue, nothing to drain).
+        await opportunity_cache.stop()
         logger.info("%s stopped", settings.app_name)
 
 
