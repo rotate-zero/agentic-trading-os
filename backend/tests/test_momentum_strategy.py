@@ -270,14 +270,13 @@ async def test_accelerating_but_trend_disagreeing_never_fires():
     assert opp is None
 
 
-@pytest.mark.asyncio
-async def test_outside_regular_session_never_fires():
-    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
-    strategy = MomentumStrategy(config)
-    premarket = _et(2026, 8, 17, 8, 0)
-    fs = _make_features(premarket, close=100.0, high=100.5, low=99.8)
-    opp = await strategy.evaluate("TEST", _make_market_state(premarket), fs, ContextChanged())
-    assert opp is None
+# Session-gate coverage removed here (D16, decision #119) — MomentumStrategy
+# no longer checks session itself; StrategyScheduler/gate_conditions.py is
+# the sole enforcement authority (decisions #117/#118). See
+# test_gate_conditions.py and test_strategy_scheduler.py (particularly
+# test_gated_strategy_skipped_when_candle_outside_regular_session and
+# test_scheduler_end_to_end_gate_conditions_blocks_strategy_outside_regular_session)
+# for where this contract is actually proven now.
 
 
 @pytest.mark.asyncio

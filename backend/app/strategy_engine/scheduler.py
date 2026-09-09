@@ -42,19 +42,21 @@ of its own. Two things worth stating here rather than only there:
      `gate_conditions.py`'s own docstring for why an unrecognized gate
      condition is a materially worse failure mode than an unwired
      trigger kind, not the same one.
-  2. **This closes a real, currently-live gap for 3 of the 7 strategies,
-     not merely a redundancy for the other 4.** Checked directly against
-     every strategy file, not assumed: `gap_strategy.py`,
-     `momentum_strategy.py`, and `volume_spike_strategy.py` each already
-     call `MarketClock.is_regular_session()` inline in their own GATE
-     step (genuinely redundant with the new central check now — left in
-     place FOR NOW; tracked for removal, §10 D16, not bundled into this
-     change); `orb_strategy.py` never calls it directly but is
-     effectively self-gating anyway via `minutes_since_open()` returning
-     0 whenever the market isn't open. But `first_pullback_strategy.py`,
+  2. **This closed a real, currently-live gap for 3 of the 7 strategies,
+     not merely a redundancy for the other 4 — and it was 3, not 4, that
+     had a duplicate gate.** Checked directly against every strategy
+     file, not assumed: `gap_strategy.py`, `momentum_strategy.py`, and
+     `volume_spike_strategy.py` each called `MarketClock.is_regular_
+     session()` inline in their own GATE step at the time this was
+     built — genuinely redundant with the new central check, since
+     removed (D16, decision #119; see below). `orb_strategy.py` never
+     called it directly and was never gated on session at all — its
+     `minutes_since_open()` usage is unrelated opening-range-formation
+     timing, load-bearing MATCH logic, not a duplicate session gate; D16
+     never touched it. `first_pullback_strategy.py`,
      `reversal_strategy.py`, and `vwap_strategy.py` all declare
      `gate_conditions={"session": "regular"}` and have **no session
-     check anywhere in their own `evaluate()`** — before this change,
+     check anywhere in their own `evaluate()`** — before decision #117,
      that declared precondition was enforced by nothing at all. The
      central check below is these three strategies' only session gate,
      not a second layer on top of an existing one.
@@ -62,12 +64,13 @@ of its own. Two things worth stating here rather than only there:
      and this class are the ONLY code allowed to interpret
      `gate_conditions` — a `Strategy` subclass may declare it on its own
      `StrategyConfig`, but must never independently interpret the dict
-     or enforce a gate itself. The 4 strategies' own inline
-     `is_regular_session()` calls above are a pre-existing, tolerated
-     exception (they predate this rule), not a template — tracked for
-     removal in §10 D16 precisely so "session" has exactly one place it
-     can ever be interpreted. No strategy built after this point should
-     add a second one.
+     or enforce a gate itself. The 3 strategies' own inline
+     `is_regular_session()` calls named above were a pre-existing,
+     tolerated exception (they predated this rule), not a template — D16
+     tracked their removal precisely so "session" would have exactly one
+     place it can ever be interpreted; **removed, decision #119.**
+     `gap_strategy.py`/`momentum_strategy.py`/`volume_spike_strategy.py`
+     no longer check session directly. No strategy should add one.
 
 **Why the live trigger is `MarketStateChanged`, not `FeaturesUpdated` —
 found by testing, not assumed up front.** The first version of this

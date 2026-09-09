@@ -16,13 +16,15 @@ declare gate_conditions on its own StrategyConfig, but must never
 independently interpret the dict, invent a new key's meaning, or
 enforce one itself — that would silently fork one condition into two
 possibly-divergent implementations, the exact failure mode a single
-shared registry exists to prevent. A strategy's own inline
-MarketClock.is_regular_session() call (4 of the 7 today — see decision
-#117's own finding) is a pre-existing, currently-tolerated exception,
-not a template: it predates this rule, is flagged as redundant, and is
-tracked for removal (§10 D16) precisely so it stops being a second
-place "session" could ever be interpreted differently. No NEW strategy
-should add another one.
+shared registry exists to prevent. D16 (§10) tracked removing the
+pre-existing inline MarketClock.is_regular_session() calls that predated
+this rule — resolved by decision #119: gap_strategy.py,
+momentum_strategy.py, and volume_spike_strategy.py (3 of the 7, not 4 —
+decision #117's own "4 of the 7" framing conflated orb_strategy.py's
+unrelated minutes_since_open() opening-range-formation timing with a
+genuine duplicate session gate; orb_strategy.py never called
+is_regular_session() and was never touched by D16). No strategy should
+add a new inline gate_conditions interpretation going forward.
 
 v1 SCOPE — supports exactly one key, "session": "regular". Verified
 directly against every one of the 7 built strategies' own

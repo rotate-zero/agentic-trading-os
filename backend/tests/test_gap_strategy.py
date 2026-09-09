@@ -289,17 +289,13 @@ async def test_gap_already_filled_before_first_evaluate_never_fires():
     assert opp is None
 
 
-@pytest.mark.asyncio
-async def test_outside_regular_session_never_fires():
-    """Pre-market/after-hours — gap continuation is a regular-session
-    concept, even if gap_pct happens to already be in the features dict
-    (e.g. after-hours, same day, gap frozen earlier that morning)."""
-    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
-    strategy = GapStrategy(config)
-    after_hours_ts = _et(2026, 8, 17, 17, 0)
-    fs = _gap_features(after_hours_ts, close=104.0, pdc=100.0, gap_dollars=3.0, gap_pct=3.0)
-    opp = await strategy.evaluate("TEST", _make_market_state(after_hours_ts), fs, ContextChanged())
-    assert opp is None
+# Session-gate coverage removed here (D16, decision #119) — GapStrategy no
+# longer checks session itself; StrategyScheduler/gate_conditions.py is the
+# sole enforcement authority (decisions #117/#118). See
+# test_gate_conditions.py and test_strategy_scheduler.py (particularly
+# test_gated_strategy_skipped_when_candle_outside_regular_session and
+# test_scheduler_end_to_end_gate_conditions_blocks_strategy_outside_regular_session)
+# for where this contract is actually proven now.
 
 
 @pytest.mark.asyncio

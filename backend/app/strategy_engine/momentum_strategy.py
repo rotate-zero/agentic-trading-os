@@ -167,10 +167,15 @@ discipline as the swing-lookback choice above.
 
 --- Session scope ---
 
-Gated to `MarketClock.is_regular_session()`, same as
-`gap_strategy.py`/`volume_spike_strategy.py` — thin, unreliable trend/
-volume readings outside regular hours, and nothing else in this file's
-own trigger (`every_candle`, all session) would otherwise bound it.
+`gate_conditions={"session": "regular"}` (declared in `default_config()`
+below, enforced solely by `StrategyScheduler`/`gate_conditions.py` —
+decisions #117/#118, D16/#119), same as `gap_strategy.py`/
+`volume_spike_strategy.py` — thin, unreliable trend/volume readings
+outside regular hours, and nothing else in this file's own trigger
+(`every_candle`, all session) would otherwise bound it. This file itself
+no longer checks session directly; see D16/decision #119 for why the
+prior inline `MarketClock.is_regular_session()` call here was removed as
+redundant.
 
 --- `allows_waiting` stays `False` for v1 ---
 
@@ -389,8 +394,6 @@ class MomentumStrategy(Strategy):
             # orb_strategy.py's own opening-range check already documents).
 
         clock = get_market_clock()
-        if not clock.is_regular_session(features.candle_ts):
-            return None  # thin, unreliable trend/volume readings outside regular hours — module docstring "Session scope"
 
         if market_state.acceleration_score is None:
             return None  # honest absence — this symbol's first-ever Market State recompute (decision #93)

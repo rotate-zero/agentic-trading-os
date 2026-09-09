@@ -125,15 +125,19 @@ tuning question, not something to patch around here.
 
 --- Session scope ---
 
-Gated to `MarketClock.is_regular_session()` — Gap's continuation-or-not
-question only means something once the regular-session open print
-exists to test against. `_update_gap` (Feature Engine) leaves `gap_pct`
-frozen and present in `features.features` for the REST of the day,
-including power hour and (per `_update_gap`'s own code, which applies no
-session filter after the initial freeze) after-hours — without this
-gate, a stale gap read late in the day would keep re-testing the same
-frozen level well past the point "gap continuation" is a meaningful
-day-trading pattern.
+`gate_conditions={"session": "regular"}` (declared in `default_config()`
+below, enforced solely by `StrategyScheduler`/`gate_conditions.py` —
+decisions #117/#118, D16/#119) — Gap's continuation-or-not question only
+means something once the regular-session open print exists to test
+against. `_update_gap` (Feature Engine) leaves `gap_pct` frozen and
+present in `features.features` for the REST of the day, including power
+hour and (per `_update_gap`'s own code, which applies no session filter
+after the initial freeze) after-hours — without this gate, a stale gap
+read late in the day would keep re-testing the same frozen level well
+past the point "gap continuation" is a meaningful day-trading pattern.
+This file itself no longer checks session directly; see D16/decision
+#119 for why the prior inline `MarketClock.is_regular_session()` call
+here was removed as redundant.
 
 --- MarketStateEngine race: not a caveat here, unlike ORB/Momentum/VWAP ---
 
@@ -306,10 +310,9 @@ def default_config(active_from, version: str = "gap_v1") -> StrategyConfig:
         strategy_name="Gap",
         version=version,
         params=default_params(),
-        gate_conditions={"session": "regular"},  # mirrors what evaluate() already
-        # enforces itself via MarketClock.is_regular_session() — declarative
-        # defense-in-depth, not yet consumed by any Scheduler (base_strategy.py's
-        # own docstring: the Scheduler that would read this doesn't exist yet).
+        gate_conditions={"session": "regular"},  # enforced solely by
+        # StrategyScheduler via gate_conditions.py (decisions #117/#118) —
+        # this file no longer checks session itself (D16, decision #119).
         allows_waiting=False,
         active_from=active_from,
         active_to=None,
@@ -370,8 +373,6 @@ class GapStrategy(Strategy):
         if features.timeframe != timeframe:
             return None  # defensive timeframe scope — see module docstring
         clock = get_market_clock()
-        if not clock.is_regular_session(features.candle_ts):
-            return None  # gap continuation is a regular-session concept — module docstring "Session scope"
 
         gap_pct = features.features.get("gap_pct")
         gap_dollars = features.features.get("gap_dollars")

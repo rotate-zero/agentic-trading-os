@@ -312,14 +312,13 @@ async def test_second_independent_spike_fires_again_after_cooldown_elapses():
     assert second_opp is not None  # cooldown elapsed — a genuinely later, independent spike fires
 
 
-@pytest.mark.asyncio
-async def test_outside_regular_session_never_fires():
-    config = default_config(active_from=datetime(2026, 1, 1, tzinfo=timezone.utc))
-    strategy = VolumeSpikeStrategy(config)
-    premarket_ts = _et(2026, 8, 17, 8, 0)
-    fs = _make_features(premarket_ts, close=101.0, open_=100.0, volume=50000)
-    opp = await strategy.evaluate("TEST", _make_market_state(premarket_ts), fs, ContextChanged())
-    assert opp is None
+# Session-gate coverage removed here (D16, decision #119) —
+# VolumeSpikeStrategy no longer checks session itself; StrategyScheduler/
+# gate_conditions.py is the sole enforcement authority (decisions
+# #117/#118). See test_gate_conditions.py and test_strategy_scheduler.py
+# (particularly test_gated_strategy_skipped_when_candle_outside_regular_session
+# and test_scheduler_end_to_end_gate_conditions_blocks_strategy_outside_regular_session)
+# for where this contract is actually proven now.
 
 
 @pytest.mark.asyncio

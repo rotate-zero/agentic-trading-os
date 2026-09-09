@@ -137,13 +137,18 @@ distinct, second event worth its own signal.
 
 --- Session scope ---
 
-Gated to `MarketClock.is_regular_session()`, same reasoning as
-`gap_strategy.py`: pre-market/after-hours volume is thin by construction
-(decision #94's own IEX-coverage findings for the live tape aside, even
-the historical/backfill volume any of these sessions print is a fraction
-of regular-hours turnover), so a "3x the recent baseline" test means
+`gate_conditions={"session": "regular"}` (declared in `default_config()`
+below, enforced solely by `StrategyScheduler`/`gate_conditions.py` —
+decisions #117/#118, D16/#119), same reasoning as `gap_strategy.py`:
+pre-market/after-hours volume is thin by construction (decision #94's
+own IEX-coverage findings for the live tape aside, even the
+historical/backfill volume any of these sessions print is a fraction of
+regular-hours turnover), so a "3x the recent baseline" test means
 something different, and less reliably, outside regular hours. Kept
 simple for v1 rather than inventing a session-specific threshold scheme.
+This file itself no longer checks session directly; see D16/decision
+#119 for why the prior inline `MarketClock.is_regular_session()` call
+here was removed as redundant.
 
 --- Absolute volume floor and body/displacement check (decision #111) ---
 
@@ -381,10 +386,9 @@ def default_config(active_from, version: str = "volume_spike_v1") -> StrategyCon
         strategy_name="Volume Spike",
         version=version,
         params=default_params(),
-        gate_conditions={"session": "regular"},  # mirrors what evaluate() already
-        # enforces itself via MarketClock.is_regular_session() — declarative
-        # defense-in-depth, not yet consumed by any Scheduler (base_strategy.py's
-        # own docstring: the Scheduler that would read this doesn't exist yet).
+        gate_conditions={"session": "regular"},  # enforced solely by
+        # StrategyScheduler via gate_conditions.py (decisions #117/#118) —
+        # this file no longer checks session itself (D16, decision #119).
         allows_waiting=False,
         active_from=active_from,
         active_to=None,
@@ -452,8 +456,6 @@ class VolumeSpikeStrategy(Strategy):
         if features.timeframe != timeframe:
             return None  # defensive timeframe scope — see module docstring
         clock = get_market_clock()
-        if not clock.is_regular_session(features.candle_ts):
-            return None  # thin, unreliable volume outside regular hours — module docstring "Session scope"
         if features.open is None or features.high is None or features.low is None or features.volume is None:
             return None  # honest absence — pre-decision #99 FeatureSet, or an aggregated
             # timeframe's FeatureSet slipping through despite the check above; either way,
