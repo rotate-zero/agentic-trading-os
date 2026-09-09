@@ -1,123 +1,81 @@
-# Design review's agreed changes — Gap, Volume Spike, and a shared utility
+# AI Analysis Panel wired to the real Opportunity contract (decision #118)
 
 Copy this into your repo root, overwriting the existing path — replaces
-the previous drop note (Gap/Volume Spike's initial build). This is the
-response to the design-level review of that build: six agreed changes,
-made in full, plus one thing discovered mid-change (git was updated
-with First Pullback/Reversal) that changed this drop's scope slightly.
+the previous drop note (`gate_conditions` enforcement, decision #117).
+Frontend only; that #117 work is untouched by this drop and this drop
+doesn't touch anything #117 touched — confirmed by diffing before
+starting.
 
-## Note: pulled First Pullback/Reversal mid-session
+## What this is
 
-Before implementing, I pulled and found First Pullback and Reversal
-(decisions #107–#110) had been built concurrently on another track.
-Checked for conflicts first: `base_strategy.py`/`orb_strategy.py`/
-`gap_strategy.py`/`volume_spike_strategy.py` were untouched by those
-commits, so no code conflicts. Two consequences:
+`AIAnalysisPanel.tsx` was fully built but fed entirely by
+`mocks/opportunities.ts` — a Phase-5 stand-in, per its own header
+comment. Phase 5 (Stage 2, decisions #114-#117) is built and running.
+This drop wires the panel to the real `GET /intelligence/opportunities`
++ `opportunity.new` WebSocket contract. No backend changes — both
+already existed.
 
-- This drop's own decision got renumbered from a planned #107 to **#111**
-  (#107–#110 were already taken).
-- `first_pullback_strategy.py`/`reversal_strategy.py` turned out to have
-  independently duplicated the exact `_clamp`/threshold-guard pattern
-  item 4 below was extracting — a fourth and fifth copy, found in real
-  time. Folded both into the same extraction rather than leaving it
-  half-finished; verified behavior-neutral against their own suites.
+## A correction to the task brief, not just a build note
 
-## The six changes
-
-**1 — `regular_open` published by Feature Engine.** `gap_strategy.py`
-no longer reconstructs it as `pdc + gap_dollars` — `_update_gap`
-(`feature_engine/engine.py`) now publishes it as its own `features` key,
-same category as `pdc`/`pdh`/`pdl`, known the moment today's regular
-session opens even without a prior day to compare against.
-
-**2 — Gap bounded to `max_minutes_since_open` (v1 default 60 min).**
-Nothing previously stopped a match hours after the open — a 2pm reclaim
-of `regular_open` read identically to a clean 9:30 hold. MATCH now
-refuses past this window. Doesn't resolve the deeper, still-open
-question (does an instantaneous close-vs-open comparison really prove
-"holding"?) — deliberately deferred pending real outcome data.
-
-**3 — Volume Spike gained `min_absolute_volume` (500 shares) and
-`min_body_ratio` (0.3).** Closes two concrete gaps: a ratio-only test
-can't catch a small order against a thin/illiquid baseline; a
-huge-volume, razor-thin-body candle previously passed as directional on
-`close != open` alone. Both computable from data already on the candle.
-Deliberately NOT addressed: exhaustion-vs-continuation ambiguity, and
-whether the spike candle's own wick makes an impractically wide stop —
-both need real outcome data, not a guessed fix.
-
-**4 — New shared `scoring_utils.py` (`clamp`, `trend_magnitude`,
-`validate_mirror_threshold`).** Extracted from what was, by this point,
-five near-identical copies (ORB, Gap, Volume Spike, plus First
-Pullback/Reversal found mid-change). Each strategy's own MATCH
-conditions and SCORE weights stayed exactly where they were — this is
-mechanical, domain-free arithmetic only, not a "strategy scoring engine."
-
-**5 — `Opportunity.expected_horizon_minutes` added to
-`base_strategy.py`.** Every strategy had an implicit, unencoded
-expectation of how long its setup should take — lost the moment
-`evaluate()` returned. Optional, honest-absence default. Populated by
-ORB (45 min), Gap (60 min), Volume Spike (15 min) — each a v1 guess.
-Deliberately left unpopulated on First Pullback/Reversal — that's a
-value judgment for whichever thread owns them, not something this drop
-should decide on their behalf; the field is available to them
-automatically since it defaults to `None`.
-
-**6 — Renumbering only**, covered above.
+The brief that started this task claimed `evidence` never carries a
+narrative `reason`/`basis`, only `conditions` — and warned that an
+earlier `{"reason", "basis"}` shape was fabricated test scaffolding not
+to be trusted. That's wrong as the repo stands: all 5 real strategies
+(`orb_strategy.py`, `gap_strategy.py`, `volume_spike_strategy.py`,
+`first_pullback_strategy.py`, `reversal_strategy.py`) populate
+`evidence.reason`/`evidence.basis` alongside `conditions`, and
+`strategy-engine-design.md` §4 confirms this is intentional (`reason`
+is meant "for display"). Built against the real shape, not the brief's
+claim — full account in `strategy-engine-design.md` §19 and
+`confirmed-decisions.md` #118.
 
 ## Files changed
 
-- `backend/app/strategy_engine/scoring_utils.py` — new.
-- `backend/app/strategy_engine/base_strategy.py` — `Opportunity.expected_horizon_minutes`.
-- `backend/app/feature_engine/engine.py` — `_update_gap` publishes `regular_open`.
-- `backend/app/strategy_engine/orb_strategy.py` — `scoring_utils` adoption + `expected_horizon_minutes`.
-- `backend/app/strategy_engine/gap_strategy.py` — `regular_open` read directly, `max_minutes_since_open`, `scoring_utils`, `expected_horizon_minutes`.
-- `backend/app/strategy_engine/volume_spike_strategy.py` — `min_absolute_volume`, `min_body_ratio`, `scoring_utils`, `expected_horizon_minutes`.
-- `backend/app/strategy_engine/first_pullback_strategy.py`, `reversal_strategy.py` — `scoring_utils` adoption only, no behavior change.
-- `backend/tests/test_scoring_utils.py` — new, 11 tests.
-- `backend/tests/test_gap_strategy.py` — +3 tests (now 18): window-expiry pure tests + an end-to-end stale-signal test.
-- `backend/tests/test_volume_spike_strategy.py` — +4 tests (now 22): absolute-floor and body-ratio pure tests, plus their end-to-end counterparts (thin-illiquid-baseline, wide-range-thin-body).
-- `backend/tests/test_base_strategy.py` — +1 test for the new field.
-- `backend/tests/test_orb_strategy.py` — assertion added to an existing test (no new test).
-- `backend/tests/test_feature_engine.py` — assertions added to three existing gap tests for `regular_open` (no new tests; one runs DB-free and passes here, two are DB-gated).
-- `docs/decisions/confirmed-decisions.md` — decision #111 appended (no rollover needed, file well under the size trigger).
-- `docs/decisions/INDEX.md` — row added for #111.
-- `docs/architecture/strategy-engine-design.md` — new §17 covering this change.
-- `docs/architecture/trading-intelligence-architecture.md` §8 — also fixed a stale claim found in passing: it still said "First Pullback and Reversal remain unbuilt" after decisions #109/#110 had already built them. Updated to reflect all five built strategies accurately.
+- `frontend/src/services/api-client.ts` — additive: `OpportunityWireShape`/`fetchOpportunities()`.
+- `frontend/src/hooks/useOpportunities.ts` — new.
+- `frontend/src/components/ai-panel/AIAnalysisPanel.tsx` — rewritten against the real shape.
+- `frontend/src/components/workspace/InfoTab.tsx` — `ConnectorContent` updated.
+- `frontend/src/mocks/opportunities.ts`, `frontend/src/types/intelligence.ts` — deleted (**zip can't delete — see TESTING.md, manual `rm` required**).
+- `docs/architecture/system-design.md` — §10.3's stale `OpportunityCreated` row fixed.
+- `docs/architecture/strategy-engine-design.md` — new §19, new D16, §12 updated.
+- `docs/decisions/confirmed-decisions.md`/`INDEX.md` — decision #118.
 
 ## Verified
 
-Full backend suite, before and after this entire change, in this
-session's own Postgres-free sandbox (fresh clone, includes decisions
-#107–#110): identical 40 pre-existing DB-connectivity failures, 119
-skipped, both unchanged; 346 passed vs. the 327-passed baseline
-immediately before this change — exactly these 19 new tests, zero
-regressions anywhere, including confirmation that folding First
-Pullback/Reversal into the `scoring_utils.py` extraction left their own
-(skipped, DB-gated) suites unaffected.
+`tsc -b`/`vite build` clean. Beyond that: real PostgreSQL provisioned,
+real app lifespan run in-process, real `Opportunity` objects published
+onto the real `EventBus`, read back and confirmed field-for-field
+matching over both `GET /intelligence/opportunities` and the
+`opportunity.new` WebSocket push (including a `status="waiting"` case
+with a real `wait_reason`). Full details, exact numbers: TESTING.md.
+Full backend suite re-run for a clean baseline: 596 passed, 2 failed,
+both pre-existing/unrelated (same two flaky tests decisions
+#114/#116/#117 already document) — confirms zero backend regressions
+from a change that touches zero backend files.
 
-**Not verified:** against a real local Postgres (none available in this
-session) — the two DB-gated `test_feature_engine.py` assertions for
-`regular_open`'s freeze/backfill behavior specifically need your own
-local run, same standing limitation every DB-gated file in this
-project's log already carries.
+**Not verified:** in an actual browser — no browser available in this
+sandbox, standing gap every delivery in this log notes.
 
 ## Left open, on purpose
 
-Everything else the design review raised — the exhaustion-vs-
-continuation ambiguity for Volume Spike, cooldown-vs-re-arm, restart
-persistence for strategy state, promoting the rolling volume baseline to
-Feature Engine, an explicit entry-price field on `Opportunity` — was
-deliberately left alone. Either they need real backtest/outcome data to
-resolve responsibly, or they're not costing anything by waiting. Full
-reasoning for each is in the review itself, not repeated here.
+- **D16** (`strategy-engine-design.md` §10) — whether to surface
+  `wait_expires_at`/a countdown for waiting Opportunities. Deferred:
+  no v1 strategy sets `allows_waiting=True` yet, so the field is
+  always `null` in real data today (same deferral trigger as D5).
+- `evidence.conditions`' generic `key=value` rendering doesn't do any
+  strategy-aware formatting (e.g. knowing `gap_pct` is a percentage,
+  `trend_score` is 0-100) — every value is just `.toFixed(2)` if
+  numeric. Minor, not promoted to a numbered open item; would need a
+  per-key formatting table that doesn't exist anywhere in this
+  codebase yet and wasn't worth inventing for this drop.
+- A real visual/browser check of the panel — see "Not verified" above.
 
 ## Next
 
-- First Pullback and Reversal's own `expected_horizon_minutes` values,
-  if you want them populated — that's a call for whichever thread picks
-  those files back up, not made here.
-- Momentum and VWAP remain the two unbuilt strategies from the planned
-  v1 set.
-- Your own local Postgres run for the two DB-gated `regular_open`
-  assertions above.
+- Your own visual check of the panel in a browser, ideally with a real
+  strategy actually firing (or the same in-process publish technique
+  this drop's own verification used, adapted to hit the frontend dev
+  server instead of just the API).
+- Whether `GeneralContent` (the market-wide Info tab view) should ever
+  get its own opportunities summary — explicitly out of this drop's
+  scope, not decided here either way.

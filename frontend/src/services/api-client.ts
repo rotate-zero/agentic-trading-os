@@ -217,6 +217,90 @@ export async function fetchFeatureSeries(
   return (await res.json()) as FeatureSeriesWireShape;
 }
 
+// Matches GET /intelligence/opportunities's response shape (confirmed
+// decision #114, Stage 2/D10) — a thin passthrough of
+// OpportunityCache.get_snapshot() (backend/app/trading_intelligence/
+// opportunity_cache.py). Field names/types below are copied directly from
+// the real Opportunity model (backend/app/strategy_engine/base_strategy.py),
+// re-verified against that file's current contents, NOT from
+// frontend/src/types/intelligence.ts's old Phase-5-placeholder shape —
+// that guessed shape (symbol/reason/suggested_entry/suggested_stop/
+// suggested_target/timestamp as flat top-level fields) never matched what
+// actually got built. Real, load-bearing differences: no `symbol` field
+// on the payload itself (it's the outer dict's key — see
+// OpportunityWireShape's own comment below); no `suggested_entry`
+// anywhere (Trade Planning Engine, which would compute one, isn't built);
+// `suggested_stop`/`suggested_target` are `structural_invalidation`/
+// `structural_target` — the price at which the strategy's own thesis is
+// falsified, not a refined trade-ready number (strategy-engine-design.md
+// §4); `reason` is NOT a top-level field — it lives nested inside
+// `evidence` alongside `conditions`/`basis` (same §4: `reason` is a
+// human-readable sentence GENERATED from `conditions` for display,
+// `conditions` is the literal MATCH-stage values Performance Intelligence
+// later queries). `confidence` is 0-100, not 0-1 (scoring_utils.py's
+// `_clamp` default range, confirmed against every real strategy's own
+// score_confidence()).
+export interface OpportunityEvidenceWireShape {
+  conditions: Record<string, number | string>;
+  // Present on every real v1 strategy as of decision #99/#111 (all 7
+  // populate both) — optional in the type anyway, since `Opportunity.
+  // evidence: dict` on the backend is untyped Python and nothing
+  // structurally guarantees a future strategy keeps setting either key.
+  reason?: string;
+  basis?: "live" | "closed";
+}
+
+export interface OpportunityWireShape {
+  strategy: string;
+  version: string;
+  direction: "BUY" | "SELL";
+  confidence: number; // 0-100
+  structural_invalidation: number;
+  structural_target: number;
+  expected_horizon_minutes?: number | null;
+  evidence: OpportunityEvidenceWireShape;
+  status: "potential" | "waiting" | "actionable" | "expired";
+  wait_reason?: string | null;
+  wait_expires_at?: string | null;
+  setup_detected_at: string;
+  confirmed_at?: string | null;
+  decided_at?: string | null;
+  // OpportunityCache's own wall-clock read of when IT received the
+  // OpportunityCreated event — deliberately separate from
+  // setup_detected_at/confirmed_at/decided_at above (all real domain
+  // timestamps, derived from features.candle_ts — see base_strategy.py's
+  // §7 backtest-safety invariant). Not the field this UI displays as
+  // "when" — see useOpportunities.ts for which one was picked and why.
+  received_at: string;
+}
+
+// {"symbols": {"<TICKER>": {"<strategy_name>": {...OpportunityWireShape}}}}
+// — get_snapshot()'s own shape, confirmed decision #114. A (symbol,
+// strategy) pair this process has never received an OpportunityCreated
+// for is simply absent (honest state over fabricated state, same
+// convention every other engine's get_snapshot() already follows) — this
+// is NOT pre-populated for every symbol/every registered strategy.
+export interface OpportunitiesSnapshotWireShape {
+  symbols: Record<string, Record<string, OpportunityWireShape>>;
+}
+
+/**
+ * GET /intelligence/opportunities — confirmed decision #114. `symbol`
+ * scopes to one ticker (same `?symbol=` convention fetchIntelligenceState
+ * already uses); omit to get every (symbol, strategy) pair this backend
+ * process currently has cached.
+ */
+export async function fetchOpportunities(symbol?: string): Promise<OpportunitiesSnapshotWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/opportunities?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/opportunities`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as OpportunitiesSnapshotWireShape;
+}
+
 // Matches GET /scanner/state's response shape (v1, on-demand — not the
 // continuous MarketActivityScanner docs/architecture/scanner-design.md
 // §5 describes, not built yet). `features` only ever carries whichever

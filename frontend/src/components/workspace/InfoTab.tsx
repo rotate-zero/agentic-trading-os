@@ -1,9 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import { LINK_CONNECTOR_IDS, type InfoConnectorMode } from "../../types/workspace";
 import { MOCK_TICKERS } from "../../mocks/tickers";
-import { generateMockOpportunities } from "../../mocks/opportunities";
 import { useLatestPrices } from "../../hooks/useLatestPrices";
-import { useLiveCandles } from "../../hooks/useLiveCandles";
+import { useOpportunities } from "../../hooks/useOpportunities";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -67,9 +66,11 @@ function GeneralContent() {
 }
 
 function ConnectorContent({ symbol }: { symbol: string }) {
-  const candles = useLiveCandles(symbol);
-  const opportunities = useMemo(() => generateMockOpportunities(symbol, candles), [symbol, candles]);
-  return <AIAnalysisPanel symbol={symbol} opportunities={opportunities} />;
+  // Real Strategy Engine wiring (decision #114/D10) replaces
+  // generateMockOpportunities — candles are no longer needed here at all,
+  // that mock was their only real consumer in this file.
+  const { opportunities, loading } = useOpportunities(symbol);
+  return <AIAnalysisPanel symbol={symbol} opportunities={opportunities} loading={loading} />;
 }
 
 export function InfoTab() {
