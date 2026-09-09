@@ -27,8 +27,11 @@ deferred this alongside `active_from`/`active_to`; this build closes it
 on its own, `active_from`/`active_to` remains separately deferred (see
 above). `app/strategy_engine/gate_conditions.py` holds the actual
 registry/check/validation — see that module's own docstring for the
-full v1-scope and extensibility reasoning. Two things worth stating
-here rather than only there:
+full v1-scope and extensibility reasoning, AND for the architectural
+rule decision #118 made explicit: `gate_conditions.py` and this class
+are the SOLE authority for interpreting `gate_conditions` — no
+strategy may independently interpret the dict or invent gate semantics
+of its own. Two things worth stating here rather than only there:
 
   1. **Every registered strategy's `gate_conditions` is validated once,
      at `StrategyScheduler.__init__` time, before anything else** —
@@ -45,10 +48,8 @@ here rather than only there:
      `momentum_strategy.py`, and `volume_spike_strategy.py` each already
      call `MarketClock.is_regular_session()` inline in their own GATE
      step (genuinely redundant with the new central check now — left in
-     place, per §2b's own text that `evaluate()`'s internal GATE stays
-     for strategy-specific preconditions, and per this task's own scope:
-     removing a strategy's own inline check is separate, later work, not
-     bundled here); `orb_strategy.py` never calls it directly but is
+     place FOR NOW; tracked for removal, §10 D16, not bundled into this
+     change); `orb_strategy.py` never calls it directly but is
      effectively self-gating anyway via `minutes_since_open()` returning
      0 whenever the market isn't open. But `first_pullback_strategy.py`,
      `reversal_strategy.py`, and `vwap_strategy.py` all declare
@@ -57,6 +58,16 @@ here rather than only there:
      that declared precondition was enforced by nothing at all. The
      central check below is these three strategies' only session gate,
      not a second layer on top of an existing one.
+  3. **Sole enforcement authority, decision #118.** `gate_conditions.py`
+     and this class are the ONLY code allowed to interpret
+     `gate_conditions` — a `Strategy` subclass may declare it on its own
+     `StrategyConfig`, but must never independently interpret the dict
+     or enforce a gate itself. The 4 strategies' own inline
+     `is_regular_session()` calls above are a pre-existing, tolerated
+     exception (they predate this rule), not a template — tracked for
+     removal in §10 D16 precisely so "session" has exactly one place it
+     can ever be interpreted. No strategy built after this point should
+     add a second one.
 
 **Why the live trigger is `MarketStateChanged`, not `FeaturesUpdated` —
 found by testing, not assumed up front.** The first version of this

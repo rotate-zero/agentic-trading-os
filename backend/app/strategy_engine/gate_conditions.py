@@ -7,6 +7,23 @@ market-condition precondition inside its own evaluate(), same "tunable
 numbers as data, pattern logic as code" split §3 already applies to
 thresholds, extended to cover gates too.
 
+ARCHITECTURAL RULE (made explicit, decision #118) — this module and
+StrategyScheduler are the ONLY code allowed to interpret
+gate_conditions. StrategyConfig.gate_conditions is declarative
+configuration, nothing more; StrategyScheduler (via the two functions
+below) is its sole enforcement authority. A Strategy subclass may
+declare gate_conditions on its own StrategyConfig, but must never
+independently interpret the dict, invent a new key's meaning, or
+enforce one itself — that would silently fork one condition into two
+possibly-divergent implementations, the exact failure mode a single
+shared registry exists to prevent. A strategy's own inline
+MarketClock.is_regular_session() call (4 of the 7 today — see decision
+#117's own finding) is a pre-existing, currently-tolerated exception,
+not a template: it predates this rule, is flagged as redundant, and is
+tracked for removal (§10 D16) precisely so it stops being a second
+place "session" could ever be interpreted differently. No NEW strategy
+should add another one.
+
 v1 SCOPE — supports exactly one key, "session": "regular". Verified
 directly against every one of the 7 built strategies' own
 default_config() (grepped, not assumed — see decision #117): all 7
