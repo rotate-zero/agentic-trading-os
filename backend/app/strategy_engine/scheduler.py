@@ -13,13 +13,50 @@ HERE" note on this exact module is what this file resolves.
 
 Explicitly OUT of scope, decided directly by Saqib and not silently
 resolved here:
-  - **`gate_conditions` (§2b)** — every registered strategy is called on
-    every matching trigger regardless of its config's `gate_conditions`.
-  - **`active_from`/`active_to`** — same treatment; `_default_registry()`
-    passes "now, at Scheduler construction time" as an honest default
-    with zero behavioral effect today.
+  - **`active_from`/`active_to`** — D14/decision #116, canonically closed:
+    `_default_registry()` passes "now, at Scheduler construction time" as
+    an honest default with zero behavioral effect today, and this module
+    must not compare `candle_ts` against either field. Do not reopen this
+    just because `gate_conditions` (below) is now enforced in the same
+    handler — they are separate items, closed on separate terms.
   - **Opportunity Engine ranking (§9)** — every `Opportunity` any strategy
     returns gets published, independently, with no dedup or ranking.
+
+**`gate_conditions` (§2b) — NOW enforced, decision #117.** D10 originally
+deferred this alongside `active_from`/`active_to`; this build closes it
+on its own, `active_from`/`active_to` remains separately deferred (see
+above). `app/strategy_engine/gate_conditions.py` holds the actual
+registry/check/validation — see that module's own docstring for the
+full v1-scope and extensibility reasoning. Two things worth stating
+here rather than only there:
+
+  1. **Every registered strategy's `gate_conditions` is validated once,
+     at `StrategyScheduler.__init__` time, before anything else** —
+     an unrecognized key or value raises `ValueError` and the Scheduler
+     fails to construct. This deliberately differs from the
+     `after_time`/`on_event` precedent just below ("accepted into the
+     registry but logged as unreachable") — see
+     `gate_conditions.py`'s own docstring for why an unrecognized gate
+     condition is a materially worse failure mode than an unwired
+     trigger kind, not the same one.
+  2. **This closes a real, currently-live gap for 3 of the 7 strategies,
+     not merely a redundancy for the other 4.** Checked directly against
+     every strategy file, not assumed: `gap_strategy.py`,
+     `momentum_strategy.py`, and `volume_spike_strategy.py` each already
+     call `MarketClock.is_regular_session()` inline in their own GATE
+     step (genuinely redundant with the new central check now — left in
+     place, per §2b's own text that `evaluate()`'s internal GATE stays
+     for strategy-specific preconditions, and per this task's own scope:
+     removing a strategy's own inline check is separate, later work, not
+     bundled here); `orb_strategy.py` never calls it directly but is
+     effectively self-gating anyway via `minutes_since_open()` returning
+     0 whenever the market isn't open. But `first_pullback_strategy.py`,
+     `reversal_strategy.py`, and `vwap_strategy.py` all declare
+     `gate_conditions={"session": "regular"}` and have **no session
+     check anywhere in their own `evaluate()`** — before this change,
+     that declared precondition was enforced by nothing at all. The
+     central check below is these three strategies' only session gate,
+     not a second layer on top of an existing one.
 
 **Why the live trigger is `MarketStateChanged`, not `FeaturesUpdated` —
 found by testing, not assumed up front.** The first version of this
@@ -136,6 +173,7 @@ from app.strategy_engine import (
     vwap_strategy,
 )
 from app.strategy_engine.base_strategy import Strategy
+from app.strategy_engine.gate_conditions import gate_conditions_satisfied, validate_gate_conditions
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +213,17 @@ class StrategyScheduler:
         self._strategies = (
             strategies if strategies is not None else _default_registry(datetime.now(timezone.utc))
         )
+
+        # gate_conditions validation (decision #117) — fails loudly,
+        # before anything else, for any strategy declaring a
+        # precondition this build can't actually check. See
+        # gate_conditions.py's own docstring, and this module's
+        # docstring's "gate_conditions — NOW enforced" section, for why
+        # this is a hard construction-time failure rather than a
+        # logged-and-continue warning (deliberately NOT the same
+        # treatment as the unwired-trigger-kind case just below).
+        for strategy in self._strategies:
+            validate_gate_conditions(strategy.name, strategy.config.gate_conditions)
 
         self._every_candle_by_timeframe: dict[str, list[Strategy]] = defaultdict(list)
         for strategy in self._strategies:
@@ -259,6 +308,33 @@ class StrategyScheduler:
             return
 
         for strategy in strategies:
+            # gate_conditions (§2b, decision #117) — evaluated centrally,
+            # BEFORE evaluate() is even called, per §2b's own text. Own
+            # try/except, isolated from evaluate()'s below, so a bug in
+            # the gate check itself can't cut off every strategy after
+            # it in this loop any more than a bug inside evaluate() can
+            # (same reasoning as the existing isolation just below).
+            try:
+                if not gate_conditions_satisfied(strategy.config.gate_conditions, market_state.candle_ts):
+                    logger.debug(
+                        "StrategyScheduler skipping %s for %s @ %s — gate_conditions %r not "
+                        "satisfied for candle_ts=%s (honest gate skip, not an error)",
+                        strategy.name,
+                        symbol,
+                        timeframe,
+                        strategy.config.gate_conditions,
+                        market_state.candle_ts,
+                    )
+                    continue
+            except Exception:  # noqa: BLE001 — a gate-check bug must not stop the rest either
+                logger.exception(
+                    "StrategyScheduler: gate_conditions check raised for %s on %s — skipped, "
+                    "other strategies this candle are unaffected",
+                    strategy.name,
+                    symbol,
+                )
+                continue
+
             try:
                 opportunity = await strategy.evaluate(symbol, market_state, features, context)
             except Exception:  # noqa: BLE001 — one bad strategy must not stop the rest

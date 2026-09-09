@@ -29,12 +29,27 @@ Strategy Scheduler tests (decision #112/#114, strategy-engine-design.md
      strategy's OWN MATCH conditions actually firing through this full
      stack end-to-end. Each strategy's test file already proves its
      MATCH/SCORE logic correct against hand-built inputs.
+
+  3. gate_conditions enforcement (§2b, decision #117) — registration-time
+     validation (raises for an unrecognized key/value, including a
+     regression guard that the real 7-strategy registry stays valid),
+     the per-candle skip against a REAL MarketClock (never mocked —
+     gate_conditions.py itself never stands MarketClock in for anything)
+     using real pre-market/regular/after-hours timestamps, per-strategy
+     isolation (an ungated strategy alongside a gated one; a gate-check
+     exception not blocking the strategy after it), and one DB-gated
+     real-engine end-to-end test proving the actual failure mode this
+     closes against REAL MarketStateEngine/ContextEngine output, not a
+     hand-built MarketState. See test_gate_conditions.py for the
+     underlying registry/check functions' own direct unit tests
+     (independent of any Scheduler wiring).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -55,6 +70,15 @@ from app.strategy_engine.base_strategy import Opportunity, ScheduleTrigger, Stra
 from app.strategy_engine.scheduler import _CROSS_SYMBOL_SENTINEL, StrategyScheduler, _default_registry
 
 _TS = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
+
+# Same calendar date as _TS above (Monday 2026-08-10, a real non-holiday
+# trading weekday) but given directly in ET so it's unambiguous which
+# Session each one falls in, for gate_conditions tests (decision #117).
+# _TS itself (14:00 UTC = 10:00 ET) is already inside regular session —
+# these two are deliberately outside it.
+_ET = ZoneInfo("America/New_York")
+_PRE_MARKET_TS = datetime(2026, 8, 10, 7, 0, tzinfo=_ET)  # 07:00 ET — pre-market
+_AFTER_HOURS_TS = datetime(2026, 8, 10, 17, 0, tzinfo=_ET)  # 17:00 ET — after-hours
 
 
 # --- shared fakes/stubs ------------------------------------------------------
@@ -189,6 +213,52 @@ def test_unsupported_trigger_kind_registered_but_never_dispatched(caplog: pytest
     assert odd not in scheduler._every_candle_by_timeframe.get("1m", [])
 
 
+# --- gate_conditions registration validation (decision #117) ----------------
+
+
+def _stub_with_gate_conditions(name: str, gate_conditions: dict, **kwargs) -> _StubStrategy:
+    """_StubStrategy's own StrategyConfig has no gate_conditions kwarg
+    (see its docstring) — build one directly and swap it in, same
+    "construct then override .config" shape as no other stub needs
+    today."""
+    stub = _StubStrategy(name, **kwargs)
+    stub.config = StrategyConfig(
+        strategy_name=name, version="stub_v1", params={}, gate_conditions=gate_conditions, active_from=_TS
+    )
+    return stub
+
+
+def test_construction_raises_for_unrecognized_gate_condition_key():
+    """Fails LOUDLY at registration (decision #117), not silently at
+    eval time — see gate_conditions.py's own docstring for the full
+    reasoning. Deliberately differs from the after_time/on_event
+    precedent just above (registered-but-unreachable, no exception)."""
+    bad = _stub_with_gate_conditions("Bad", {"vix_min": 20})
+    with pytest.raises(ValueError, match="vix_min"):
+        StrategyScheduler(_FakeBus(), strategies=[bad])
+
+
+def test_construction_raises_naming_the_offending_strategy():
+    bad = _stub_with_gate_conditions("VixGated", {"vix_min": 20})
+    with pytest.raises(ValueError, match="VixGated"):
+        StrategyScheduler(_FakeBus(), strategies=[bad])
+
+
+def test_construction_succeeds_for_the_only_real_condition():
+    ok = _stub_with_gate_conditions("OK", {"session": "regular"})
+    StrategyScheduler(_FakeBus(), strategies=[ok])  # must not raise
+
+
+def test_construction_succeeds_for_the_real_seven_strategy_registry():
+    """Regression guard: every one of the 7 real strategies' own
+    default_config() gate_conditions must stay something this module
+    actually recognizes. If a future strategy build adds a new
+    gate_conditions key without also teaching gate_conditions.py about
+    it, THIS is the test that should start failing, at construction
+    time — not a runtime surprise once the app is live."""
+    StrategyScheduler(_FakeBus(), strategies=_default_registry(_TS))  # must not raise
+
+
 # --- _on_features_updated: caching only, never evaluates (pure) -------------
 
 
@@ -276,6 +346,120 @@ async def test_market_state_changed_skips_when_context_absent(monkeypatch: pytes
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
     assert stub.calls == []
     assert fake_bus.published == []
+
+
+# --- gate_conditions enforcement, per-candle (decision #117) ----------------
+
+
+async def test_gated_strategy_skipped_when_candle_outside_regular_session(monkeypatch: pytest.MonkeyPatch):
+    """The core failure mode this closes (§2b): a strategy declaring
+    gate_conditions={"session": "regular"} must not have evaluate()
+    called when the triggering candle's own timestamp falls outside
+    regular session — against a REAL MarketClock check
+    (gate_conditions.py never mocks MarketClock), not a stand-in."""
+    _install_fake_context(monkeypatch)
+    fake_bus = _FakeBus()
+    gated = _stub_with_gate_conditions("Gated", {"session": "regular"}, result=_make_opportunity("Gated"))
+    scheduler = StrategyScheduler(fake_bus, strategies=[gated])
+
+    await scheduler._on_features_updated(_features_updated_envelope("AAPL", candle_ts=_PRE_MARKET_TS))
+    await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL", candle_ts=_PRE_MARKET_TS))
+
+    assert gated.calls == []  # evaluate() never reached — gated out before it
+    assert fake_bus.published == []
+
+
+async def test_gated_strategy_fires_when_candle_inside_regular_session(monkeypatch: pytest.MonkeyPatch):
+    _install_fake_context(monkeypatch)
+    fake_bus = _FakeBus()
+    gated = _stub_with_gate_conditions("Gated", {"session": "regular"}, result=_make_opportunity("Gated"))
+    scheduler = StrategyScheduler(fake_bus, strategies=[gated])
+
+    # default candle_ts=_TS (10:00 ET) — regular session
+    await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
+    await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
+
+    assert len(gated.calls) == 1
+    assert len(fake_bus.published) == 1
+
+
+async def test_strategy_with_no_gate_conditions_never_blocked_by_this_mechanism(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Empty gate_conditions (StrategyConfig's own default — no kwarg
+    needed here) means no restriction declared, never "block
+    everything" — proved against the SAME after-hours candle_ts that
+    blocks the gated strategy above, so this isn't just "gating never
+    runs," it's "gating correctly does nothing for an ungated
+    strategy.\""""
+    _install_fake_context(monkeypatch)
+    fake_bus = _FakeBus()
+    ungated = _StubStrategy("Ungated", result=_make_opportunity("Ungated"))  # gate_conditions={} by default
+    scheduler = StrategyScheduler(fake_bus, strategies=[ungated])
+
+    await scheduler._on_features_updated(_features_updated_envelope("AAPL", candle_ts=_AFTER_HOURS_TS))
+    await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL", candle_ts=_AFTER_HOURS_TS))
+
+    assert len(ungated.calls) == 1
+    assert len(fake_bus.published) == 1
+
+
+async def test_gate_check_is_per_strategy_not_a_blanket_skip(monkeypatch: pytest.MonkeyPatch):
+    """Both strategies watch the same candle; only the one declaring
+    the session gate is affected by an outside-session candle_ts."""
+    _install_fake_context(monkeypatch)
+    fake_bus = _FakeBus()
+    gated = _stub_with_gate_conditions("Gated", {"session": "regular"}, result=_make_opportunity("Gated"))
+    ungated = _StubStrategy("Ungated", result=_make_opportunity("Ungated"))
+    scheduler = StrategyScheduler(fake_bus, strategies=[gated, ungated])
+
+    await scheduler._on_features_updated(_features_updated_envelope("AAPL", candle_ts=_PRE_MARKET_TS))
+    await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL", candle_ts=_PRE_MARKET_TS))
+
+    assert gated.calls == []
+    assert len(ungated.calls) == 1
+    assert {env.payload["strategy"] for env in fake_bus.published} == {"Ungated"}
+
+
+def _raising_gate_check(gate_conditions: dict, _candle_ts) -> bool:
+    """Stands in for gate_conditions_satisfied() — raises only for a
+    strategy that actually declares a condition (broken_gate's
+    {"session": "regular"}), not for healthy's empty {} (StrategyConfig's
+    own default), so this exercises "one strategy's gate check blows up"
+    rather than "every gate check blows up.\""""
+    if gate_conditions:
+        raise RuntimeError("deliberate gate-check failure for the isolation test")
+    return True
+
+
+async def test_gate_check_exception_does_not_block_other_strategies(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """Same isolation guarantee test_one_strategy_raising_does_not_
+    block_the_others already proves for evaluate() itself, for the gate
+    check: a bug raised while checking one strategy's gate_conditions
+    must not stop the strategy after it in the loop."""
+    _install_fake_context(monkeypatch)
+    fake_bus = _FakeBus()
+    broken_gate = _stub_with_gate_conditions(
+        "BrokenGate", {"session": "regular"}, result=_make_opportunity("BrokenGate")
+    )
+    healthy = _StubStrategy("Healthy", result=_make_opportunity("Healthy"))
+    scheduler = StrategyScheduler(fake_bus, strategies=[broken_gate, healthy])
+
+    import app.strategy_engine.scheduler as scheduler_module
+
+    monkeypatch.setattr(scheduler_module, "gate_conditions_satisfied", _raising_gate_check)
+
+    await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
+    with caplog.at_level(logging.ERROR):
+        await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
+
+    assert broken_gate.calls == []  # gate check raised — evaluate() never reached
+    assert len(healthy.calls) == 1  # NOT blocked by broken_gate's gate-check exception
+    assert {env.payload["strategy"] for env in fake_bus.published} == {"Healthy"}
+    assert "gate_conditions check raised" in caplog.text
+    assert "BrokenGate" in caplog.text
 
 
 async def test_matching_strategy_gets_called_and_publishes(monkeypatch: pytest.MonkeyPatch):
@@ -489,6 +673,52 @@ async def test_scheduler_end_to_end_real_seven_strategies_no_crash_no_fabricated
         await asyncio.sleep(0.6)
 
         assert received == []  # honest: nothing legitimately fired, nothing fabricated either
+    finally:
+        await scheduler.stop()
+        await context_engine.stop()
+        await bus.stop()
+        await market_state_engine.stop()
+        _clean_test_symbol(ticker)
+
+
+async def test_scheduler_end_to_end_gate_conditions_blocks_strategy_outside_regular_session():
+    """The real-engine proof decision #117's task itself demanded: a
+    strategy whose config declares {"session": "regular"} does NOT get
+    evaluate() called when the triggering candle's timestamp falls
+    outside regular session — against a REAL MarketStateEngine/
+    ContextEngine/MarketClock, not a hand-built stand-in for any of
+    them. `stub`'s own `result` is a real, well-formed Opportunity — if
+    the gate weren't actually enforced here, this test would see it
+    published."""
+    ticker = "TESTSCH3"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    market_state_engine = MarketStateEngine(bus)
+    market_state_engine.start()
+    context_engine = ContextEngine(bus, providers=[_FakeCalendarProvider()], symbol_providers=[])
+    context_engine.start()
+    _install_engine_singletons(market_state_engine, context_engine)
+
+    gated = _stub_with_gate_conditions("Gated", {"session": "regular"}, result=_make_opportunity("Gated"))
+    scheduler = StrategyScheduler(bus, strategies=[gated])
+    scheduler.start()
+
+    received: list[EventEnvelope] = []
+    bus.subscribe(EventType.OPPORTUNITY_CREATED, lambda env: received.append(env))
+
+    try:
+        await context_engine.evaluate_all()
+        await context_engine.evaluate_for_symbol(ticker)
+        premarket_ts = datetime(2026, 8, 10, 7, 0, tzinfo=ZoneInfo("America/New_York"))
+        payload = FeatureSet(
+            timeframe="1m", candle_ts=premarket_ts, close=100.0, features={"sma_20_slope_angle": 10.0}
+        )
+        await bus.publish(make_envelope(EventType.FEATURES_UPDATED, payload, symbol=ticker))
+        await asyncio.sleep(0.6)
+
+        assert gated.calls == []  # gated out centrally, before evaluate() — real MarketClock, real candle_ts
+        assert received == []
     finally:
         await scheduler.stop()
         await context_engine.stop()
