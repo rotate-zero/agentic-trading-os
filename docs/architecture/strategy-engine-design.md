@@ -306,6 +306,8 @@ Persists to the `strategy_outcomes` table (renamed from `strategy_performance` �
 
 **v1 feedback loop is human-reviewed, not automatic — a direct decision, not a default assumed.** Performance Intelligence surfaces evidence; Saqib reviews and decides whether to promote a new `StrategyConfig` version. Automatic reweighting is a real future direction (trading-intelligence-architecture.md §14 already names "reweight or retire" as Performance Intelligence's eventual feedback into Strategy Engine) but isn't built now — same "empirical before architectural commitment" discipline already applied to Polygon depth, IBKR access, and Finnhub concurrency. Trigger to revisit: enough closed trades per `StrategyConfig` version that a reweight isn't noise.
 
+**Two of the three query types above are built — decision #122, `app/trading_intelligence/performance_queries.py`.** `get_win_rate_by_hour()` and `get_expectancy_by_session_type()` (one concrete regime dimension, not regime analytics generally). "Parameter sensitivity" stays a query, not a field, with no implementation yet — decision #122's own entry states why.
+
 ---
 
 ## 6. Decision Engine and Governor — two different questions over the same evidence

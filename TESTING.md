@@ -1,177 +1,150 @@
-# TESTING.md — opportunity-engine-v1-conflict-view (decision #121)
+# Testing — Performance Intelligence's read-side query layer (decision #122)
 
-A deliberately narrow, non-scoring read-side view over
-`OpportunityCache.get_snapshot()`: per symbol, classifies 2+ currently
-cached strategies as `agreement` (all one direction) or `conflict`
-(BUY and SELL both present). **This is NOT the Opportunity Engine and
-does NOT resolve D4** (`strategy-engine-design.md` §10) — D4 stays
-explicitly OPEN. Full reasoning: `docs/decisions/confirmed-decisions.md`
-#121.
+This file is a fresh delete-first replacement, scoped to this delivery only
+(the two `GROUP BY` query functions over `strategy_outcomes`). It supersedes
+whatever `TESTING.md` existed before this change; look at `docs/decisions/`
+for the history of prior deliveries' own validation write-ups.
 
-## Decision-number collision — read this first
+## What this delivery touched
 
-This task's own prompt re-checked the log tail immediately before
-writing and found #119 latest, #120 free — same as the sibling
-persistence-layer track's prompt, at the same time. **The sibling
-track's push (Performance Intelligence's `strategy_outcomes`/
-`backtests` persistence layer) landed on `main` first and claimed
-#120.** This delivery is built against a fresh pull of that already-
-merged state and renumbers its own entry to **#121**. Same category of
-collision this log already documents at #98/#99, #111/#112, and
-#114/#115 — noted explicitly here and in the decision entry itself,
-not silently renumbered.
+- **New:** `backend/app/trading_intelligence/performance_queries.py`
+- **New:** `backend/tests/test_performance_queries.py`
+- `docs/decisions/confirmed-decisions.md` (decision #122 appended)
+- `docs/decisions/INDEX.md` (matching row appended)
+- `docs/architecture/strategy-engine-design.md` (small §5 pointer only —
+  locked schema untouched)
+- This file
 
-No functional collision: `diff -rq` against a freshly re-pulled clone
-confirms this delivery's footprint (`opportunity_view.py`,
-`test_opportunity_view.py`, this file, the D4 row note, the two
-decision-log files) shares no file with #120's own
-(`app/models/trading_intelligence.py`, `app/schemas/performance.py`,
-`app/trading_intelligence/performance.py`, migration `0008`,
-`app/db/base.py`).
+Confirmed by `diff -rq` against a freshly-pulled, untouched second clone
+(`/home/claude/baseline-clone` in this session) immediately before writing
+this file: no other file differs (modulo `__pycache__`/`.pytest_cache` build
+artifacts, which aren't part of the repo). In particular, `app/
+trading_intelligence/performance.py`, `backend/tests/
+test_performance_intelligence.py`, `app/api/routes/intelligence.py`,
+`app/models/trading_intelligence.py`, `app/schemas/performance.py`,
+`app/trading_intelligence/opportunity_view.py`, and everything under
+`frontend/` are all untouched — confirmed, not assumed.
 
-## What changed
+## Environment
 
-- `backend/app/trading_intelligence/opportunity_view.py` — **new.**
-  - `compute_opportunity_conflicts(snapshot: dict) -> dict` — pure
-    function. Takes exactly `OpportunityCache.get_snapshot()`'s shape
-    (`{"symbols": {ticker: {strategy_name: {...Opportunity fields,
-    "received_at": ...}}}}`) and returns
-    `{"agreements": {...}, "conflicts": {...}}`.
-  - `get_opportunity_conflicts(symbol: str | None = None) -> dict` —
-    thin wrapper, calls `get_opportunity_cache().get_snapshot(symbol)`
-    then delegates to the pure function above. This is the one call
-    site a future route would use, unchanged.
-  - No new state, no singleton — nothing added to `main.py`'s lifespan
-    or `conftest.py`'s singleton-reset fixture, since this module owns
-    nothing to start/stop/reset.
+Real local PostgreSQL 16, matching the project's actual `postgres:16`
+image (`docker-compose.yml`) — provisioned directly in this sandbox via
+`apt-get install postgresql postgresql-contrib` (Docker itself isn't
+available in this sandbox; this is a native local server, not a
+container, but it is genuinely real Postgres, not a mock or SQLite
+substitute). Role/database created to match `app/core/config.py`'s actual
+defaults exactly (`trading`/`trading`@`localhost:5432`/`trading_workspace`),
+so no environment-variable overrides were needed. Schema built with
+`alembic upgrade head` (all 8 migrations, through `0008_strategy_outcomes_
+and_backtests.py`) — never a hand-built schema.
 
-- `backend/tests/test_opportunity_view.py` — **new, 16 tests, all
-  DB-free.**
+Backend Python dependencies installed from `backend/requirements.txt`.
 
-- `docs/architecture/strategy-engine-design.md` — **modified.** §10's
-  D4 row gets a note pointing to decision #121 and this capability.
-  **D4 itself is NOT marked resolved** — it remains "Still deliberately
-  not decided." (References decision #121, not #120 — updated to match
-  the renumbering above.)
+## Before this change (baseline)
 
-- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md`
-  — **modified.** New entry **#121** (not #120 — see collision note
-  above), inserted after the sibling track's own #120 entry.
+Full suite run against a freshly migrated database:
 
-- **Not touched, confirmed by diff against a freshly re-pulled clone:**
-  `opportunity_cache.py`, its `get_snapshot()` contract,
-  `state_snapshot.py`, `scheduler.py`, `gate_conditions.py`, any
-  `strategy_engine/*_strategy.py` file, `strategy_outcomes`/`backtests`,
-  `app/models/trading_intelligence.py`, `app/schemas/performance.py`,
-  `app/trading_intelligence/performance.py`, migration `0008`,
-  `app/db/base.py`, `app/api/routes/intelligence.py`. `StrategyOutcome`
-  is not read anywhere in this module — also unrelated to #120's own
-  new open item D17 (a `strategy_outcomes` nullability gap).
+```
+617 passed, 2 failed in 46.05s
+```
 
-## Classification rule (mutually exclusive, per symbol)
+Both failures matched decision #119's documented flaky cluster exactly:
+`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_
+warming_up` and `test_intelligence_routes.py::test_daily_levels_carry_
+level_interaction_once_touched`. Total (619) matches the decision-log's
+own running arithmetic exactly: 598 (#117/#118 baseline) − 3 (#119's
+removed tests) + 8 (#120's new tests) + 16 (#121's new tests) = 619.
 
-- 0 or 1 strategy currently cached for a symbol → absent from **both**
-  `agreements` and `conflicts` — honest absence, not a false negative.
-- 2+ strategies, all one `direction` → one `agreements` entry.
-- 2+ strategies, both `BUY` and `SELL` present → **one** `conflicts`
-  entry covering every strategy for that symbol, grouped by direction
-  (`by_direction["BUY"]`, `by_direction["SELL"]`) — a 2-BUY-1-SELL
-  symbol is never split into a 2-agreement plus a separate anomaly.
-- An entry with a missing/malformed `direction` is excluded from that
-  symbol's classification (logged at `debug`), not a crash.
+## Implementation, sanity-checked against real Postgres before the formal suite
 
-`confidence`/`setup_detected_at` are **passthrough only** — copied
-verbatim per strategy, never averaged, compared, or used to rank/select
-a "winner." No score, weight, or priority of any kind is computed.
+Both query builders' compiled SQL were printed and inspected directly —
+confirmed real `entry_filled_at AT TIME ZONE :market_timezone` and real
+`context_at_entry ->> :session_type` extraction, not a Python-side
+equivalent. Then exercised end-to-end against real data (synthetic rows
+via the real `record_strategy_outcome()` write path): correct hour-of-day
+bucketing across a DST-live September date, breakeven correctly excluded
+from win count, the honest `None` group for a missing `session_type` key,
+backtest isolation, empty-result handling, and the version-filter guard
+all verified manually before the formal pytest suite was written.
 
-## Terminology note
+## New tests — `backend/tests/test_performance_queries.py`
 
-`OpportunityCache` is status-blind (never reads `Opportunity.status`)
-and has no TTL/purge — it retains the LAST `Opportunity` per
-`(symbol, strategy)` indefinitely. This view inherits that exactly and
-deliberately says "currently cached," never "live," in its own
-docstring and output — a conflict reported here could be two strategies
-that fired on the same candle, or two that fired hours apart with
-neither having re-fired since. Not "fixed" here — that would mean
-changing `OpportunityCache`'s own retention/status contract, out of
-this task's scope.
+8 new tests, all synthetic `StrategyOutcome`s written through the real
+`record_strategy_outcome()` write path (never a raw SQL insert), all run
+against real Postgres:
 
-## Route
+1. `test_empty_table_returns_empty_list_for_both_queries`
+2. `test_win_rate_by_hour_groups_correctly_and_computes_exact_win_rate`
+3. `test_expectancy_by_session_type_groups_correctly_and_computes_exact_average`
+4. `test_expectancy_by_session_type_groups_missing_key_as_honest_none`
+5. `test_backtest_isolation_never_blends_live_and_backtest`
+6. `test_strategy_version_isolation_does_not_blend_versions`
+7. `test_strategy_name_filter_excludes_other_strategies`
+8. `test_strategy_version_without_strategy_name_raises_value_error`
 
-**Intentionally skipped.** No route added to
-`app/api/routes/intelligence.py` — at the time this task's route
-decision was made, that file was a plausible collision point with the
-sibling `strategy_outcomes`/`backtests` persistence track working in
-parallel, and decision #115 in this log already documents this exact
-failure mode once (two sessions' concurrent edits to a shared file, one
-silently dropped on merge). In the event, #120's own landed delivery
-didn't touch `intelligence.py` either — but that wasn't knowable when
-this task's own decision was made, so skipping was still the right call
-given the information available at the time. `get_opportunity_conflicts()`
-is ready to be called by a route whenever one is added later.
+Run in isolation, 3 independent times, freshly cleaned between tests via
+an autouse fixture: **16/16 passed every time** (this file's 8 plus
+`test_performance_intelligence.py`'s existing 8, confirming the untouched
+write-path suite still passes cleanly alongside the new one).
 
-## Manual merge notes
+```
+16 passed in 0.86s
+16 passed in 0.90s
+16 passed in 0.99s
+```
 
-None. This delivery's only footprint is two new files
-(`opportunity_view.py`, `test_opportunity_view.py`) plus three doc
-files (`strategy-engine-design.md`, `confirmed-decisions.md`,
-`INDEX.md`) — no shared application file was touched, so there is no
-insertion point to manually merge, and no interaction with #120's own
-already-landed files.
+No test for a NULL `realized_r` population: checked directly before
+writing this suite — `StrategyOutcomeRecord.realized_r` is
+`Numeric(10, 4), nullable=False` (ORM) and `StrategyOutcome.realized_r`
+is `float` with no default and no `| None` (Pydantic) — there is no code
+path that can produce a NULL-`realized_r` row via the real write path, so
+there's no NULL policy to prove.
 
-**Housekeeping note, not acted on unilaterally:** `confirmed-
-decisions.md` is now a little over 97KB, approaching this project's own
-~100KB dated-archive rollover threshold. Worth a rollover pass soon —
-not done as part of this delivery since that's a structural change
-outside this task's own scope.
+## After this change
 
-## Test suite — before/after, real local Postgres, against the merged-upstream state
+Full suite re-run twice, each time against a **freshly dropped and
+recreated** database (this project's own established practice for
+avoiding order-dependent failures, per decision #119):
 
-Environment: PostgreSQL 16 provisioned directly in this session
-(`apt-get install postgresql`), `CREATE USER trading ... SUPERUSER`,
-`CREATE DATABASE trading_workspace OWNER trading`, `alembic upgrade
-head` (now through migration `0008`, the sibling track's own
-`strategy_outcomes`/`backtests` tables). DB wiped and recreated between
-every run (this project's own established practice for avoiding
-order-dependent failures), against a **freshly re-pulled** second clone
-(post-#120, pre-this-task) for the "before" side — not the stale
-pre-#120 clone this delivery was originally verified against before the
-git update landed.
+```
+Run 1: 623 passed, 4 failed in 45.42s
+Run 2: 624 passed, 3 failed in 45.33s
+```
 
-**Before (freshly re-pulled clone, post-#120), two independent runs:**
-- Run 1: 603 total, 601 passed, 2 failed
-- Run 2: 603 total, 601 passed, 2 failed
-- Failures both runs, identical: the known pre-existing flaky pair from
-  decisions #114/#116/#117/#118/#119 —
-  `test_vwap_publishes_even_while_sma_is_still_warming_up`,
-  `test_daily_levels_carry_level_interaction_once_touched`.
+Both runs' totals are 627 — exactly 619 (baseline) + 8 (this delivery's
+new tests), confirming zero tests were silently lost or duplicated.
 
-**After (this delivery, on top of the merged-upstream state), two
-independent runs:**
-- Run 1: 619 total, 617 passed, 2 failed
-- Run 2: 619 total, 617 passed, 2 failed
-- Failures both runs: the **same** known flaky pair, same test names —
-  confirmed by diffing failing test IDs directly against the
-  freshly-re-pulled-clone runs, not a new failure mode.
-- 619 total = 603 baseline + 16 new `test_opportunity_view.py` tests,
-  exactly.
+Every failure across both runs is a member of decision #119's documented
+four-test flaky cluster, confirmed by name against that entry's full text
+(not just `INDEX.md`'s summary row) rather than assumed:
 
-**New tests in isolation**, run 3 times independently:
-`test_opportunity_view.py` — 16/16 passed every run, zero flakiness.
-Combined with the existing opportunity-adjacent tests
-(`test_opportunity_cache.py`, `test_intelligence_routes.py -k
-opportunit`) — 26/26 passed every run, zero flakiness.
+- `test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+- `test_feature_engine.py::test_feature_engine_backfills_from_persisted_history_on_cold_start`
+- `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
+- `test_intelligence_routes.py::test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction`
 
-**Zero regressions**, and zero interaction with #120's own new tests
-(`test_performance_intelligence.py`) — not run as part of this
-delivery's own isolated checks, but included and passing in every
-full-suite run above. `diff -rq` against the freshly-re-pulled clone
-(excluding `.pytest_cache`) confirms exactly the 5 files listed above
-changed — nothing else, and nothing belonging to #120.
+None of these touch `strategy_outcomes`, `performance_queries.py`, or
+anything else this delivery changed — #119's own entry already traced
+each to Feature Engine cold-start/timing races with "no code path
+anywhere near `strategy_engine/`," and this delivery doesn't touch that
+code either. Consistent with #119's own description of this cluster
+flickering "between 1-3 failing per run depending on execution order" —
+run 1 surfaced all 4, run 2 surfaced 3; the baseline run (before this
+change, above) happened to surface only 2. **Zero new/unexpected
+failures in any run. Zero regressions.**
 
-## D4 status
+One incidental note, recorded honestly rather than glossed over: mid-session,
+this sandbox's local Postgres process stopped on its own between two
+"before/after" run batches (surfaced as a connection-refused error on the
+next test invocation) and was restarted with `service postgresql start` —
+the database and schema were intact afterward (same data directory, no
+data loss). This is a sandbox-process artifact, not a test or migration
+failure — the same category decision #116 already recorded once before
+("a Postgres-availability artifact of that session's sandbox, not a
+regression").
 
-**D4 remains OPEN.** Nothing in this delivery decides, narrows, or
-implies a resolution to the "Candidate Selection Score" question.
-`strategy-engine-design.md` §10's D4 row states this explicitly and
-points to decision #121 (not #120).
+## Area actually changed, verified in isolation
+
+`app/trading_intelligence/performance_queries.py` and `backend/tests/
+test_performance_queries.py` together, run 3 independent times against a
+freshly cleaned table each time: **100% stable, zero flakiness observed.**
