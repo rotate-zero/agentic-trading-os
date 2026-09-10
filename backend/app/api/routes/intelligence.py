@@ -377,3 +377,91 @@ async def get_opportunities_snapshot(symbol: str | None = Query(None)) -> dict[s
     from app.trading_intelligence.opportunity_cache import get_opportunity_cache
 
     return get_opportunity_cache().get_snapshot(symbol)
+
+
+@router.get("/strategy-outcomes")
+async def get_strategy_outcomes(limit: int = Query(50, le=500)) -> dict[str, Any]:
+    """
+    Decision #122 — raw recent-rows observability into `strategy_outcomes`
+    (decision #89/#120), the same "make a built-but-unwired capability
+    visible outside of tests" purpose GET /opportunities already served
+    for OpportunityCache (decision #114).
+
+    Deliberately NOT an aggregate/statistic — that's a query-layer concern
+    (`app/trading_intelligence/performance.py`, a separate, still-in-
+    flight parallel track as of this delivery) this route does not import
+    from or depend on. This is "show me what's actually in the table,"
+    most recent `exit_filled_at` first, capped by `limit` — same
+    `Query(default, le=cap)` shape GET /series already uses for `count`,
+    not GET /opportunities' shape (which has no such param at all).
+
+    Rows are validated through the existing `schemas.performance.
+    StrategyOutcome` Pydantic contract (`model_validate(row,
+    from_attributes=True)`) rather than a parallel response model —
+    that's the paired contract decision #120 already built for exactly
+    this ORM table, and reusing it (rather than hand-mapping fields a
+    second time) is the same "don't reinvent an adjacent decision's own
+    shape" posture GET /opportunity-conflicts below takes toward
+    `opportunity_view.py`.
+
+    `strategy_outcomes` has zero real rows in production today (no
+    Execution Engine/Position Monitor writes to it yet) — an empty table
+    returns `{"outcomes": []}`, 200, not an error. Honest absence, same
+    convention every get_snapshot()/route in this file already follows.
+
+    Import is local to this function, not hoisted to this file's
+    top-of-file import block — same collision-avoidance reasoning GET
+    /opportunities' own docstring gives above (decision #114): this
+    route and GET /opportunity-conflicts below are this delivery's only
+    touch to this file, appended as a single additive block.
+    """
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.trading_intelligence import StrategyOutcomeRecord
+    from app.schemas.performance import StrategyOutcome
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            select(StrategyOutcomeRecord)
+            .order_by(StrategyOutcomeRecord.exit_filled_at.desc())
+            .limit(limit)
+        ).scalars().all()
+    finally:
+        session.close()
+
+    outcomes = [
+        StrategyOutcome.model_validate(row, from_attributes=True).model_dump(mode="json")
+        for row in rows
+    ]
+    return {"outcomes": outcomes}
+
+
+@router.get("/opportunity-conflicts")
+async def get_opportunity_conflicts_view(symbol: str | None = Query(None)) -> dict[str, Any]:
+    """
+    Decision #122 — live observability into `opportunity_view.py`'s
+    co-occurrence/conflict view (decision #121), same "make a built-but-
+    unwired capability visible outside of tests" purpose as GET
+    /strategy-outcomes above and GET /opportunities before it.
+
+    A genuinely thin wrapper — `get_opportunity_conflicts()` (decision
+    #121) already IS the read contract a route should call; this adds no
+    logic, reshaping, or filtering of its own. `symbol` optional, same
+    convention as GET /opportunities/GET /market-state/GET /context:
+    "what's true about anything" by default, narrowable to one ticker.
+
+    Response shape is exactly `get_opportunity_conflicts()`'s own
+    `{"agreements": {...}, "conflicts": {...}}` — see that function's own
+    docstring (and `compute_opportunity_conflicts()`'s, which it wraps)
+    for the full shape and the classification rules behind it. Nothing
+    here duplicates that logic; a change to the conflict/agreement rules
+    belongs in `opportunity_view.py`, never here.
+
+    Import is local to this function — see GET /strategy-outcomes' own
+    docstring immediately above for why.
+    """
+    from app.trading_intelligence.opportunity_view import get_opportunity_conflicts
+
+    return get_opportunity_conflicts(symbol)

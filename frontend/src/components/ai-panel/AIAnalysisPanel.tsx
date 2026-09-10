@@ -1,4 +1,5 @@
 import type { Opportunity } from "../../hooks/useOpportunities";
+import type { OpportunityAgreementWireShape, OpportunityConflictWireShape } from "../../services/api-client";
 
 function confidenceColor(confidence: number) {
   if (confidence >= 70) return "text-bull";
@@ -101,14 +102,54 @@ function OpportunityRow({ opp }: { opp: Opportunity }) {
   );
 }
 
+// Small additional section (decision #123) surfacing GET /intelligence/
+// opportunity-conflicts alongside the opportunity list above — NOT a new
+// panel type, just one more rounded-md block in the same flex column
+// every other section here already uses. Renders nothing at all when
+// neither prop is set (the honest 0/1-cached-opportunity absence
+// get_opportunity_conflicts() itself already represents by leaving the
+// symbol out of both collections — see useOpportunityConflicts.ts).
+function ConflictStatus({
+  agreement,
+  conflict,
+}: {
+  agreement: OpportunityAgreementWireShape | null;
+  conflict: OpportunityConflictWireShape | null;
+}) {
+  if (!agreement && !conflict) return null;
+
+  if (conflict) {
+    const buyCount = conflict.by_direction.BUY?.length ?? 0;
+    const sellCount = conflict.by_direction.SELL?.length ?? 0;
+    return (
+      <div className="rounded-md border border-bear/30 bg-bear/5 p-2 text-[11px] text-bear">
+        <span className="uppercase tracking-wide">Conflict</span> — {buyCount} BUY vs {sellCount} SELL
+      </div>
+    );
+  }
+
+  if (!agreement) return null; // unreachable given the guard above, but keeps TS's narrowing honest below
+
+  return (
+    <div className="rounded-md border border-bull/30 bg-bull/5 p-2 text-[11px] text-bull">
+      <span className="uppercase tracking-wide">Agreement</span> — {agreement.count} strategies aligned{" "}
+      {agreement.direction}
+    </div>
+  );
+}
+
 export function AIAnalysisPanel({
   symbol,
   opportunities,
   loading,
+  agreement = null,
+  conflict = null,
 }: {
   symbol: string;
   opportunities: Opportunity[];
   loading: boolean;
+  agreement?: OpportunityAgreementWireShape | null;
+  conflict?: OpportunityConflictWireShape | null;
 }) {
   const sorted = [...opportunities].sort((a, b) => b.confidence - a.confidence);
   const top = sorted.find((o) => o.status === "actionable") ?? sorted[0];
@@ -147,6 +188,8 @@ export function AIAnalysisPanel({
           <div className="font-mono text-2xl font-semibold text-signal">{top.confidence.toFixed(0)}%</div>
         </div>
       )}
+
+      <ConflictStatus agreement={agreement} conflict={conflict} />
 
       <div className="flex flex-col gap-2">
         {sorted.map((opp) => (

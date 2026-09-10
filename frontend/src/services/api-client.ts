@@ -301,6 +301,132 @@ export async function fetchOpportunities(symbol?: string): Promise<Opportunities
   return (await res.json()) as OpportunitiesSnapshotWireShape;
 }
 
+// Matches GET /intelligence/strategy-outcomes's response shape (decision
+// #123). Field names/types copied directly from `schemas/performance.py`'s
+// `StrategyOutcome` (re-verified against that file's current contents) —
+// the route validates every ORM row through that exact Pydantic contract
+// before returning it (`model_validate(row, from_attributes=True).
+// model_dump(mode="json")`), so this is the real, exact wire shape, not a
+// guess. `outcome_id`/`opportunity_id`/`backtest_run_id`/
+// `feature_snapshot_id` serialize as plain strings (JSON has no UUID
+// type); `trading_day` as "YYYY-MM-DD"; every `datetime` field as a full
+// ISO 8601 string.
+export interface StrategyOutcomeWireShape {
+  outcome_id: string;
+  opportunity_id: string;
+  schema_version: number;
+  strategy_name: string;
+  strategy_version: string;
+  symbol: string;
+  origin: "auto" | "manual";
+  is_backtest: boolean;
+  backtest_run_id: string | null;
+  trading_day: string;
+  setup_detected_at: string;
+  signal_confirmed_at: string | null;
+  decided_at: string | null;
+  entry_filled_at: string;
+  exit_filled_at: string;
+  holding_seconds: number;
+  direction: "BUY" | "SELL";
+  entry_price: number;
+  entry_qty: number;
+  exit_price: number;
+  exit_qty: number;
+  commission_total: number | null;
+  slippage_entry: number | null;
+  realized_pnl: number;
+  realized_r: number;
+  exit_reason: "target" | "stop" | "time" | "eod_flatten" | "manual" | "reversal";
+  structural_invalidation: number;
+  structural_target: number;
+  final_stop: number;
+  final_target: number;
+  confidence_at_signal: number;
+  evidence: Record<string, unknown>;
+  market_state_at_entry: Record<string, unknown>;
+  context_at_entry: Record<string, unknown>;
+  market_state_at_exit: Record<string, unknown>;
+  context_at_exit: Record<string, unknown>;
+  feature_snapshot_id: string | null;
+}
+
+export interface StrategyOutcomesWireShape {
+  outcomes: StrategyOutcomeWireShape[];
+}
+
+/**
+ * GET /intelligence/strategy-outcomes — decision #123. Raw recent-rows
+ * read, most recent `exit_filled_at` first, capped by `limit` (backend
+ * default 50 when omitted, same `Query(default, le=cap)` convention
+ * `fetchFeatureSeries`'s `count` param already uses — not `symbol`-scoped
+ * like fetchOpportunities above, since `strategy_outcomes` has no symbol
+ * filter on this route (deliberately global — see the route's own
+ * docstring). `strategy_outcomes` has zero real rows in production today
+ * (no Execution Engine/Position Monitor writes to it yet); an empty
+ * `outcomes` array is the honest, expected response, not an error.
+ */
+export async function fetchStrategyOutcomes(limit?: number): Promise<StrategyOutcomesWireShape> {
+  const url =
+    limit !== undefined
+      ? `${API_BASE_URL}/intelligence/strategy-outcomes?limit=${encodeURIComponent(limit)}`
+      : `${API_BASE_URL}/intelligence/strategy-outcomes`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as StrategyOutcomesWireShape;
+}
+
+// Matches GET /intelligence/opportunity-conflicts's response shape
+// (decision #123) — a genuinely thin passthrough of
+// `opportunity_view.get_opportunity_conflicts()` (decision #121); see
+// that function's own docstring (backend/app/trading_intelligence/
+// opportunity_view.py) for the classification rules behind these two
+// shapes. `strategies`/`by_direction`'s entries are the same passthrough
+// fields `opportunity_view.py`'s own `_passthrough()` copies — a strict
+// subset of OpportunityWireShape above, not the full Opportunity payload.
+export interface OpportunityConflictStrategyWireShape {
+  strategy: string;
+  confidence: number | null;
+  setup_detected_at: string | null;
+}
+
+export interface OpportunityAgreementWireShape {
+  direction: "BUY" | "SELL";
+  count: number;
+  strategies: OpportunityConflictStrategyWireShape[];
+}
+
+export interface OpportunityConflictWireShape {
+  count: number;
+  by_direction: Partial<Record<"BUY" | "SELL", OpportunityConflictStrategyWireShape[]>>;
+}
+
+export interface OpportunityConflictsWireShape {
+  agreements: Record<string, OpportunityAgreementWireShape>;
+  conflicts: Record<string, OpportunityConflictWireShape>;
+}
+
+/**
+ * GET /intelligence/opportunity-conflicts — decision #123. `symbol`
+ * scopes to one ticker, same convention as fetchOpportunities above; omit
+ * to get every symbol this process currently has an agreement or conflict
+ * for. A symbol with 0 or 1 currently-cached opportunity is honestly
+ * absent from BOTH `agreements` and `conflicts` — not a fabricated
+ * "no conflict" entry (see get_opportunity_conflicts()'s own docstring).
+ */
+export async function fetchOpportunityConflicts(symbol?: string): Promise<OpportunityConflictsWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/opportunity-conflicts?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/opportunity-conflicts`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as OpportunityConflictsWireShape;
+}
+
 // Matches GET /scanner/state's response shape (v1, on-demand — not the
 // continuous MarketActivityScanner docs/architecture/scanner-design.md
 // §5 describes, not built yet). `features` only ever carries whichever

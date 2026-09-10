@@ -1,150 +1,189 @@
-# Testing — Performance Intelligence's read-side query layer (decision #122)
+# Testing — `strategy-outcomes`/`opportunity-conflicts` observability routes (decision #123)
 
-This file is a fresh delete-first replacement, scoped to this delivery only
-(the two `GROUP BY` query functions over `strategy_outcomes`). It supersedes
-whatever `TESTING.md` existed before this change; look at `docs/decisions/`
-for the history of prior deliveries' own validation write-ups.
+This file is a fresh delete-first replacement, scoped to this delivery only.
+It supersedes whatever `TESTING.md` existed before this change (decision
+#122's own write-up); look at `docs/decisions/` for the history of prior
+deliveries' own validation.
+
+## A mid-session decision-number collision, found and handled
+
+This session started against a clone whose latest decision was #121. Partway
+through, a routine re-diff against a freshly-pulled tarball (done before
+writing anything to the decision log, per this project's own protocol)
+showed `backend/app/trading_intelligence/performance_queries.py` and
+`backend/tests/test_performance_queries.py` now existed on `main` — the
+sibling parallel track's own delivery had landed mid-session and claimed
+decision **#122**. This session's own work was file-disjoint from that
+delivery throughout (confirmed below), so nothing needed to change except
+the decision number: this delivery re-pulled `main` live, rebased its own
+changes onto the current tip, re-checked the decision-log tail a second
+time immediately before writing anything, and is recorded as **decision
+#123** — same renumbering pattern as #98/#99, #111/#112, #114/#115, #120/#121.
 
 ## What this delivery touched
 
-- **New:** `backend/app/trading_intelligence/performance_queries.py`
-- **New:** `backend/tests/test_performance_queries.py`
-- `docs/decisions/confirmed-decisions.md` (decision #122 appended)
+- `backend/app/api/routes/intelligence.py` — two new routes appended,
+  additive only
+- **New:** `backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`
+- `frontend/src/services/api-client.ts` — two new fetch wrappers + wire types
+- **New:** `frontend/src/hooks/useStrategyOutcomes.ts`
+- **New:** `frontend/src/hooks/useOpportunityConflicts.ts`
+- `frontend/src/components/ai-panel/AIAnalysisPanel.tsx` — one new small
+  section (`ConflictStatus`)
+- `frontend/src/components/workspace/InfoTab.tsx` — one new small section
+  (`RecentClosedTrades`, in `GeneralContent`) + `ConnectorContent` now also
+  calls `useOpportunityConflicts`
+- `docs/decisions/confirmed-decisions.md` (decision #123 appended)
 - `docs/decisions/INDEX.md` (matching row appended)
-- `docs/architecture/strategy-engine-design.md` (small §5 pointer only —
-  locked schema untouched)
+- `docs/architecture/strategy-engine-design.md` (one new §12 staged-plan
+  bullet, closing the "route intentionally skipped" note both #120 and #121
+  carried — no other section changed)
 - This file
 
+Note: `frontend/tsconfig.tsbuildinfo` was also regenerated locally in this
+sandbox by running `npx tsc -b` below (an incremental-build cache file,
+tracked in git, not hand-edited) — deliberately **not** included in the
+delivered zip, since it embeds this sandbox's own absolute paths and will
+regenerate correctly the moment `npx tsc -b` is run in the real environment.
+
 Confirmed by `diff -rq` against a freshly-pulled, untouched second clone
-(`/home/claude/baseline-clone` in this session) immediately before writing
-this file: no other file differs (modulo `__pycache__`/`.pytest_cache` build
-artifacts, which aren't part of the repo). In particular, `app/
-trading_intelligence/performance.py`, `backend/tests/
-test_performance_intelligence.py`, `app/api/routes/intelligence.py`,
+immediately before writing this file: no other file differs (modulo
+`__pycache__`/`.pytest_cache`/`node_modules`/`dist`/`.env`, none of which are
+part of the repo). In particular, `app/trading_intelligence/performance.py`,
+`app/trading_intelligence/performance_queries.py`,
+`backend/tests/test_performance_intelligence.py`,
+`backend/tests/test_performance_queries.py`,
 `app/models/trading_intelligence.py`, `app/schemas/performance.py`,
-`app/trading_intelligence/opportunity_view.py`, and everything under
-`frontend/` are all untouched — confirmed, not assumed.
+`app/trading_intelligence/opportunity_view.py`, `frontend/src/hooks/
+useOpportunities.ts`, and the five other existing routes in
+`intelligence.py` (`/state`, `/market-state`, `/context`, `/series`,
+`/opportunities`) are all untouched — confirmed, not assumed.
 
 ## Environment
 
-Real local PostgreSQL 16, matching the project's actual `postgres:16`
-image (`docker-compose.yml`) — provisioned directly in this sandbox via
+Real local PostgreSQL 16, matching the project's actual `postgres:16` image
+(`docker-compose.yml`) — provisioned directly in this sandbox via
 `apt-get install postgresql postgresql-contrib` (Docker itself isn't
-available in this sandbox; this is a native local server, not a
-container, but it is genuinely real Postgres, not a mock or SQLite
-substitute). Role/database created to match `app/core/config.py`'s actual
-defaults exactly (`trading`/`trading`@`localhost:5432`/`trading_workspace`),
-so no environment-variable overrides were needed. Schema built with
-`alembic upgrade head` (all 8 migrations, through `0008_strategy_outcomes_
-and_backtests.py`) — never a hand-built schema.
-
-Backend Python dependencies installed from `backend/requirements.txt`.
+available in this sandbox; this is a native local server, not a container,
+but genuinely real Postgres, not a mock or SQLite substitute). Role/database
+created to match `app/core/config.py`'s actual defaults exactly
+(`trading`/`trading`@`localhost:5432`/`trading_workspace`), so no
+environment-variable overrides were needed. Schema built with
+`alembic upgrade head` (all 8 migrations, through
+`0008_strategy_outcomes_and_backtests.py` — no new migration needed for this
+delivery). Backend Python dependencies installed from
+`backend/requirements.txt`. Frontend dependencies installed via `npm install`
+(Node 22.22.2, npm 10.9.7).
 
 ## Before this change (baseline)
 
-Full suite run against a freshly migrated database:
+Full suite run against a freshly migrated database, on an untouched clone
+already carrying decision #122 (the sibling track's own delivery):
 
 ```
-617 passed, 2 failed in 46.05s
+627 collected, 624 passed, 3 failed in 46.05s
 ```
 
-Both failures matched decision #119's documented flaky cluster exactly:
-`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_
-warming_up` and `test_intelligence_routes.py::test_daily_levels_carry_
-level_interaction_once_touched`. Total (619) matches the decision-log's
-own running arithmetic exactly: 598 (#117/#118 baseline) − 3 (#119's
-removed tests) + 8 (#120's new tests) + 16 (#121's new tests) = 619.
+All 3 failures matched decision #119's documented four-test flaky cluster
+exactly (that cluster flickers between 1-4 failures per run, per #119's own
+description — this run happened to surface 3 of the 4):
 
-## Implementation, sanity-checked against real Postgres before the formal suite
+- `test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+- `test_intelligence_routes.py::test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction`
+- `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
 
-Both query builders' compiled SQL were printed and inspected directly —
-confirmed real `entry_filled_at AT TIME ZONE :market_timezone` and real
-`context_at_entry ->> :session_type` extraction, not a Python-side
-equivalent. Then exercised end-to-end against real data (synthetic rows
-via the real `record_strategy_outcome()` write path): correct hour-of-day
-bucketing across a DST-live September date, breakeven correctly excluded
-from win count, the honest `None` group for a missing `session_type` key,
-backtest isolation, empty-result handling, and the version-filter guard
-all verified manually before the formal pytest suite was written.
+Total (627) matches the decision log's own running arithmetic: 619 (post-#121
+baseline, per #122's own entry) + 8 (#122's new tests) = 627.
 
-## New tests — `backend/tests/test_performance_queries.py`
+## New tests — `backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`
 
-8 new tests, all synthetic `StrategyOutcome`s written through the real
-`record_strategy_outcome()` write path (never a raw SQL insert), all run
-against real Postgres:
+6 new tests, real Postgres throughout:
 
-1. `test_empty_table_returns_empty_list_for_both_queries`
-2. `test_win_rate_by_hour_groups_correctly_and_computes_exact_win_rate`
-3. `test_expectancy_by_session_type_groups_correctly_and_computes_exact_average`
-4. `test_expectancy_by_session_type_groups_missing_key_as_honest_none`
-5. `test_backtest_isolation_never_blends_live_and_backtest`
-6. `test_strategy_version_isolation_does_not_blend_versions`
-7. `test_strategy_name_filter_excludes_other_strategies`
-8. `test_strategy_version_without_strategy_name_raises_value_error`
+1. `test_strategy_outcomes_table_actually_empty_returns_honest_empty_collection`
+   — wipes the whole table (safe: nothing else in this codebase writes to
+   it), asserts `{"outcomes": []}` exactly, 200
+2. `test_strategy_outcomes_populated_case_round_trips_actual_fields` — one
+   `StrategyOutcomeRecord` inserted directly via the ORM (not via
+   `record_strategy_outcome()`, which belongs to #120/#122's own footprint),
+   asserts 18 real returned field values, not just status/length
+3. `test_strategy_outcomes_orders_by_exit_filled_at_descending`
+4. `test_strategy_outcomes_limit_caps_returned_rows`
+5. `test_opportunity_conflicts_route_reflects_real_cache_agreement` — real
+   `EventBus`/`OpportunityCache` via `app.router.lifespan_context(app)` +
+   httpx `ASGITransport`, real `OpportunityCreated` envelopes published,
+   asserting the route's actual `agreements` shape
+6. `test_opportunity_conflicts_route_symbol_filter_forwards_correctly` — a
+   real conflict on one symbol, a real agreement on a second, confirming
+   `symbol` filtering doesn't leak either direction
 
-Run in isolation, 3 independent times, freshly cleaned between tests via
-an autouse fixture: **16/16 passed every time** (this file's 8 plus
-`test_performance_intelligence.py`'s existing 8, confirming the untouched
-write-path suite still passes cleanly alongside the new one).
+Found and fixed one real bug of its own while writing this suite:
+`StrategyOutcomeRecord.outcome_id` can't be read off an ORM object after its
+`SessionLocal()` session has closed (`sqlalchemy.orm.exc.
+DetachedInstanceError`) — fixed by generating and comparing against `uuid.
+uuid4()` values captured in local variables before insert, never read back
+off a detached instance.
+
+Run 3 independent times in isolation, freshly migrated DB:
 
 ```
-16 passed in 0.86s
-16 passed in 0.90s
-16 passed in 0.99s
+6 passed in 1.29s
+6 passed in 1.25s
+6 passed in 1.23s
 ```
 
-No test for a NULL `realized_r` population: checked directly before
-writing this suite — `StrategyOutcomeRecord.realized_r` is
-`Numeric(10, 4), nullable=False` (ORM) and `StrategyOutcome.realized_r`
-is `float` with no default and no `| None` (Pydantic) — there is no code
-path that can produce a NULL-`realized_r` row via the real write path, so
-there's no NULL policy to prove.
+100% stable, zero flakiness observed.
 
 ## After this change
 
 Full suite re-run twice, each time against a **freshly dropped and
-recreated** database (this project's own established practice for
-avoiding order-dependent failures, per decision #119):
+recreated** database (this project's own established practice for avoiding
+order-dependent failures, per decision #119):
 
 ```
-Run 1: 623 passed, 4 failed in 45.42s
-Run 2: 624 passed, 3 failed in 45.33s
+Run 1: 633 collected, 631 passed, 2 failed in 46.49s
+Run 2: 633 collected, 630 passed, 3 failed in 45.41s
 ```
 
-Both runs' totals are 627 — exactly 619 (baseline) + 8 (this delivery's
-new tests), confirming zero tests were silently lost or duplicated.
+Both totals are 633 — exactly 627 (baseline) + 6 (this delivery's new
+tests), confirming zero tests were silently lost or duplicated. Every
+failure across both runs is a member of decision #119's documented four-test
+flaky cluster (run 1 surfaced 2 of the 4; run 2 surfaced 3 — the same
+"1-3 failing per run depending on execution order" pattern #119's own entry
+describes). None of the four touch `strategy_outcomes`,
+`opportunity_conflicts`, or `intelligence.py` at all — #119's own entry
+already traced each to Feature Engine cold-start/timing races with "no code
+path anywhere near `strategy_engine/`." **Zero new/unexpected failures in
+either run. Zero regressions.**
 
-Every failure across both runs is a member of decision #119's documented
-four-test flaky cluster, confirmed by name against that entry's full text
-(not just `INDEX.md`'s summary row) rather than assumed:
+## Frontend validation
 
-- `test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
-- `test_feature_engine.py::test_feature_engine_backfills_from_persisted_history_on_cold_start`
-- `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
-- `test_intelligence_routes.py::test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction`
+```
+npx tsc -b
+```
 
-None of these touch `strategy_outcomes`, `performance_queries.py`, or
-anything else this delivery changed — #119's own entry already traced
-each to Feature Engine cold-start/timing races with "no code path
-anywhere near `strategy_engine/`," and this delivery doesn't touch that
-code either. Consistent with #119's own description of this cluster
-flickering "between 1-3 failing per run depending on execution order" —
-run 1 surfaced all 4, run 2 surfaced 3; the baseline run (before this
-change, above) happened to surface only 2. **Zero new/unexpected
-failures in any run. Zero regressions.**
+4 errors, all in `src/components/workspace/GridPresetPicker.tsx` — confirmed
+byte-for-byte identical (same 4 errors, same lines) against a freshly-pulled
+untouched clone before treating them as pre-existing (decision #35). Zero
+new TypeScript errors anywhere this delivery touched.
 
-One incidental note, recorded honestly rather than glossed over: mid-session,
-this sandbox's local Postgres process stopped on its own between two
-"before/after" run batches (surfaced as a connection-refused error on the
-next test invocation) and was restarted with `service postgresql start` —
-the database and schema were intact afterward (same data directory, no
-data loss). This is a sandbox-process artifact, not a test or migration
-failure — the same category decision #116 already recorded once before
-("a Postgres-availability artifact of that session's sandbox, not a
-regression").
+```
+npx vite build
+```
+
+```
+✓ 84 modules transformed.
+✓ built in 4.21s
+```
+
+Clean build, no warnings beyond Vite's own standard output.
+
+No new frontend test file — confirmed by search that no hook in this
+codebase has a companion test file today (`useOpportunities.ts` included),
+so this delivery doesn't introduce a new testing pattern solely for itself.
 
 ## Area actually changed, verified in isolation
 
-`app/trading_intelligence/performance_queries.py` and `backend/tests/
-test_performance_queries.py` together, run 3 independent times against a
-freshly cleaned table each time: **100% stable, zero flakiness observed.**
+`app/api/routes/intelligence.py`'s two new routes and
+`test_strategy_outcomes_and_opportunity_conflicts_routes.py` together, run 3
+independent times against a freshly migrated DB each time: **100% stable,
+zero flakiness observed** (see above).

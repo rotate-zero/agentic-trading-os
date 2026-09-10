@@ -3,6 +3,8 @@ import { LINK_CONNECTOR_IDS, type InfoConnectorMode } from "../../types/workspac
 import { MOCK_TICKERS } from "../../mocks/tickers";
 import { useLatestPrices } from "../../hooks/useLatestPrices";
 import { useOpportunities } from "../../hooks/useOpportunities";
+import { useOpportunityConflicts } from "../../hooks/useOpportunityConflicts";
+import { useStrategyOutcomes } from "../../hooks/useStrategyOutcomes";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -22,6 +24,66 @@ const CONNECTOR_COLORS: Record<number, string> = {
 const MIN_WIDTH = 64;
 const MAX_WIDTH = 480;
 const COLLAPSED_WIDTH = 36;
+
+// exit_filled_at formatted the same "time only" way
+// AIAnalysisPanel.tsx's own formatDetectedAt does for setup_detected_at —
+// this list is a recent-activity feed, not a full trade-history view, so
+// same "just the clock time" treatment fits.
+function formatExitTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Small additional section (decision #123) surfacing GET /intelligence/
+// strategy-outcomes — global, not tied to any one connector's symbol, so
+// it lives here in GeneralContent (the market-wide view) rather than
+// inside ConnectorContent/AIAnalysisPanel below, which are both scoped to
+// whichever single symbol a connector currently holds. Always rendered,
+// including the empty case — hiding it entirely would make this
+// capability harder to notice once real rows start flowing in (no
+// Execution Engine/Position Monitor writes here yet — decision #120).
+function RecentClosedTrades() {
+  const { outcomes, loading } = useStrategyOutcomes(10);
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">Recent Closed Trades</div>
+      {loading && outcomes.length === 0 ? (
+        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
+      ) : outcomes.length === 0 ? (
+        <p className="p-1 text-[11px] text-text-muted">No closed trades recorded yet.</p>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {outcomes.map((o) => (
+            <div
+              key={o.outcomeId}
+              className="flex items-center justify-between rounded border border-base-border px-2 py-1.5"
+            >
+              <div>
+                <div className="font-mono text-xs font-medium text-text-primary">
+                  {o.symbol} <span className="text-text-muted">{o.strategyName}</span>
+                </div>
+                <div className="text-[10px] text-text-muted">
+                  {o.direction} · {o.exitReason} · {formatExitTime(o.exitFilledAt)}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className={`font-mono text-xs ${o.realizedPnl >= 0 ? "text-bull" : "text-bear"}`}>
+                  {o.realizedPnl >= 0 ? "+" : ""}
+                  {o.realizedPnl.toFixed(2)}
+                </div>
+                <div className={`font-mono text-[10px] ${o.realizedR >= 0 ? "text-bull" : "text-bear"}`}>
+                  {o.realizedR >= 0 ? "+" : ""}
+                  {o.realizedR.toFixed(2)}R
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function GeneralContent() {
   const symbols = useMemo(() => MOCK_TICKERS.map((t) => t.symbol), []);
@@ -56,6 +118,7 @@ function GeneralContent() {
           </div>
         ))}
       </div>
+      <RecentClosedTrades />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
       <p className="text-xs leading-relaxed text-text-muted">
         General mode isn't tied to any single connector — it's the scrollable, market-wide view. Select a
@@ -70,7 +133,20 @@ function ConnectorContent({ symbol }: { symbol: string }) {
   // generateMockOpportunities — candles are no longer needed here at all,
   // that mock was their only real consumer in this file.
   const { opportunities, loading } = useOpportunities(symbol);
-  return <AIAnalysisPanel symbol={symbol} opportunities={opportunities} loading={loading} />;
+  // Decision #123 — same symbol, same underlying OpportunityCache;
+  // ConnectorContent owns all data-fetching for this connector and passes
+  // clean props down, same split useOpportunities/AIAnalysisPanel above
+  // already establish (AIAnalysisPanel itself fetches nothing).
+  const { agreement, conflict } = useOpportunityConflicts(symbol);
+  return (
+    <AIAnalysisPanel
+      symbol={symbol}
+      opportunities={opportunities}
+      loading={loading}
+      agreement={agreement}
+      conflict={conflict}
+    />
+  );
 }
 
 export function InfoTab() {
