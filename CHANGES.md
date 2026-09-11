@@ -1,92 +1,86 @@
-# Backtest Runner v1 — Units 1-3 (replay plumbing + fill simulation), NOT the full task
+# Backtest Runner v1 — Units 1-4 complete: the core proof works end-to-end
 
-Copy this into your repo root, overwriting the existing path. This is a
-**mid-task checkpoint**, not a finished delivery — per your "smaller
-units" direction, this covers Units 1-3 of a 4-unit plan; Unit 4 (the
-actual `BacktestRunner` orchestrator that ties this into
-`record_strategy_outcome()` and writes a real `BacktestRunRecord`) is not
-built yet and is not in this zip. No decision log entry yet, on purpose —
-that lands with the completed task, not a partial one, same convention
-this log always uses for "one entry per coherent piece of work."
+Copy this into your repo root, overwriting the existing path. Units 1-4
+of the 4-unit plan are done and verified — one fixture-driven run
+produces a real `BacktestRunRecord` and a real
+`StrategyOutcomeRecord(is_backtest=True)` resolving to it, through the
+real unmodified engine pipeline and a real (unmodified) `Strategy`
+interface. **Still not a full task close-out**: no decision log entry
+yet, no `TESTING.md`, no full-suite before/after regression run (only
+the adjacent suites re-run as a sanity check) — those are Unit 5/6, next
+drop, pending your review of this one. Same convention as the last
+drop: one entry per coherent piece of *finished* work, not a partial one.
 
-## What this is
+## What's new since the Units 1-3 drop
 
-New module `backend/app/backtest_runner/` (plus tests) — the historical
-data landmine, the D17 context landmine (and a third landmine found
-during investigation: Context Engine has no historical replay mode at
-all, deeper than the Polygon gap), the replay-state-settling design, and
-the fill model were all discussed and confirmed with you in-session
-before any of this was written; not re-litigated here, just built.
+- `backend/app/backtest_runner/runner.py` — `BacktestRunner`, the
+  orchestrator. Replays one symbol's candles through the real pipeline,
+  calls one real `Strategy.evaluate()` on EVERY candle (matching live —
+  see below), simulates fills for actionable `Opportunity`s, and
+  persists real outcomes.
+- `backend/tests/test_backtest_runner.py` — 3 tests, real Postgres. The
+  main one is the whole task's central proof: fixture run → real
+  `BacktestRunRecord` + `StrategyOutcomeRecord(is_backtest=True)`,
+  `backtest_run_id` resolving correctly, `market_state_at_entry`/
+  `context_at_entry`/`_at_exit` all real dicts, `realized_r` matching
+  hand-computed expected value.
 
-## Files added (all new, nothing existing touched)
+## The design finding that reshaped Unit 4 mid-planning
 
-- `backend/app/backtest_runner/__init__.py`
-- `backend/app/backtest_runner/fixture_provider.py` — `FixtureCandleProvider(MarketDataProvider)`, explicitly labeled synthetic, never claims to validate real historical performance.
-- `backend/app/backtest_runner/context_provider.py` — `BacktestContextProvider` ABC, `FixtureBacktestContextProvider` (real `MarketClock` logic, calendar-only, `symbol_providers=[]` — Fundamentals/News honestly absent, never faked), `HistoricalContextProvider` as a documented, deliberately-unbuilt extension point.
-- `backend/app/backtest_runner/engine_singleton_guard.py` — installs a run's own engines as the process-wide singleton `state_snapshot.py` resolves through; serializes runs in-process; restores prior state even on exception. Documents (doesn't fix) that concurrent backtests aren't supported in one process.
-- `backend/app/backtest_runner/replay_state_producer.py` — `ReplayStateProducer` ABC + `EngineBackedReplayStateProducer`, the real seam: wires the real `EventBus`/`FeatureEngine`/`LevelInteractionEngine`/`MarketStateEngine`/`ContextEngine` (zero modification to any of them), settles each replayed candle to real state, raises `ReplaySettleTimeout` rather than ever returning stale state. All wall-clock waiting is contained here — nothing above this seam knows a sleep exists anywhere.
-- `backend/app/backtest_runner/fill_simulator.py` — pure, `MarketClock`-derived fill model: next-open entry, forward-walk exit against `structural_target`/`structural_invalidation`, stop-wins same-candle tie-break, real-session-close `eod_flatten`. Distinguishes `eod_flatten` from a fixture simply running out of data before close (`InsufficientReplayDataError`) rather than collapsing the two.
-- `backend/app/backtest_runner/gate_and_warmup.py` — `check_entry_allowed()`, D17 option (a): gate_conditions then both real capture functions non-`None`, never a fabricated placeholder.
-- `backend/tests/test_backtest_runner_fixtures.py` (12 tests)
-- `backend/tests/test_replay_state_producer.py` (4 tests, real-Postgres DB-gated)
-- `backend/tests/test_fill_simulator_and_gate.py` (16 tests)
+`schemas/performance.py` states directly that `market_state_at_entry`
+is "captured at `entry_filled_at`, not `setup_detected_at`" — and
+`state_snapshot.py` has an existing (previously unnoticed by this
+session) `capture_strategy_outcome_snapshots()` convenience function
+documented as the call a real fill handler makes "once, at
+`entry_filled_at`, and again, separately, at `exit_filled_at`." That
+moved D17's real check off the signal candle and onto the fill/exit
+candles specifically — `runner.py` captures snapshots at exactly those
+two instants, not when `evaluate()` first returns an Opportunity. This
+was surfaced and discussed with you before any of `runner.py` was
+written, not discovered mid-implementation.
 
-## A real bug found and fixed during Unit 2's proof run, not caught by reasoning alone
+## Also surfaced and confirmed before coding
 
-First draft of `advance_to()` only called `ContextEngine.evaluate_for_symbol()`.
-The calendar provider is registered on the market-wide `providers` list,
-which only `evaluate_all()` populates — `evaluate_for_symbol()` alone
-never called it, so `context.providers` came back `{}` every candle.
-Caught by actually running the fixture replay and inspecting output, not
-by code review; fixed by calling both, same two-call order
-`test_strategy_scheduler.py`'s own real-engine integration test already
-established for this exact reason.
+`Strategy.evaluate()` is called on **every** replayed candle, even while
+a simulated position is open — traced from `scheduler.py`: live, acting
+on an Opportunity is a downstream Decision Engine concern that doesn't
+exist yet (blocked on D4), so skipping `evaluate()` mid-trade would
+silently diverge from live and corrupt a strategy's own internal state
+(ORB's `candles_seen`, concretely). Confirmed empirically in this drop's
+own test: `strategy.calls == 4` for a 4-candle replay with one open
+position spanning most of it.
 
-## A second bug found in the same proof run
+## First-use conventions established here (none existed anywhere in this
+codebase — checked by grep before choosing, not guessed)
 
-`FeatureEngine` has no `async def stop()` (confirmed — unlike
-`LevelInteractionEngine`/`MarketStateEngine`, it was never given the
-decision #84 poison-pill teardown). A backtest run genuinely needs clean
-multi-run teardown, so `EngineBackedReplayStateProducer.stop()` now
-cancels `feature_engine._worker_task` directly rather than leaking it —
-found because pytest's cross-test event-loop teardown surfaced a real
-"Event loop is closed" warning from the leaked task, not a cosmetic one.
-`feature_engine/engine.py` itself is untouched — this is handled entirely
-by the producer that owns the instance.
-
-## An independent corroboration, not something I had to guess at
-
-Decision #124 (landed upstream mid-session, synced in before this drop)
-confirms the real shape `capture_context_snapshot()` produces is
-provider-keyed — `context_at_entry["calendar"]["session"]` — exactly
-matching what `FixtureBacktestContextProvider`/`_ReplayClockCalendarProvider`
-already produce here. Built independently, same shape, before that
-decision's fix was even visible to this session.
+- `opportunity_id`: `Opportunity` carries no identity field, `OpportunityCache`
+  doesn't assign one either — `runner.py` mints a fresh `uuid4()` at the
+  moment a signal is accepted for simulated entry.
+- `config_hash`: sha256 hex of a stable JSON serialization of
+  `(gate_conditions, params)`.
+- `feature_version`: caller-supplied, no silent default (Feature Engine
+  has no versioning scheme yet — a hidden default risked a future
+  real-data run forgetting to override it).
+- `final_stop`/`final_target` (required floats): set equal to
+  `structural_invalidation`/`structural_target` — no Trade Planning
+  refinement stage exists in v1.
+- `origin="auto"`, `feature_snapshot_id=None` (the `feature_snapshots`
+  table doesn't exist anywhere in this codebase — confirmed by grep,
+  same finding the schema's own docstring already states independently).
 
 ## Verified
 
-Real local Postgres (PG16, provisioned fresh this session — not the
-sandbox's default state). 32 new tests, all passing. Diffed this drop's
-files against an untouched clone: confirmed additive-only, nothing
-existing modified. `test_performance_queries.py` (9 tests, decision #124's
-own suite) re-run alongside this drop's tests as a sanity check — all
-pass, confirming this checkpoint doesn't regress anything decision
-#124/#125 just landed. Full backend suite before/after (not just the
-adjacent files) not yet run — that's part of Unit 4's delivery, once the
-whole task is done, not this checkpoint's.
+Real local Postgres. 44 tests total (12 from Unit 1, 4 from Unit 2, 16
+from Unit 3, 3 new from Unit 4), all passing. Diffed this entire working
+tree against a fresh untouched clone: **zero modification anywhere**
+outside the new `backtest_runner/` module, the four new test files, and
+this file — confirmed directly, not asserted (`diff -rq`, clean). Every
+one of the 7 real strategy files byte-identical to the untouched clone.
+`test_performance_queries.py` (decision #124's own suite, 9 tests)
+re-run alongside this drop as a sanity check — still passes, this drop
+doesn't regress it.
 
-**Not yet done, honestly:** the actual `BacktestRunner` orchestrator
-(Unit 4) that calls all of the above plus `record_strategy_outcome()`
-and writes a real `BacktestRunRecord`; the full-suite before/after
-regression run; `TESTING.md`; the decision log entry; the optional
-`backend/app/api/routes/backtest.py` route. Next drop.
-
-## Left open, on purpose
-
-Same two judgment calls flagged and confirmed with you before this was
-written — recorded here for anyone reading this file cold:
-- `FixtureBacktestContextProvider` as v1's only real implementation of
-  `BacktestContextProvider` — calendar-only, `symbol_providers=[]`,
-  confirmed rather than defaulted.
-- Stop-wins on a same-candle target/stop tie in `fill_simulator.py` —
-  confirmed conservative v1 convention, not the only defensible choice.
+**Not yet done:** the full backend suite before/after (not just adjacent
+files); the decision log entry; `TESTING.md`; the optional
+`backend/app/api/routes/backtest.py` route (deferred last drop, still
+deferred). Next drop, once you've had a look at this one.
