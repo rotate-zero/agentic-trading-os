@@ -33,6 +33,12 @@ EVENT_TO_CHANNEL: dict[EventType, str] = {
     # frequency, and collapsing the two would silently throttle the watchlist down to 5s too.
     EventType.FEATURES_UPDATED: "features.updated",  # confirmed decision #47
     EventType.LEVEL_INTERACTION_CHANGED: "intelligence.level",  # confirmed decision #47
+    EventType.CONTEXT_CHANGED: "intelligence.context",  # confirmed decision #126 — ContextEngine
+    # already publishes this (decisions #92/#96); this is the missing routing entry
+    # decision #125 found absent. Two envelope shapes reach this one channel, same
+    # "one channel, distinguish by envelope.symbol" convention MarketStateChanged
+    # already uses (decision #91): symbol unset = global/calendar (evaluate_all()),
+    # symbol=<ticker> = per-symbol fundamentals/news (evaluate_for_symbol()).
     EventType.OPPORTUNITY_CREATED: "opportunity.new",
     EventType.OPPORTUNITY_SELECTED: "opportunity.selected",
     EventType.ORDER_APPROVED: "orders.status",

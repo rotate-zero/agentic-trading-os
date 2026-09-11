@@ -6,6 +6,7 @@ import {
   type FundamentalsProviderWireShape,
   type NewsProviderWireShape,
 } from "../services/api-client";
+import { workspaceSocket, type WireMessage } from "../services/websocket-client";
 
 // Normalized, display-ready shapes — same camelCase-flattening split
 // useOpportunities.ts's own Opportunity type establishes for its wire
@@ -79,28 +80,36 @@ function normalizeNews(wire: NewsProviderWireShape): NewsContext {
 }
 
 // Poll interval reasoning, stated explicitly (same discipline
-// useStrategyOutcomes.ts's own docstring used for its no-WS choice):
-// there is no `EventType.CONTEXT_CHANGED` entry in `EVENT_TO_CHANNEL`
-// (backend/app/api/websocket/channels.py, confirmed against the live
-// file) — no WebSocket channel relays Context updates to the frontend
-// today, so a push-based refresh isn't available, unlike
-// useOpportunities.ts/useOpportunityConflicts.ts.
+// useStrategyOutcomes.ts's own docstring used for its no-WS choice).
 //
-// Unlike `strategy_outcomes` (useStrategyOutcomes.ts's own case — no
-// live writer exists AT ALL yet, so a plain fetch-on-mount is honest),
-// Context genuinely changes on its own while a connector panel stays
-// open: session boundaries several times a trading day
-// (pre_market -> open -> lunch -> power_hour -> after_hours -> closed)
-// plus a 15-minute Fundamentals/News timer per symbol (both cadences
-// straight from context_engine/engine.py's own module docstring,
-// decisions #92/#96). `ContextEngine.get_snapshot()` is also a
-// synchronous, in-memory, zero-I/O read by its own docstring — cheap
-// enough that a light poll costs effectively nothing server-side.
-// 60 seconds is tighter than the 15-minute provider cadence (so most
-// ticks return byte-identical data — fine, since the read is free) but
-// loose enough to not hammer anything, and it catches a session-boundary
-// transition within a minute of it happening without needing to compute
-// the client's own guess at exactly when the next boundary lands.
+// AS OF DECISION #126, this is no longer the primary update path —
+// `EVENT_TO_CHANNEL` (backend/app/api/websocket/channels.py) now routes
+// `EventType.CONTEXT_CHANGED` to WebSocket channel "intelligence.context"
+// (the gap this comment used to describe), so WebSocket push is the
+// primary trigger below, same as useOpportunities.ts/
+// useOpportunityConflicts.ts. This poll stays as a safety-net/recovery
+// fallback, deliberately NOT removed outright, for reasons specific to
+// this hook rather than copied from those two:
+//
+// Unlike `OpportunityCreated` (fires on every qualifying candle during
+// a live session — frequent enough that a dropped/reconnecting
+// WebSocket self-heals quickly once reconnected), Context genuinely
+// changes on a much slower cadence: session boundaries a handful of
+// times a trading day (pre_market -> open -> lunch -> power_hour ->
+// after_hours -> closed) plus a 15-minute Fundamentals/News timer per
+// symbol (both cadences straight from context_engine/engine.py's own
+// module docstring, decisions #92/#96). The backend doesn't push a
+// snapshot on (re)subscribe (channels.py's websocket_endpoint only acks
+// — confirmed by reading it), so a WebSocket session that drops and
+// reconnects has no self-correcting signal until the next real
+// ContextChanged fires, which could be up to 15 minutes away. This poll
+// bounds that worst case instead of leaving it open-ended.
+// `ContextEngine.get_snapshot()` is a synchronous, in-memory, zero-I/O
+// read by its own docstring, so keeping this poll running underneath
+// the WebSocket push costs effectively nothing server-side — 60 seconds
+// is tighter than the 15-minute provider cadence (so most ticks return
+// byte-identical data — fine, since the read is free) but loose enough
+// to not hammer anything.
 const POLL_INTERVAL_MS = 60_000;
 
 export interface UseContextSnapshotResult {
@@ -128,19 +137,33 @@ export interface UseContextSnapshotResult {
  * Named `useContextSnapshot`, deliberately not `useContext` — the
  * latter would collide with React's own built-in hook of that name.
  *
- * Fetch-based + lightly polled, NOT WebSocket-push — see
- * POLL_INTERVAL_MS's own comment above for the full reasoning on both
- * halves of that choice.
+ * WebSocket-primary as of decision #126, with a poll fallback — see
+ * POLL_INTERVAL_MS's own comment above for the full reasoning on why
+ * the poll stays rather than being removed outright now that a real
+ * channel exists.
+ *
+ * Subscribes to the "intelligence.context" channel (mirroring
+ * useOpportunities.ts's subscribe/handle/unsubscribe pattern) as an
+ * INVALIDATION signal, not a second normalization path: a relevant push
+ * just calls this hook's own `load()`, the same REST fetch that's
+ * already the source of truth, rather than hand-parsing
+ * `WireMessage.payload` into `CalendarContext`/`FundamentalsContext`/
+ * `NewsContext` a second time. `ContextChanged`'s two envelope shapes
+ * (decision #96) route as: `symbol == null` (global/calendar changed)
+ * -> reload; `symbol === this hook's own symbol argument` (that
+ * symbol's fundamentals/news changed) -> reload; any other symbol ->
+ * ignored, via `symbolRef` so a push arriving after a symbol switch
+ * can't act on a stale closed-over symbol.
  *
  * Uses a `mountedRef` guard rather than the single per-effect
  * `cancelled` closure useOpportunities.ts/useStrategyOutcomes.ts use:
  * those hooks' `load()` only ever runs once per effect invocation (on
  * mount/symbol-change, or once per manual refetch), so one closed-over
- * flag covers it. This hook's `load()` also fires repeatedly from
- * `setInterval` within a single effect run, so a flag scoped to just
- * the initial call wouldn't cover every later poll tick — `mountedRef`
- * covers all of them uniformly for as long as the component stays
- * mounted.
+ * flag covers it. This hook's `load()` also fires repeatedly — every
+ * poll tick AND every relevant WebSocket push, both within a single
+ * effect run — so a flag scoped to just the initial call wouldn't cover
+ * every later trigger; `mountedRef` covers all of them uniformly for as
+ * long as the component stays mounted.
  */
 export function useContextSnapshot(symbol?: string): UseContextSnapshotResult {
   const [calendar, setCalendar] = useState<CalendarContext | null>(null);
@@ -197,7 +220,25 @@ export function useContextSnapshot(symbol?: string): UseContextSnapshotResult {
 
     load();
     const interval = setInterval(load, POLL_INTERVAL_MS);
-    return () => clearInterval(interval);
+
+    // WebSocket-primary trigger (decision #126) — invalidation signal
+    // only, see this hook's own docstring above for why `load()` (a
+    // real refetch) rather than merging `msg.payload` in piecemeal.
+    const onUpdate = (msg: WireMessage) => {
+      if (msg.symbol == null) {
+        load(); // global/calendar context changed
+      } else if (msg.symbol === symbolRef.current) {
+        load(); // this hook's own symbol's fundamentals/news changed
+      }
+      // else: a different symbol's context changed — not this hook
+      // instance's concern, ignore rather than merge it in.
+    };
+    const unsubscribe = workspaceSocket.subscribe("intelligence.context", onUpdate);
+
+    return () => {
+      clearInterval(interval);
+      unsubscribe();
+    };
   }, [symbol, load]);
 
   return { calendar, calendarEvaluatedAt, fundamentals, news, symbolEvaluatedAt, loading, refetch: load };
