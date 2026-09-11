@@ -52,25 +52,59 @@ without inventing a new bucketing scheme:
     hour.
 
   - `get_expectancy_by_session_type()` — groups by
-    `context_at_entry->>'session_type'` (real PostgreSQL JSONB `->>`
-    extraction, exercised against a real Postgres in this module's own
-    test file, not assumed from reading the code). §5's own field
-    comment for `context_at_entry` names three candidate regime
-    dimensions verbatim: "gap day?, session type, VIX regime."
-    `session_type` is the one chosen for v1, for two concrete reasons
-    checked directly rather than picked arbitrarily: (1) decision #117
-    already confirmed by grep that no `vix` field exists anywhere in
+    `context_at_entry->'calendar'->>'session'` (real PostgreSQL nested
+    JSONB extraction, exercised against a real Postgres in this module's
+    own test file, not assumed from reading the code — see the
+    correction note below). §5's own field comment for `context_at_entry`
+    names three candidate regime dimensions verbatim: "gap day?, session
+    type, VIX regime." Session is the one chosen for v1, for two concrete
+    reasons checked directly rather than picked arbitrarily: (1) decision
+    #117 already confirmed by grep that no `vix` field exists anywhere in
     this codebase to back a VIX-regime grouping — there is nothing real
     to group by yet; (2) `gap_day` is a boolean flag, not a genuine
-    multi-valued regime dimension the way `session_type` (e.g.
-    "regular"/"pre_market"/"power_hour") actually is. **This is
-    Performance Intelligence's first concrete regime dimension, not
-    "regime" solved generally** — there is deliberately no
-    `regime_dimension` parameter or generic JSONB-key abstraction here;
-    adding one now would silently imply a generalized regime framework
-    that was never asked for and has exactly one real instance to
-    generalize from. A future second regime dimension is a new,
+    multi-valued regime dimension the way session actually is (real
+    values, confirmed against `core/market_clock.py`'s own `Session`
+    enum: `pre_market`, `open`, `lunch`, `power_hour`, `after_hours`,
+    `closed` — six real labels, not the three this module originally
+    assumed; see the correction note below for why that matters).
+    **This is Performance Intelligence's first concrete regime
+    dimension, not "regime" solved generally** — there is deliberately
+    no `regime_dimension` parameter or generic JSONB-key abstraction
+    here; adding one now would silently imply a generalized regime
+    framework that was never asked for and has exactly one real instance
+    to generalize from. A future second regime dimension is a new,
     separately-considered function, not a parameter added to this one.
+
+**Correction, found and fixed after this module's original delivery.**
+The original `get_expectancy_by_session_type()` extracted
+`context_at_entry->>'session_type'` — a flat top-level key. The REAL
+shape `context_at_entry` actually has in production
+(`state_snapshot.py`'s `capture_context_snapshot()`, itself just
+`ContextEngine.get_snapshot()`'s per-symbol `providers` dict, verified
+directly against `context_engine/engine.py` and
+`context_engine/providers/calendar.py`) is keyed by provider name —
+`{"calendar": {"session": ..., "is_market_open": ..., ...},
+"fundamentals": {...}, "news": {...}}` — so `session_type` never existed
+as a top-level key at all, and the real field inside `calendar` is named
+`session`, not `session_type`. This module's own tests passed anyway,
+because its synthetic fixture (`test_performance_queries.py`'s
+`_make_outcome()`) built `context_at_entry = {"session_type": ...}`
+directly — a shape matching this bug, not matching what
+`ContextEngine` actually produces. Against real production data (once a
+real caller populates `context_at_entry` via `capture_context_snapshot()`
+— none exists yet, same "zero real rows today" state this table has had
+since decision #120), the original query would have silently returned
+only the honest-`None` group on every row, never a real breakdown — not
+a crash, a silently-useless result. Fixed by extracting
+`context_at_entry->'calendar'->>'session'` instead, and by rebuilding the
+test fixture to nest under `"calendar"`/`"session"` the same way
+`ContextEngine` really does. The output field/function name stays
+`session_type` — a fine, still-accurate label for "what part of the
+session this trade happened in"; only the JSONB extraction path was
+wrong, not the concept. No route or other caller of this function exists
+yet (§5/§7's own "no route, computed on demand" framing, unchanged), so
+this correction has zero external-contract impact — it only ever
+returned a silently-empty real breakdown before, to nobody.
 
 **Explicitly out of scope: "parameter sensitivity."** `StrategyConfig
 .params`'s shape varies per strategy (§3) — there is no single column
@@ -194,12 +228,14 @@ class HourlyWinRate:
 
 @dataclass(frozen=True)
 class SessionTypeExpectancy:
-    """One row per `context_at_entry->>'session_type'` value with at
-    least one matching outcome. `session_type` is `None` only for the
-    group of outcomes whose `context_at_entry` dict had no
-    `"session_type"` key at write time — an honest, real group, not a
-    dropped/excluded one. `expectancy_r` is `AVG(realized_r)` for the
-    group."""
+    """One row per `context_at_entry->'calendar'->>'session'` value with
+    at least one matching outcome (real `Session` enum values —
+    `core/market_clock.py` — e.g. `"open"`, `"pre_market"`,
+    `"power_hour"`; not a synthetic "regular" bucket, see this module's
+    own correction note above). `session_type` is `None` only for the
+    group of outcomes whose `context_at_entry` had no `calendar.session`
+    value at write time — an honest, real group, not a dropped/excluded
+    one. `expectancy_r` is `AVG(realized_r)` for the group."""
 
     session_type: str | None
     trade_count: int
@@ -305,7 +341,12 @@ def _build_expectancy_by_session_type_query(
     strategy_version: str | None,
     is_backtest: bool,
 ) -> Select:
-    session_type_expr = StrategyOutcomeRecord.context_at_entry["session_type"].astext
+    # Nested extraction — context_at_entry is keyed by provider name
+    # (ContextEngine.get_snapshot()'s own shape; see this module's
+    # correction note above). `["calendar"]` stays JSONB-typed (no
+    # `.astext` yet) so `["session"]` can chain on top of it; `.astext`
+    # only applies once, on the final scalar leaf.
+    session_type_expr = StrategyOutcomeRecord.context_at_entry["calendar"]["session"].astext
     filters = _common_filters(strategy_name=strategy_name, strategy_version=strategy_version, is_backtest=is_backtest)
     return (
         select(
@@ -326,9 +367,9 @@ def get_expectancy_by_session_type(
     is_backtest: bool = False,
 ) -> list[SessionTypeExpectancy]:
     """Expectancy (`AVG(realized_r)`) grouped by
-    `context_at_entry->>'session_type'` — Performance Intelligence's
-    first concrete "expectancy by regime" query (§5), not a general
-    regime framework. `is_backtest=False` (default) returns live rows
+    `context_at_entry->'calendar'->>'session'` — Performance
+    Intelligence's first concrete "expectancy by regime" query (§5), not
+    a general regime framework. `is_backtest=False` (default) returns live rows
     only; `True` returns backtest rows only — never both. Raises
     `ValueError` if `strategy_version` is given without `strategy_name`.
     Returns `[]`, never a fabricated row, when nothing matches."""

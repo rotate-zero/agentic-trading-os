@@ -89,13 +89,21 @@ def _make_outcome(
     entry_filled_at: datetime,
     realized_r: float,
     is_backtest: bool = False,
-    session_type: str | None = "regular",
+    session_type: str | None = "open",
 ) -> StrategyOutcome:
-    """Minimal, realistic synthetic outcome. `context_at_entry` carries
-    `session_type` only when one is given — `None` means "simulate a
-    row whose context dict never had that key," exercising the honest-
-    None grouping path, not an omission."""
-    context_at_entry = {"session_type": session_type} if session_type is not None else {}
+    """Minimal, realistic synthetic outcome. `context_at_entry` mirrors
+    the REAL shape `ContextEngine.get_snapshot()`/`capture_context_
+    snapshot()` actually produces — provider-keyed, `{"calendar":
+    {"session": ..., ...}, ...}` — not a flat `{"session_type": ...}`
+    dict (that flat shape was this module's own original bug, corrected
+    above; a fixture matching the bug instead of reality is exactly how
+    it went undetected). `session_type` is only given when a session
+    value is meant to be simulated — `None` means "simulate a row whose
+    context dict never had a calendar.session value," exercising the
+    honest-None grouping path, not an omission. `"open"`/`"pre_market"`
+    etc. are real `core/market_clock.py` `Session` enum values, checked
+    directly — there is no `"regular"` value in that enum."""
+    context_at_entry = {"calendar": {"session": session_type}} if session_type is not None else {}
     return StrategyOutcome(
         outcome_id=uuid.uuid4(),
         opportunity_id=uuid.uuid4(),
@@ -175,10 +183,10 @@ def test_win_rate_by_hour_groups_correctly_and_computes_exact_win_rate():
 def test_expectancy_by_session_type_groups_correctly_and_computes_exact_average():
     strategy = f"{_STRATEGY_PREFIX}_EXPECTANCY"
     record_strategy_outcome(
-        _make_outcome(strategy_name=strategy, entry_filled_at=_utc(13, 0), realized_r=1.0, session_type="regular")
+        _make_outcome(strategy_name=strategy, entry_filled_at=_utc(13, 0), realized_r=1.0, session_type="open")
     )
     record_strategy_outcome(
-        _make_outcome(strategy_name=strategy, entry_filled_at=_utc(13, 30), realized_r=3.0, session_type="regular")
+        _make_outcome(strategy_name=strategy, entry_filled_at=_utc(13, 30), realized_r=3.0, session_type="open")
     )
     record_strategy_outcome(
         _make_outcome(
@@ -189,12 +197,95 @@ def test_expectancy_by_session_type_groups_correctly_and_computes_exact_average(
     results = get_expectancy_by_session_type(strategy_name=strategy)
 
     by_type = {r.session_type: r for r in results}
-    assert set(by_type) == {"pre_market", "regular"}
-    assert [r.session_type for r in results] == ["pre_market", "regular"]  # alphabetical, deterministic
-    assert by_type["regular"].trade_count == 2
-    assert by_type["regular"].expectancy_r == pytest.approx(2.0)  # (1.0 + 3.0) / 2
+    assert set(by_type) == {"pre_market", "open"}
+    assert [r.session_type for r in results] == ["open", "pre_market"]  # alphabetical, deterministic
+    assert by_type["open"].trade_count == 2
+    assert by_type["open"].expectancy_r == pytest.approx(2.0)  # (1.0 + 3.0) / 2
     assert by_type["pre_market"].trade_count == 1
     assert by_type["pre_market"].expectancy_r == pytest.approx(-2.0)
+
+
+def test_expectancy_by_session_type_reads_the_real_provider_nested_shape():
+    """The exact regression this correction is for: a realistic
+    `context_at_entry` with sibling provider keys alongside `calendar`
+    (the real shape `ContextEngine.get_snapshot()` produces — `calendar`/
+    `fundamentals`/`news`, not just the one field under test), proving
+    the query reads `calendar.session` specifically and isn't fooled by,
+    or accidentally dependent on, `calendar` being the only key present.
+    Built as a direct ORM insert, field-by-field, the same explicit
+    construction `record_strategy_outcome()` itself uses (not
+    `_make_outcome()`) — specifically so this test's fixture shape is
+    independent of this file's own helper. A bug in `_make_outcome()`'s
+    shape (the original failure mode here — it matched the bug, not
+    reality) can't hide a bug in the query this way."""
+    from app.db.session import SessionLocal as _SessionLocal
+    from app.models.trading_intelligence import StrategyOutcomeRecord
+
+    strategy = f"{_STRATEGY_PREFIX}_REALSHAPE"
+    entry_filled_at = _utc(15, 0)
+    record = StrategyOutcomeRecord(
+        outcome_id=uuid.uuid4(),
+        opportunity_id=uuid.uuid4(),
+        schema_version=1,
+        strategy_name=strategy,
+        strategy_version="v1",
+        symbol="AAPL",
+        origin="auto",
+        is_backtest=False,
+        backtest_run_id=None,
+        trading_day=entry_filled_at.date(),
+        setup_detected_at=entry_filled_at,
+        signal_confirmed_at=entry_filled_at,
+        decided_at=entry_filled_at,
+        entry_filled_at=entry_filled_at,
+        exit_filled_at=entry_filled_at,
+        holding_seconds=60,
+        direction="BUY",
+        entry_price=100.0,
+        entry_qty=1,
+        exit_price=102.5,
+        exit_qty=1,
+        commission_total=0.0,
+        slippage_entry=0.0,
+        realized_pnl=2.5,
+        realized_r=2.5,
+        exit_reason="target",
+        structural_invalidation=99.0,
+        structural_target=102.0,
+        final_stop=99.0,
+        final_target=102.0,
+        confidence_at_signal=0.5,
+        evidence={},
+        market_state_at_entry={},
+        context_at_entry={
+            "calendar": {
+                "session": "power_hour",
+                "is_market_open": True,
+                "is_half_day": False,
+                "minutes_since_open": 330,
+                "fed_day": False,
+                "trading_day": "2026-09-10",
+            },
+            "fundamentals": {"sector": "Technology", "industry": "Software"},
+            "news": {"present": False, "count_15m": 0},
+        },
+        market_state_at_exit={},
+        context_at_exit={},
+        feature_snapshot_id=None,
+    )
+    session = _SessionLocal()
+    try:
+        session.add(record)
+        session.commit()
+    finally:
+        session.close()
+
+    results = get_expectancy_by_session_type(strategy_name=strategy)
+
+    assert len(results) == 1
+    assert results[0].session_type == "power_hour"
+    assert results[0].trade_count == 1
+    assert results[0].expectancy_r == pytest.approx(2.5)
 
 
 def test_expectancy_by_session_type_groups_missing_key_as_honest_none():
