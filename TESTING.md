@@ -1,130 +1,161 @@
-# Testing — correction to decision #122's `get_expectancy_by_session_type()` (decision #124)
+# TESTING.md — Context Engine frontend surfacing
 
-Delete-first replacement, scoped to this correction only. Supersedes the
-`TESTING.md` decision #123's own delivery left behind.
+## What changed
 
-## What this was
+Frontend-only. `ContextEngine` (`CalendarProvider`/`FundamentalsProvider`/
+`NewsFlagProvider`, decisions #90/#96) was fully built and already reachable
+via `GET /intelligence/context` (decision #98), but nothing in the UI showed
+it. This delivery surfaces it, following the same "built-but-invisible
+capability" pattern decision #123 already closed for `strategy_outcomes`/
+opportunity conflicts.
 
-While scoping unrelated next-step tasks, I found that decision #122's
-`get_expectancy_by_session_type()` extracts a JSONB path
-(`context_at_entry->>'session_type'`) that never exists in real production
-data. The real shape (`ContextEngine.get_snapshot()` /
-`state_snapshot.py`'s `capture_context_snapshot()`, both verified directly
-against live code) is provider-keyed: `{"calendar": {"session": ...},
-"fundamentals": {...}, "news": {...}}`. #122's own test fixture built the
-same wrong flat shape the bug expected, so its tests passed while the query
-itself would have silently returned only the honest-`None` group forever
-against any real row. Decisions are immutable once minted, so #122's own
-entry is untouched — this is a new entry (#124) documenting the fix.
+**No backend file was touched.** `intelligence.py`'s `/context` route,
+`context_engine/engine.py`, and all three provider files are read-only
+references for this task — confirmed unchanged by `diff -rq` against a
+freshly-pulled untouched clone (see below).
 
-## Fix
+### Files touched
 
-- `backend/app/trading_intelligence/performance_queries.py` —
-  `_build_expectancy_by_session_type_query()` now extracts
-  `context_at_entry["calendar"]["session"].astext` (real chained JSONB
-  indexing) instead of the flat `context_at_entry["session_type"]`.
-  Docstrings updated to match (module docstring, `SessionTypeExpectancy`
-  dataclass, `get_expectancy_by_session_type()`'s own docstring) plus a new
-  "Correction, found and fixed after this module's original delivery"
-  section explaining the bug in place.
-- `backend/tests/test_performance_queries.py` — `_make_outcome()`'s
-  `context_at_entry` construction rebuilt to nest under `calendar`/
-  `session`, matching the real shape. Synthetic session values corrected
-  from the fictional `"regular"` (not a real `Session` enum value —
-  confirmed against `core/market_clock.py`: the six real values are
-  `pre_market`, `open`, `lunch`, `power_hour`, `after_hours`, `closed`) to
-  the real `"open"`. One new regression test added,
-  `test_expectancy_by_session_type_reads_the_real_provider_nested_shape`,
-  using a direct ORM insert (not `_make_outcome()`) with a realistic
-  `context_at_entry` carrying sibling `fundamentals`/`news` keys alongside
-  `calendar`, to prove the fix reads `calendar.session` specifically and
-  isn't accidentally dependent on `calendar` being the only key present.
+- `frontend/src/services/api-client.ts` (extended) — new
+  `fetchContextSnapshot(symbol?)` + wire types
+  (`CalendarProviderWireShape`, `FundamentalsProviderWireShape`,
+  `NewsProviderWireShape`, `ContextProvidersWireShape`,
+  `ContextGlobalWireShape`, `ContextSymbolWireShape`,
+  `ContextSnapshotWireShape`), copied field-for-field from the real
+  backend provider code, not guessed.
+- `frontend/src/hooks/useContextSnapshot.ts` (**new**) — fetch on
+  mount/symbol-change + a light 60-second poll (no WebSocket push
+  available — see reasoning below and in decision #125).
+- `frontend/src/components/workspace/InfoTab.tsx` (extended) — new
+  `MarketSessionSummary` section (Calendar, market-wide) in
+  `GeneralContent`.
+- `frontend/src/components/ai-panel/AIAnalysisPanel.tsx` (extended) —
+  new `SymbolContextSummary` section (Fundamentals/News, per-symbol),
+  alongside decision #123's own `ConflictStatus`.
+- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` —
+  new decision #125.
+- This file.
 
-**Output field/function name unchanged** — `session_type` stays the label
-for both the dataclass field and the function name; only the extraction
-path and the fixture shape were wrong, not the concept name.
+**Not touched:** any backend file; `useOpportunities.ts`;
+`useOpportunityConflicts.ts`; `useStrategyOutcomes.ts`; any new
+page/route/panel type; any chart/visualization.
 
-**Scope discipline** — did not add a `regime_dimension` parameter, a
-session-bucket-collapsing option (e.g. merging `open`/`lunch`/`power_hour`
-into one "regular" bucket), or any `gap_day`/`vix_regime` handling. All
-were out of scope for #122 originally and remain out of scope here. This
-correction fixes exactly the one wrong JSONB path and the fixture that hid
-it.
+## Why a poll, and why 60 seconds
 
-## What this touched
+There is no `EventType.CONTEXT_CHANGED` entry in
+`app/api/websocket/channels.py`'s `EVENT_TO_CHANNEL` — confirmed by reading
+the live file — so there's no WebSocket channel to subscribe to for
+Context updates. Unlike `useStrategyOutcomes.ts` (which stays pure
+fetch-on-mount because `strategy_outcomes` has no live writer at all yet),
+Context genuinely changes on its own while a panel is open: session
+boundaries several times a day, plus a 15-minute Fundamentals/News timer
+per symbol. `ContextEngine.get_snapshot()` is a synchronous, in-memory,
+zero-I/O read by its own docstring, so a light poll is cheap. 60 seconds
+catches a session-boundary transition within a minute without hammering
+anything or trying to compute the client's own guess at exactly when the
+next boundary lands. Full reasoning is in the hook's own comments and in
+decision #125.
 
-Confirmed by `diff -rq` against a freshly-pulled untouched clone: exactly
-four files differ —
+## Aggregate/global context score
 
-- `backend/app/trading_intelligence/performance_queries.py`
-- `backend/tests/test_performance_queries.py`
-- `docs/decisions/confirmed-decisions.md` (decision #124 appended)
-- `docs/decisions/INDEX.md` (matching row appended)
+Checked directly against `ContextEngine.get_snapshot()`'s real
+implementation: the "global" section is exactly
+`{"providers": {...}, "evaluated_at": ...}` — no aggregate score,
+composite assessment, or other derived/summary field exists anywhere in
+the real snapshot today. Per the explicit instruction not to recompute,
+reinterpret, or invent one if absent: **none was added.** Each Calendar
+field is shown as-is.
 
-`performance.py`, `models/trading_intelligence.py`, `schemas/
-performance.py`, `app/api/routes/intelligence.py`, `opportunity_view.py`,
-and every frontend file are untouched.
+## Placement — Calendar vs. Fundamentals/News
 
-## A mechanical note on this delivery's own decision-log editing
+- **Calendar** (`session`, `is_market_open`, `fed_day`, ...) is
+  market-wide, not symbol-specific — it surfaces in `InfoTab.tsx`'s
+  `GeneralContent` (the same market-wide view decision #123's "Recent
+  Closed Trades" already lives in), as a new `MarketSessionSummary`
+  section, always rendered including the not-yet-evaluated case.
+- **Fundamentals/News** are genuinely per-symbol (decision #96) — they
+  surface in `AIAnalysisPanel.tsx` as a new `SymbolContextSummary`
+  section, fed by `ConnectorContent`'s own new `useContextSnapshot(symbol)`
+  call (same "parent fetches, child renders" split `useOpportunities`
+  already establishes).
+- **One deliberate deviation from decision #123's own layout:**
+  `ConflictStatus` renders `null` when there's nothing to show (0/1
+  cached opportunities is a legitimate absence). `SymbolContextSummary`
+  never renders `null` — it's hoisted into a shared `header` block
+  rendered from **all three** of `AIAnalysisPanel`'s return branches
+  (loading/empty/populated), not gated behind Opportunities being
+  non-empty, since Context Engine data has nothing to do with whether
+  Strategy Engine has fired an opportunity yet. Gating it the same way
+  `ConflictStatus` is gated would have hidden real, available Context
+  data in the common case of a symbol with no opportunities yet.
 
-An intermediate edit to `confirmed-decisions.md` briefly misplaced the new
-entry between #122 and #123 in file order, and a subsequent correction
-attempt briefly mislabeled #123's own header as "124" and dropped the new
-entry's body entirely. Caught immediately by re-diffing against a verified
-untouched clone before proceeding to tests — the file was restored from
-that clean clone and the new entry re-appended with a plain, safe append
-rather than further string-replacement, then re-verified line-for-line
-against the untouched original up to the append point. Mentioning this
-only because this project's own discipline is to surface exactly this kind
-of thing rather than quietly smooth over it — the final file, verified
-below, is correct.
+## Empty/absent states
 
-## Environment
+- **Fundamentals:** a `null` entry (Context Engine never evaluated this
+  symbol) and a non-null entry with every field `null` (evaluated, but no
+  `symbol_fundamentals` refresh has landed yet) both render "No
+  fundamentals data yet." — the UI can't act on the distinction, so one
+  honest message covers both. `sector` is never displayed (not even as
+  "—"): it's permanently `null` by construction in this build (Finnhub
+  has no separate sector field), not a value that's ever "not yet
+  fetched."
+- **News:** `null` (never evaluated) renders "No news data yet.";
+  `present: false` (evaluated, nothing found) renders "No recent
+  headlines." — deliberately the same neutral copy whether that's a
+  genuine no-headlines symbol or SPY/QQQ/IWM's unconditional decision-#94
+  exclusion, since the wire shape is identical either way.
 
-Real local PostgreSQL 16 (same sandbox-provisioned instance used for
-decision #123's own delivery), freshly dropped and recreated before each
-run below, `alembic upgrade head` (still 8 migrations, no new one needed).
-
-## Before this change
-
-Full suite, untouched clone (current `main`, post-#123):
-
-```
-633 collected, 631 passed, 2 failed in 46.50s
-```
-
-Both failures matched decision #119's documented flaky cluster:
-
-- `test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
-- `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
-
-## New/changed tests — `backend/tests/test_performance_queries.py`
-
-All 9 tests in this file (8 original, corrected in place, + 1 new), run in
-isolation against a freshly migrated DB, 3 independent times:
-
-```
-9 passed in 0.85s
-9 passed in 0.83s
-9 passed in 0.82s
-```
-
-100% stable, zero flakiness.
-
-## After this change
-
-Full suite, 2 independent runs, each against a freshly dropped/recreated
-database:
+## Verification
 
 ```
-Run 1: 634 collected, 632 passed, 2 failed in 48.85s
-Run 2: 634 collected, 632 passed, 2 failed in 45.32s
+cd frontend
+npx tsc -b
+npx vite build
 ```
 
-Both totals are 634 — exactly 633 (baseline) + 1 (the new regression test).
-Both runs' failures are the same 2 #119-cluster tests listed above, neither
-of which touches `strategy_outcomes`, `performance_queries.py`, or
-Context Engine at all. **Zero new/unexpected failures. Zero regressions.**
+Both clean. `tsc -b` shows exactly the four known pre-existing
+`GridPresetPicker.tsx` errors (decision #35) — confirmed identical (same
+four errors, same lines) against a freshly-pulled untouched second clone
+before filtering:
 
-No frontend changes in this delivery — `npx tsc -b`/`npx vite build` not
-applicable.
+```
+src/components/workspace/GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.
+src/components/workspace/GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.
+```
+
+`vite build` succeeds cleanly (85 modules transformed, up from 84 on an
+untouched clone — the one new hook file).
+
+**Footprint**, confirmed via `diff -rq` against a freshly-pulled untouched
+second clone: only `frontend/src/services/api-client.ts`,
+`frontend/src/hooks/useContextSnapshot.ts` (new),
+`frontend/src/components/workspace/InfoTab.tsx`,
+`frontend/src/components/ai-panel/AIAnalysisPanel.tsx`,
+`docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, and
+this file differ. Zero backend files, zero unrelated frontend files.
+
+## Not done / intentionally out of scope
+
+- No backend change of any kind, including adding a `ContextChanged`
+  WebSocket channel — flagged in the task prompt as a real gap but
+  explicitly out of bounds for this delivery.
+- No frontend test file for `useContextSnapshot.ts` — matches this
+  codebase's existing (test-free) hook practice, re-confirmed by search
+  immediately before writing, not assumed from decision #123's
+  description of it.
+- No new dashboard, panel type, page, or chart/visualization of Context
+  data.
+
+## Decision log
+
+New entry: **#125** in `docs/decisions/confirmed-decisions.md` +
+matching `INDEX.md` row. Re-checked the tail twice against a fresh pull
+(once before reading, once immediately before writing) — #124 stayed
+latest both times, no collision. `confirmed-decisions.md` is ~33KB after
+this entry, well under the ~100KB archive-rollover trigger (`README.md`)
+— no rollover needed this round. Note for Saqib: the "~97KB, rollover
+imminent" figure from before this session's context is stale — decision
+#121's own rollover already reset `confirmed-decisions.md` to start
+fresh at #122, before this task began.

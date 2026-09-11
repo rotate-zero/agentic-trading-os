@@ -5,6 +5,7 @@ import { useLatestPrices } from "../../hooks/useLatestPrices";
 import { useOpportunities } from "../../hooks/useOpportunities";
 import { useOpportunityConflicts } from "../../hooks/useOpportunityConflicts";
 import { useStrategyOutcomes } from "../../hooks/useStrategyOutcomes";
+import { useContextSnapshot } from "../../hooks/useContextSnapshot";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -85,6 +86,56 @@ function RecentClosedTrades() {
   );
 }
 
+// Calendar (Context Engine, decision #90/#92/#96) is market-wide, not
+// symbol-specific — same "global" scope GeneralContent below already
+// has, so it surfaces here rather than per-connector in
+// AIAnalysisPanel.tsx (that's where Fundamentals/News go instead — see
+// AIAnalysisPanel.tsx's own SymbolContextSummary comment). Always
+// rendered, including the not-yet-evaluated case, same "don't hide it,
+// don't fabricate it" posture RecentClosedTrades above already
+// establishes for this file.
+//
+// Note on aggregate/global scoring: `ContextEngine.get_snapshot()`
+// exposes exactly `{"providers": {...}, "evaluated_at": ...}` for its
+// "global" section (confirmed directly against context_engine/
+// engine.py's own get_snapshot() docstring and implementation) — no
+// aggregate context score, assessment, or other derived/summary field
+// exists anywhere in the real snapshot today. Nothing below recomputes
+// or invents one; each Calendar field is shown as-is.
+function MarketSessionSummary() {
+  const { calendar, loading } = useContextSnapshot();
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">Market Session</div>
+      {loading && !calendar ? (
+        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
+      ) : !calendar ? (
+        <p className="p-1 text-[11px] text-text-muted">No calendar data yet.</p>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1 rounded border border-base-border px-2 py-1.5 font-mono text-[11px]">
+          <div>
+            <div className="text-text-muted">Session</div>
+            <div className="text-text-primary">{calendar.session.replace("_", " ")}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">Market</div>
+            <div className={calendar.isMarketOpen ? "text-bull" : "text-text-muted"}>
+              {calendar.isMarketOpen ? "Open" : "Closed"}
+            </div>
+          </div>
+          {calendar.fedDay && (
+            <div className="col-span-2">
+              <span className="rounded border border-signal/40 px-1 py-0.5 text-signal">Fed Day</span>
+            </div>
+          )}
+          {calendar.isHalfDay && <div className="col-span-2 text-text-muted">Half day session</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GeneralContent() {
   const symbols = useMemo(() => MOCK_TICKERS.map((t) => t.symbol), []);
   const prices = useLatestPrices(symbols);
@@ -118,6 +169,7 @@ function GeneralContent() {
           </div>
         ))}
       </div>
+      <MarketSessionSummary />
       <RecentClosedTrades />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
       <p className="text-xs leading-relaxed text-text-muted">
@@ -138,6 +190,14 @@ function ConnectorContent({ symbol }: { symbol: string }) {
   // clean props down, same split useOpportunities/AIAnalysisPanel above
   // already establish (AIAnalysisPanel itself fetches nothing).
   const { agreement, conflict } = useOpportunityConflicts(symbol);
+  // Same symbol, Fundamentals/News per-symbol Context Engine data
+  // (decision #96) — Calendar itself is out of scope here, it's
+  // market-wide and surfaces separately in GeneralContent's own
+  // MarketSessionSummary above. ConnectorContent owns all data-fetching
+  // for this connector and passes clean props down, same split
+  // useOpportunities/useOpportunityConflicts and AIAnalysisPanel already
+  // establish (AIAnalysisPanel itself fetches nothing).
+  const { fundamentals, news } = useContextSnapshot(symbol);
   return (
     <AIAnalysisPanel
       symbol={symbol}
@@ -145,6 +205,8 @@ function ConnectorContent({ symbol }: { symbol: string }) {
       loading={loading}
       agreement={agreement}
       conflict={conflict}
+      fundamentals={fundamentals}
+      news={news}
     />
   );
 }

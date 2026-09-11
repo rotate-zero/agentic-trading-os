@@ -1,4 +1,5 @@
 import type { Opportunity } from "../../hooks/useOpportunities";
+import type { FundamentalsContext, NewsContext } from "../../hooks/useContextSnapshot";
 import type { OpportunityAgreementWireShape, OpportunityConflictWireShape } from "../../services/api-client";
 
 function confidenceColor(confidence: number) {
@@ -138,33 +139,132 @@ function ConflictStatus({
   );
 }
 
+// Compact, minimal Fundamentals/News surfacing (this task) — Fundamentals/
+// News are per-symbol Context Engine providers (decision #96), so they
+// land here alongside decision #123's own ConflictStatus section, not in
+// InfoTab.tsx's GeneralContent (that's Calendar's spot instead — see
+// InfoTab.tsx's own MarketSessionSummary comment, since Calendar is
+// market-wide, not symbol-specific). Unlike ConflictStatus, this section
+// never renders null: a real Opportunity/Strategy user still benefits
+// from knowing "no fundamentals data yet" or "no recent headlines"
+// rather than the section silently vanishing, per this task's own
+// honest-empty-state requirement. Rendered from the shared top part of
+// this component (see below) so it shows up regardless of whether
+// Opportunities happen to be loading/empty/populated — Context Engine
+// data has nothing to do with whether Strategy Engine has fired yet.
+function formatMarketCap(v: number): string {
+  const abs = Math.abs(v);
+  if (abs >= 1e12) return `$${(v / 1e12).toFixed(2)}T`;
+  if (abs >= 1e9) return `$${(v / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  return `$${v.toFixed(0)}`;
+}
+
+function formatEarningsDate(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function SymbolContextSummary({
+  fundamentals,
+  news,
+}: {
+  fundamentals: FundamentalsContext | null;
+  news: NewsContext | null;
+}) {
+  // `fundamentals` null means Context Engine has never evaluated this
+  // symbol at all yet; a non-null row with every field null means it
+  // HAS evaluated but no `symbol_fundamentals` refresh has landed yet
+  // (fundamentals.py's own `_read` docstring) — both read the same to a
+  // user ("nothing to show"), so one shared message covers both rather
+  // than distinguishing a difference nobody here can act on. `sector` is
+  // deliberately never shown — it's permanently null in this build
+  // (Finnhub has no separate sector field, decision #96), not a value
+  // that's ever "not yet fetched," so surfacing it would only ever read
+  // as a dead placeholder.
+  const hasFundamentals =
+    fundamentals !== null &&
+    (fundamentals.industry != null || fundamentals.marketCap != null || fundamentals.nextEarningsDate != null);
+
+  return (
+    <div className="rounded-md border border-base-border bg-base-bg/60 p-2 text-[11px] text-text-muted">
+      <div className="flex flex-wrap items-center gap-x-1.5">
+        {hasFundamentals ? (
+          <>
+            {fundamentals!.industry && <span className="text-text-primary">{fundamentals!.industry}</span>}
+            {fundamentals!.marketCap != null && <span>Mkt cap {formatMarketCap(fundamentals!.marketCap)}</span>}
+            {fundamentals!.nextEarningsDate && (
+              <span>Earnings {formatEarningsDate(fundamentals!.nextEarningsDate)}</span>
+            )}
+          </>
+        ) : (
+          <span>No fundamentals data yet.</span>
+        )}
+      </div>
+      <div className="mt-1">
+        {/* news === null: Context Engine hasn't evaluated this symbol
+            yet. news.present === false: it has, and found nothing —
+            same neutral copy for a genuine "no recent headlines" symbol
+            and for SPY/QQQ/IWM's unconditional exclusion (decision #94)
+            — the wire shape is identical either way, so this UI
+            shouldn't (and structurally can't) imply a difference. */}
+        {news === null
+          ? "No news data yet."
+          : news.present
+            ? `News: ${news.importance} · ${news.count15m} in last 15m`
+            : "No recent headlines."}
+      </div>
+    </div>
+  );
+}
+
 export function AIAnalysisPanel({
   symbol,
   opportunities,
   loading,
   agreement = null,
   conflict = null,
+  fundamentals = null,
+  news = null,
 }: {
   symbol: string;
   opportunities: Opportunity[];
   loading: boolean;
   agreement?: OpportunityAgreementWireShape | null;
   conflict?: OpportunityConflictWireShape | null;
+  fundamentals?: FundamentalsContext | null;
+  news?: NewsContext | null;
 }) {
   const sorted = [...opportunities].sort((a, b) => b.confidence - a.confidence);
   const top = sorted.find((o) => o.status === "actionable") ?? sorted[0];
 
+  // Context Engine's Fundamentals/News (this task) live in the shared
+  // header block below, rendered in every branch — deliberately NOT
+  // gated behind the Opportunities loading/empty checks above/below:
+  // whether Strategy Engine has fired anything for this symbol is
+  // unrelated to whether Context Engine has Fundamentals/News for it.
+  const header = (
+    <div>
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">AI Opportunity Score</div>
+      <div className="font-mono text-lg font-semibold text-text-primary">{symbol}</div>
+    </div>
+  );
+
   if (loading && opportunities.length === 0) {
-    return <div className="p-3 text-center text-[11px] text-text-muted">Loading {symbol}…</div>;
+    return (
+      <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
+        {header}
+        <SymbolContextSummary fundamentals={fundamentals} news={news} />
+        <div className="p-3 text-center text-[11px] text-text-muted">Loading {symbol}…</div>
+      </div>
+    );
   }
 
   if (opportunities.length === 0) {
     return (
       <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
-        <div>
-          <div className="text-[11px] uppercase tracking-wide text-text-muted">AI Opportunity Score</div>
-          <div className="font-mono text-lg font-semibold text-text-primary">{symbol}</div>
-        </div>
+        {header}
+        <SymbolContextSummary fundamentals={fundamentals} news={news} />
         <div className="flex flex-col gap-2 p-1 text-center text-[11px] text-text-muted">
           <p>No opportunities reported yet for {symbol}.</p>
           <p>Strategy Engine evaluates on every candle/market-state update — nothing has fired here yet.</p>
@@ -175,10 +275,8 @@ export function AIAnalysisPanel({
 
   return (
     <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
-      <div>
-        <div className="text-[11px] uppercase tracking-wide text-text-muted">AI Opportunity Score</div>
-        <div className="font-mono text-lg font-semibold text-text-primary">{symbol}</div>
-      </div>
+      {header}
+      <SymbolContextSummary fundamentals={fundamentals} news={news} />
 
       {top && (
         <div className="rounded-md border border-signal/30 bg-signal/5 p-3">

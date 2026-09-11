@@ -427,6 +427,105 @@ export async function fetchOpportunityConflicts(symbol?: string): Promise<Opport
   return (await res.json()) as OpportunityConflictsWireShape;
 }
 
+// Matches GET /intelligence/context's response shape exactly
+// (ContextEngine.get_snapshot(), backend/app/context_engine/engine.py) —
+// verified directly against that method's own docstring/implementation.
+// "global" is always present (the last evaluate_all() result — today:
+// CalendarProvider only), even when `symbol` is omitted or never
+// evaluated. "symbols" has at most one entry when `symbol` is passed —
+// per get_snapshot()'s own docstring, that entry's "providers" dict
+// MERGES the global path's own Calendar output with that ticker's
+// Fundamentals/News (server-side merge, decision #96's two-path split),
+// so symbols[ticker].providers CAN also carry a "calendar" key,
+// duplicating global.providers.calendar. This app reads Calendar only
+// from "global" (InfoTab.tsx's GeneralContent, market-wide) and
+// Fundamentals/News only from "symbols" (AIAnalysisPanel, per-symbol)
+// rather than reading the duplicate — see useContextSnapshot.ts.
+export interface CalendarProviderWireShape {
+  session: "pre_market" | "open" | "lunch" | "power_hour" | "after_hours" | "closed";
+  is_market_open: boolean;
+  is_half_day: boolean;
+  minutes_since_open: number;
+  fed_day: boolean;
+  trading_day: string;
+}
+
+// FundamentalsProvider (backend/app/context_engine/providers/
+// fundamentals.py) — every field is honestly null, not a fabricated
+// zero/placeholder, when no `symbol_fundamentals` refresh has ever run
+// for this symbol yet (see that file's own `_read` docstring: "every
+// field genuinely unknown, not checked-and-confirmed-empty"). `sector`
+// is permanently null for every symbol in this build regardless of
+// refresh state (Finnhub's `/stock/profile2` has no separate sector
+// field — decision #96); `industry` is the one real classification
+// field that DOES get populated.
+export interface FundamentalsProviderWireShape {
+  sector: string | null;
+  industry: string | null;
+  profile_updated_at: string | null;
+  market_cap: number | null;
+  market_cap_updated_at: string | null;
+  revenue_ttm: number | null;
+  net_income_ttm: number | null;
+  operating_cash_flow_ttm: number | null;
+  financials_period: string | null;
+  financials_updated_at: string | null;
+  next_earnings_date: string | null;
+  earnings_updated_at: string | null;
+}
+
+// NewsFlagProvider (backend/app/context_engine/providers/news.py) —
+// `present: false` unconditionally for SPY/QQQ/IWM (decision #94:
+// Finnhub's `/company-news` mislabels generic broad-market news as
+// fund-specific for ETFs) — wire-identical to a genuine "nothing
+// recent" result for any other symbol; the frontend cannot and should
+// not try to tell the two apart.
+export interface NewsProviderWireShape {
+  present: boolean;
+  count_15m: number;
+  recency_seconds: number | null;
+  importance: "high" | "medium" | "low" | "none";
+}
+
+export interface ContextProvidersWireShape {
+  calendar?: CalendarProviderWireShape;
+  fundamentals?: FundamentalsProviderWireShape;
+  news?: NewsProviderWireShape;
+}
+
+export interface ContextGlobalWireShape {
+  providers: ContextProvidersWireShape;
+  evaluated_at: string | null;
+}
+
+export interface ContextSymbolWireShape {
+  providers: ContextProvidersWireShape;
+  evaluated_at: string;
+}
+
+export interface ContextSnapshotWireShape {
+  global: ContextGlobalWireShape;
+  symbols: Record<string, ContextSymbolWireShape>;
+}
+
+/**
+ * GET /intelligence/context — confirmed decision #98 (built), unsurfaced
+ * anywhere in the UI until this task. `symbol` optional, same convention
+ * as fetchOpportunities/fetchOpportunityConflicts above: omit for the
+ * market-wide "global" section only, pass a ticker to also populate
+ * "symbols" for that one ticker.
+ */
+export async function fetchContextSnapshot(symbol?: string): Promise<ContextSnapshotWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/context?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/context`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ContextSnapshotWireShape;
+}
+
 // Matches GET /scanner/state's response shape (v1, on-demand — not the
 // continuous MarketActivityScanner docs/architecture/scanner-design.md
 // §5 describes, not built yet). `features` only ever carries whichever
