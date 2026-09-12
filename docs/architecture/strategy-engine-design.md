@@ -296,21 +296,6 @@ Persists to the `strategy_outcomes` table (renamed from `strategy_performance` �
               ▼                      ▼                      ▼
    expectancy by regime     win rate by time-of-day   parameter sensitivity
       (query, not a field)     (query, not a field)     (query, not a field)
-   performance_queries.py   performance_queries.py     no implementation yet
-   (#122, correction #124)  (#122, correction #124)
-              │                      │
-              ▼                      ▼
-   GET /intelligence/        GET /intelligence/
-   expectancy-by-session-    win-rate-by-hour
-   type (#127)               (#127)
-              │                      │
-              └──────────┬───────────┘
-                         ▼
-             usePerformanceAnalytics() (frontend hook, #127)
-                         │
-                         ▼
-        InfoTab.tsx GeneralContent's "Strategy Performance"
-          section (#127) — no dashboard, no filter UI
 ```
 
 **Two governing principles, agreed and worth stating as load-bearing, not implicit:**
@@ -322,8 +307,6 @@ Persists to the `strategy_outcomes` table (renamed from `strategy_performance` �
 **v1 feedback loop is human-reviewed, not automatic — a direct decision, not a default assumed.** Performance Intelligence surfaces evidence; Saqib reviews and decides whether to promote a new `StrategyConfig` version. Automatic reweighting is a real future direction (trading-intelligence-architecture.md §14 already names "reweight or retire" as Performance Intelligence's eventual feedback into Strategy Engine) but isn't built now — same "empirical before architectural commitment" discipline already applied to Polygon depth, IBKR access, and Finnhub concurrency. Trigger to revisit: enough closed trades per `StrategyConfig` version that a reweight isn't noise.
 
 **Two of the three query types above are built — decision #122, `app/trading_intelligence/performance_queries.py`.** `get_win_rate_by_hour()` and `get_expectancy_by_session_type()` (one concrete regime dimension, not regime analytics generally). "Parameter sensitivity" stays a query, not a field, with no implementation yet — decision #122's own entry states why.
-
-**As of decision #127, both of those two query functions are also exposed end-to-end** — `GET /intelligence/win-rate-by-hour` / `GET /intelligence/expectancy-by-session-type` (thin route wrappers, no new logic), a combined frontend hook (`usePerformanceAnalytics.ts`), and a minimal "Strategy Performance" section in `InfoTab.tsx`'s `GeneralContent` (see the diagram above). This closes the same "built but nobody can see it" gap decisions #123/#125 already closed for `strategy_outcomes`/opportunity-conflicts and Context Engine, respectively — not a new capability, purely read-side surfacing of #122's own query layer. `strategy_outcomes` still has zero real rows in production today (no Execution Engine yet), so this honestly renders "No performance data yet" rather than a fabricated chart.
 
 ---
 
@@ -427,6 +410,56 @@ class BacktestRun(BaseModel):
 **Scale check, done rather than assumed:** 5 years of 1m candles, regular session only, ≈490K rows/symbol; even 30–40 symbols stays well within current plain-Postgres monthly partitioning. Doesn't trigger the Timescale-migration question (`future-ideas.md` #7) at the symbol counts discussed — revisit only if the backtest universe grows substantially past that.
 
 Not built now. Constrains how the first strategy gets written (pure `evaluate()`, `MarketClock`-only timing); the harness itself is real, deferred work.
+
+---
+
+**As-built note (decision #128) — v1 is the vertical slice above the dashed line only, nothing below it.** Everything above described the eventual full system prospectively, before any of `backend/app/backtest_runner/` existed. What actually got built (Units 1-5) is the first vertical slice — proving the plumbing works end-to-end — not the outer grid-search/walk-forward/promotion loop described above, which remains real, deferred, future work exactly as originally scoped:
+
+```
+                    IMPLEMENTED (v1, decision #127)
+   ┌──────────────────────────────────────────────────────────┐
+   │  Fixture Candle Data                                       │
+   │  (FixtureCandleProvider — plumbing proof, NOT real          │
+   │   historical-market validation)                             │
+   │            │                                                │
+   │            ▼                                                │
+   │  ReplayStateProducer                                        │
+   │  (real EventBus/FeatureEngine/LevelInteractionEngine/       │
+   │   MarketStateEngine — zero modification to any of them)     │
+   │            │                                                │
+   │            ▼                                                │
+   │  Feature / Market State  ──────┐                            │
+   │            │                    │                           │
+   │            ▼                    ▼                           │
+   │      Context Engine      (BacktestContextProvider boundary  │
+   │  (FixtureBacktestContextProvider — fixture/calendar only,   │
+   │   NOT point-in-time historical context fidelity)            │
+   │            │                                                │
+   │            ▼                                                │
+   │  Strategy.evaluate()  (real, unmodified — every candle)     │
+   │            │                                                │
+   │            ▼                                                │
+   │  Fill Simulator (pure, MarketClock-derived)                  │
+   │            │                                                │
+   │            ▼                                                │
+   │  StrategyOutcome rows (is_backtest=True, backtest_run_id)   │
+   │            │                                                │
+   │            ▼                                                │
+   │  Performance Intelligence (decisions #120/#122 — read-only) │
+   └──────────────────────────────────────────────────────────┘
+                             │
+   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+                             ▼
+                    FUTURE (not built, real prerequisites remain)
+   Real minute-level historical data (paid Polygon tier or another
+   vendor — future-ideas.md #17) + point-in-time historical context
+   (HistoricalContextProvider, a documented but unbuilt extension
+   point) + multi-symbol replay + outer grid-search/walk-forward loop
+   + robustness/parameter-sensitivity report + human review + promotion
+   — the full flow diagrammed earlier in this section, unchanged.
+```
+
+`HistoricalContextProvider` (`backend/app/backtest_runner/context_provider.py`) already exists as a named, documented extension point for the Context half of the future boundary above — deliberately unbuilt (`NotImplementedError`), not a stub pretending to work. `BacktestContextProvider` is the seam a real implementation plugs into without `BacktestRunner` itself changing. See decision #128 for the full as-built record, including why entry/exit snapshots are captured at `entry_filled_at`/`exit_filled_at` rather than the signal candle — a correction to this section's own original, less precise framing.
 
 ---
 
@@ -633,7 +666,6 @@ Everything above, connected — the learning loop this design is actually buildi
 - [x] **Stage 2 (continued) — `gate_conditions` enforcement built (decision #117/D15).** `app/strategy_engine/gate_conditions.py` (new) — registry/validation/check for §2b's declarative preconditions, wired into `scheduler.py` centrally, before `evaluate()`. v1 supports exactly `{"session": "regular"}`, the only condition any real `StrategyConfig` declares. Closed a real, live gap for 3 of 7 strategies (First Pullback/Reversal/VWAP had no session enforcement anywhere before this). 20 new tests, real local Postgres, zero regressions.
 - [x] **Performance Intelligence's persistence layer built — `strategy_outcomes` + `backtests` tables (decision #120).** §5/§7's shape (decision #89), Stage 0 since #89, now has a real migration (0008), ORM (`app/models/trading_intelligence.py`'s `StrategyOutcomeRecord`/`BacktestRunRecord`), Pydantic contract (new `app/schemas/performance.py`), and a real but unwired write path (`app/trading_intelligence/performance.py`'s `record_strategy_outcome()`, asserting `entry_qty == exit_qty` before every write, raising rather than swallowing per §11). Establishes this codebase's first JSONB and native-UUID-PK/FK conventions. `feature_snapshot_id`/`opportunity_id` stay unenforced UUID references — their target tables don't exist yet; `backtest_run_id` is a real FK to `backtests`, built in the same migration. Surfaced a genuine, deliberately unresolved gap between §5's required-dict typing and `state_snapshot.py`'s (#98) honest-`None` capture behavior — tracked as new open item D17, not silently patched. No Execution Engine/Position Monitor exists yet to call `record_strategy_outcome()` for real — same "build the stable contract now, real callers plug in later" precedent decision #98 set for the read side. 8 new tests, real local Postgres, 100% stable across repeated runs.
 - [x] **`strategy_outcomes` and the opportunity conflict view (#120/#121) exposed via routes — `GET /intelligence/strategy-outcomes`, `GET /intelligence/opportunity-conflicts` (decision #123).** Both #120 and #121 deliberately shipped without a route, each citing the same parallel-track collision risk on `app/api/routes/intelligence.py`; that risk is gone now, closing the gap the same way `GET /intelligence/opportunities` did for `OpportunityCache` back in Stage 2. `/strategy-outcomes` is a raw recent-rows read (`ORDER BY exit_filled_at DESC`, `limit`-capped) through #120's own `StrategyOutcome` Pydantic contract — not an aggregate, and not dependent on #122's `performance_queries.py` (that module's own `GROUP BY` queries remain unrouted, by design, per #122's own entry). `/opportunity-conflicts` is a genuinely thin wrapper over #121's `get_opportunity_conflicts()`. Minimal frontend surfacing: a per-symbol "conflict/agreement" section next to the existing opportunities list (`AIAnalysisPanel.tsx`), and a global "Recent Closed Trades" section in the market-wide view (`InfoTab.tsx`'s `GeneralContent`, since `strategy_outcomes` has no `symbol` filter) — no new page or panel type. `strategy_outcomes` still has zero real rows in production (no Execution Engine/Position Monitor exists to write one) — the empty state is rendered honestly, not hidden.
-- [x] **`performance_queries.py`'s two `GROUP BY` queries (#122, correction #124) exposed via routes — `GET /intelligence/win-rate-by-hour`, `GET /intelligence/expectancy-by-session-type` (decision #127).** The route #122's own entry explicitly deferred, for the same parallel-track collision reasoning #120/#121 cited before #123 closed it — that risk is gone now too. Both routes are genuinely thin wrappers (no new SQL, no reshaping beyond `dataclasses.asdict()`) exposing the real filter surface the query layer already has — `strategy_name`/`strategy_version` (`_validate_strategy_filters()`'s version-requires-name rule surfaces as a 400) and `is_backtest` (a strict live/backtest selector, not a route-level addition — it is `get_win_rate_by_hour()`/`get_expectancy_by_session_type()`'s own second keyword argument). Frontend: one combined hook, `usePerformanceAnalytics.ts` (deliberately one-shot, not polled/WS-driven — no event exists for a `strategy_outcomes` write, same reasoning `useStrategyOutcomes.ts` already established), and a minimal "Strategy Performance" section in `InfoTab.tsx`'s `GeneralContent`, directly below "Recent Closed Trades." Unlike every prior hook in this file, `usePerformanceAnalytics` exposes a caller-visible `error` state distinct from genuinely-empty data — a deliberate, first-of-its-kind deviation, not an oversight, so a real backend failure can't render identically to "no `StrategyOutcome` data yet." No filter UI, no new dashboard/page — this is explicitly minimal surfacing, and both routes stay fully filterable for a future, separately-considered UI.
 
 ---
 

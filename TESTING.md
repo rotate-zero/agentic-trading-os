@@ -1,178 +1,147 @@
-# TESTING.md — Performance analytics exposure (decision #127)
+# TESTING.md — Backtest Runner v1 close-out (decision #128)
 
-## What changed
+## What this documents
 
-`backend/app/trading_intelligence/performance_queries.py` already contained
-two working query functions — `get_win_rate_by_hour()` and
-`get_expectancy_by_session_type()` (decision #122, correction #124) — with
-no route, no frontend client, and no UI. This delivery closes that gap:
-two new thin routes, a frontend API client + hook, and a minimal "Strategy
-Performance" section in the workspace UI. Full reasoning: decision #127,
-`docs/decisions/confirmed-decisions.md`.
+`backend/app/backtest_runner/` (Units 1-5, five separate deliveries) is
+now feature-complete and this file's own close-out (Unit 6) is
+documentation-only — zero `backend/app/` changes of its own. Full
+reasoning, including the precise data/Context/D17 boundaries: decision
+#128, `docs/decisions/confirmed-decisions.md`.
 
-### Files touched
+### A note on repo state during this close-out
 
-- `backend/app/api/routes/intelligence.py` (extended) — two new routes
-  appended at file end: `GET /intelligence/win-rate-by-hour`,
-  `GET /intelligence/expectancy-by-session-type`. No other change to this
-  file.
-- `backend/tests/test_performance_analytics_routes.py` (new) — 9 tests.
-- `frontend/src/services/api-client.ts` (extended) — wire types
-  (`HourlyWinRateWireShape`, `WinRateByHourWireShape`,
-  `SessionTypeExpectancyWireShape`, `ExpectancyBySessionTypeWireShape`,
-  `PerformanceAnalyticsFilters`) and two fetch wrappers
-  (`fetchWinRateByHour`, `fetchExpectancyBySessionType`), inserted between
-  the existing opportunity-conflicts and context sections.
-- `frontend/src/hooks/usePerformanceAnalytics.ts` (new) — combined hook
-  fetching both endpoints.
-- `frontend/src/components/workspace/InfoTab.tsx` (extended) — new
-  `StrategyPerformanceSummary` component + `formatHourEt` helper, rendered
-  in `GeneralContent` directly below `RecentClosedTrades`; one new import.
-- `docs/architecture/strategy-engine-design.md` (extended) — §5's existing
-  ASCII diagram extended (not duplicated) to show the new route/hook/UI
-  chain, one new paragraph noting the exposure, one new Stage 12 checklist
-  entry.
-- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` — new
-  decision #127 entry.
+Mid-close-out, a separate parallel session's Performance Analytics work
+landed on `main` and had independently claimed decision #127 — a real
+numbering collision, same category as #98/#99, #111/#112, #114/#115,
+#120/#121, #122/#123. This entry's own decision was drafted under #127
+too, before either session could see the other; reconciled by renumbering
+this one to #128 rather than overwriting theirs (decisions are immutable).
+Synced their files in (`intelligence.py`, `InfoTab.tsx`, `api-client.ts`,
+`usePerformanceAnalytics.ts`, `test_performance_analytics_routes.py`) and
+re-ran the full suite against the truly-current, merged `main` before
+finalizing the numbers below — not against this session's own earlier,
+now-stale snapshot. Cross-confirmed file-disjoint both ways: decision
+#127's own entry states it never touched `backend/app/backtest_runner/`;
+this entry confirms it never touched any of #127's files either.
+
+### Files touched by this close-out
+
+- `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md` —
+  new decision #128 entry + index row.
+- `docs/architecture/strategy-engine-design.md` — targeted addition to
+  §7 (one diagram, one "as-built" note). No rewrite, no restructure.
 - This file.
 
-### Explicitly NOT touched
+**Zero backend/app/ changes from this entry.** Confirmed by `diff -rq`
+against a fresh untouched clone — see "Fresh-clone diff verification"
+below. (`intelligence.py` et al. differ from an *older* clone only
+because decision #127's own, independent work is now part of current
+`main` — not because this close-out touched them.)
 
-`performance_queries.py`, `models/trading_intelligence.py`,
-`schemas/performance.py`, `main.py`, `useStrategyOutcomes.ts`,
-`useOpportunityConflicts.ts`, `useOpportunities.ts`, `useContextSnapshot.ts`,
-`AIAnalysisPanel.tsx`, `backend/app/backtest_runner/*`,
-`backend/app/context_engine/*`, `backend/app/api/websocket/channels.py`,
-`CHANGES.md` (belongs to the concurrent Backtest Runner "Unit 5" delivery
-already on `main` — see "Parallel-work note" below).
+## What Backtest Runner v1 proves (built across Units 1-5, not this close-out)
 
-## What was NOT built (explicitly out of scope)
+A fixture-driven replay of one symbol through the real, unmodified engine
+pipeline and a real, unmodified `Strategy.evaluate()` produces a real
+`BacktestRunRecord` and a real `StrategyOutcomeRecord(is_backtest=True)`
+resolving to it, with entry/exit snapshots captured at the real
+`entry_filled_at`/`exit_filled_at` instants (not the signal candle), and
+`is_backtest=True` isolation reused directly from decisions #120/#122.
 
-- No new analytics calculation — both routes are thin wrappers over the
-  existing query functions. No route-level recomputation.
-- No date filter, symbol filter, or pagination on either route — neither
-  underlying query function supports them, so none is exposed. The only
-  filters exposed are the three the functions actually have:
-  `strategy_name`, `strategy_version`, `is_backtest`.
-- No filter UI (strategy/backtest dropdowns) in the frontend section —
-  minimal surfacing only, per this task's own scope. Both routes stay
-  fully filterable for a future, separately-considered UI.
-- No new dashboard, page, tab, or charting system.
-- No Pydantic schema addition — `dataclasses.asdict()` is used directly,
-  matching `performance_queries.py`'s own stated reasoning for keeping
-  these as local dataclasses.
+## What it does NOT prove — read this before citing this milestone as more than it is
 
-## A correction worth flagging
+- **Real historical-market accuracy or strategy profitability.**
+  `FixtureCandleProvider` validates replay/persistence plumbing only —
+  hand-built or synthetic candles, never claimed otherwise.
+- **Real historical Context Engine replay.** `FixtureBacktestContextProvider`
+  is calendar-only (`MarketClock`-derived, real logic) with Fundamentals/
+  News honestly absent — no point-in-time historical context source
+  exists in this codebase yet. `HistoricalContextProvider` is a
+  documented extension point, not a working implementation.
+- **Multi-symbol replay, sweep execution, walk-forward validation,
+  parameter optimization, ML/predictive performance, or production
+  trading performance.** None of these were built, and Backtest Runner
+  v1's own data structures are symbol-keyed specifically so a future
+  multi-symbol runner can extend this without a rewrite — but nothing
+  here exercises that path today.
 
-An earlier draft of this task's instructions asserted that
-`get_win_rate_by_hour()`/`get_expectancy_by_session_type()` support only
-`strategy_name`/`strategy_version`, and warned against "inventing"
-`is_backtest`. Read directly against the real, current function
-signatures in `performance_queries.py` before any route was written, this
-is incorrect: `is_backtest: bool = False` is both functions' own third
-keyword argument, already fully implemented and documented in each
-function's own docstring. It is kept as a real, exposed filter on both
-routes. See decision #127's own entry for the full account.
+## Backend validation — Backtest Runner's own test suite
 
-## Parallel-work note
-
-Partway through this task, a routine re-pull of `main` surfaced a new,
-unrelated parallel landing: Backtest Runner "Unit 5" (test-only, its own
-`CHANGES.md`, one new file `backend/tests/test_backtest_runner_regression.py`,
-20 new tests). Confirmed via `diff -rq` that `backend/app/backtest_runner/`
-was byte-identical to this task's starting snapshot and that
-`intelligence.py` upstream carried zero backtest-related content —
-genuinely file-disjoint. That file was pulled into this session's local
-working tree purely so this delivery's own before/after test counts
-reflect current `main`, not a stale starting snapshot. It is **not** part
-of this delivery's zip — it already exists on `main`, so a checkout that
-tracks `main` already has it. This delivery's `CHANGES.md` is likewise
-left untouched, since it belongs to that other delivery, not this one.
-
-## Backend validation
-
-Real PostgreSQL 16, provisioned locally to match the project's documented
-setup exactly (`trading`/`trading`/`trading_workspace`), migrated via
+Real local Postgres (provisioned this session), migrations applied via
 `alembic upgrade head`.
 
-**Baseline** (fresh untouched clone of current `main`, including Backtest
-Runner Unit 5's own +20 tests — see parallel-work note above):
-
 ```
-693 collected, 691 passed, 2 failed
-```
-
-The 2 failures are the pre-existing, documented decision-#119 flaky
-cluster (`test_vwap_publishes_even_while_sma_is_still_warming_up`,
-`test_daily_levels_carry_level_interaction_once_touched`) — a standing
-baseline fixture, not investigated per standing project convention.
-
-**Working tree** (baseline + this delivery):
-
-```
-702 collected, 700 passed, 2 failed
+cd backend
+python -m pytest tests/test_backtest_runner_fixtures.py \
+                  tests/test_replay_state_producer.py \
+                  tests/test_fill_simulator_and_gate.py \
+                  tests/test_backtest_runner.py \
+                  tests/test_backtest_runner_regression.py -v
 ```
 
-Exactly +9 — this delivery's own new tests, all passing. Same 2
-flaky-cluster failures, zero regressions. Re-ran the full suite twice
-against a freshly wiped-and-recreated database; identical result both
-times. The 9 new tests were also run in isolation twice for stability;
-100% pass rate both times.
+**64/64 passing.** Breakdown: 12 (fixture provider/context provider,
+Unit 1) + 4 (replay state producer, real engines, Unit 2) + 16 (fill
+simulator/D17 gate, pure, Unit 3) + 3 (full end-to-end run, Unit 4) + 20
+(runner-level D17, singleton serialization, Polygon propagation,
+strategy-branch regression guard, Unit 5) + 9
+(`test_performance_queries.py`, decision #124's own suite, re-run
+alongside as a sanity check every delivery).
 
-### New tests (`backend/tests/test_performance_analytics_routes.py`)
+Not re-proven here, deliberately: `performance_queries.py`'s own query
+correctness (decisions #122/#124/#127 already cover it in full) —
+Backtest Runner only ever calls `record_strategy_outcome()`, never those
+query functions, and duplicating their tests here would test code this
+task never touches.
 
-Mirrors `test_strategy_outcomes_and_opportunity_conflicts_routes.py`'s own
-route-test posture: direct `StrategyOutcomeRecord` ORM inserts, proving
-each route forwards to and shapes the real query-layer result — does
-**not** re-test the grouping/arithmetic itself, which
-`test_performance_queries.py` already covers exhaustively (8 tests, real
-Postgres).
-
-- Empty-table case for both routes (`{"hourly_win_rates": []}` /
-  `{"session_expectancy": []}`, 200, not an error)
-- Populated case for both routes, asserting exact field values including
-  the honest-`None` session-type group
-- `strategy_name` filter correctly isolates rows
-- `is_backtest` filter correctly isolates rows (mixed live/backtest rows
-  with deliberately opposite outcomes, so blending would be detectable)
-- `strategy_version` without `strategy_name` → 400 for both routes
-
-## Frontend validation
-
-**Baseline** (fresh untouched clone):
+## Full-suite regression — real local Postgres, run against current `main` (including decision #127's work) before this close-out's own doc changes
 
 ```
-npx tsc -b   → 4 errors, all in GridPresetPicker.tsx (decision #35, known pre-existing)
-npx vite build → not reached (tsc -b exits non-zero); ran standalone: succeeds, 86 modules
+cd backend
+python -m pytest -q
 ```
 
-**Working tree:**
+**702 collected, 700 passed, 2 failed.** Both failures checked
+individually against the documented decision #119 flaky cluster, not
+assumed:
 
-```
-npx tsc -b   → same 4 errors, same lines, GridPresetPicker.tsx only
-npx vite build → succeeds, 86 modules transformed
-```
+- `tests/test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
+  — reproduces the cluster's documented intermittent/order-sensitive
+  signature exactly (passed clean on isolated rerun), consistent with
+  this test's full history in the decision log since #113.
+- `tests/test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+  — matches the cluster by name and by its long-documented general
+  fragility (this exact test's hardcoded assertion has needed widening
+  multiple times before, for `session_volume` then `vwap_ext`/
+  `session_volume_ext`, each logged as "expected, not a regression").
+  **This run's specific cause is newly identified, not previously
+  logged**: decision #111 made `_update_gap` publish `regular_open` for
+  any candle at/after real regular-session open; this test's fixture
+  candle sits exactly at regular-session open and has triggered that
+  publish ever since #111 landed, but #111's own text only mentions
+  updating "three existing gap tests" — not this one. Reproduces
+  deterministically in isolation (confirmed by direct rerun), unlike the
+  daily-levels member above. Flagged precisely here rather than folded
+  into "2 known #119 failures, nothing to see" — a genuine, minor,
+  pre-existing test-staleness gap, unrelated to any Backtest Runner or
+  Performance Analytics work, and out of scope for this documentation-
+  only close-out to fix (would mean editing `test_feature_engine.py`).
 
-No new frontend errors. No new frontend tests added, matching this
-codebase's existing test-free hook convention.
+**Zero regressions from either parallel track**: same 2 failures, same
+causes, both before and after decision #127's own work merged, and on a
+tree with only this close-out's documentation changes applied on top.
 
-## Known limitations
-
-- `strategy_outcomes` has zero real rows in production today (no
-  Execution Engine exists yet to write one) — both routes and the new UI
-  section will show "No performance data yet." until that changes. This
-  is expected and matches the exact posture decision #123 already
-  shipped for `/strategy-outcomes`/`/opportunity-conflicts`.
-- The new `usePerformanceAnalytics.ts` hook exposes a caller-visible
-  `error` state, unlike every other existing hook in this codebase
-  (`useStrategyOutcomes`, `useOpportunityConflicts`, `useContextSnapshot`
-  all collapse fetch failures into an empty/default result). This is a
-  deliberate, stated deviation — see decision #127 — not an inconsistency
-  to "fix" by matching the older hooks; if anything, the older hooks are
-  candidates for the same fix in a future, separately-scoped task.
-
-## Final verification
+## Fresh-clone diff verification
 
 `diff -rq` against a freshly-pulled untouched clone of current `main`
-confirms the only files changed are the ones listed under "Files touched"
-above.
+(post-#127-merge) confirms this close-out's own change set is exactly the
+"Files touched" list above — `backend/app/` and `backend/tests/`
+untouched by this entry (Unit 6 adds no tests, per its own scope), no
+accidental touch to any file outside the four documents this close-out
+targets, and no interference with decision #127's own independent work.
+
+## Known limitations / deferred, not done here
+
+- `backend/app/api/routes/backtest.py` — the optional route to trigger a
+  run over HTTP. Deferred every delivery so far, remains a separate
+  follow-up decision, not built or tested in Units 1-6.
+- The `regular_open` test-staleness finding above — flagged, not fixed,
+  per this close-out's documentation-only scope.
