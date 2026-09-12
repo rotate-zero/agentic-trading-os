@@ -427,6 +427,111 @@ export async function fetchOpportunityConflicts(symbol?: string): Promise<Opport
   return (await res.json()) as OpportunityConflictsWireShape;
 }
 
+// Matches GET /intelligence/win-rate-by-hour's response shape (decision
+// #127) — field names/types copied directly from
+// `performance_queries.py`'s `HourlyWinRate` dataclass (re-verified
+// against that file's current contents), returned via
+// `dataclasses.asdict()` with no reshaping in the route. `hour_et` is
+// Eastern-time (0-23), converted server-side from the stored UTC
+// timestamp — never a raw UTC hour; see that dataclass's own docstring.
+export interface HourlyWinRateWireShape {
+  hour_et: number;
+  total_trades: number;
+  win_count: number;
+  win_rate: number;
+}
+
+export interface WinRateByHourWireShape {
+  hourly_win_rates: HourlyWinRateWireShape[];
+}
+
+// Matches GET /intelligence/expectancy-by-session-type's response shape
+// (decision #127) — field names/types copied directly from
+// `performance_queries.py`'s `SessionTypeExpectancy` dataclass.
+// `session_type` is `null` for the honest "no calendar.session recorded
+// at write time" group, never a synthetic label and never dropped from
+// the list — see that dataclass's own docstring.
+export interface SessionTypeExpectancyWireShape {
+  session_type: string | null;
+  trade_count: number;
+  expectancy_r: number;
+}
+
+export interface ExpectancyBySessionTypeWireShape {
+  session_expectancy: SessionTypeExpectancyWireShape[];
+}
+
+// Shared real filter surface for both routes below — `strategyName`/
+// `strategyVersion` (passing a version without a name is a backend 400,
+// the same `_validate_strategy_filters()` guard both
+// `get_win_rate_by_hour()`/`get_expectancy_by_session_type()` enforce
+// themselves) and `isBacktest` (a strict live/backtest selector already
+// on the query layer itself — `false` on the backend when omitted,
+// never blended — see performance_queries.py's own docstring). No
+// filter beyond these three exists on either function; none is invented
+// at this layer.
+export interface PerformanceAnalyticsFilters {
+  strategyName?: string;
+  strategyVersion?: string;
+  isBacktest?: boolean;
+}
+
+// A small helper, unlike the inline `url +=` pattern fetchIntelligenceState
+// above uses — that pattern fits one optional param bolted onto a
+// mandatory `symbol=`; both routes below have THREE independent optional
+// params and no mandatory one, so building the same way here would mean
+// tracking "is this the first param appended yet" by hand at each call
+// site. Same conditional-append-if-present semantics either way.
+function _performanceAnalyticsQuery(filters?: PerformanceAnalyticsFilters): string {
+  const parts: string[] = [];
+  if (filters?.strategyName !== undefined) {
+    parts.push(`strategy_name=${encodeURIComponent(filters.strategyName)}`);
+  }
+  if (filters?.strategyVersion !== undefined) {
+    parts.push(`strategy_version=${encodeURIComponent(filters.strategyVersion)}`);
+  }
+  if (filters?.isBacktest !== undefined) {
+    parts.push(`is_backtest=${filters.isBacktest}`);
+  }
+  return parts.length > 0 ? `?${parts.join("&")}` : "";
+}
+
+/**
+ * GET /intelligence/win-rate-by-hour — decision #127. Global/strategy-
+ * level, not symbol-scoped (the route has no `symbol` filter — same
+ * posture as fetchStrategyOutcomes above). `strategy_outcomes` has zero
+ * real rows in production today (no Execution Engine/Position Monitor
+ * writes to it yet); an empty `hourly_win_rates` array is the honest,
+ * expected response, not an error. Throws `ApiError` (e.g. status 400
+ * for a `strategyVersion` passed without `strategyName`) rather than
+ * returning a value — callers must distinguish a request error from a
+ * genuinely empty result themselves (see `usePerformanceAnalytics`).
+ */
+export async function fetchWinRateByHour(filters?: PerformanceAnalyticsFilters): Promise<WinRateByHourWireShape> {
+  const url = `${API_BASE_URL}/intelligence/win-rate-by-hour${_performanceAnalyticsQuery(filters)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as WinRateByHourWireShape;
+}
+
+/**
+ * GET /intelligence/expectancy-by-session-type — decision #127. Same
+ * filter surface, empty-state posture, and error-throwing behavior as
+ * fetchWinRateByHour immediately above.
+ */
+export async function fetchExpectancyBySessionType(
+  filters?: PerformanceAnalyticsFilters,
+): Promise<ExpectancyBySessionTypeWireShape> {
+  const url = `${API_BASE_URL}/intelligence/expectancy-by-session-type${_performanceAnalyticsQuery(filters)}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExpectancyBySessionTypeWireShape;
+}
+
 // Matches GET /intelligence/context's response shape exactly
 // (ContextEngine.get_snapshot(), backend/app/context_engine/engine.py) —
 // verified directly against that method's own docstring/implementation.

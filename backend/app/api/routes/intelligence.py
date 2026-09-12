@@ -465,3 +465,111 @@ async def get_opportunity_conflicts_view(symbol: str | None = Query(None)) -> di
     from app.trading_intelligence.opportunity_view import get_opportunity_conflicts
 
     return get_opportunity_conflicts(symbol)
+
+
+@router.get("/win-rate-by-hour")
+async def get_win_rate_by_hour_view(
+    strategy_name: str | None = Query(None),
+    strategy_version: str | None = Query(None),
+    is_backtest: bool = Query(False),
+) -> dict[str, Any]:
+    """
+    Decision #127 — read-side exposure of `performance_queries.
+    get_win_rate_by_hour()` (decision #122, correction #124), the same
+    "make a built-but-unwired capability visible outside of tests"
+    purpose GET /strategy-outcomes and GET /opportunity-conflicts above
+    already served for their own tables/views. Decision #122's own
+    "not built here" note named this exact route as future work,
+    deferred specifically to avoid colliding with the sibling parallel
+    track's own route work on this file at the time (that track landed
+    as #123) — this is that deferred route, now that #123 is long since
+    landed and stable.
+
+    All three params are real, already-existing parameters of
+    `get_win_rate_by_hour()` itself — `strategy_name`/`strategy_version`
+    (with `_validate_strategy_filters()`'s own version-requires-name
+    rule) and `is_backtest` (a strict live/backtest selector, never a
+    blend — see that function's own docstring). No filter beyond these
+    three is invented; `is_backtest` in particular is not a route-level
+    addition, it is the function's own second keyword argument, read
+    directly from `performance_queries.py` before this route was
+    written, not guessed from an unrelated prompt.
+
+    A genuinely thin wrapper: this route builds no SQL, applies no
+    filtering of its own, and does not touch `strategy_outcomes`
+    directly — `get_win_rate_by_hour()` already IS the read contract.
+    `ValueError` (strategy_version without strategy_name) becomes a 400,
+    the same clean-400 posture GET /series already uses for an
+    unsupported timeframe, rather than a raw 500.
+
+    Response is `{"hourly_win_rates": [...]}`, one entry per
+    `HourlyWinRate` dataclass row (`hour_et`, `total_trades`,
+    `win_count`, `win_rate`) via `dataclasses.asdict()` — no new
+    Pydantic schema, matching that module's own stated reasoning for
+    using local dataclasses over `schemas/performance.py`. Zero real
+    `strategy_outcomes` rows exist in production today (no Execution
+    Engine yet), so this honestly returns `{"hourly_win_rates": []}`,
+    200, not an error — same convention every route in this file
+    already follows.
+
+    Import is local to this function, not hoisted to this file's
+    top-of-file import block — same collision-avoidance reasoning GET
+    /opportunities' and GET /strategy-outcomes' own docstrings give
+    above: this route and GET /expectancy-by-session-type below are
+    this delivery's only touch to this file, appended as a single
+    additive block.
+    """
+    from dataclasses import asdict
+
+    from app.trading_intelligence.performance_queries import get_win_rate_by_hour
+
+    try:
+        rows = get_win_rate_by_hour(
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            is_backtest=is_backtest,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"hourly_win_rates": [asdict(row) for row in rows]}
+
+
+@router.get("/expectancy-by-session-type")
+async def get_expectancy_by_session_type_view(
+    strategy_name: str | None = Query(None),
+    strategy_version: str | None = Query(None),
+    is_backtest: bool = Query(False),
+) -> dict[str, Any]:
+    """
+    Decision #127 — read-side exposure of `performance_queries.
+    get_expectancy_by_session_type()` (decision #122, correction #124),
+    same purpose and same deferred-then-landed relationship to #122/#123
+    as GET /win-rate-by-hour immediately above; see that route's own
+    docstring for the shared reasoning (deferred route, thin wrapper,
+    real filter surface, local-import collision avoidance) rather than
+    repeating it here.
+
+    Response is `{"session_expectancy": [...]}`, one entry per
+    `SessionTypeExpectancy` dataclass row (`session_type`, `trade_count`,
+    `expectancy_r`) via `dataclasses.asdict()`. `session_type` is `None`
+    for the honest "no `calendar.session` recorded" group — see
+    `SessionTypeExpectancy`'s own docstring — passed through as JSON
+    `null`, not coerced into a synthetic label or dropped from the list.
+    Same empty-table posture as GET /win-rate-by-hour: `{"session_
+    expectancy": []}`, 200, when nothing matches, never a fabricated row.
+    """
+    from dataclasses import asdict
+
+    from app.trading_intelligence.performance_queries import get_expectancy_by_session_type
+
+    try:
+        rows = get_expectancy_by_session_type(
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            is_backtest=is_backtest,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"session_expectancy": [asdict(row) for row in rows]}

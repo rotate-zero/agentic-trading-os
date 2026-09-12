@@ -5,6 +5,7 @@ import { useLatestPrices } from "../../hooks/useLatestPrices";
 import { useOpportunities } from "../../hooks/useOpportunities";
 import { useOpportunityConflicts } from "../../hooks/useOpportunityConflicts";
 import { useStrategyOutcomes } from "../../hooks/useStrategyOutcomes";
+import { usePerformanceAnalytics } from "../../hooks/usePerformanceAnalytics";
 import { useContextSnapshot } from "../../hooks/useContextSnapshot";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
@@ -80,6 +81,90 @@ function RecentClosedTrades() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small additional section (decision #127) surfacing GET /intelligence/
+// win-rate-by-hour + GET /intelligence/expectancy-by-session-type — same
+// "global, not tied to any one connector's symbol" placement reasoning
+// RecentClosedTrades above already establishes for this file (both read
+// the same strategy_outcomes table), so it sits directly below it.
+// Always rendered, including the empty case, same "don't hide it, don't
+// fabricate it" posture as the rest of this file — but unlike
+// RecentClosedTrades, a request failure renders as its own distinct
+// error state rather than folding into "no data yet": see
+// usePerformanceAnalytics's own docstring for why that distinction
+// matters here specifically. No filter UI (strategy/backtest dropdowns)
+// — this is explicitly a minimal surfacing of an existing capability,
+// not a new dashboard; both routes stay fully filterable for a future,
+// separately-considered UI.
+function formatHourEt(hourEt: number): string {
+  const period = hourEt < 12 ? "AM" : "PM";
+  const hour12 = hourEt % 12 === 0 ? 12 : hourEt % 12;
+  return `${hour12} ${period} ET`;
+}
+
+function StrategyPerformanceSummary() {
+  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics();
+  const isEmpty = winRateByHour.length === 0 && sessionExpectancy.length === 0;
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">Strategy Performance</div>
+      {loading && isEmpty ? (
+        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
+      ) : error ? (
+        <p className="p-1 text-[11px] text-bear">Couldn't load performance data — {error}</p>
+      ) : isEmpty ? (
+        <p className="p-1 text-[11px] text-text-muted">No performance data yet.</p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          {winRateByHour.length > 0 && (
+            <div>
+              <div className="mb-1 text-[10px] text-text-muted">Win rate by hour</div>
+              <div className="flex flex-col gap-1">
+                {winRateByHour.map((row) => (
+                  <div
+                    key={row.hour_et}
+                    className="flex items-center justify-between rounded border border-base-border px-2 py-1 font-mono text-[11px]"
+                  >
+                    <span className="text-text-primary">{formatHourEt(row.hour_et)}</span>
+                    <span className="text-text-muted">
+                      {row.win_count}/{row.total_trades}
+                    </span>
+                    <span className={row.win_rate >= 0.5 ? "text-bull" : "text-bear"}>
+                      {(row.win_rate * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {sessionExpectancy.length > 0 && (
+            <div>
+              <div className="mb-1 text-[10px] text-text-muted">Expectancy by session</div>
+              <div className="flex flex-col gap-1">
+                {sessionExpectancy.map((row) => (
+                  <div
+                    key={row.session_type ?? "__none__"}
+                    className="flex items-center justify-between rounded border border-base-border px-2 py-1 font-mono text-[11px]"
+                  >
+                    <span className="text-text-primary">
+                      {row.session_type ? row.session_type.replace("_", " ") : "Unknown session"}
+                    </span>
+                    <span className="text-text-muted">{row.trade_count} trades</span>
+                    <span className={row.expectancy_r >= 0 ? "text-bull" : "text-bear"}>
+                      {row.expectancy_r >= 0 ? "+" : ""}
+                      {row.expectancy_r.toFixed(2)}R
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -171,6 +256,7 @@ function GeneralContent() {
       </div>
       <MarketSessionSummary />
       <RecentClosedTrades />
+      <StrategyPerformanceSummary />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
       <p className="text-xs leading-relaxed text-text-muted">
         General mode isn't tied to any single connector — it's the scrollable, market-wide view. Select a
