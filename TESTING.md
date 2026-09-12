@@ -1,147 +1,135 @@
-# TESTING.md — Backtest Runner v1 close-out (decision #128)
+# TESTING.md — `regular_open` test-staleness fix (decision #129)
 
 ## What this documents
 
-`backend/app/backtest_runner/` (Units 1-5, five separate deliveries) is
-now feature-complete and this file's own close-out (Unit 6) is
-documentation-only — zero `backend/app/` changes of its own. Full
-reasoning, including the precise data/Context/D17 boundaries: decision
-#128, `docs/decisions/confirmed-decisions.md`.
+A single, targeted test fix: `backend/tests/test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+was widened to assert the `regular_open` key that decision #111's
+`_update_gap` has genuinely been publishing in this test's payload since
+#111 landed. Full reasoning: decision #129, `docs/decisions/confirmed-decisions.md`.
 
-### A note on repo state during this close-out
+This closes the exact gap decision #128's own close-out identified and
+deliberately left unfixed (that entry's scope was documentation-only for
+Backtest Runner v1; fixing this meant editing `test_feature_engine.py`,
+outside its footprint).
 
-Mid-close-out, a separate parallel session's Performance Analytics work
-landed on `main` and had independently claimed decision #127 — a real
-numbering collision, same category as #98/#99, #111/#112, #114/#115,
-#120/#121, #122/#123. This entry's own decision was drafted under #127
-too, before either session could see the other; reconciled by renumbering
-this one to #128 rather than overwriting theirs (decisions are immutable).
-Synced their files in (`intelligence.py`, `InfoTab.tsx`, `api-client.ts`,
-`usePerformanceAnalytics.ts`, `test_performance_analytics_routes.py`) and
-re-ran the full suite against the truly-current, merged `main` before
-finalizing the numbers below — not against this session's own earlier,
-now-stale snapshot. Cross-confirmed file-disjoint both ways: decision
-#127's own entry states it never touched `backend/app/backtest_runner/`;
-this entry confirms it never touched any of #127's files either.
+### Files touched by this fix
 
-### Files touched by this close-out
-
+- `backend/tests/test_feature_engine.py` — one test's exact-equality
+  assertion widened by one key, plus an explanatory comment.
 - `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md` —
-  new decision #128 entry + index row.
-- `docs/architecture/strategy-engine-design.md` — targeted addition to
-  §7 (one diagram, one "as-built" note). No rewrite, no restructure.
+  new decision #129 entry + index row.
 - This file.
 
-**Zero backend/app/ changes from this entry.** Confirmed by `diff -rq`
-against a fresh untouched clone — see "Fresh-clone diff verification"
-below. (`intelligence.py` et al. differ from an *older* clone only
-because decision #127's own, independent work is now part of current
-`main` — not because this close-out touched them.)
+**Zero other `backend/app/` or `backend/tests/` changes.** Confirmed by
+`diff -rq` against a freshly re-pulled untouched clone — see "Fresh-clone
+diff verification" below.
 
-## What Backtest Runner v1 proves (built across Units 1-5, not this close-out)
+## The bug, precisely
 
-A fixture-driven replay of one symbol through the real, unmodified engine
-pipeline and a real, unmodified `Strategy.evaluate()` produces a real
-`BacktestRunRecord` and a real `StrategyOutcomeRecord(is_backtest=True)`
-resolving to it, with entry/exit snapshots captured at the real
-`entry_filled_at`/`exit_filled_at` instants (not the signal candle), and
-`is_backtest=True` isolation reused directly from decisions #120/#122.
+`_update_gap` (`backend/app/feature_engine/engine.py`) publishes
+`regular_open` as its own `features` key whenever
+`state["regular_open"] is not None` — true the moment today's regular
+session has opened, deliberately independent of whether `gap_pct`/
+`gap_dollars` are also computable yet (decision #111). The fixture candle
+in `test_vwap_publishes_even_while_sma_is_still_warming_up` is published
+at `_et(2026, 8, 11, 9, 30)` — exactly regular-session open — so
+`regular_open: 100.0` has been a real, present key in this test's actual
+`FEATURES_UPDATED` payload ever since #111 landed. Decision #111's own
+text names only "three existing gap tests" as updated for the new key;
+this test lives in the VWAP-warmup group, not the gap group, so its
+hardcoded exact-equality dict was never touched and silently fell out of
+sync with the real payload.
 
-## What it does NOT prove — read this before citing this milestone as more than it is
+This is the same "hardcoded dict needs widening every time a new key
+joins the set" pattern this test's own comment already documents
+happening twice before (`session_volume`, then `vwap_ext`/
+`session_volume_ext`) — just never caught for `regular_open` specifically
+until decision #128's own targeted trace during Backtest Runner
+close-out verification.
 
-- **Real historical-market accuracy or strategy profitability.**
-  `FixtureCandleProvider` validates replay/persistence plumbing only —
-  hand-built or synthetic candles, never claimed otherwise.
-- **Real historical Context Engine replay.** `FixtureBacktestContextProvider`
-  is calendar-only (`MarketClock`-derived, real logic) with Fundamentals/
-  News honestly absent — no point-in-time historical context source
-  exists in this codebase yet. `HistoricalContextProvider` is a
-  documented extension point, not a working implementation.
-- **Multi-symbol replay, sweep execution, walk-forward validation,
-  parameter optimization, ML/predictive performance, or production
-  trading performance.** None of these were built, and Backtest Runner
-  v1's own data structures are symbol-keyed specifically so a future
-  multi-symbol runner can extend this without a rewrite — but nothing
-  here exercises that path today.
+## The fix
 
-## Backend validation — Backtest Runner's own test suite
+```python
+assert features == {
+    "vwap": 100.0,
+    "session_volume": 10.0,
+    "vwap_ext": 100.0,
+    "session_volume_ext": 10.0,
+    "regular_open": 100.0,
+}
+```
 
-Real local Postgres (provisioned this session), migrations applied via
-`alembic upgrade head`.
+with an inline comment naming both decision #111 (why the key exists)
+and decision #129 (why it's now asserted). No change to `_update_gap`,
+`indicators/gap.py`, or any other test in this file.
+
+## Why this one is a real fix, not another #119-cluster entry
+
+Confirmed genuinely deterministic for this specific cause — 3/3 isolated
+reruns failed identically (same missing-`regular_open` diff) before the
+fix, and 3/3 passed clean after. Separately,
+`test_daily_levels_carry_level_interaction_once_touched` (the #119
+cluster's other currently-failing member, left completely untouched by
+this change) was re-run in isolation 5 times during this task's
+verification: failed once, passed clean the other four — consistent with
+its long-documented order/timing-sensitive signature (decisions #113
+onward). The two were not conflated; only the genuinely deterministic one
+was touched.
+
+## Verification
+
+Real local Postgres 16 (provisioned directly in this session —
+`apt-get install postgresql`, `service postgresql start`, `trading`/
+`trading`/`trading_workspace`, `alembic upgrade head`).
+
+**Target test, before the fix** (freshly-pulled untouched clone), 3
+isolated reruns:
 
 ```
 cd backend
-python -m pytest tests/test_backtest_runner_fixtures.py \
-                  tests/test_replay_state_producer.py \
-                  tests/test_fill_simulator_and_gate.py \
-                  tests/test_backtest_runner.py \
-                  tests/test_backtest_runner_regression.py -v
+python -m pytest tests/test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up -v
 ```
 
-**64/64 passing.** Breakdown: 12 (fixture provider/context provider,
-Unit 1) + 4 (replay state producer, real engines, Unit 2) + 16 (fill
-simulator/D17 gate, pure, Unit 3) + 3 (full end-to-end run, Unit 4) + 20
-(runner-level D17, singleton serialization, Polygon propagation,
-strategy-branch regression guard, Unit 5) + 9
-(`test_performance_queries.py`, decision #124's own suite, re-run
-alongside as a sanity check every delivery).
+All 3 failed identically:
+`AssertionError: ... Left contains 1 more item: {'regular_open': 100.0}`.
 
-Not re-proven here, deliberately: `performance_queries.py`'s own query
-correctness (decisions #122/#124/#127 already cover it in full) —
-Backtest Runner only ever calls `record_strategy_outcome()`, never those
-query functions, and duplicating their tests here would test code this
-task never touches.
-
-## Full-suite regression — real local Postgres, run against current `main` (including decision #127's work) before this close-out's own doc changes
+**Full suite, before the fix** (same untouched clone):
 
 ```
 cd backend
 python -m pytest -q
 ```
 
-**702 collected, 700 passed, 2 failed.** Both failures checked
-individually against the documented decision #119 flaky cluster, not
-assumed:
+**702 collected, 700 passed, 2 failed** — matching decision #128's own
+reported baseline exactly:
+`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+and `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`.
 
-- `tests/test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`
-  — reproduces the cluster's documented intermittent/order-sensitive
-  signature exactly (passed clean on isolated rerun), consistent with
-  this test's full history in the decision log since #113.
-- `tests/test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
-  — matches the cluster by name and by its long-documented general
-  fragility (this exact test's hardcoded assertion has needed widening
-  multiple times before, for `session_volume` then `vwap_ext`/
-  `session_volume_ext`, each logged as "expected, not a regression").
-  **This run's specific cause is newly identified, not previously
-  logged**: decision #111 made `_update_gap` publish `regular_open` for
-  any candle at/after real regular-session open; this test's fixture
-  candle sits exactly at regular-session open and has triggered that
-  publish ever since #111 landed, but #111's own text only mentions
-  updating "three existing gap tests" — not this one. Reproduces
-  deterministically in isolation (confirmed by direct rerun), unlike the
-  daily-levels member above. Flagged precisely here rather than folded
-  into "2 known #119 failures, nothing to see" — a genuine, minor,
-  pre-existing test-staleness gap, unrelated to any Backtest Runner or
-  Performance Analytics work, and out of scope for this documentation-
-  only close-out to fix (would mean editing `test_feature_engine.py`).
+**Target test, after the fix**, 3 isolated reruns: all 3 passed.
 
-**Zero regressions from either parallel track**: same 2 failures, same
-causes, both before and after decision #127's own work merged, and on a
-tree with only this close-out's documentation changes applied on top.
+**Full suite, after the fix**, run twice against the same live database:
+
+**702 collected, 701 passed, 1 failed** both times —
+`test_daily_levels_carry_level_interaction_once_touched` only,
+separately re-confirmed intermittent above (not a regression from this
+change; same pre-existing #119-cluster member, unaffected by this fix's
+footprint).
+
+No frontend files touched by this change — `npx tsc -b`/`npx vite build`
+not re-run for this delivery.
 
 ## Fresh-clone diff verification
 
-`diff -rq` against a freshly-pulled untouched clone of current `main`
-(post-#127-merge) confirms this close-out's own change set is exactly the
-"Files touched" list above — `backend/app/` and `backend/tests/`
-untouched by this entry (Unit 6 adds no tests, per its own scope), no
-accidental touch to any file outside the four documents this close-out
-targets, and no interference with decision #127's own independent work.
+`diff -rq` against a freshly-pulled untouched clone of current `main`,
+taken immediately before writing decision #129, confirms this fix's own
+change set is exactly the "Files touched" list above —
+`backend/app/` and every other test file in `backend/tests/` untouched.
 
 ## Known limitations / deferred, not done here
 
-- `backend/app/api/routes/backtest.py` — the optional route to trigger a
-  run over HTTP. Deferred every delivery so far, remains a separate
-  follow-up decision, not built or tested in Units 1-6.
-- The `regular_open` test-staleness finding above — flagged, not fixed,
-  per this close-out's documentation-only scope.
+- The `regular_open` field remains published as designed (decision
+  #111) — this fix only updates a stale test assertion to match real,
+  intended behavior; no production code path changed.
+- No other test files were audited for similar staleness against #111's
+  `regular_open` key beyond the one this task traced and fixed — out of
+  scope for this targeted fix.

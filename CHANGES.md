@@ -1,87 +1,63 @@
-# Backtest Runner v1 — Unit 5: four regression gaps closed, test-only
+# `regular_open` test-staleness fix (decision #129) — test-only
 
 Copy this into your repo root, overwriting the existing path. Test-only
-delivery, as scoped: **zero changes to any production file** — confirmed
-directly (`diff -rq` of `backend/app/` against a fresh pull of current
-`main`, clean; `backend/app/backtest_runner/` byte-for-byte identical to
-what's already committed there). One new file:
-`backend/tests/test_backtest_runner_regression.py` (20 tests).
+delivery: **zero changes to any production file** — confirmed directly
+(`diff -rq` of `backend/app/` against a fresh pull of current `main`,
+clean). One file changed: `backend/tests/test_feature_engine.py`
+(one test's assertion widened by one key).
 
-## What each of the four sections proves
+## What this closes
 
-**1. Runner-level D17 enforcement (3 tests, real Postgres).** Mocks
-`capture_strategy_outcome_snapshots` at `app.backtest_runner.runner`'s
-own namespace — the name as the Runner actually calls it, not just
-`gate_and_warmup.check_entry_allowed()` in isolation (which Unit 4's
-D17 finding showed isn't the Runner's real gate anymore). Proves: (a)
-`None` at the fill candle → signal discarded, `record_strategy_outcome()`
-never called, no exit-time capture even attempted (position was voided
-first); (b) `None` at the exit candle → outcome not persisted, no
-fabricated `{}` substituted; (c) real dicts at both instants →
-`record_strategy_outcome()` called exactly once, with those exact dicts
-flowing through to `market_state_at_entry`/`context_at_entry`/`_at_exit`
-unchanged — confirming the mock target genuinely matches what the Runner
-calls, not a coincidence.
+Decision #128's Backtest Runner v1 close-out traced this run's second
+failing test to a specific, previously-unlogged cause rather than
+folding it into the documented #119 flaky cluster, and flagged it
+precisely without fixing it (out of scope for that documentation-only
+entry). This delivery closes exactly that gap.
 
-```text
-Opportunity
-    |
-capture snapshots (at fill candle, then again at exit candle)
-    |
- present?
-  no -> discard signal, DiscardedSignal recorded, never call record_strategy_outcome()
-  yes -> persist outcome
+## The bug
+
+`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`
+publishes its fixture candle at exactly regular-session open. Since
+decision #111, `_update_gap` publishes a real `regular_open` key
+whenever today's regular session has opened — independent of whether
+`gap_pct`/`gap_dollars` are computable yet. #111's own text says it
+updated "three existing gap tests"; this test isn't one of them (it
+lives in the VWAP-warmup group), so its hardcoded exact-equality dict
+was never widened and has been silently stale ever since, failing
+deterministically rather than intermittently.
+
+## The fix
+
+One key added to one assertion:
+
+```python
+assert features == {
+    "vwap": 100.0,
+    "session_volume": 10.0,
+    "vwap_ext": 100.0,
+    "session_volume_ext": 10.0,
+    "regular_open": 100.0,
+}
 ```
-
-**2. `engine_singleton_guard` serialization (2 tests, DB-free).** The
-new one proves actual mutual exclusion, not merely an observed call
-order: two coroutines race for the guard via `asyncio.gather`, one holds
-it for 0.2s, the other for 0.05s, both timestamp their own enter/exit
-instants with `time.monotonic()`. The assertion checks the two
-`[enter, exit]` intervals don't overlap **in either possible
-acquisition order** — a coincidental pass isn't possible the way a bare
-"B's log line came after A's" check could be. Kept the existing
-restore-on-exception test alongside it, same file now.
-
-```text
-Run A: enter -----0.2s hold----- exit
-Run B:                            enter --0.05s-- exit
-                    ^-- B cannot enter here; the lock blocks it
-```
-
-**3. Polygon `NOT_AUTHORIZED` propagation (1 test, DB-free — the
-exception fires before `BacktestRunner` ever touches the DB).** Reuses
-`test_polygon_provider.py`'s own established seam
-(`adapter._client.get_aggs` monkeypatched to raise the real captured
-`NOT_AUTHORIZED` body) against a real `PolygonAdapter` fed into a real
-`BacktestRunner`. Confirms `HistoricalDataUnavailableError` propagates
-uncaught — same exception type, same `.provider == "Polygon"` — and
-`strategy.calls == 0`: the Runner never reaches candle replay, so
-there's no risk of a silent partial or empty "successful" run.
-
-**4. No backtest-specific branches in the 7 real strategy files (14
-tests, DB-free, AST-based).** Two checks per file: no import with
-"backtest" anywhere in the module path or imported names; no `if`
-condition (walking the whole expression, not just top-level) referencing
-an identifier containing "backtest". AST-based specifically so the
-several legitimate docstring/comment mentions of "backtest" already in
-these files (e.g. "backtest-safe by construction") never trigger a false
-positive — only real Python identifiers in import statements and
-if-conditions are inspected, never string/comment content.
 
 ## Confirmed per the acceptance criteria
 
-- New tests: 20/20 pass.
-- Existing Backtest Runner suite (Units 1-4, 44 tests) + adjacent
-  `test_performance_queries.py` (9 tests) re-run alongside: 64/64 pass.
-- **No production behavior changed.** Verified two ways: `diff -rq`
-  against a fresh pull of current `main` (clean), and running the three
-  DB-free sections with Postgres deliberately stopped — they pass
-  regardless (17/20 pass, exactly the 3 D17 tests skip, confirming the
-  DB-gating is scoped to only the tests that genuinely need it, not a
-  blanket module-wide skip that would have falsely gated the other 17).
+- Target test: 3/3 isolated reruns failed identically before the fix
+  (same missing-key diff every time — genuinely deterministic, not
+  timing-sensitive), 3/3 passed after.
+- Full suite, real local Postgres 16: 702 collected / 700 passed / 2
+  failed before (matches decision #128's own reported baseline exactly)
+  → 702 collected / 701 passed / 1 failed after, run twice.
+- The one remaining failure (`test_daily_levels_carry_level_interaction_once_touched`)
+  separately re-confirmed genuinely intermittent — 1 fail / 4 pass across
+  isolated reruns, consistent with its documented #119-cluster signature
+  — and deliberately left untouched.
+- `diff -rq` against a freshly-pulled untouched clone: only
+  `backend/tests/test_feature_engine.py` differs in `backend/`.
 
-## Not done, on purpose, per Unit 5's own scope boundary
+## Not done, on purpose, per this fix's own scope boundary
 
-Full-suite before/after regression run, decision log entry, `TESTING.md`,
-the optional API route — Unit 6, next drop, pending review of this one.
+No audit of other test files for similar staleness against #111's
+`regular_open` key beyond the one instance this task traced. No
+production code touched — `regular_open`'s publish behavior is exactly
+as decision #111 designed it; only the stale assertion was wrong.

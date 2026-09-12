@@ -998,7 +998,20 @@ async def test_vwap_publishes_even_while_sma_is_still_warming_up():
         # session — this test's exact-equality shape gets touched each
         # time a new one joins that set, same as it was for
         # session_volume's own addition; not a regression.
-        assert features == {"vwap": 100.0, "session_volume": 10.0, "vwap_ext": 100.0, "session_volume_ext": 10.0}
+        # regular_open (decision #111) publishes independently of
+        # gap_pct/gap_dollars the moment today's regular session has
+        # opened — this fixture's candle sits exactly at regular-session
+        # open (9:30 ET), so it's real here too. Missed when #111 landed
+        # (that entry only names "three existing gap tests" as updated);
+        # closed by decision #129, which traced this test's failure to
+        # this specific missing key rather than folding it into #119.
+        assert features == {
+            "vwap": 100.0,
+            "session_volume": 10.0,
+            "vwap_ext": 100.0,
+            "session_volume_ext": 10.0,
+            "regular_open": 100.0,
+        }
     finally:
         await engine.stop()
         await bus.stop()
