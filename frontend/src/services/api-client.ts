@@ -751,3 +751,120 @@ export async function removeScannerUniverseSymbol(symbol: string): Promise<boole
   const wire = (await res.json()) as { symbol: string; removed: boolean };
   return wire.removed;
 }
+
+// ---------------------------------------------------------------------
+// Backtest Runner trigger route (POST /backtest/run, decision #130) —
+// BacktestPanel.tsx's only backend dependency.
+//
+// The 7 real v1 strategy names and 4 real fixture scenario names below
+// are hardcoded rather than fetched from the backend. Neither
+// `strategy_engine.scheduler.default_registry()` nor
+// `backtest_runner/scenarios.py`'s `available_scenarios()` is reachable
+// over HTTP anywhere in this codebase today — exposing either would mean
+// adding a new backend route or editing scheduler.py/scenarios.py
+// directly, both explicitly out of this task's frontend-only file
+// boundary. Both lists were confirmed directly against that Python
+// source (not guessed) before being copied here; POST /backtest/run's
+// own 400 response body already lists the real valid values as a live
+// fallback if either list ever silently drifts out of sync with the
+// backend — see BacktestPanel.tsx's error-rendering for why that's
+// enough of a safety net not to duplicate here as a second source of
+// truth.
+export const BACKTEST_STRATEGY_NAMES = [
+  "ORB",
+  "Gap",
+  "Volume Spike",
+  "FirstPullback",
+  "Reversal",
+  "Momentum",
+  "VWAP",
+] as const;
+
+export interface BacktestScenarioInfo {
+  name: string;
+  description: string;
+  candleCount: number;
+}
+
+// Descriptions condensed from scenarios.py's own per-scenario strings;
+// candleCount drives BacktestPanel.tsx's "~Ns expected" hint before a
+// run starts (see that route's own docstring: ~1 measured second of
+// engine-settle time per replayed candle, not a formula — these counts
+// are read directly off _SCENARIO_FILES, not computed).
+export const BACKTEST_SCENARIOS: BacktestScenarioInfo[] = [
+  {
+    name: "first_pullback_vwap_dip",
+    description:
+      "Established uptrend + a dip into, and rejected back out of, VWAP's aura band. Verified to fire FirstPullback (BUY, target hit).",
+    candleCount: 130,
+  },
+  {
+    name: "reversal_vwap_break",
+    description:
+      "Established uptrend + a genuine break-through of VWAP (conquered, not rejected). Verified to fire Reversal (SELL, stopped out).",
+    candleCount: 140,
+  },
+  {
+    name: "vwap_neutral_conquest",
+    description:
+      "Flat/choppy session with a genuine VWAP conquest partway through. Verified to fire VWAP (SELL, target hit).",
+    candleCount: 140,
+  },
+  {
+    name: "volume_gated_baseline",
+    description:
+      "Generic moderate-uptrend session, not engineered to trigger any particular strategy. The only scenario available for ORB / Gap / Volume Spike / Momentum — their MATCH conditions hard-gate on volume_regime_score, which is structurally always 0.0 in any BacktestRunner replay today (no historical data provider wired into the replay stack). Verified to run cleanly (outcomes_recorded=0, no discarded signals) against all four — a 0 here is an honest, expected result, not an error.",
+    candleCount: 120,
+  },
+];
+
+// BacktestRunResult's real fields (backend/app/backtest_runner/runner.py),
+// returned verbatim by the route via dataclasses.asdict() — no
+// Performance Analytics wrapping, no reshaping. UUIDs/timestamps stay
+// plain strings here, same treatment CandleWireShape's candle_ts gets
+// above; nothing in BacktestPanel.tsx needs them as parsed types.
+export interface DiscardedSignalWireShape {
+  signal_candle_ts: string;
+  reason: string;
+  detail: string;
+}
+
+export interface BacktestRunResultWireShape {
+  run_id: string;
+  sweep_id: string;
+  outcomes_recorded: number;
+  discarded_signals: DiscardedSignalWireShape[];
+}
+
+/**
+ * POST /backtest/run (decision #130) — triggers one real BacktestRunner
+ * replay against a named fixture scenario and returns its real
+ * BacktestRunResult. All three params are required FastAPI Query(...)
+ * params on the real route (confirmed directly against backtest.py —
+ * not a JSON body), so this follows subscribeSymbol's existing
+ * POST-with-query-params-in-the-URL convention above rather than
+ * addScannerUniverseSymbol's JSON-body convention; no other adjustment
+ * to this file's fetch/API_BASE_URL usage was needed for a POST call.
+ *
+ * **This call is genuinely slow — expect ~1 real second per replayed
+ * candle (~120-140s for every scenario in BACKTEST_SCENARIOS above),
+ * not a fast request.** That's the route's own documented, deliberate
+ * behavior (`EngineBackedReplayStateProducer`'s real engine-settle time),
+ * not a client-side timeout to work around — see useBacktestRun.ts for
+ * how BacktestPanel.tsx surfaces that wait honestly instead of hiding it
+ * behind a generic spinner.
+ */
+export async function triggerBacktest(
+  strategyName: string,
+  symbol: string,
+  scenario: string,
+): Promise<BacktestRunResultWireShape> {
+  const url =
+    `${API_BASE_URL}/backtest/run?strategy_name=${encodeURIComponent(strategyName)}` +
+    `&symbol=${encodeURIComponent(symbol)}&scenario=${encodeURIComponent(scenario)}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BacktestRunResultWireShape;
+}

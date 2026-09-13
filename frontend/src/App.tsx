@@ -7,6 +7,7 @@ import { SubWindowGrid } from "./components/workspace/SubWindowGrid";
 import { InfoTab } from "./components/workspace/InfoTab";
 import { FeatureEnginePanel } from "./components/intelligence/FeatureEnginePanel";
 import { ScannerPanel } from "./components/scanner/ScannerPanel";
+import { BacktestPanel } from "./components/backtest/BacktestPanel";
 
 // Minimal hand-rolled routing — the only two shapes this app needs: "/"
 // (the full multi-tab workspace) and "/window/:id" (one Main Window,
@@ -46,6 +47,7 @@ function FullWorkspaceShell() {
         <InfoTab />
         <FeatureEnginePanel />
         <ScannerPanel />
+        <BacktestPanel />
       </main>
     </div>
   );
@@ -105,6 +107,7 @@ function PoppedOutWindowShell({ windowId }: { windowId: string }) {
         <InfoTab />
         <FeatureEnginePanel />
         <ScannerPanel />
+        <BacktestPanel />
       </main>
     </div>
   );

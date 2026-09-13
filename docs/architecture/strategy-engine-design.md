@@ -485,6 +485,31 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 
 `performance_queries.py`'s `_common_filters()` (decision #122) already enforced this exact discipline for the two `GROUP BY` queries next to this route; decision #130 brings `/strategy-outcomes` in line with it via the equivalent single predicate, since this route's raw-row shape doesn't share `_common_filters()`'s `GROUP BY`-oriented signature. `backtest_run_id` is additive-only — it always requires `is_backtest=true` alongside it (a live row never carries one), enforced as a 400, not a silently-empty result.
 
+**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #130) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response.
+
+```
+BacktestPanel.tsx (form: strategy_name / scenario / symbol)
+            │
+            ▼
+   POST /backtest/run                 ◄── fully synchronous, ~1s/candle,
+   (useBacktestRun.ts)                     ~120-140s per scenario — the
+            │                              panel shows a live "Nm Ns
+            ▼                              elapsed" state, not a bare
+   BacktestRunResult, rendered              spinner, while this is in
+   verbatim: run_id / sweep_id /            flight
+   outcomes_recorded / discarded_signals[]
+            │
+            ▼
+   outcomes_recorded=0 renders as a plain, neutral fact — four of the
+   seven strategies are structurally unreachable in any BacktestRunner
+   replay today (this section's own note above), so a zero here is
+   expected for many (strategy, scenario) pairs, not an error state.
+   No link into "Recent Closed Trades" / Performance Analytics UI —
+   explicitly out of scope, matching this route's own stated boundary.
+```
+
+Strategy names (`ORB`/`Gap`/`Volume Spike`/`FirstPullback`/`Reversal`/`Momentum`/`VWAP`) and scenario names/descriptions are hardcoded in `api-client.ts` rather than fetched at runtime — `default_registry()`/`available_scenarios()` are Python-only, not reachable over HTTP anywhere in this codebase, and exposing either would mean adding a new backend route or editing `scheduler.py`/`scenarios.py` directly, both outside this delivery's own frontend-only file boundary; the route's own 400 error body remains the live source of truth if either list ever drifts. The panel's own collapsed/width state is local component state, not threaded through `WorkspaceContext.tsx` the way Scanner/FeatureEngine panels' persisted, cross-tab-synced state is — a run's in-flight/finished state belongs to the one browser tab that started it and has no server-side push to sync from, so extending `WorkspaceContextValue`/`MainWindowState`'s localStorage schema for it would add persistence with no real use — flagged as a deliberate, reconsiderable choice in the component's own comment, not a silent deviation from the established pattern. No decision-log entry accompanies this note (see this delivery's own `CHANGES.md` for why); Saqib may fold it into a numbered decision at merge time if he wants one.
+
 ---
 
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation
