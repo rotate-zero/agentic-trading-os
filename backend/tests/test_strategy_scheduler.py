@@ -67,7 +67,7 @@ from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.features import FeatureSet
 from app.schemas.events.market_state import MarketState
 from app.strategy_engine.base_strategy import Opportunity, ScheduleTrigger, Strategy, StrategyConfig, every_candle
-from app.strategy_engine.scheduler import _CROSS_SYMBOL_SENTINEL, StrategyScheduler, _default_registry
+from app.strategy_engine.scheduler import _CROSS_SYMBOL_SENTINEL, StrategyScheduler, default_registry
 
 _TS = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
 
@@ -191,7 +191,7 @@ class _FakeBus:
 
 
 def test_default_registry_builds_all_seven_real_strategies_on_every_candle_1m():
-    registry = _default_registry(_TS)
+    registry = default_registry(_TS)
     assert len(registry) == 7
     assert {s.name for s in registry} == {
         "ORB", "Gap", "Volume Spike", "FirstPullback", "Reversal", "Momentum", "VWAP",
@@ -256,7 +256,7 @@ def test_construction_succeeds_for_the_real_seven_strategy_registry():
     gate_conditions key without also teaching gate_conditions.py about
     it, THIS is the test that should start failing, at construction
     time — not a runtime surprise once the app is live."""
-    StrategyScheduler(_FakeBus(), strategies=_default_registry(_TS))  # must not raise
+    StrategyScheduler(_FakeBus(), strategies=default_registry(_TS))  # must not raise
 
 
 # --- _on_features_updated: caching only, never evaluates (pure) -------------
@@ -644,7 +644,7 @@ async def test_scheduler_end_to_end_real_engines_stub_strategy_publishes_opportu
 
 
 async def test_scheduler_end_to_end_real_seven_strategies_no_crash_no_fabricated_opportunity():
-    """The real _default_registry() — all 7 built strategies — genuinely
+    """The real default_registry() — all 7 built strategies — genuinely
     called against a real (but MATCH-failing) candle. Not a claim that
     any strategy's MATCH conditions are satisfied here; only that wiring
     7 real strategies through the full stack doesn't crash and doesn't
@@ -659,7 +659,7 @@ async def test_scheduler_end_to_end_real_seven_strategies_no_crash_no_fabricated
     context_engine.start()
     _install_engine_singletons(market_state_engine, context_engine)
 
-    scheduler = StrategyScheduler(bus, strategies=_default_registry(_TS))
+    scheduler = StrategyScheduler(bus, strategies=default_registry(_TS))
     scheduler.start()
 
     received: list[EventEnvelope] = []

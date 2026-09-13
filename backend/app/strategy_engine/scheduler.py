@@ -14,7 +14,7 @@ HERE" note on this exact module is what this file resolves.
 Explicitly OUT of scope, decided directly by Saqib and not silently
 resolved here:
   - **`active_from`/`active_to`** — D14/decision #116, canonically closed:
-    `_default_registry()` passes "now, at Scheduler construction time" as
+    `default_registry()` passes "now, at Scheduler construction time" as
     an honest default with zero behavioral effect today, and this module
     must not compare `candle_ts` against either field. Do not reopen this
     just because `gate_conditions` (below) is now enforced in the same
@@ -197,14 +197,22 @@ logger = logging.getLogger(__name__)
 _CROSS_SYMBOL_SENTINEL = "__MARKET__"
 
 
-def _default_registry(active_from: datetime) -> list[Strategy]:
+def default_registry(active_from: datetime) -> list[Strategy]:
     """The 7 v1 strategies (trading-intelligence-architecture.md §8),
     each built from its own module's `default_config()`. Declaration
     order here is deliberate and fixed: `_on_market_state_changed` calls
     `evaluate()` in registry order, so this order is also the order two
     strategies that both fire on the same candle get published in — no
     ordering SEMANTICS implied (Opportunity Engine's ranking, §9, is what
-    will eventually decide precedence), just reproducibility."""
+    will eventually decide precedence), just reproducibility.
+
+    Promoted from a private, module-local `_default_registry()` to a
+    real public function (decision #130) — the Backtest Runner trigger
+    route needed the one place this codebase correctly builds all 7 real
+    strategies, and reaching into a private name from another module was
+    flagged as worth promoting rather than done silently. Behavior is
+    completely unchanged; only the name and this docstring note are new.
+    """
     return [
         orb_strategy.ORBStrategy(orb_strategy.default_config(active_from)),
         gap_strategy.GapStrategy(gap_strategy.default_config(active_from)),
@@ -225,7 +233,7 @@ class StrategyScheduler:
     def __init__(self, bus: EventBus, strategies: list[Strategy] | None = None) -> None:
         self._bus = bus
         self._strategies = (
-            strategies if strategies is not None else _default_registry(datetime.now(timezone.utc))
+            strategies if strategies is not None else default_registry(datetime.now(timezone.utc))
         )
 
         # gate_conditions validation (decision #117) — fails loudly,
