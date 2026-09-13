@@ -1,4 +1,4 @@
-"""Backtest Runner trigger route (decision #130) — the real, callable
+"""Backtest Runner trigger route (decision #131) — the real, callable
 HTTP entry point Backtest Runner v1 (decisions #120-#129) never had.
 Before this route, `BacktestRunner` could only be constructed by writing
 Python directly against its internal constructor args (`test_backtest_
@@ -53,6 +53,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.api.routes import finnhub_data, market_data
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.fixture_provider import FixtureCandleProvider
 from app.backtest_runner.runner import BacktestRunner
@@ -87,6 +88,44 @@ def _validate_scenario(scenario: str) -> None:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown scenario {scenario!r}. Valid values: {valid_scenarios}",
+        )
+
+
+def _reject_if_live_data_connected() -> None:
+    """Decision #132. This route's own docstring already warned that
+    `install_replay_engines()` swapping the process-wide Feature/Level-
+    Interaction/MarketState/Context singletons is unsafe to run
+    concurrently with live trading — but nothing enforced that until
+    now. Since this deployment is a single always-on process (no
+    per-request worker isolation — see this route's own docstring), "is
+    this process live" is precisely "is a live streaming provider
+    currently connected," which `finnhub_data.py`/`market_data.py`
+    already track for their own `/status` routes. Reusing that existing
+    signal directly, rather than adding a separate settings flag someone
+    would have to remember to set, means this check is automatically
+    correct in both dev and production — it can only ever fire when live
+    data is genuinely flowing."""
+    if finnhub_data.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to run a backtest: Finnhub is currently connected. "
+                "This route temporarily replaces the live Feature/LevelInteraction/"
+                "MarketState/Context engine singletons for its full duration, which "
+                "would corrupt live state. Disconnect Finnhub first if this is not "
+                "a live-trading process."
+            ),
+        )
+    if market_data.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to run a backtest: Polygon is currently connected. "
+                "This route temporarily replaces the live Feature/LevelInteraction/"
+                "MarketState/Context engine singletons for its full duration, which "
+                "would corrupt live state. Disconnect Polygon first if this is not "
+                "a live-trading process."
+            ),
         )
 
 
@@ -126,17 +165,19 @@ async def run_backtest(
     could behave differently, which this route has no way to know or
     control.
 
-    **Do not call this against a live-trading process.**
+    **Refuses to run against a live-trading process (decision #132).**
     `engine_singleton_guard.py`'s `install_replay_engines()` (unchanged
     by this task) temporarily replaces the process's real
     Feature/LevelInteraction/MarketState/Context engine singletons with
     this run's fresh ones for the entire duration of the call — already
     documented there as unsafe to run concurrently with live trading in
-    the same process. That risk isn't new here, but this route is the
-    first thing that makes it directly, easily HTTP-reachable rather
-    than requiring someone to write Python against internal constructor
-    args, so it's worth restating plainly rather than leaving it
-    findable only by reading that module.
+    the same process. That risk isn't new here, but this route was the
+    first thing that made it directly, easily HTTP-reachable rather than
+    requiring someone to write Python against internal constructor args.
+    As of decision #132, this is enforced rather than merely documented:
+    a Finnhub or Polygon connection currently live in this process
+    causes a `409` before any engine is touched, not just a warning to
+    read here.
 
     See this module's own docstring for what a response does and does
     not prove (several (strategy, scenario) pairs are expected to
@@ -149,6 +190,7 @@ async def run_backtest(
     symbol = symbol.strip().upper()
     _validate_strategy_name(strategy_name)
     _validate_scenario(scenario)
+    _reject_if_live_data_connected()
 
     strategy = next(
         s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name

@@ -119,3 +119,15 @@ async def disconnect() -> dict:
             broker_registry.clear_streaming_provider()
     _provider = None
     return {"status": "disconnected"}
+
+
+def is_connected() -> bool:
+    """Public accessor for other modules that need to know whether this
+    process currently has a live Polygon connection — e.g. the Backtest
+    Runner trigger route refusing to run while live data is flowing (see
+    backend/app/api/routes/backtest.py). Mirrors the same check GET
+    /market-data/status already returns; exposed as a plain function so a
+    caller outside this router doesn't need to build a request against
+    its own app just to ask a question this module already knows the
+    answer to."""
+    return _provider is not None and _provider.is_connected()

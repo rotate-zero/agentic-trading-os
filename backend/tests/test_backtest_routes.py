@@ -1,4 +1,4 @@
-"""HTTP-level tests for POST /backtest/run (decision #130). Real
+"""HTTP-level tests for POST /backtest/run (decision #131). Real
 Postgres, DB-gated, same convention as the rest of this suite.
 
 Deliberately does NOT re-test `BacktestRunner`'s own orchestration
@@ -42,6 +42,7 @@ import pytest
 from sqlalchemy import text
 from starlette.testclient import TestClient
 
+from app.api.routes import finnhub_data, market_data
 from app.db.session import SessionLocal
 from app.main import app
 
@@ -211,3 +212,56 @@ def test_run_backtest_requires_all_three_query_params():
     # FastAPI's own required-query-param validation (422), not this
     # route's own 400s -- confirms no silent defaults were introduced.
     assert resp.status_code == 422
+
+
+# --- Decision #132: refuses to run while live data is connected ---
+#
+# Both tests below monkeypatch is_connected() directly rather than
+# standing up a real Finnhub/Polygon connection (which would need a real
+# API key this test environment doesn't have, and would reintroduce this
+# route's own ~1s/candle real-time cost for no benefit — the guard fires
+# before any candle is replayed, so these are deliberately fast tests).
+
+
+def test_run_backtest_rejects_when_finnhub_connected(monkeypatch):
+    monkeypatch.setattr(finnhub_data, "is_connected", lambda: True)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/backtest/run",
+            params={
+                "strategy_name": "FirstPullback",
+                "symbol": FIRST_PULLBACK_SYMBOL,
+                "scenario": "first_pullback_vwap_dip",
+            },
+        )
+
+    assert resp.status_code == 409
+    assert "Finnhub" in resp.json()["detail"]
+
+    # The guard must fire before any row is written — confirms this
+    # isn't a race where the replay starts and is aborted partway.
+    session = SessionLocal()
+    try:
+        row = session.execute(
+            text("SELECT 1 FROM strategy_outcomes WHERE symbol = :t"),
+            {"t": FIRST_PULLBACK_SYMBOL},
+        ).fetchone()
+    finally:
+        session.close()
+    assert row is None
+
+
+def test_run_backtest_rejects_when_polygon_connected(monkeypatch):
+    monkeypatch.setattr(market_data, "is_connected", lambda: True)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/backtest/run",
+            params={
+                "strategy_name": "FirstPullback",
+                "symbol": FIRST_PULLBACK_SYMBOL,
+                "scenario": "first_pullback_vwap_dip",
+            },
+        )
+
+    assert resp.status_code == 409
+    assert "Polygon" in resp.json()["detail"]

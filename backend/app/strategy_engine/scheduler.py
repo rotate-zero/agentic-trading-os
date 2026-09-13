@@ -207,7 +207,7 @@ def default_registry(active_from: datetime) -> list[Strategy]:
     will eventually decide precedence), just reproducibility.
 
     Promoted from a private, module-local `_default_registry()` to a
-    real public function (decision #130) — the Backtest Runner trigger
+    real public function (decision #131) — the Backtest Runner trigger
     route needed the one place this codebase correctly builds all 7 real
     strategies, and reaching into a private name from another module was
     flagged as worth promoting rather than done silently. Behavior is

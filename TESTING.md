@@ -1,124 +1,139 @@
-# TESTING.md — Backtest Runner frontend panel
+# TESTING.md — Decisions #131 & #132: Backtest Runner trigger route reconciliation + live-data safety guard
 
-## What changed and why
+## What this delivery is
 
-New `BacktestPanel.tsx` + `useBacktestRun.ts` give `POST /backtest/run`
-(decision #130) its first real UI caller — pick a strategy, pick a
-fixture scenario, submit, see the real `BacktestRunResult` come back.
-Full reasoning lives in `CHANGES.md`; this file covers what to run to
-verify it and what was deliberately not covered.
+Two things, landed together:
 
-This is a frontend-only delivery — **zero backend files changed**,
-confirmed by `diff -rq` against a fresh clone. The existing backend test
-suite (`backend/tests/`) is unaffected by construction; it was not
-re-run as part of this delivery.
+1. **Decision #131 — retroactive documentation.** The Backtest Runner
+   trigger route (`POST /backtest/run`) was already built, working, and
+   on `main` before this delivery started. It had never gotten its own
+   decision-log entry — every file it touched incorrectly self-cited
+   "(decision #130)," a number decision #130 (the unrelated
+   `/strategy-outcomes` `is_backtest` filter) had already legitimately
+   taken. #131 is that missing entry, written after the fact — it
+   documents and corrects attribution for code that already shipped,
+   it does not introduce new behavior.
+2. **Decision #132 — a real new fix.** While verifying #131, the route's
+   own docstring turned out to only *warn* that calling it against a
+   live-trading process is unsafe, without actually enforcing that.
+   Raised directly by Saqib; closed by making it a real `409` instead
+   of a warning nobody is forced to read.
+
+Full reasoning for both lives in `docs/decisions/confirmed-decisions.md`
+(#131, #132); this file covers what to run to verify them and what a
+reader should know before touching this route again.
 
 ## Files changed
 
-- `frontend/src/components/backtest/BacktestPanel.tsx` — new.
-- `frontend/src/hooks/useBacktestRun.ts` — new.
-- `frontend/src/services/api-client.ts` — `triggerBacktest()`,
-  `BacktestRunResultWireShape`/`DiscardedSignalWireShape`,
-  `BACKTEST_STRATEGY_NAMES`/`BACKTEST_SCENARIOS` appended.
-- `frontend/src/App.tsx` — `<BacktestPanel />` mounted in both workspace
-  shells.
-- `docs/architecture/strategy-engine-design.md` — §7 gains one as-built
-  note + one diagram.
+**Decision #131 (misattribution fix only — no logic changed):**
+- `backend/app/api/routes/backtest.py` — docstring's decision-number
+  citation corrected.
+- `backend/app/backtest_runner/scenarios.py` — same.
+- `backend/app/strategy_engine/scheduler.py` — same (the
+  `_default_registry()` → `default_registry()` rename itself was
+  already-shipped, pre-existing work; only its docstring's citation
+  changed here).
+- `backend/tests/test_backtest_routes.py` — same (module docstring's
+  citation).
 
-## Automated verification (what was actually run)
+**Decision #132 (real code change):**
+- `backend/app/api/routes/backtest.py` — new
+  `_reject_if_live_data_connected()`, called at the top of
+  `run_backtest()` before any engine or `BacktestRunner` construction;
+  raises `409` if either Finnhub or Polygon is currently connected.
+  Route docstring updated from a warning to a statement of enforcement.
+- `backend/app/api/routes/finnhub_data.py` — new `is_connected()` public
+  accessor (no behavior change; mirrors the existing `/finnhub/status`
+  computation).
+- `backend/app/api/routes/market_data.py` — new `is_connected()` public
+  accessor (same, mirrors `/market-data/status`).
+- `backend/tests/test_backtest_routes.py` — two new tests:
+  `test_run_backtest_rejects_when_finnhub_connected`,
+  `test_run_backtest_rejects_when_polygon_connected`.
 
-Real local `npm install` + `npx tsc -b` + `npx vite build`, run twice:
-once against a freshly re-pulled, untouched clone of current `main`
-(the baseline), once against this delivery's own working copy, output
-diffed directly rather than eyeballed.
+**Both decisions:**
+- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` —
+  new #131 and #132 entries.
 
-- **`npx tsc -b`**
-  - Baseline: 4 errors, all in `src/components/workspace/GridPresetPicker.tsx`
-    (the known decision-#35 dead-code file — `GRID_PRESETS`/`preset`/
-    `setPreset` don't exist on the real `WorkspaceContextValue`, plus one
-    implicit-`any` parameter).
-  - This delivery: **identical 4 errors, same file, same lines, nothing
-    else.** `BacktestPanel.tsx`/`useBacktestRun.ts`/the `api-client.ts`
-    additions introduce zero new type errors.
-- **`npx vite build`**
-  - Baseline: clean, 86 modules transformed.
-  - This delivery: clean, **88 modules transformed** — exactly +2, the
-    two new files. No warnings beyond Vite's own standard output.
+## What was deliberately NOT built
 
-No frontend unit tests were added for `useBacktestRun.ts`, matching this
-codebase's existing, established practice for hooks
-(`useStrategyOutcomes.ts`, `useOpportunityConflicts.ts`,
-`useContextSnapshot.ts`, `usePerformanceAnalytics.ts` — none of them
-have a test file either; decision #123 says so explicitly for the first
-two). A hook whose only real behavior is "call one function, track four
-pieces of state, run a `setInterval`" doesn't clear the bar this
-codebase already draws for adding one.
+- **No auth system.** Grepped the entire `backend/app/api/routes/` tree
+  before deciding this — no `Depends`/`HTTPBearer`/`APIKeyHeader`
+  pattern exists anywhere in this codebase today. Adding one for a
+  single route would be a larger, inconsistent change; the live-data
+  connection check already solves the actual risk precisely.
+- **No new settings flag.** A `settings.allow_backtest_trigger`-style
+  bool was considered and explicitly rejected in favor of reusing
+  `is_connected()` — a flag is one more thing to remember to leave off
+  in production; the connection check can only ever fire when live data
+  is genuinely flowing, in dev or prod alike.
+- **No fix for the intermittent `ForeignKeyViolation` investigated
+  during #131's own verification** — because there was nothing in this
+  delivery's code to fix. See "A note on test flakiness" below.
+- **`backend/app/backtest_runner/runner.py`, `engine_singleton_guard.py`,
+  `main.py`'s router wiring, `broker.py`, and every file already
+  correctly attributed to decision #130** — untouched, confirmed by
+  `diff -rq` against a freshly re-pulled clone.
 
-## Manual verification (what to actually click through)
+## A note on test flakiness encountered while verifying this delivery
 
-This panel's core behavior — a genuinely-synchronous ~2 minute HTTP
-call — isn't meaningfully provable by `tsc`/`vite build` alone. To
-verify it end to end:
+During #131's own initial full-suite verification,
+`test_run_backtest_first_pullback_scenario_fires_and_persists` failed
+twice with a genuine Postgres-server-side `ForeignKeyViolation`. This
+was investigated directly rather than patched around or ignored:
 
-1. **Bring up a real backend against a real Postgres**, same pattern
-   this project always uses:
-   ```
-   CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;
-   CREATE DATABASE trading_workspace OWNER trading;
-   ```
-   `alembic upgrade head`, then run the FastAPI app (`uvicorn` per
-   `backend/`'s own README/Dockerfile) so `http://localhost:8000` is
-   live.
-2. **Run the frontend dev server** (`npm run dev` in `frontend/`) and
-   open the workspace. The Backtest panel starts collapsed on the far
-   right, alongside Scanner — click `«` to expand it.
-3. **Guaranteed-fire path.** Strategy `FirstPullback`, scenario
-   `first_pullback_vwap_dip`, any symbol (e.g. `ZBTR1`). Click Run
-   Backtest.
-   - Expect: the form disables immediately, a live
-     `Running… 0s elapsed` line appears and counts up in real time
-     (`1s`, `2s`, ... `1m 5s`, ...) for roughly 130 real seconds — not a
-     generic spinner.
-   - Expect on completion: `outcomes_recorded: 1`, `discarded_signals:
-     None.`, real-looking `run_id`/`sweep_id` UUIDs, form re-enables.
-4. **Honest-zero path.** Strategy `ORB`, scenario
-   `volume_gated_baseline`, any symbol. Click Run Backtest.
-   - Expect: same live elapsed counter (~120s), then
-     `outcomes_recorded: 0` rendered in the *same* neutral styling as
-     step 3's `1` — no red, no "error" framing, no warning icon.
-5. **Double-click / concurrent-submit guard.** While a run from step 3
-   or 4 is still in flight, try clicking Run Backtest again (or pressing
-   Enter in the Symbol field).
-   - Expect: nothing happens — the button and every field are disabled
-     for the whole run, so there's no way to fire a second request from
-     this panel while one is outstanding.
-6. **Validation-error path.** Stop the backend (or point
-   `VITE_API_BASE_URL` at a dead port), then submit a valid-looking
-   form.
-   - Expect: after the fetch fails, the panel leaves `running` and shows
-     a plain-text error message (via `ApiError`'s own `detail`/`message`)
-     in the panel body — not a silent failure, not a crash.
-7. **Resize/collapse.** Drag the panel's left-edge handle; confirm it
-   respects the same 64px/480px min/max as Scanner. Collapse and
-   re-expand; confirm in-progress or completed run state is preserved
-   (it's local component state, not remounted by collapsing).
+- Decision #128's own pre-existing test of the identical
+  write-then-insert sequence (`test_backtest_runner.py`) never failed,
+  in this session or historically.
+- Multiple standalone reproductions of the exact same sequence — both
+  via direct `BacktestRunner` construction and via `TestClient`,
+  entirely outside pytest — succeeded every time.
+- Postgres's own server log showed an unambiguous hard crash during
+  this session (`database system was not properly shut down; automatic
+  recovery in progress`, following simultaneous `Connection reset by
+  peer` messages on every open connection) — consistent with an
+  out-of-memory kill in this sandbox's constrained (3.9GB) container.
+- After restarting Postgres, the identical suite ran clean multiple
+  times in direct succession, including one full run of 715 passed / 0
+  failed.
+- Postgres was separately observed to die a second time with zero query
+  activity in the intervening window — ruling out this delivery's own
+  test load as the sole trigger.
 
-Steps 3 and 4 are the two real, ~130s+~120s waits — budget about 5
-minutes total if running both. This mirrors exactly what
-`test_backtest_routes.py`'s own two deliberately-slow HTTP tests already
-prove on the backend side (decision #130); this manual pass is the
-frontend's own equivalent, since there's no practical way to unit-test
-"does the browser correctly render a real-time counter across a real
-2-minute wait" without literally waiting it out.
+**Conclusion: this is a sandbox-environment artifact, not a defect in
+`BacktestRunner`, the trigger route, or anything else in this
+delivery.** It's recorded here and in decision #131 for visibility, not
+as an open bug to track. If it resurfaces on a properly provisioned
+machine (real CI, a dev box not memory-constrained to under 4GB), that
+would change this conclusion and should be re-investigated from
+scratch rather than assumed to be the same cause.
 
-## What was deliberately NOT tested
+## How to verify
 
-- **No automated end-to-end test.** Spinning up `TestClient` +
-  Playwright/Cypress against a real Postgres for a ~130s-per-case UI
-  flow isn't something this codebase has any existing harness for
-  (frontend has no test runner configured at all — `package.json`'s
-  `scripts` are `dev`/`build`/`preview` only, confirmed directly) and
-  adding one would be a much larger, separate undertaking than this
-  task's own scope.
-- **No re-run of the backend suite.** Zero backend files changed; see
-  `CHANGES.md`'s footprint confirmation.
+```bash
+# Full suite, real Postgres 16 (matches this project's standing convention)
+cd backend
+alembic upgrade head
+python3 -m pytest -q
+```
+
+Expect **715 collected**. One pre-existing, documented flake may appear:
+`test_daily_levels_carry_level_interaction_once_touched` (the #119
+cluster) — order/timing-sensitive, unrelated to this delivery,
+intentionally left unfixed per standing project convention. Everything
+else should pass.
+
+```bash
+# Just this delivery's own tests (7 total; 2 are genuinely slow, ~130s each —
+# EngineBackedReplayStateProducer's real ~1s/candle engine-settle cost,
+# not a bug — see backtest.py's own docstring)
+python3 -m pytest -q tests/test_backtest_routes.py
+```
+
+The two new #132 guard tests
+(`test_run_backtest_rejects_when_finnhub_connected`/`..._polygon_connected`)
+are fast — they monkeypatch `is_connected()` rather than standing up a
+real connection, since the guard fires before any candle is replayed.
+
+No frontend changes in this delivery — `npx tsc -b`/`npx vite build`
+were not re-run, since neither `frontend/` file was touched.

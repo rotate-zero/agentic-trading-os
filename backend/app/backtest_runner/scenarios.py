@@ -1,5 +1,5 @@
 """Named fixture scenarios for the Backtest Runner trigger route
-(decision #130) — the "a way to select which fixture scenario to run
+(decision #131) — the "a way to select which fixture scenario to run
 against" this task's own brief asked for, resolved here as a small,
 fixed set of scenarios checked into the repo, loaded via
 `fixture_provider.load_fixture_candles_csv()`.
@@ -37,7 +37,7 @@ docstrings):
     unreachable via BacktestRunner today. No amount of candle
     engineering changes this; it needs a fixture daily-history seam
     wired into the replay stack, which is real, separate, follow-on
-    work (flagged in decision #130, not attempted here — out of scope
+    work (flagged in decision #131, not attempted here — out of scope
     for "a route + strategy lookup").
   - **First Pullback, Reversal, VWAP** gate MATCH only on `trend_score`
     (established or neutral) and a real `LevelInteractionEngine`
