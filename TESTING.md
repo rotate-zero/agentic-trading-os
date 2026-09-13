@@ -1,229 +1,140 @@
-# TESTING.md — Backtest Runner trigger route (decision #130)
+# TESTING.md — Decision #130: `is_backtest` isolation on `GET /strategy-outcomes`
 
-## What this documents
+## What changed and why
 
-`POST /backtest/run` (`backend/app/api/routes/backtest.py`) — the first
-real, directly HTTP-callable entry point to `BacktestRunner`, closing
-the "optional API route" decision #128 deferred. Full reasoning:
-decision #130, `docs/decisions/confirmed-decisions.md`.
+`GET /intelligence/strategy-outcomes` (decision #123) shipped with no
+`is_backtest` filter at all — harmless while `strategy_outcomes` had no
+writer, but a live bug the moment Backtest Runner v1 (decision #128)
+started writing real `is_backtest=True` rows: "Recent Closed Trades"
+(`InfoTab.tsx`) would have silently rendered a backtest-simulated trade
+as if it were a real closed one, with zero visual distinction.
 
-### Files touched by this delivery
+This delivery closes that gap by making `is_backtest` a strict selector
+on the route — copying the same discipline `performance_queries.py`'s
+`_common_filters()` already enforces for the two aggregate queries next
+to this route — and adds an optional `backtest_run_id` filter for
+inspecting one specific backtest run's outcomes.
 
-- `backend/app/api/routes/backtest.py` — **new.** The route itself.
-- `backend/app/backtest_runner/scenarios.py` — **new.** Named fixture
-  scenario registry.
-- `backend/app/backtest_runner/fixtures/*.csv` — **new**, 4 files.
-  `first_pullback_vwap_dip.csv`, `reversal_vwap_break.csv`,
-  `vwap_neutral_conquest.csv`, `volume_gated_baseline.csv`.
-- `backend/app/main.py` — 2-line router registration.
-- `backend/app/strategy_engine/scheduler.py` — `_default_registry()`
-  promoted to public `default_registry()` (Saqib's direct call).
-  Behavior unchanged; name and one docstring note only.
-- `backend/tests/test_strategy_scheduler.py` — import/usage updated for
-  the rename above (4 call sites). No behavior/coverage change.
-- `backend/tests/test_backtest_routes.py` — **new.** Real HTTP-level
-  tests for the route.
-- `docs/architecture/strategy-engine-design.md` — §7 extended with a
-  small new diagram + two findings (below); new open item D18 in §10.
-- `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md` —
-  new decision #130 entry + index row.
-- This file.
+Full design reasoning lives in decision #130
+(`docs/decisions/confirmed-decisions.md`); this file covers what to run
+to verify it and what was deliberately not covered.
 
-**Zero touch to any of this task's explicit boundary files** —
-`intelligence.py`, `performance_queries.py`, any of the 7 real strategy
-files, `performance.py`, `models/trading_intelligence.py`,
-`schemas/performance.py`, or any frontend file. Confirmed by `diff -rq`
-against a freshly re-pulled untouched clone — see "Fresh-clone diff
-verification" below.
+## Files changed
 
-## Two findings that shaped this delivery, not just documentation notes
+- `backend/app/api/routes/intelligence.py` — `GET /strategy-outcomes`
+  gains `is_backtest: bool = Query(False)` and
+  `backtest_run_id: str | None = Query(None)`; docstring corrected.
+- `backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`
+  — 6 new tests (12 total in the file).
+- `frontend/src/services/api-client.ts` — `fetchStrategyOutcomes()`
+  gains two new optional positional params (`isBacktest`,
+  `backtestRunId`); query-string building switched to the
+  conditional-append pattern `_performanceAnalyticsQuery` already uses.
+- `frontend/src/hooks/useStrategyOutcomes.ts` — now calls
+  `fetchStrategyOutcomes(limit, /* isBacktest */ false)` explicitly.
+  Public hook signature (`useStrategyOutcomes(limit?: number)`)
+  unchanged — `InfoTab.tsx`'s one call site needed no edit.
+- `docs/architecture/strategy-engine-design.md` — §16's decision-#123
+  checklist bullet corrected (was: "zero real rows in production"; now:
+  zero real *live* rows, real *backtest* rows since #128); new diagram
+  added to §7, directly after the existing decision-#128 as-built
+  diagram, showing the `is_backtest` split feeding the two route call
+  shapes.
+- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` —
+  new decision #130 entry.
 
-### Finding 1 — `volume_regime_score`/`volatility_regime_score` are structurally always `0.0` in any BacktestRunner replay
+## What was deliberately NOT built
 
-Found while trying to build a guaranteed-fire ORB scenario: a clean,
-steep synthetic breakout still produced `volume_regime_score == 0.00`
-for the entire replay. Traced to source, then confirmed by direct
-execution rather than assumed from the trace: `FeatureEngine`'s
-`rvol`/`atr_14_pct` are populated exclusively from
-`self._daily_candle_cache`, itself populated only by
-`_maybe_refresh_daily_levels()` calling
-`broker_registry.get_historical_provider().get_historical(symbol, "1d",
-...)`. `EngineBackedReplayStateProducer` constructs a brand-new
-`FeatureEngine` with no historical provider wired in at all, and
-`BacktestRunner` never touches `broker_registry` — so both scores are
-structurally `0.0` for any replay, for any symbol, regardless of how the
-fixture candles are built.
+- **No "view backtest results" toggle UI.** This task closes the silent
+  conflation; it does not add a way to browse backtest outcomes from
+  the UI. `backtest_run_id`/`isBacktest` exist end-to-end (route →
+  `api-client.ts`) for whatever future work wants them — e.g. a
+  backtest-results viewer — but no UI consumes them yet.
+- **No `InfoTab.tsx` change.** Checked directly against the live file:
+  once `useStrategyOutcomes.ts` pins `isBacktest: false`, backtest rows
+  never reach that component, so no visual-distinction badge or
+  conditional rendering was needed.
+- **`backend/app/backtest_runner/**`, `backend/app/main.py`,
+  `useOpportunities.ts`, `useOpportunityConflicts.ts`,
+  `useContextSnapshot.ts`, `usePerformanceAnalytics.ts`** — explicit
+  boundaries for this task, confirmed untouched by `diff -rq` against a
+  fresh clone.
 
-Checked against every real strategy's actual MATCH-stage code (not
-docstrings):
+## How to verify
 
-| Strategy | MATCH-stage volume gate? | Can fire via BacktestRunner today? |
-|---|---|---|
-| ORB | `volume_regime_score < 45 → None` | **No** |
-| Gap | `volume_regime_score < 45 → None` | **No** |
-| Volume Spike | `volume_regime_score < 45 → None` | **No** |
-| Momentum | `volume_regime_score < 45 → None` | **No** |
-| First Pullback | none — volume only affects SCORE | Yes |
-| Reversal | none — volume only affects SCORE | Yes |
-| VWAP | none — volume only affects SCORE | Yes |
+### Backend (real Postgres — no SQLite, no mocks)
 
-Raised directly to Saqib with three options before proceeding (guaranteed-fire
-for the 3 reachable strategies + honest best-effort for the other 4, log
-the gap; build a temporary fixture daily-history seam into
-`broker_registry` so all 7 can fire; fall back to generic scenarios) —
-the first was chosen. Tracked as new open item **D18**
-(`strategy-engine-design.md` §10) rather than worked around silently.
+```bash
+# From a clean environment:
+apt-get install -y postgresql postgresql-contrib
+service postgresql start
+su - postgres -c "psql -c \"CREATE USER trading WITH SUPERUSER PASSWORD 'trading';\""
+su - postgres -c "psql -c \"CREATE DATABASE trading_workspace OWNER trading;\""
 
-### Finding 2 — replay costs a real, measured ~1 second per candle
-
-`EngineBackedReplayStateProducer` costs a genuine ~1 second of
-engine-settle time per replayed candle (confirmed by direct per-candle
-timing, not estimated) — so this route's response time is proportional
-to scenario length, not request-processing overhead. Raised directly by
-Saqib as a real API-design concern mid-task, not something to leave as a
-docstring footnote:
-
-- Checked this deployment's actual `Dockerfile`/`docker-compose.yml`:
-  single uvicorn worker, no reverse proxy, no `--timeout-keep-alive`
-  override — nothing in this stack today would truncate a multi-minute
-  synchronous request.
-- Confirmed directly that `TestClient`'s in-process ASGI transport does
-  **not** enforce httpx's normal 5-second default client timeout (a
-  throwaway `asyncio.sleep(7)` endpoint returns successfully through it)
-  — so a passing HTTP-level test alone would not prove real latency
-  either way. The new tests measure their own wall-clock elapsed time
-  and assert a floor for exactly this reason (see below).
-- Deliberately did **not** add background-job, polling, or webhook
-  infrastructure — no such pattern exists anywhere else in this
-  codebase, and this task's scope is "a route + strategy lookup," not
-  new async infrastructure. Stated explicitly in the route's own
-  docstring as a deliberate v1 trade-off, not an oversight.
-
-## Scenarios, each verified by direct execution against the real `BacktestRunner`
-
-Not reasoned about from reading strategy source, and re-verified a
-second time from their actual checked-in CSV form (not just the
-in-memory candle objects used to build them):
-
-- **`first_pullback_vwap_dip`** (130 candles) — established uptrend +
-  a single engineered dip into VWAP's aura band that bounces back out
-  the same side (REJECTED), genuinely the day's first touch. Real
-  persisted row: `FirstPullback, BUY, entry=106.585, exit=107.857,
-  exit_reason=target, realized_r=2.0`.
-- **`reversal_vwap_break`** (140 candles) — same uptrend base, but the
-  dip breaks all the way through VWAP (CONQUERED) instead of bouncing;
-  the established uptrend resumes afterward (the reversal attempt
-  fails), cleanly stopping the resulting SELL out. Real persisted row:
-  `Reversal, SELL, entry=105.314, exit=105.949, exit_reason=stop,
-  realized_r=-1.0`.
-- **`vwap_neutral_conquest`** (140 candles) — flat/choppy session
-  (trend_score held ~50 throughout, confirmed against
-  `scoring_utils.trend_established_side`'s exact neutral band) with a
-  genuine VWAP conquest partway through. Real persisted row: `VWAP,
-  SELL, entry=99.978, exit=99.087, exit_reason=target, realized_r=2.0`.
-- **`volume_gated_baseline`** (120 candles) — generic moderate-uptrend
-  session, deliberately not shaped to attempt triggering any particular
-  strategy (see Finding 1 — a shaped-but-structurally-futile scenario
-  would misrepresent the situation, not honestly represent it).
-  Verified clean (`outcomes_recorded=0, discarded_signals=[]`, no
-  errors) against all four volume-gated strategies individually.
-
-Any `(strategy_name, scenario)` pair is accepted by the route — the
-per-strategy names describe what each scenario was built to
-demonstrate, not a restriction.
-
-## Tests
-
-`backend/tests/test_backtest_routes.py`, real Postgres, DB-gated (same
-`_db_available()`/`pytestmark.skipif` convention as the rest of this
-suite). Deliberately does not re-test `BacktestRunner`'s own
-orchestration — that's `test_backtest_runner.py`'s job.
-
-```
 cd backend
-python -m pytest -q tests/test_backtest_routes.py
-```
+pip install -r requirements.txt --break-system-packages   # or use a venv
+python -m alembic upgrade head
 
-5 tests:
+# Focused test file (12 tests: 6 pre-existing + 6 new for decision #130)
+python -m pytest -q tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py -v
 
-- `test_run_backtest_first_pullback_scenario_fires_and_persists` —
-  **~130s, deliberately.** Asserts the real response shape, a real
-  persisted `strategy_outcomes` row (queried directly, not just trusted
-  from the response body), and `elapsed > 60` as a floor — specifically
-  so a future change that accidentally short-circuits the replay would
-  fail this test rather than silently ship a faster-but-wrong response.
-- `test_run_backtest_volume_gated_strategy_returns_honest_zero` —
-  **~120s, deliberately.** Confirms `outcomes_recorded=0` is a real 200,
-  not an error, for the documented volume-gated case.
-- `test_run_backtest_rejects_unknown_strategy_name` — fast, 400 with
-  valid names listed.
-- `test_run_backtest_rejects_unknown_scenario` — fast, 400 with valid
-  scenarios listed.
-- `test_run_backtest_requires_all_three_query_params` — fast, FastAPI's
-  own 422 for a missing required param (confirms no silent default).
-
-Run both individually (each pass) and together (5 passed in 247.52s) —
-100% stable both ways. The ~248s combined runtime is a real, deliberate
-cost this test file's own module docstring explains, not something to
-work around.
-
-## Verification
-
-Real local Postgres 16 (provisioned directly in this session —
-`apt-get install postgresql`, `service postgresql start`, `trading`/
-`trading`/`trading_workspace`, `alembic upgrade head`, fresh
-wipe-and-recreate before both the baseline and the final run).
-
-**Baseline** (freshly re-pulled untouched clone):
-
-```
-cd backend
+# Full suite
 python -m pytest -q
 ```
 
-**702 collected, 701 passed, 1 failed** —
-`test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`,
-the #119 cluster's own documented intermittent flake, matching decision
-#129's own reported post-fix baseline exactly.
+Observed in this session:
 
-**Working copy, all of this delivery's changes included:**
+- Focused file: 12 passed, stable across 3 isolated reruns.
+- Full suite baseline (fresh clone, before this delivery): 702
+  collected, 702 passed.
+- Full suite after this delivery: 708 collected (exactly +6). One run
+  showed 707 passed / 1 failed
+  (`test_daily_levels_carry_level_interaction_once_touched`); a later
+  run showed 708 passed / 0 failed. This is the pre-existing #119
+  flaky cluster's other documented member (decision #129) — genuinely
+  intermittent, confirmed by 5 isolated reruns of that one test across
+  this session (3 fails, 2 passes), unrelated to and untouched by
+  anything in this delivery. Not a regression.
 
+### Frontend
+
+```bash
+cd frontend
+npm install
+npx tsc -b 2>&1 | grep -v "GridPresetPicker"   # should print nothing
+npx vite build                                  # should succeed
 ```
-cd backend
-python -m pytest -q
+
+Observed: `tsc -b` raw output shows exactly the 4 known decision-#35
+`GridPresetPicker` errors and nothing else; `vite build` succeeds (86
+modules transformed).
+
+### Manual API check
+
+```bash
+# Default — live rows only (empty today, honestly, since no live writer exists)
+curl "http://localhost:8000/intelligence/strategy-outcomes"
+
+# Explicit live-only (same as above)
+curl "http://localhost:8000/intelligence/strategy-outcomes?is_backtest=false"
+
+# Backtest rows (real, after running a backtest via Backtest Runner v1)
+curl "http://localhost:8000/intelligence/strategy-outcomes?is_backtest=true"
+
+# One specific backtest run
+curl "http://localhost:8000/intelligence/strategy-outcomes?is_backtest=true&backtest_run_id=<run-id>"
+
+# Rejected — backtest_run_id without is_backtest=true (400)
+curl "http://localhost:8000/intelligence/strategy-outcomes?backtest_run_id=<run-id>"
+
+# Rejected — malformed UUID (400)
+curl "http://localhost:8000/intelligence/strategy-outcomes?is_backtest=true&backtest_run_id=not-a-uuid"
 ```
 
-**707 collected, 706 passed, 1 failed** — the identical single failure,
-exactly +5 collected/passed (this delivery's own new test file), zero
-regressions. Confirmed both with the new test file run in isolation
-per-test and as one combined file run.
+## Manual merge notes
 
-`test_strategy_scheduler.py`'s own 30 tests re-run clean immediately
-after the `default_registry()` rename, before building anything on top
-of it.
-
-No frontend files touched by this delivery — `npx tsc -b`/`npx vite
-build` not re-run.
-
-## Fresh-clone diff verification
-
-`diff -rq` against a freshly-pulled untouched clone of current `main`,
-taken at the start of this task and re-checked (decision-log tail only)
-immediately before writing decision #130, confirms this delivery's own
-change set is exactly the "Files touched" list above.
-
-## Known limitations / deferred, not done here
-
-- **D18** (new): ORB/Gap/Volume Spike/Momentum cannot fire through
-  `BacktestRunner` today, for any fixture, because of Finding 1 above.
-  Closing this means wiring a fixture daily-history provider into the
-  replay stack specifically for `_maybe_refresh_daily_levels()` to
-  find — real, separate work, genuinely bigger than it first looks
-  (`broker_registry` is a process-wide singleton also used by live
-  trading). Not attempted here.
-- Replay latency (~1s/candle) is inherited, unmodified,
-  `EngineBackedReplayStateProducer` behavior — not something this task
-  changed or optimized. No background-job/polling infrastructure added.
-- No Performance Analytics UI wiring for this route's results — a
-  caller wanting the raw persisted rows can already query the existing,
-  unmodified `/intelligence/strategy-outcomes` separately.
+None. This delivery has zero file overlap with the parallel Backtest
+Runner trigger-route work (`backend/app/api/routes/backtest.py` does
+not exist anywhere in this delivery's changed-file list) — confirmed by
+`diff -rq` against a freshly re-pulled clone immediately before writing
+the decision log entry.

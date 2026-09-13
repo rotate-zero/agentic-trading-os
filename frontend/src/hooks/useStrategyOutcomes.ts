@@ -45,6 +45,18 @@ function normalize(wire: StrategyOutcomeWireShape): StrategyOutcomeRow {
  * docstring), so unlike useOpportunities/useOpportunityConflicts this
  * hook takes no `symbol` argument and does not call subscribeSymbol().
  *
+ * Passes `isBacktest: false` to `fetchStrategyOutcomes()` explicitly
+ * (decision #130) rather than omitting it and relying on the route's
+ * own matching default — a deliberate divergence from
+ * `usePerformanceAnalytics.ts` (which omits `isBacktest` and relies on
+ * the backend default for the same effective result). This section is
+ * specifically titled "Recent Closed Trades," so the live-only intent
+ * should be visible at this call site, not merely inherited silently
+ * from a backend default that a future change could alter. No
+ * `isBacktest` toggle is exposed on this hook's own signature — that
+ * would be building the backtest-results-viewer UI decision #130
+ * explicitly deferred as separate, future scope.
+ *
  * Deliberately one-shot on mount, NOT re-fetch-on-WebSocket-push like
  * useOpportunities/useIntelligenceState: there is no event published
  * when a row is written to `strategy_outcomes` (no
@@ -70,7 +82,7 @@ export function useStrategyOutcomes(limit?: number): {
   const load = useCallback(() => {
     let cancelled = false;
     setLoading(true);
-    fetchStrategyOutcomes(limit)
+    fetchStrategyOutcomes(limit, /* isBacktest */ false)
       .then((wire) => {
         if (!cancelled) {
           setOutcomes(wire.outcomes.map(normalize));

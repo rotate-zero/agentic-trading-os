@@ -356,21 +356,52 @@ export interface StrategyOutcomesWireShape {
 }
 
 /**
- * GET /intelligence/strategy-outcomes — decision #123. Raw recent-rows
+ * GET /intelligence/strategy-outcomes — decision #123, `is_backtest`/
+ * `backtest_run_id` isolation added by decision #130. Raw recent-rows
  * read, most recent `exit_filled_at` first, capped by `limit` (backend
  * default 50 when omitted, same `Query(default, le=cap)` convention
  * `fetchFeatureSeries`'s `count` param already uses — not `symbol`-scoped
  * like fetchOpportunities above, since `strategy_outcomes` has no symbol
  * filter on this route (deliberately global — see the route's own
- * docstring). `strategy_outcomes` has zero real rows in production today
- * (no Execution Engine/Position Monitor writes to it yet); an empty
- * `outcomes` array is the honest, expected response, not an error.
+ * docstring).
+ *
+ * `isBacktest` defaults to the backend's own default (`false`) when
+ * omitted — matching the exact live/backtest strict-selector semantics
+ * `fetchWinRateByHour`/`fetchExpectancyBySessionType` below already use
+ * via `PerformanceAnalyticsFilters.isBacktest`. `backtestRunId` narrows
+ * further to one specific backtest run; the backend rejects it with a
+ * 400 (surfaced here as a thrown `ApiError`, not a silently-empty
+ * result) if `isBacktest` isn't also `true` — see the route's own
+ * docstring for why. Kept as three independent, individually-optional
+ * positional params rather than an options object: this function has
+ * exactly one caller (`useStrategyOutcomes.ts`) today, so a filters-
+ * object rewrite would be pure restructuring with no caller it actually
+ * helps — same "smallest change that fits" reasoning that kept this
+ * function's original single-`limit`-param shape rather than matching
+ * `PerformanceAnalyticsFilters`'s object shape below. Query construction
+ * still switches to the conditional-append-if-present pattern
+ * `_performanceAnalyticsQuery` below already established, rather than
+ * this function's own previous single-param ternary — that ternary
+ * shape stops scaling past one optional param for the same reason
+ * `_performanceAnalyticsQuery`'s own comment gives.
+ *
+ * `strategy_outcomes` has zero real LIVE rows in production today (no
+ * Execution Engine/Position Monitor writes to it yet), but does have
+ * real, persisted BACKTEST rows as of decision #128 (Backtest Runner
+ * v1) — genuine rows representing simulated execution, not fabricated
+ * ones. An empty `outcomes` array from the default (live-only) call is
+ * still the honest, expected response today, not an error.
  */
-export async function fetchStrategyOutcomes(limit?: number): Promise<StrategyOutcomesWireShape> {
-  const url =
-    limit !== undefined
-      ? `${API_BASE_URL}/intelligence/strategy-outcomes?limit=${encodeURIComponent(limit)}`
-      : `${API_BASE_URL}/intelligence/strategy-outcomes`;
+export async function fetchStrategyOutcomes(
+  limit?: number,
+  isBacktest?: boolean,
+  backtestRunId?: string,
+): Promise<StrategyOutcomesWireShape> {
+  const parts: string[] = [];
+  if (limit !== undefined) parts.push(`limit=${encodeURIComponent(limit)}`);
+  if (isBacktest !== undefined) parts.push(`is_backtest=${isBacktest}`);
+  if (backtestRunId !== undefined) parts.push(`backtest_run_id=${encodeURIComponent(backtestRunId)}`);
+  const url = `${API_BASE_URL}/intelligence/strategy-outcomes${parts.length > 0 ? `?${parts.join("&")}` : ""}`;
   const res = await fetch(url);
   if (!res.ok) {
     throw new ApiError(await parseErrorDetail(res), res.status);

@@ -380,7 +380,11 @@ async def get_opportunities_snapshot(symbol: str | None = Query(None)) -> dict[s
 
 
 @router.get("/strategy-outcomes")
-async def get_strategy_outcomes(limit: int = Query(50, le=500)) -> dict[str, Any]:
+async def get_strategy_outcomes(
+    limit: int = Query(50, le=500),
+    is_backtest: bool = Query(False),
+    backtest_run_id: str | None = Query(None),
+) -> dict[str, Any]:
     """
     Decision #122 — raw recent-rows observability into `strategy_outcomes`
     (decision #89/#120), the same "make a built-but-unwired capability
@@ -404,27 +408,81 @@ async def get_strategy_outcomes(limit: int = Query(50, le=500)) -> dict[str, Any
     shape" posture GET /opportunity-conflicts below takes toward
     `opportunity_view.py`.
 
-    `strategy_outcomes` has zero real rows in production today (no
-    Execution Engine/Position Monitor writes to it yet) — an empty table
-    returns `{"outcomes": []}`, 200, not an error. Honest absence, same
-    convention every get_snapshot()/route in this file already follows.
+    **Decision #130 — `is_backtest` isolation, closing a gap this route
+    shipped with.** `is_backtest: bool = Query(False)` is applied as a
+    strict selector — `StrategyOutcomeRecord.is_backtest.is_(is_backtest)`
+    — never optional, never blended, same discipline `performance_queries.
+    py`'s own `_common_filters()` documents for the two aggregate queries
+    next to this route. `_common_filters()` itself is NOT imported here:
+    it's built for `GROUP BY` queries sharing `strategy_name`/
+    `strategy_version` filters this route doesn't have, so the single
+    `is_backtest` predicate is copied directly rather than pulling in an
+    abstraction shaped for a different query. Before this decision, this
+    route had no `is_backtest` filter at all — harmless while
+    `strategy_outcomes` had no writer, a live bug the moment Backtest
+    Runner v1 (decision #128) started writing real `is_backtest=True`
+    rows: "Recent Closed Trades" (`InfoTab.tsx`) would have silently
+    rendered backtest-simulated trades as if they were real closed ones,
+    with zero visual distinction.
+
+    `backtest_run_id: str | None = Query(None)` narrows further to one
+    specific backtest run (`StrategyOutcomeRecord.backtest_run_id`, a
+    real FK to `backtests` since decision #120/#128) — applied IN
+    ADDITION to `is_backtest`, never instead of it. A live row
+    (`is_backtest=False`) never carries a `backtest_run_id`, so supplying
+    one without also passing `is_backtest=true` is a caller contradiction,
+    not a legitimately-empty query — this raises 400, same clean-400
+    posture GET /series already uses for an unsupported timeframe, rather
+    than silently returning `[]` and letting "you asked for something
+    that can't exist" look identical to "no rows exist." A malformed
+    (non-UUID) `backtest_run_id` is likewise a 400.
+
+    `strategy_outcomes` has zero real LIVE rows in production today (no
+    Execution Engine/Position Monitor writes to it yet) — but, as of
+    decision #128, it does have real, persisted BACKTEST rows
+    (`is_backtest=True`): genuine database records produced by Backtest
+    Runner v1, representing simulated/backtest execution rather than
+    live execution, not fabricated placeholders. The default
+    (`is_backtest=False`) still honestly returns `{"outcomes": []}`, 200,
+    not an error, matching the convention every route in this file
+    already follows for a genuinely empty result set.
 
     Import is local to this function, not hoisted to this file's
     top-of-file import block — same collision-avoidance reasoning GET
-    /opportunities' own docstring gives above (decision #114): this
-    route and GET /opportunity-conflicts below are this delivery's only
-    touch to this file, appended as a single additive block.
+    /opportunities' own docstring gives above (decision #114).
     """
+    import uuid as _uuid
+
     from sqlalchemy import select
 
     from app.db.session import SessionLocal
     from app.models.trading_intelligence import StrategyOutcomeRecord
     from app.schemas.performance import StrategyOutcome
 
+    backtest_run_uuid: _uuid.UUID | None = None
+    if backtest_run_id is not None:
+        if not is_backtest:
+            raise HTTPException(
+                status_code=400,
+                detail="backtest_run_id requires is_backtest=true (a live row never carries a backtest_run_id)",
+            )
+        try:
+            backtest_run_uuid = _uuid.UUID(backtest_run_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"backtest_run_id {backtest_run_id!r} is not a valid UUID",
+            ) from exc
+
+    filters = [StrategyOutcomeRecord.is_backtest.is_(is_backtest)]
+    if backtest_run_uuid is not None:
+        filters.append(StrategyOutcomeRecord.backtest_run_id == backtest_run_uuid)
+
     session = SessionLocal()
     try:
         rows = session.execute(
             select(StrategyOutcomeRecord)
+            .where(*filters)
             .order_by(StrategyOutcomeRecord.exit_filled_at.desc())
             .limit(limit)
         ).scalars().all()

@@ -4,6 +4,14 @@ Route-level tests for decision #122's two new GET /intelligence routes:
 gap — decisions #120/#121 built real capabilities but explicitly skipped
 adding a route, citing parallel-track collision risk that's now gone.
 
+Decision #130 added the "Decision #130" section below `/strategy-outcomes`'
+own limit/ordering tests: `is_backtest`/`backtest_run_id` isolation,
+closing the gap where this route had no live/backtest selector at all.
+Every one of those tests seeds both an `is_backtest=False` and an
+`is_backtest=True` row side by side and asserts on actual returned
+`outcome_id`/`is_backtest`/`backtest_run_id` values, not response length —
+a blended query returning the numerically "right" count must still fail.
+
 Deliberately split into two very different test styles, matching each
 route's own dependency:
 
@@ -54,7 +62,7 @@ from app.db.session import SessionLocal
 from app.event_bus.bus import get_event_bus
 from app.event_bus.events import make_envelope
 from app.main import app
-from app.models.trading_intelligence import StrategyOutcomeRecord
+from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
 from app.schemas.events.envelope import EventType
 from app.strategy_engine.base_strategy import Opportunity
 
@@ -78,7 +86,10 @@ def _db_available() -> bool:
 def _clean_own_rows() -> None:
     session = SessionLocal()
     try:
+        # strategy_outcomes first — it FK's to backtests, not the other way
+        # around (delete parent-before-child would violate the constraint).
         session.execute(text("DELETE FROM strategy_outcomes WHERE strategy_name = :n"), {"n": _STRATEGY_NAME})
+        session.execute(text("DELETE FROM backtests WHERE strategy_name = :n"), {"n": _STRATEGY_NAME})
         session.commit()
     finally:
         session.close()
@@ -150,6 +161,39 @@ def _make_outcome_record(exit_filled_at: datetime, **overrides) -> StrategyOutco
     )
     fields.update(overrides)
     return StrategyOutcomeRecord(**fields)
+
+
+def _insert_backtest_run() -> "uuid.UUID":
+    """Inserts one real `backtests` row, scoped to `_STRATEGY_NAME` for
+    this file's own cleanup, and returns its real generated `run_id`.
+    Needed because `strategy_outcomes.backtest_run_id` is a real,
+    enforced FK to `backtests.run_id` (decision #120) — an arbitrary
+    UUID that was never actually inserted raises `IntegrityError` on
+    write, confirmed directly (not assumed) while first writing these
+    tests. Field set matches `test_performance_intelligence.py`'s own
+    `BacktestRunRecord` fixture exactly, since that's the one other place
+    in this codebase already proving this exact FK relationship."""
+    session = SessionLocal()
+    try:
+        row = BacktestRunRecord(
+            sweep_id=uuid.uuid4(),
+            strategy_name=_STRATEGY_NAME,
+            strategy_version="orb_v1",
+            config_hash=f"cfg_{uuid.uuid4().hex[:8]}",
+            symbol_universe=["AAPL"],
+            date_range_start=date(2026, 1, 1),
+            date_range_end=date(2026, 6, 30),
+            data_version="polygon_2026_08",
+            feature_version="feature_engine_v1",
+            walk_forward_fold=1,
+            is_holdout=False,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.run_id
+    finally:
+        session.close()
 
 
 def _insert(records: list[StrategyOutcomeRecord]) -> None:
@@ -278,6 +322,172 @@ def test_strategy_outcomes_limit_caps_returned_rows():
     # The two most recent of our three (11:00, then 10:00) — 09:00 is
     # correctly clamped out by `limit`.
     assert [o["outcome_id"] for o in body["outcomes"]] == [str(ids[2]), str(ids[1])]
+
+
+# --- Decision #130 — is_backtest/backtest_run_id isolation ------------------
+#
+# The exact gap this decision closes: before #130, this route had no
+# `is_backtest` filter at all, so a real `is_backtest=True` row written by
+# Backtest Runner v1 (decision #128) would render in "Recent Closed
+# Trades" identically to a genuine live trade. Every test below asserts
+# on actual returned `outcome_id`/`is_backtest`/`backtest_run_id` content,
+# never just response length — a blended query that happened to return
+# the "right" count must still fail these.
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_default_call_returns_only_the_live_row():
+    live_id, backtest_id = uuid.uuid4(), uuid.uuid4()
+    run_id = _insert_backtest_run()
+    live = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 1, 9, 0, tzinfo=timezone.utc),
+        outcome_id=live_id,
+        is_backtest=False,
+        backtest_run_id=None,
+    )
+    backtest = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 1, 10, 0, tzinfo=timezone.utc),
+        outcome_id=backtest_id,
+        is_backtest=True,
+        backtest_run_id=run_id,
+    )
+    _insert([live, backtest])
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/strategy-outcomes", params={"limit": 500})
+
+    assert resp.status_code == 200
+    ours = [o for o in resp.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    returned_ids = {o["outcome_id"] for o in ours}
+    assert returned_ids == {str(live_id)}
+    assert all(o["is_backtest"] is False for o in ours)
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_explicit_is_backtest_false_returns_only_the_live_row():
+    """Same as the default-call case above, but with `is_backtest=false`
+    passed explicitly — proves the param works as a real selector in the
+    live direction too, not merely that the unparameterized default
+    happens to be correct."""
+    live_id, backtest_id = uuid.uuid4(), uuid.uuid4()
+    run_id = _insert_backtest_run()
+    live = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 2, 9, 0, tzinfo=timezone.utc),
+        outcome_id=live_id,
+        is_backtest=False,
+        backtest_run_id=None,
+    )
+    backtest = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 2, 10, 0, tzinfo=timezone.utc),
+        outcome_id=backtest_id,
+        is_backtest=True,
+        backtest_run_id=run_id,
+    )
+    _insert([live, backtest])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 500, "is_backtest": "false"},
+        )
+
+    assert resp.status_code == 200
+    ours = [o for o in resp.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    returned_ids = {o["outcome_id"] for o in ours}
+    assert returned_ids == {str(live_id)}
+    assert all(o["is_backtest"] is False for o in ours)
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_is_backtest_true_returns_only_the_backtest_row():
+    live_id, backtest_id = uuid.uuid4(), uuid.uuid4()
+    run_id = _insert_backtest_run()
+    live = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 3, 9, 0, tzinfo=timezone.utc),
+        outcome_id=live_id,
+        is_backtest=False,
+        backtest_run_id=None,
+    )
+    backtest = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 3, 10, 0, tzinfo=timezone.utc),
+        outcome_id=backtest_id,
+        is_backtest=True,
+        backtest_run_id=run_id,
+    )
+    _insert([live, backtest])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 500, "is_backtest": "true"},
+        )
+
+    assert resp.status_code == 200
+    ours = [o for o in resp.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    returned_ids = {o["outcome_id"] for o in ours}
+    assert returned_ids == {str(backtest_id)}
+    assert all(o["is_backtest"] is True for o in ours)
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_backtest_run_id_narrows_to_exactly_one_run():
+    """Two distinct backtest runs under the same strategy — proves
+    `backtest_run_id` narrows to one specific run's rows, not merely to
+    `is_backtest=True` generally."""
+    run_a, run_b = _insert_backtest_run(), _insert_backtest_run()
+    id_a, id_b = uuid.uuid4(), uuid.uuid4()
+    row_a = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 4, 9, 0, tzinfo=timezone.utc),
+        outcome_id=id_a,
+        is_backtest=True,
+        backtest_run_id=run_a,
+    )
+    row_b = _make_outcome_record(
+        exit_filled_at=datetime(2099, 2, 4, 10, 0, tzinfo=timezone.utc),
+        outcome_id=id_b,
+        is_backtest=True,
+        backtest_run_id=run_b,
+    )
+    _insert([row_a, row_b])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 500, "is_backtest": "true", "backtest_run_id": str(run_a)},
+        )
+
+    assert resp.status_code == 200
+    ours = [o for o in resp.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    returned_ids = {o["outcome_id"] for o in ours}
+    assert returned_ids == {str(id_a)}
+    assert all(o["backtest_run_id"] == str(run_a) for o in ours)
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_backtest_run_id_without_is_backtest_true_is_rejected():
+    """A live row never carries a `backtest_run_id` — supplying one
+    without also passing `is_backtest=true` is a caller contradiction,
+    not a legitimately-empty query, so this must be a 400, never a
+    silent `{"outcomes": []}` that looks identical to an honest empty
+    result."""
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"backtest_run_id": str(uuid.uuid4())},
+        )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_malformed_backtest_run_id_is_rejected():
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"is_backtest": "true", "backtest_run_id": "not-a-uuid"},
+        )
+
+    assert resp.status_code == 400
 
 
 # --- GET /intelligence/opportunity-conflicts --------------------------------
