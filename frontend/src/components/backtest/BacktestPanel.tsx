@@ -1,5 +1,6 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestRun } from "../../hooks/useBacktestRun";
+import { useWorkspace } from "../../state/WorkspaceContext";
 import {
   BACKTEST_SCENARIOS,
   BACKTEST_STRATEGY_NAMES,
@@ -78,6 +79,23 @@ function ResultsView({
         <span className="font-semibold text-text-primary">{outcomesRecorded}</span>
       </div>
 
+      {/* Decision #134: this run_id is written to shared WorkspaceContext
+          state (setLastBacktestRunId, see BacktestForm below) the moment
+          this view renders — not a separate action here, just a plain
+          note so the person knows where to find it. Not rendered as a
+          clickable/actionable link: the Backtest Results panel's own
+          collapsed state is deliberately local, not shared, per that
+          panel's own header comment, so there's nothing this panel could
+          reliably "jump to" without reversing that design for a
+          convenience this task didn't ask for. If the Results panel is
+          currently showing a different, manually-picked run_id, this
+          new run won't silently override it there — see that panel's
+          own "auto"/"manual" filter-mode comment for the full reasoning. */}
+      <span className="font-mono text-[9px] text-text-muted">
+        → prefilled as the run_id filter in the Backtest Results panel (unless it's currently pinned to a different run
+        you picked manually there).
+      </span>
+
       <div className="flex flex-col gap-1">
         <span className="text-[10px] uppercase tracking-wide text-text-muted">
           discarded_signals {discardedSignals.length > 0 ? `(${discardedSignals.length})` : ""}
@@ -98,10 +116,25 @@ function ResultsView({
 
 function BacktestForm() {
   const { status, result, error, elapsedSeconds, run } = useBacktestRun();
+  const { setLastBacktestRunId } = useWorkspace();
   const [strategyName, setStrategyName] = useState("");
   const [scenario, setScenario] = useState("");
   const [symbol, setSymbol] = useState("");
   const symbolInputRef = useRef<HTMLInputElement>(null);
+
+  // Decision #134: the exact moment this panel already renders a
+  // finished run's real run_id (the `status === "done" && result` branch
+  // below) is also the moment it's published to shared WorkspaceContext
+  // state, so BacktestResultsPanel.tsx can default its own filter to it
+  // without the person copy-pasting anything. Fires once per genuinely
+  // new `result` object (a fresh `run()` call always produces a new
+  // object, even for a re-run of the same strategy/scenario/symbol), not
+  // on every render.
+  useEffect(() => {
+    if (status === "done" && result?.run_id) {
+      setLastBacktestRunId(result.run_id);
+    }
+  }, [status, result, setLastBacktestRunId]);
 
   const running = status === "running";
   const selectedScenario = useMemo(() => BACKTEST_SCENARIOS.find((sc) => sc.name === scenario), [scenario]);

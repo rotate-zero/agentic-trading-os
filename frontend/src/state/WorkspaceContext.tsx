@@ -52,6 +52,14 @@ interface WorkspaceContextValue {
   featureEnginePanelSymbol: string;
   scannerCollapsed: boolean;
   scannerWidthPx: number;
+  // Backtest Runner's most recent run_id (decision #134) — same
+  // "one panel sets a piece of shared state, a sibling panel reads it"
+  // pattern as featureEnginePanelSymbol above, reused deliberately
+  // rather than inventing a new mechanism. BacktestPanel.tsx (the
+  // trigger panel) is the sole writer; BacktestResultsPanel.tsx (the
+  // viewer panel) reads it to default its own run_id filter. `null`
+  // means "no run has finished yet in this Main Window."
+  lastBacktestRunId: string | null;
 
   // GLOBAL — shared across every Main Window. This is what makes "connector 0
   // in Layout 1" and "connector 0 in Layout 2" the same link group.
@@ -70,6 +78,7 @@ interface WorkspaceContextValue {
   setFeatureEnginePanelSymbol: (symbol: string) => void;
   setScannerCollapsed: (collapsed: boolean) => void;
   setScannerWidthPx: (width: number) => void;
+  setLastBacktestRunId: (runId: string | null) => void;
 
   // No-database save/load — everything lives in localStorage for now. Same
   // JSON shape this produces is what a future workspace_layouts API call
@@ -165,6 +174,7 @@ function makeMainWindow(id: string, label: string, subWindows: SubWindowConfig[]
     featureEnginePanelSymbol: DEFAULT_SYMBOL,
     scannerCollapsed: true, // starts collapsed, same reasoning as Feature Engine above — a third sidebar shouldn't grab space by default either
     scannerWidthPx: 300,
+    lastBacktestRunId: null, // no run has finished yet for a freshly created Main Window
   };
 }
 
@@ -324,7 +334,15 @@ function normalizeSubWindow(sw: SubWindowConfig & { indicators?: string[] }): Su
 }
 
 function normalizeMainWindow(w: MainWindowState): MainWindowState {
-  return { ...w, subWindows: w.subWindows.map(normalizeSubWindow) };
+  return {
+    ...w,
+    subWindows: w.subWindows.map(normalizeSubWindow),
+    // Back-fill for sessions persisted before lastBacktestRunId existed
+    // (decision #134) — old localStorage sessions won't have this key
+    // at all, so this keeps it a real `string | null` at runtime instead
+    // of `undefined`, same reasoning as every other backfill above.
+    lastBacktestRunId: w.lastBacktestRunId ?? null,
+  };
 }
 
 function loadSession(): StoredSession | null {
@@ -498,6 +516,7 @@ export function WorkspaceProvider({
   const setScannerCollapsed = (collapsed: boolean) => updateActive({ scannerCollapsed: collapsed });
   const setScannerWidthPx = (width: number) => updateActive({ scannerWidthPx: width });
   const setFeatureEnginePanelSymbol = (symbol: string) => updateActive({ featureEnginePanelSymbol: symbol });
+  const setLastBacktestRunId = (runId: string | null) => updateActive({ lastBacktestRunId: runId });
 
   const addMainWindow = () => {
     const id = `mw-${Date.now()}`;
@@ -613,6 +632,7 @@ export function WorkspaceProvider({
       featureEnginePanelSymbol: activeWindow.featureEnginePanelSymbol,
       scannerCollapsed: activeWindow.scannerCollapsed,
       scannerWidthPx: activeWindow.scannerWidthPx,
+      lastBacktestRunId: activeWindow.lastBacktestRunId,
 
       connectorSymbols,
 
@@ -629,6 +649,7 @@ export function WorkspaceProvider({
       setFeatureEnginePanelSymbol,
       setScannerCollapsed,
       setScannerWidthPx,
+      setLastBacktestRunId,
 
       savedLayouts,
       saveCurrentLayout,

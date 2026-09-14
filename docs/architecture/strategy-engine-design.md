@@ -547,6 +547,67 @@ BacktestResultsPanel.tsx (free-text run_id filter, Apply/Clear)
 
 No new route, no change to `fetchStrategyOutcomes()`/`StrategyOutcomeWireShape` (both already covered every field this panel needed), no change to `useStrategyOutcomes.ts` (that hook's own comment already named this exact panel as its deferred, separate scope — this delivery is that deferral being picked up, not a reason to touch the hook it was deferred from).
 
+**As-built note (decision #134) — the two Backtest panels stop needing a copy-paste between them.** Both panels above already worked independently; `useBacktestOutcomes.ts`'s own comment named the gap explicitly (see that file directly) — this delivery closes exactly that connection and nothing else. Frontend-only, no backend/API change. New shared state on `WorkspaceContext.tsx`/`MainWindowState` — `lastBacktestRunId` / `setLastBacktestRunId` — modeled directly on `featureEnginePanelSymbol`'s own established "one panel writes, a sibling reads" pattern (decision #48), not a new mechanism. Scoped per-Main-Window, same as `featureEnginePanelSymbol`, since both panels are mounted once per active-window shell (`App.tsx`), not globally or per-sub-window.
+
+```
+BacktestPanel.tsx (BacktestForm)              BacktestResultsPanel.tsx (BacktestResultsBody)
+        │                                                    │
+   run() → POST /backtest/run resolves                       │
+   status === "done", result.run_id                          │
+        │                                                    │
+        ▼                                                    │
+setLastBacktestRunId(result.run_id)                           │
+        │                                                    │
+        ▼                                                    │
+  WorkspaceContext.tsx                                        │
+  MainWindowState.lastBacktestRunId  ─── useWorkspace() ──────►
+  (persisted via the existing                    │
+   session-autosave path, same                   ▼
+   as every other MainWindowState        mode === "auto"?
+   field — normalizeMainWindow()            │           │
+   back-fills it for pre-#134             yes           no
+   sessions that predate it)                │           │
+                                             ▼           ▼
+                              runIdInput/appliedRunId   left exactly as the
+                              synced to the new value   person set it — a
+                                             │           run finishing
+                                             ▼           elsewhere never
+                          useBacktestOutcomes({ backtestRunId })  clobbers an
+                          — its own [limit, backtestRunId]        in-progress
+                          dependency array (unchanged by this     manual lookup
+                          task) already refetches reactively,
+                          so the just-finished run's rows
+                          appear with no new fetch logic
+```
+
+**Internal flow within the changed module (`BacktestResultsBody`, inside `BacktestResultsPanel.tsx`)** — the "don't silently overwrite a manual lookup" requirement this task's own prompt called out explicitly, resolved as a small two-state mode machine local to this component:
+
+```
+                 mount (mode = "auto", seeded from
+                 whatever lastBacktestRunId already is)
+                              │
+                              ▼
+             ┌───────────►  AUTO  ◄──────────────────┐
+             │      (runIdInput/appliedRunId follow    │
+             │       lastBacktestRunId on every          │
+             │       change, incl. new runs finishing     │
+             │       while this panel is already open)     │
+             │                    │                      │
+             │   person clicks Apply OR Clear      person clicks
+             │   (typing a run_id, or explicitly   "↺ Follow latest run"
+             │    clearing to "show everything" —   (the only way back
+             │    both are real, deliberate          to auto — collapsing/
+             │    manual choices, both freeze)        re-expanding the panel
+             │                    ▼                   also resets to auto,
+             └────────────  MANUAL  ────────────────► since this component
+                    (frozen: lastBacktestRunId          unmounts on collapse,
+                     keeps changing in shared state       but that's not a
+                     as new runs finish, but this          discoverable path,
+                     panel's own filter no longer           so this control
+                     follows it — exactly the                is explicit)
+                     "don't clobber" requirement)
+```
+
 ---
 
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation

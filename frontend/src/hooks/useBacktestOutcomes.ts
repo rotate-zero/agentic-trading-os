@@ -46,10 +46,25 @@ import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "
  * assumed) since no live writer exists yet — same reasoning
  * `useStrategyOutcomes.ts`/`usePerformanceAnalytics.ts` already
  * document for this exact table. `refetch()` is exposed for a manual
- * "Refresh" action in the panel (this table's own writer, Backtest
- * Runner v1, is triggered from a separate, unlinked panel per this
- * task's own scope, so a manual refresh is the only way to see a
- * just-finished run's rows without a full reload).
+ * "Refresh" action in the panel.
+ *
+ * Decision #134 update: this table's own writer, Backtest Runner v1, was
+ * triggered from a separate, unlinked panel (`BacktestPanel.tsx`) when
+ * this comment was originally written — that's now closed. A finished
+ * run's `run_id` is published to shared `WorkspaceContext` state
+ * (`lastBacktestRunId`) and `BacktestResultsPanel.tsx` defaults its
+ * `backtestRunId` param to it, so this hook's own `[limit, backtestRunId]`
+ * dependency array (already reactive, unchanged by that task) now
+ * re-fires this fetch automatically the moment a run the panel is
+ * auto-following finishes — a real refetch, not merely a UI hint, since
+ * `POST /backtest/run` is synchronous and only resolves after its own
+ * `StrategyOutcome` rows are already written. `refetch()`/manual
+ * "Refresh" remain meaningful for anything outside that path: a run
+ * triggered from a different browser tab or by another operator, or
+ * while the results panel's filter is pinned to a different run_id the
+ * person picked manually (see that panel's own auto/manual mode
+ * comment) — this hook itself has no way to distinguish those cases,
+ * that logic lives entirely in the panel above it.
  */
 export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: string }): {
   outcomes: StrategyOutcomeWireShape[];

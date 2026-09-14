@@ -1,138 +1,152 @@
-# TESTING.md — Decision #133: Backtest Results frontend panel
+# TESTING.md — Decision #134: Link Backtest Panel and Backtest Results Panel by run_id
 
 ## What this delivery is
 
-A new, frontend-only "Backtest Results" panel — the first thing in this
-codebase that renders a persisted `StrategyOutcome` row with
-`is_backtest=True` (Backtest Runner v1, decision #128) anywhere outside
-a `curl` call or a direct Postgres query. `GET /intelligence/
-strategy-outcomes` (decision #123) got real `is_backtest`/
-`backtest_run_id` filtering from decision #130 specifically so those
-rows would be queryable in isolation from (someday) real live trades —
-nothing had ever rendered them before this.
+Both `BacktestPanel.tsx` (decision #131, the trigger) and
+`BacktestResultsPanel.tsx` (decision #133, the viewer) already worked
+independently. `useBacktestOutcomes.ts`'s own docstring named the gap
+explicitly before this delivery: the Runner is "triggered from a
+separate, unlinked panel ... so a manual refresh is the only way to see
+a just-finished run's rows without a full reload." Today, using both
+panels together meant: run a backtest, get a `run_id` back, select and
+copy it out of a plain `<span>`, click over to the other panel, paste it
+into a free-text field. Every piece of information needed to skip that
+was already sitting in React state on the same page — this delivery
+connects it.
 
-Full reasoning lives in `docs/decisions/archive/122-133.md` (decision
-#133 — see "A note on this file's structure" in the note below on why
-it's in the archive, not the open file); this file covers what to run
-to verify it and what a reader should know before touching this panel
-again.
+Full reasoning lives in `docs/decisions/confirmed-decisions.md` (decision
+#134 — the open file, no archive/rollover involved this time); this file
+covers what to run to verify it and what a reader should know before
+touching either panel again.
 
-**Zero backend changes.** `GET /intelligence/strategy-outcomes`,
-`fetchStrategyOutcomes()`, and `StrategyOutcomeWireShape` already
-covered everything this panel needed — confirmed directly against the
-real route/client code before writing anything, not assumed from the
-task prompt.
+**Zero backend changes.** No route, no wire-shape change, no new hook.
+Confirmed directly (not assumed) before writing anything: everything
+needed was already sitting in `useBacktestRun`'s `result.run_id` and
+`useBacktestOutcomes`'s existing `backtestRunId` param.
 
 ## Files changed
 
-**New:**
-- `frontend/src/hooks/useBacktestOutcomes.ts` — new hook, calling the
-  already-existing `fetchStrategyOutcomes()` with `isBacktest` fixed
-  `true`. Deliberately separate from `useStrategyOutcomes.ts` (untouched
-  — see that file's own comment naming this exact panel as its deferred
-  scope). Exposes a caller-visible `error` state distinct from empty
-  data (same deviation `usePerformanceAnalytics.ts` already
-  established); keeps the full `StrategyOutcomeWireShape`, not a
-  narrowed display row, since the panel's expand-in-place view needs
-  `evidence`/`market_state_at_*`/`context_at_*`. One-shot on mount,
-  reactive to `backtestRunId`/`limit` changes, plus manual `refetch()` —
-  no WebSocket subscription (no `OutcomeRecorded`-shaped event exists
-  anywhere in `backend/app/schemas/events/`, confirmed by grep).
-- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` —
-  new. Fifth collapsible sibling panel, mounted in `App.tsx` alongside
-  `InfoTab`/`FeatureEnginePanel`/`ScannerPanel`/`BacktestPanel`, reusing
-  `ScannerPanel.tsx`'s exact `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH`
-  (64/480/36) and resize-handle behavior. Local component state for
-  collapsed/width, not `WorkspaceContext.tsx` — same reasoning
-  `BacktestPanel.tsx`'s own comment already gives for itself. Defaults
-  to `is_backtest=true`, `limit=500` (the route's own hard cap), no
-  `run_id` filter — "everything this table currently has," per the
-  route's own docstring confirming zero real LIVE rows exist today.
-  Free-text `run_id` filter (Enter or Apply button, Clear to reset)
-  always applies alongside the fixed `is_backtest=true`, so this panel's
-  own state machine cannot reach the route's real 400 (`backtest_run_id`
-  without `is_backtest=true`) — only a malformed UUID can still 400,
-  handled by the hook's `error` state, not conflated with an honest
-  empty result. Expand-in-place per row (chosen after confirming no
-  modal/dialog/portal pattern exists anywhere in `frontend/src/` today)
-  surfaces every scalar field plus the five JSON blobs a summary row
-  can't show. `realized_pnl`/`realized_r` render via unrounded
-  `String()` with an explicit sign, not `.toFixed(2)` — a deliberate,
-  narrow divergence from every other quick-glance summary in this
-  codebase, since this task's own scope named these two fields
-  specifically ("don't round in a way that hides sign or precision").
-- `docs/decisions/archive/122-133.md` — new. See "Decision-log rollover"
-  below.
+**Modified — all frontend:**
 
-**Modified:**
-- `frontend/src/App.tsx` — new `BacktestResultsPanel` import, mounted
-  directly after `BacktestPanel` in both `FullWorkspaceShell` and
-  `PoppedOutWindowShell`'s `<main>`.
-- `docs/decisions/confirmed-decisions.md` — decision #133 was appended
-  here, which crossed the ~100KB rollover trigger; the file was then
-  frozen to `archive/122-133.md` and replaced with a fresh, empty open
-  file starting at #134 (see below). The file as delivered contains no
-  entries yet — that's expected, not a mistake.
-- `docs/decisions/INDEX.md` — new #133 row; file-location column for
-  rows #122–#132 updated from `confirmed-decisions.md` to
-  `archive/122-133.md`.
+- `frontend/src/state/WorkspaceContext.tsx` — new `lastBacktestRunId:
+  string | null` field on `MainWindowState`, plus `setLastBacktestRunId`,
+  modeled directly on the existing `featureEnginePanelSymbol` /
+  `setFeatureEnginePanelSymbol` pair (same value-plus-setter shape,
+  exposed the same way through `useWorkspace()`, flattened from
+  `activeWindow` the same way). Per-Main-Window, not global — both
+  panels are mounted once per active-window shell in `App.tsx`, exactly
+  the same footprint `featureEnginePanelSymbol` already has, so the same
+  scoping was reused rather than inventing a new one. `makeMainWindow()`
+  seeds it `null`. `normalizeMainWindow()` now back-fills
+  `lastBacktestRunId: w.lastBacktestRunId ?? null` for any session saved
+  before this field existed — previously that function only normalized
+  `subWindows`; this is the first MainWindowState-level field to need
+  its own backfill, added following the same "old localStorage sessions
+  shouldn't throw at render time" principle `normalizeSubWindow()`
+  already established for its own fields.
+- `frontend/src/types/workspace.ts` — `lastBacktestRunId: string | null`
+  added to the `MainWindowState` interface, with a comment pointing back
+  at `featureEnginePanelSymbol` as the pattern it follows.
+- `frontend/src/components/backtest/BacktestPanel.tsx` — `BacktestForm`
+  now calls `setLastBacktestRunId(result.run_id)` in a `useEffect` keyed
+  on `status === "done" && result` — the exact same moment it already
+  renders that value in `ResultsView`, not a separate action or a second
+  code path that could drift from the render logic. `ResultsView` gained
+  one plain, non-interactive line of text noting the run_id is now
+  prefilled in the Results panel's filter. Deliberately **not** a
+  clickable "View in Results" link/button — see "What was deliberately
+  NOT built" below for why.
+- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` —
+  `BacktestResultsBody` gained a two-state `"auto"` / `"manual"` filter
+  mode (see "The one real design decision" below for the full
+  reasoning). `runIdInput`/`appliedRunId` now seed from
+  `useWorkspace().lastBacktestRunId` at mount and keep following it while
+  in `"auto"` mode; Apply or Clear switches to `"manual"` and freezes;
+  a new "↺ Follow latest run" control switches back. A small "auto" badge
+  and a "(auto)" / "(manually set)" suffix on the existing "Showing
+  run_id=..." line make the current mode visible, not just internal
+  state. `useBacktestOutcomes` itself is called exactly as before — same
+  hook, same params shape, no new hook needed.
+- `frontend/src/hooks/useBacktestOutcomes.ts` — docstring only, no
+  behavior change. The paragraph describing the "separate, unlinked
+  panel" gap was rewritten to state precisely what's now closed (the
+  run_id link, and — as an unplanned side effect of this hook's own
+  pre-existing reactive `[limit, backtestRunId]` dependency array — the
+  "manual refresh is the only way" framing too, while a person is
+  auto-following) versus what's still true (manual refresh remains
+  meaningful for a run triggered from a different tab/operator, or while
+  pinned to a different run_id manually).
+- `docs/decisions/confirmed-decisions.md` — decision #134 appended (open
+  file, no rollover — well under the ~100KB trigger at ~7KB).
+- `docs/decisions/INDEX.md` — new #134 row.
 - `docs/architecture/strategy-engine-design.md` — one new as-built note
-  + diagram appended to the end of §7, extending (not duplicating) the
-  existing #128/#130 diagrams, showing the new route → hook → panel
-  read path and its three real outcomes (empty / populated / 400).
+  in §7, with two diagrams per this task's own diagram requirement: (1)
+  cross-component data flow — `BacktestPanel` → `WorkspaceContext` →
+  `BacktestResultsPanel`, and (2) the internal `"auto"`/`"manual"` mode
+  state machine inside `BacktestResultsBody`.
 
 **Confirmed untouched** (checked via `diff -rq` against a freshly
 re-pulled clone, both before writing any code and again immediately
-before packaging): everything under `backend/`, `useStrategyOutcomes.ts`,
-`api-client.ts`, `InfoTab.tsx`, `AIAnalysisPanel.tsx`,
-`backtest/BacktestPanel.tsx`, `WorkspaceContext.tsx`.
+before packaging): everything under `backend/`, `api-client.ts`,
+`useContextSnapshot.ts`, `useOpportunities.ts`,
+`useOpportunityConflicts.ts`, `useStrategyOutcomes.ts`,
+`usePerformanceAnalytics.ts`, `App.tsx` (no new import needed — both
+panels were already mounted), `CHANGES.md`.
 
-## Decision-log rollover (same change as #133, not a separate delivery)
+## The one real design decision this task called for
 
-Appending decision #133 pushed `confirmed-decisions.md` to 102,863
-bytes — past the ~100KB trigger `docs/decisions/README.md` sets for a
-rollover. Per that file's own maintenance protocol:
+The task's own scope was explicit: `lastBacktestRunId` must be a
+**default**, never a forced value, and a run finishing elsewhere must
+**never silently overwrite an in-progress manual lookup** already sitting
+in the Results panel's filter. A silent default either way (always
+follow / never follow after first paint) would have violated one half or
+the other of that requirement, so this needed a real, stated mechanism:
 
-1. `confirmed-decisions.md` (decisions #122–#133) moved verbatim to
-   `docs/decisions/archive/122-133.md`, with its live-file header
-   replaced by the standard frozen-archive header (matching
-   `archive/107-121.md` and every earlier archive's own convention).
-2. A fresh, empty `confirmed-decisions.md` was started, ready for #134
-   onward, with its own "note on this file's structure" updated to list
-   all six archive ranges (`001-060` through `122-133`).
-3. `INDEX.md`'s file-location column updated for every row in #122–#133
-   in the same change (not a follow-up) — see "Files changed" above.
+`BacktestResultsBody` starts in `"auto"` mode, seeded from whatever
+`lastBacktestRunId` already is at mount (so a page reload or a
+freshly-expanded panel picks up the last known run immediately, not just
+runs that finish after the panel is already open). A `useEffect` keyed on
+`[lastBacktestRunId, mode]` keeps `runIdInput`/`appliedRunId` in sync with
+the shared value for as long as `mode === "auto"`.
 
-This is the sixth rollover in this project's history (after #79, #80,
-#106, and #121's own two), same size-driven trigger each time, no
-different rule.
+The moment the person clicks **Apply** (with typed text) **or Clear**,
+mode switches to `"manual"` and freezes — both are real, deliberate
+choices (Clear's own "show everything" is itself a manual choice, not a
+reset back to auto), and from that point a run finishing elsewhere
+updates the *shared* value (so `BacktestPanel.tsx`'s own "prefilled" note
+stays accurate) but no longer touches *this panel's* filter. A small
+explicit "↺ Follow latest run" button is the only way back to `"auto"` —
+collapsing and re-expanding the panel would also reset it, since
+`BacktestResultsBody` unmounts on collapse, but that's not a discoverable
+way to ask for it, so the explicit control was added rather than relying
+on that side effect alone.
 
 ## What was deliberately NOT built
 
-- **No `isBacktest` toggle on `useStrategyOutcomes.ts`.** That hook
-  backs "Recent Closed Trades," which is deliberately live-only by
-  design; this is a new, separate hook for a new, separate purpose.
-- **No changes to `api-client.ts`.** `fetchStrategyOutcomes()` and
-  `StrategyOutcomeWireShape` already covered everything this panel
-  needed — confirmed directly before writing any new wrapper.
-- **No backend changes of any kind.** The task's own scope was zero
-  backend changes since everything the screen needs was already built
-  and already live on `main`; confirmed via `diff -rq`.
-- **No pagination UI.** `limit=500` is the route's own hard cap, passed
-  explicitly; today's real row count is nowhere near it.
-- **No modal/dialog for the full-record view.** No such pattern exists
-  anywhere in this codebase's frontend; expand-in-place was chosen
-  instead — see the panel component's own comment and decision #133 for
-  the full reasoning.
-- **No `WorkspaceContext.tsx` changes.** The panel's collapsed/width
-  state is local component state, same choice `BacktestPanel.tsx`
-  already made for itself and for the same reason (no server-side push
-  to sync, no real reason to persist this specific panel's state across
-  a reload).
-- **No fetching of strategy/scenario lists at runtime, no link into
-  `BacktestPanel.tsx`.** This panel is deliberately standalone per the
-  task's own scope — it works whether or not `BacktestPanel.tsx` exists
-  in a given checkout, and never imports from it.
+- **No clickable "View in Results" link in `BacktestPanel.tsx`.** Item
+  4 in this task's own scope named this as a genuine either-way call.
+  The Results panel's own collapsed/width state is deliberately local
+  component state, not threaded through `WorkspaceContext.tsx` — its own
+  header comment already states this explicitly, unchanged by this
+  delivery. Making the run_id note "actionable" would have meant either
+  reversing that local-state design (for a convenience this task didn't
+  ask for) or inventing a second, narrower coupling on top of the one
+  piece of shared state this task actually needed. A plain informational
+  note was judged sufficient; automatic prefill already does the real
+  work.
+- **No new hook.** The existing `useBacktestRun`/`useBacktestOutcomes`
+  pair already expressed everything needed — `useBacktestOutcomes`'s own
+  pre-existing reactive params did the rest for free.
+- **No backend changes of any kind.**
+- **No changes to `api-client.ts`, `App.tsx`, or any of the four
+  explicitly-excluded hooks** (`useContextSnapshot.ts`,
+  `useOpportunities.ts`, `useOpportunityConflicts.ts`,
+  `usePerformanceAnalytics.ts`) — confirmed via `diff -rq`.
+- **No persistence changes beyond the one new field.** `lastBacktestRunId`
+  rides the existing `MainWindowState` autosave/backfill machinery
+  unchanged; no new localStorage key, no new cross-tab sync payload
+  shape (`crossTabSync.ts` untouched — it already syncs the whole
+  `mainWindows` array wholesale).
 
 ## How to verify
 
@@ -149,38 +163,44 @@ Expected: `npx tsc -b` reports exactly the four pre-existing decision
 #35 `GridPresetPicker` errors (`GRID_PRESETS` not exported, `preset`/
 `setPreset` not on `WorkspaceContextValue`, one implicit-`any`
 parameter) and nothing else — confirmed against a freshly re-pulled,
-untouched clone before this delivery's own changes were made, so these
-are a known baseline, not a regression. `npx vite build` succeeds with
-no errors or warnings beyond its own standard build output.
+untouched clone immediately before this delivery's own changes were
+made, so these are a known baseline, not a regression. `npx vite build`
+succeeds with no errors or warnings beyond its own standard build
+output.
 
 **Manual check (no backend test suite involved — this delivery has no
 Python changes to test):**
 
 1. Start the backend and frontend as usual.
-2. Trigger at least one backtest run via the existing `BacktestPanel.tsx`
-   (or `POST /backtest/run` directly) so `strategy_outcomes` has at
-   least one `is_backtest=True` row.
-3. Open the new "Backtest Results" panel (rightmost of the five sidebar
-   panels, starts collapsed like every sibling). It should show that
-   row without any filter applied.
-4. Copy the `run_id` from the `BacktestPanel.tsx` result (or the new
-   panel's own expanded detail view, which shows `backtest_run_id` on
-   every row) into the new panel's `run_id` field and press Enter — the
-   list should narrow to just that run's rows; pressing Clear should
-   return to the full view.
-5. Type a clearly-invalid string (e.g. `not-a-uuid`) into `run_id` and
-   apply it — the panel should show a distinct red/error message (the
-   backend's real 400 detail), not an empty-state message.
-6. Toggle a row's `▸`/`▾` — it should expand in place to show the full
-   record (all scalar fields plus the five JSON blobs), not navigate
-   away or open a separate window.
+2. Expand both the "Backtest" and "Backtest Results" sidebar panels.
+3. Trigger a backtest run via `BacktestPanel.tsx`. Wait for it to finish.
+4. Confirm the Results panel's `run_id` filter field auto-populates with
+   the just-finished run's `run_id` with no typing/pasting, an "auto"
+   badge appears next to "Filter by run_id," and the results list narrows
+   to that run's rows automatically (no manual "Refresh" click needed).
+5. Manually type a different (or blank) value into the Results panel's
+   filter and press Apply or Clear. Confirm the "auto" badge disappears
+   and a "↺ Follow latest run" button appears.
+6. Trigger a second backtest run. Confirm the Results panel's filter
+   does **not** change while in manual mode — it should still show
+   whatever was set in step 5.
+7. Click "↺ Follow latest run." Confirm the filter jumps to the
+   second run's `run_id` and the "auto" badge returns.
+8. Reload the page. Confirm the Results panel (once expanded) still
+   defaults its filter to the most recent run for this Main Window tab
+   (persistence via the existing session-autosave path).
+9. Open a second Main Window tab (via the `+` tab control). Confirm its
+   own Results panel filter starts independent of the first tab's —
+   per-Main-Window scoping, same as `featureEnginePanelSymbol`.
 
 ## A note on scope discipline
 
 This task's own prompt named a concurrent backend session working a
-historical-data-provider seam in `backend/app/backtest_runner/`,
-`backend/app/feature_engine/engine.py`, and `backend/tests/` — file-
-disjoint from this delivery by construction. Re-confirmed directly (not
-assumed) via a fresh tarball pull and a `docs/decisions/` diff at both
-session start and immediately before writing decision #133 — no drift
-either time, no collision to reconcile.
+historical-data-provider gap in `backend/app/backtest_runner/` and
+likely `backend/app/api/routes/backtest.py`. This delivery is
+frontend-only by construction and shares zero files with that boundary
+list. Re-confirmed directly (not assumed) via a fresh tarball pull and a
+three-source decision-log cross-check (`INDEX.md` last row,
+`confirmed-decisions.md` tail, archive file list) at both session start
+and again immediately before writing decision #134 — no drift either
+time, no collision to reconcile, #134 was free.

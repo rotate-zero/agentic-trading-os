@@ -1,5 +1,6 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useBacktestOutcomes } from "../../hooks/useBacktestOutcomes";
+import { useWorkspace } from "../../state/WorkspaceContext";
 import type { StrategyOutcomeWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
@@ -33,6 +34,13 @@ const OUTCOMES_LIMIT = 500;
 // across tabs and no real reason to survive a reload as "this Main
 // Window's" state the way Scanner's own persisted view does. Flagged
 // here explicitly, not a silent deviation.
+//
+// Decision #134 narrows this: the run_id VALUE itself (not this panel's
+// collapsed/widthPx chrome) now has a real, stated reason to be shared
+// and to survive a reload — see WorkspaceContext.tsx's
+// `lastBacktestRunId`/`setLastBacktestRunId`, read below via
+// `useWorkspace()`. Collapsed/widthPx stay exactly as they were; only
+// the run_id filter's DEFAULT now comes from shared state.
 
 // holding_seconds -> human string. Unlike BacktestPanel.tsx's own
 // formatElapsed (which only ever needs to show a few minutes of a
@@ -198,10 +206,43 @@ function OutcomeRow({ outcome }: { outcome: StrategyOutcomeWireShape }) {
   );
 }
 
+// Decision #134's own filter-mode split. `lastBacktestRunId` (shared
+// WorkspaceContext state, set by BacktestPanel.tsx when a run finishes)
+// is a DEFAULT, never a forced value — the task's own scope explicitly
+// requires that a person can still type or clear the filter and look at
+// something else, and that a run finishing elsewhere must never silently
+// overwrite an in-progress manual lookup already sitting in this filter.
+//
+// The real, stated decision (not a silent default): this panel starts
+// in "auto" mode and stays there — continuously following whatever
+// `lastBacktestRunId` currently is, including across new runs finishing
+// while this panel is already open — right up until the person
+// interacts with the filter themselves (Apply OR Clear), at which point
+// it switches to "manual" and freezes: further runs finishing elsewhere
+// update the SHARED value (so BacktestPanel.tsx's own "prefilled" note
+// stays true) but no longer touch what THIS panel is showing, exactly
+// the "don't clobber an in-progress manual lookup" requirement. A small
+// explicit "↺ follow latest run" control is the only way back to "auto"
+// from "manual" — re-collapsing/re-expanding the panel would also reset
+// it (this component unmounts on collapse), but that's not a
+// discoverable way to ask for it, so this task adds the explicit control
+// rather than relying on that side effect.
+type RunIdFilterMode = "auto" | "manual";
+
 function BacktestResultsBody() {
-  const [runIdInput, setRunIdInput] = useState("");
-  const [appliedRunId, setAppliedRunId] = useState<string | undefined>(undefined);
+  const { lastBacktestRunId } = useWorkspace();
+  const [mode, setMode] = useState<RunIdFilterMode>("auto");
+  const [runIdInput, setRunIdInput] = useState(lastBacktestRunId ?? "");
+  const [appliedRunId, setAppliedRunId] = useState<string | undefined>(lastBacktestRunId ?? undefined);
   const runIdInputRef = useRef<HTMLInputElement>(null);
+
+  // Only fires while in "auto" mode — see this function's own comment
+  // block above for why "manual" deliberately stops following.
+  useEffect(() => {
+    if (mode !== "auto") return;
+    setRunIdInput(lastBacktestRunId ?? "");
+    setAppliedRunId(lastBacktestRunId ?? undefined);
+  }, [lastBacktestRunId, mode]);
 
   const { outcomes, loading, error, refetch } = useBacktestOutcomes({
     limit: OUTCOMES_LIMIT,
@@ -210,18 +251,36 @@ function BacktestResultsBody() {
 
   const applyFilter = () => {
     const trimmed = runIdInput.trim();
+    setMode("manual");
     setAppliedRunId(trimmed === "" ? undefined : trimmed);
   };
 
   const clearFilter = () => {
     setRunIdInput("");
     setAppliedRunId(undefined);
+    setMode("manual"); // explicit "show everything" is itself a manual choice — it must stick, not silently flip back to auto on the next finished run
+  };
+
+  const followLatestRun = () => {
+    setMode("auto");
+    setRunIdInput(lastBacktestRunId ?? "");
+    setAppliedRunId(lastBacktestRunId ?? undefined);
   };
 
   return (
     <>
       <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">
-        <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Filter by run_id</span>
+        <div className="flex items-center justify-between">
+          <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Filter by run_id</span>
+          {mode === "auto" && lastBacktestRunId && (
+            <span
+              className="font-mono text-[9px] text-signal"
+              title="Automatically following the most recently finished Backtest Runner run"
+            >
+              auto
+            </span>
+          )}
+        </div>
         <div className="flex gap-1">
           <input
             ref={runIdInputRef}
@@ -246,9 +305,18 @@ function BacktestResultsBody() {
             </button>
           )}
         </div>
+        {mode === "manual" && lastBacktestRunId && (
+          <button
+            onClick={followLatestRun}
+            className="self-start rounded border border-base-border px-1.5 py-0.5 font-mono text-[9px] text-text-muted hover:border-signal hover:text-text-primary"
+            title="Switch back to automatically following the most recently finished run"
+          >
+            ↺ Follow latest run
+          </button>
+        )}
         {appliedRunId && (
           <span className="truncate font-mono text-[9px] text-text-muted" title={appliedRunId}>
-            Showing run_id={appliedRunId}
+            Showing run_id={appliedRunId} {mode === "auto" ? "(auto)" : "(manually set)"}
           </span>
         )}
       </div>

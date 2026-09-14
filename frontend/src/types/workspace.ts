@@ -736,4 +736,12 @@ export interface MainWindowState {
   // Scanner shows a whole ranked universe, not one symbol's detail.
   scannerCollapsed: boolean;
   scannerWidthPx: number;
+  // Backtest Runner's most recent run_id (decision #134) — set by
+  // BacktestPanel.tsx when a run finishes, read by
+  // BacktestResultsPanel.tsx to default its own run_id filter. Same
+  // per-Main-Window scoping as featureEnginePanelSymbol above, for the
+  // same reason: BacktestPanel/BacktestResultsPanel are each mounted
+  // once per active-window shell (App.tsx), not per sub-window or
+  // globally. `null` = no run has finished yet in this Main Window.
+  lastBacktestRunId: string | null;
 }
