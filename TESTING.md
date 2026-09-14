@@ -1,139 +1,186 @@
-# TESTING.md — Decisions #131 & #132: Backtest Runner trigger route reconciliation + live-data safety guard
+# TESTING.md — Decision #133: Backtest Results frontend panel
 
 ## What this delivery is
 
-Two things, landed together:
+A new, frontend-only "Backtest Results" panel — the first thing in this
+codebase that renders a persisted `StrategyOutcome` row with
+`is_backtest=True` (Backtest Runner v1, decision #128) anywhere outside
+a `curl` call or a direct Postgres query. `GET /intelligence/
+strategy-outcomes` (decision #123) got real `is_backtest`/
+`backtest_run_id` filtering from decision #130 specifically so those
+rows would be queryable in isolation from (someday) real live trades —
+nothing had ever rendered them before this.
 
-1. **Decision #131 — retroactive documentation.** The Backtest Runner
-   trigger route (`POST /backtest/run`) was already built, working, and
-   on `main` before this delivery started. It had never gotten its own
-   decision-log entry — every file it touched incorrectly self-cited
-   "(decision #130)," a number decision #130 (the unrelated
-   `/strategy-outcomes` `is_backtest` filter) had already legitimately
-   taken. #131 is that missing entry, written after the fact — it
-   documents and corrects attribution for code that already shipped,
-   it does not introduce new behavior.
-2. **Decision #132 — a real new fix.** While verifying #131, the route's
-   own docstring turned out to only *warn* that calling it against a
-   live-trading process is unsafe, without actually enforcing that.
-   Raised directly by Saqib; closed by making it a real `409` instead
-   of a warning nobody is forced to read.
+Full reasoning lives in `docs/decisions/archive/122-133.md` (decision
+#133 — see "A note on this file's structure" in the note below on why
+it's in the archive, not the open file); this file covers what to run
+to verify it and what a reader should know before touching this panel
+again.
 
-Full reasoning for both lives in `docs/decisions/confirmed-decisions.md`
-(#131, #132); this file covers what to run to verify them and what a
-reader should know before touching this route again.
+**Zero backend changes.** `GET /intelligence/strategy-outcomes`,
+`fetchStrategyOutcomes()`, and `StrategyOutcomeWireShape` already
+covered everything this panel needed — confirmed directly against the
+real route/client code before writing anything, not assumed from the
+task prompt.
 
 ## Files changed
 
-**Decision #131 (misattribution fix only — no logic changed):**
-- `backend/app/api/routes/backtest.py` — docstring's decision-number
-  citation corrected.
-- `backend/app/backtest_runner/scenarios.py` — same.
-- `backend/app/strategy_engine/scheduler.py` — same (the
-  `_default_registry()` → `default_registry()` rename itself was
-  already-shipped, pre-existing work; only its docstring's citation
-  changed here).
-- `backend/tests/test_backtest_routes.py` — same (module docstring's
-  citation).
+**New:**
+- `frontend/src/hooks/useBacktestOutcomes.ts` — new hook, calling the
+  already-existing `fetchStrategyOutcomes()` with `isBacktest` fixed
+  `true`. Deliberately separate from `useStrategyOutcomes.ts` (untouched
+  — see that file's own comment naming this exact panel as its deferred
+  scope). Exposes a caller-visible `error` state distinct from empty
+  data (same deviation `usePerformanceAnalytics.ts` already
+  established); keeps the full `StrategyOutcomeWireShape`, not a
+  narrowed display row, since the panel's expand-in-place view needs
+  `evidence`/`market_state_at_*`/`context_at_*`. One-shot on mount,
+  reactive to `backtestRunId`/`limit` changes, plus manual `refetch()` —
+  no WebSocket subscription (no `OutcomeRecorded`-shaped event exists
+  anywhere in `backend/app/schemas/events/`, confirmed by grep).
+- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` —
+  new. Fifth collapsible sibling panel, mounted in `App.tsx` alongside
+  `InfoTab`/`FeatureEnginePanel`/`ScannerPanel`/`BacktestPanel`, reusing
+  `ScannerPanel.tsx`'s exact `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH`
+  (64/480/36) and resize-handle behavior. Local component state for
+  collapsed/width, not `WorkspaceContext.tsx` — same reasoning
+  `BacktestPanel.tsx`'s own comment already gives for itself. Defaults
+  to `is_backtest=true`, `limit=500` (the route's own hard cap), no
+  `run_id` filter — "everything this table currently has," per the
+  route's own docstring confirming zero real LIVE rows exist today.
+  Free-text `run_id` filter (Enter or Apply button, Clear to reset)
+  always applies alongside the fixed `is_backtest=true`, so this panel's
+  own state machine cannot reach the route's real 400 (`backtest_run_id`
+  without `is_backtest=true`) — only a malformed UUID can still 400,
+  handled by the hook's `error` state, not conflated with an honest
+  empty result. Expand-in-place per row (chosen after confirming no
+  modal/dialog/portal pattern exists anywhere in `frontend/src/` today)
+  surfaces every scalar field plus the five JSON blobs a summary row
+  can't show. `realized_pnl`/`realized_r` render via unrounded
+  `String()` with an explicit sign, not `.toFixed(2)` — a deliberate,
+  narrow divergence from every other quick-glance summary in this
+  codebase, since this task's own scope named these two fields
+  specifically ("don't round in a way that hides sign or precision").
+- `docs/decisions/archive/122-133.md` — new. See "Decision-log rollover"
+  below.
 
-**Decision #132 (real code change):**
-- `backend/app/api/routes/backtest.py` — new
-  `_reject_if_live_data_connected()`, called at the top of
-  `run_backtest()` before any engine or `BacktestRunner` construction;
-  raises `409` if either Finnhub or Polygon is currently connected.
-  Route docstring updated from a warning to a statement of enforcement.
-- `backend/app/api/routes/finnhub_data.py` — new `is_connected()` public
-  accessor (no behavior change; mirrors the existing `/finnhub/status`
-  computation).
-- `backend/app/api/routes/market_data.py` — new `is_connected()` public
-  accessor (same, mirrors `/market-data/status`).
-- `backend/tests/test_backtest_routes.py` — two new tests:
-  `test_run_backtest_rejects_when_finnhub_connected`,
-  `test_run_backtest_rejects_when_polygon_connected`.
+**Modified:**
+- `frontend/src/App.tsx` — new `BacktestResultsPanel` import, mounted
+  directly after `BacktestPanel` in both `FullWorkspaceShell` and
+  `PoppedOutWindowShell`'s `<main>`.
+- `docs/decisions/confirmed-decisions.md` — decision #133 was appended
+  here, which crossed the ~100KB rollover trigger; the file was then
+  frozen to `archive/122-133.md` and replaced with a fresh, empty open
+  file starting at #134 (see below). The file as delivered contains no
+  entries yet — that's expected, not a mistake.
+- `docs/decisions/INDEX.md` — new #133 row; file-location column for
+  rows #122–#132 updated from `confirmed-decisions.md` to
+  `archive/122-133.md`.
+- `docs/architecture/strategy-engine-design.md` — one new as-built note
+  + diagram appended to the end of §7, extending (not duplicating) the
+  existing #128/#130 diagrams, showing the new route → hook → panel
+  read path and its three real outcomes (empty / populated / 400).
 
-**Both decisions:**
-- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` —
-  new #131 and #132 entries.
+**Confirmed untouched** (checked via `diff -rq` against a freshly
+re-pulled clone, both before writing any code and again immediately
+before packaging): everything under `backend/`, `useStrategyOutcomes.ts`,
+`api-client.ts`, `InfoTab.tsx`, `AIAnalysisPanel.tsx`,
+`backtest/BacktestPanel.tsx`, `WorkspaceContext.tsx`.
+
+## Decision-log rollover (same change as #133, not a separate delivery)
+
+Appending decision #133 pushed `confirmed-decisions.md` to 102,863
+bytes — past the ~100KB trigger `docs/decisions/README.md` sets for a
+rollover. Per that file's own maintenance protocol:
+
+1. `confirmed-decisions.md` (decisions #122–#133) moved verbatim to
+   `docs/decisions/archive/122-133.md`, with its live-file header
+   replaced by the standard frozen-archive header (matching
+   `archive/107-121.md` and every earlier archive's own convention).
+2. A fresh, empty `confirmed-decisions.md` was started, ready for #134
+   onward, with its own "note on this file's structure" updated to list
+   all six archive ranges (`001-060` through `122-133`).
+3. `INDEX.md`'s file-location column updated for every row in #122–#133
+   in the same change (not a follow-up) — see "Files changed" above.
+
+This is the sixth rollover in this project's history (after #79, #80,
+#106, and #121's own two), same size-driven trigger each time, no
+different rule.
 
 ## What was deliberately NOT built
 
-- **No auth system.** Grepped the entire `backend/app/api/routes/` tree
-  before deciding this — no `Depends`/`HTTPBearer`/`APIKeyHeader`
-  pattern exists anywhere in this codebase today. Adding one for a
-  single route would be a larger, inconsistent change; the live-data
-  connection check already solves the actual risk precisely.
-- **No new settings flag.** A `settings.allow_backtest_trigger`-style
-  bool was considered and explicitly rejected in favor of reusing
-  `is_connected()` — a flag is one more thing to remember to leave off
-  in production; the connection check can only ever fire when live data
-  is genuinely flowing, in dev or prod alike.
-- **No fix for the intermittent `ForeignKeyViolation` investigated
-  during #131's own verification** — because there was nothing in this
-  delivery's code to fix. See "A note on test flakiness" below.
-- **`backend/app/backtest_runner/runner.py`, `engine_singleton_guard.py`,
-  `main.py`'s router wiring, `broker.py`, and every file already
-  correctly attributed to decision #130** — untouched, confirmed by
-  `diff -rq` against a freshly re-pulled clone.
-
-## A note on test flakiness encountered while verifying this delivery
-
-During #131's own initial full-suite verification,
-`test_run_backtest_first_pullback_scenario_fires_and_persists` failed
-twice with a genuine Postgres-server-side `ForeignKeyViolation`. This
-was investigated directly rather than patched around or ignored:
-
-- Decision #128's own pre-existing test of the identical
-  write-then-insert sequence (`test_backtest_runner.py`) never failed,
-  in this session or historically.
-- Multiple standalone reproductions of the exact same sequence — both
-  via direct `BacktestRunner` construction and via `TestClient`,
-  entirely outside pytest — succeeded every time.
-- Postgres's own server log showed an unambiguous hard crash during
-  this session (`database system was not properly shut down; automatic
-  recovery in progress`, following simultaneous `Connection reset by
-  peer` messages on every open connection) — consistent with an
-  out-of-memory kill in this sandbox's constrained (3.9GB) container.
-- After restarting Postgres, the identical suite ran clean multiple
-  times in direct succession, including one full run of 715 passed / 0
-  failed.
-- Postgres was separately observed to die a second time with zero query
-  activity in the intervening window — ruling out this delivery's own
-  test load as the sole trigger.
-
-**Conclusion: this is a sandbox-environment artifact, not a defect in
-`BacktestRunner`, the trigger route, or anything else in this
-delivery.** It's recorded here and in decision #131 for visibility, not
-as an open bug to track. If it resurfaces on a properly provisioned
-machine (real CI, a dev box not memory-constrained to under 4GB), that
-would change this conclusion and should be re-investigated from
-scratch rather than assumed to be the same cause.
+- **No `isBacktest` toggle on `useStrategyOutcomes.ts`.** That hook
+  backs "Recent Closed Trades," which is deliberately live-only by
+  design; this is a new, separate hook for a new, separate purpose.
+- **No changes to `api-client.ts`.** `fetchStrategyOutcomes()` and
+  `StrategyOutcomeWireShape` already covered everything this panel
+  needed — confirmed directly before writing any new wrapper.
+- **No backend changes of any kind.** The task's own scope was zero
+  backend changes since everything the screen needs was already built
+  and already live on `main`; confirmed via `diff -rq`.
+- **No pagination UI.** `limit=500` is the route's own hard cap, passed
+  explicitly; today's real row count is nowhere near it.
+- **No modal/dialog for the full-record view.** No such pattern exists
+  anywhere in this codebase's frontend; expand-in-place was chosen
+  instead — see the panel component's own comment and decision #133 for
+  the full reasoning.
+- **No `WorkspaceContext.tsx` changes.** The panel's collapsed/width
+  state is local component state, same choice `BacktestPanel.tsx`
+  already made for itself and for the same reason (no server-side push
+  to sync, no real reason to persist this specific panel's state across
+  a reload).
+- **No fetching of strategy/scenario lists at runtime, no link into
+  `BacktestPanel.tsx`.** This panel is deliberately standalone per the
+  task's own scope — it works whether or not `BacktestPanel.tsx` exists
+  in a given checkout, and never imports from it.
 
 ## How to verify
 
-```bash
-# Full suite, real Postgres 16 (matches this project's standing convention)
-cd backend
-alembic upgrade head
-python3 -m pytest -q
-```
-
-Expect **715 collected**. One pre-existing, documented flake may appear:
-`test_daily_levels_carry_level_interaction_once_touched` (the #119
-cluster) — order/timing-sensitive, unrelated to this delivery,
-intentionally left unfixed per standing project convention. Everything
-else should pass.
+**Frontend build (this delivery touches nothing else):**
 
 ```bash
-# Just this delivery's own tests (7 total; 2 are genuinely slow, ~130s each —
-# EngineBackedReplayStateProducer's real ~1s/candle engine-settle cost,
-# not a bug — see backtest.py's own docstring)
-python3 -m pytest -q tests/test_backtest_routes.py
+cd frontend
+npm install   # first time only
+npx tsc -b
+npx vite build
 ```
 
-The two new #132 guard tests
-(`test_run_backtest_rejects_when_finnhub_connected`/`..._polygon_connected`)
-are fast — they monkeypatch `is_connected()` rather than standing up a
-real connection, since the guard fires before any candle is replayed.
+Expected: `npx tsc -b` reports exactly the four pre-existing decision
+#35 `GridPresetPicker` errors (`GRID_PRESETS` not exported, `preset`/
+`setPreset` not on `WorkspaceContextValue`, one implicit-`any`
+parameter) and nothing else — confirmed against a freshly re-pulled,
+untouched clone before this delivery's own changes were made, so these
+are a known baseline, not a regression. `npx vite build` succeeds with
+no errors or warnings beyond its own standard build output.
 
-No frontend changes in this delivery — `npx tsc -b`/`npx vite build`
-were not re-run, since neither `frontend/` file was touched.
+**Manual check (no backend test suite involved — this delivery has no
+Python changes to test):**
+
+1. Start the backend and frontend as usual.
+2. Trigger at least one backtest run via the existing `BacktestPanel.tsx`
+   (or `POST /backtest/run` directly) so `strategy_outcomes` has at
+   least one `is_backtest=True` row.
+3. Open the new "Backtest Results" panel (rightmost of the five sidebar
+   panels, starts collapsed like every sibling). It should show that
+   row without any filter applied.
+4. Copy the `run_id` from the `BacktestPanel.tsx` result (or the new
+   panel's own expanded detail view, which shows `backtest_run_id` on
+   every row) into the new panel's `run_id` field and press Enter — the
+   list should narrow to just that run's rows; pressing Clear should
+   return to the full view.
+5. Type a clearly-invalid string (e.g. `not-a-uuid`) into `run_id` and
+   apply it — the panel should show a distinct red/error message (the
+   backend's real 400 detail), not an empty-state message.
+6. Toggle a row's `▸`/`▾` — it should expand in place to show the full
+   record (all scalar fields plus the five JSON blobs), not navigate
+   away or open a separate window.
+
+## A note on scope discipline
+
+This task's own prompt named a concurrent backend session working a
+historical-data-provider seam in `backend/app/backtest_runner/`,
+`backend/app/feature_engine/engine.py`, and `backend/tests/` — file-
+disjoint from this delivery by construction. Re-confirmed directly (not
+assumed) via a fresh tarball pull and a `docs/decisions/` diff at both
+session start and immediately before writing decision #133 — no drift
+either time, no collision to reconcile.

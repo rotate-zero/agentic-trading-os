@@ -510,6 +510,43 @@ BacktestPanel.tsx (form: strategy_name / scenario / symbol)
 
 Strategy names (`ORB`/`Gap`/`Volume Spike`/`FirstPullback`/`Reversal`/`Momentum`/`VWAP`) and scenario names/descriptions are hardcoded in `api-client.ts` rather than fetched at runtime — `default_registry()`/`available_scenarios()` are Python-only, not reachable over HTTP anywhere in this codebase, and exposing either would mean adding a new backend route or editing `scheduler.py`/`scenarios.py` directly, both outside this delivery's own frontend-only file boundary; the route's own 400 error body remains the live source of truth if either list ever drifts. The panel's own collapsed/width state is local component state, not threaded through `WorkspaceContext.tsx` the way Scanner/FeatureEngine panels' persisted, cross-tab-synced state is — a run's in-flight/finished state belongs to the one browser tab that started it and has no server-side push to sync from, so extending `WorkspaceContextValue`/`MainWindowState`'s localStorage schema for it would add persistence with no real use — flagged as a deliberate, reconsiderable choice in the component's own comment, not a silent deviation from the established pattern. No decision-log entry accompanies this note (see this delivery's own `CHANGES.md` for why); Saqib may fold it into a numbered decision at merge time if he wants one.
 
+**As-built note (decision #133) — the read path finally gets a viewer.** Every note above this one describes either the write side (Backtest Runner v1 itself) or a trigger for it (`BacktestPanel.tsx`); nothing before this note rendered a single `StrategyOutcome` row. Decision #130's own diagram above ends at "`GET /strategy-outcomes` `?is_backtest=true[&backtest_run_id=<run>]`" with no consumer drawn past it — this delivery is that consumer, closing the read side the same narrow way `BacktestPanel.tsx` closed the trigger side: frontend-only, zero new backend surface, reusing what already exists rather than adding to it.
+
+```
+BacktestResultsPanel.tsx (free-text run_id filter, Apply/Clear)
+            │
+            ▼
+   useBacktestOutcomes.ts             ◄── isBacktest FIXED true here, never
+   (limit=500, backtestRunId?)             caller-toggleable — this hook's
+            │                              whole reason to exist is showing
+            ▼                              the one currently-nonempty half
+   GET /intelligence/strategy-outcomes     of `strategy_outcomes`
+   ?is_backtest=true[&backtest_run_id=…]
+            │
+            ├── 200, outcomes: []  ──────► honest "no backtest outcomes
+            │                              recorded yet" / "no outcomes
+            │                              for that run_id" — never an
+            │                              error state
+            │
+            ├── 200, outcomes: [...]  ───► one row per StrategyOutcome,
+            │                              summary fields always visible;
+            │                              ▸ toggle expands the full
+            │                              record in place (evidence /
+            │                              market_state_at_*/context_at_*
+            │                              blobs a summary row can't show)
+            │
+            └── 400 (malformed run_id —    surfaced as a distinct error
+                the is_backtest=false +     state (useBacktestOutcomes.ts's
+                backtest_run_id            own `error`), never rendered as
+                combination this route     a silently-empty result — this
+                itself 400s on is          panel's own is_backtest=true
+                unreachable from this      fix means only a malformed UUID
+                panel's own state          can reach this branch at all
+                machine)
+```
+
+No new route, no change to `fetchStrategyOutcomes()`/`StrategyOutcomeWireShape` (both already covered every field this panel needed), no change to `useStrategyOutcomes.ts` (that hook's own comment already named this exact panel as its deferred, separate scope — this delivery is that deferral being picked up, not a reason to touch the hook it was deferred from).
+
 ---
 
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation

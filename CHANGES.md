@@ -1,173 +1,143 @@
-# Backtest Runner frontend panel — a UI for `POST /backtest/run`
+# Backtest Results panel — a viewer for persisted BacktestRunner outcomes
 
-Copy this into your repo root, overwriting the existing path.
-Frontend-only delivery: **zero changes to any backend file.** Confirmed
-by `diff -rq` against a freshly re-pulled clone of current `main` before
-writing anything, and again immediately before packaging this delivery —
-the only files that differ anywhere in the repo are the ones listed
-below.
+Copy this into your repo root, overwriting the existing paths listed
+below. Frontend-only delivery: **zero changes to any backend file.**
+Confirmed by `diff -rq` against a freshly re-pulled clone of current
+`main` before writing anything, and again immediately before packaging
+this delivery — the only files that differ anywhere in the repo are the
+ones listed below.
 
 ## What this closes
 
-`POST /backtest/run` (decision #130) is a real, working route, but its
-own module docstring is explicit that it never got a UI: "this route
-does not add any Performance Analytics UI for inspecting results ... a
-caller wanting the raw persisted rows can already query the existing
-route separately." Before this delivery, running a backtest meant
-constructing a raw HTTP request by hand (`curl`, Postman, a scratch
-script) and reading raw JSON back. This delivery closes exactly that gap
-— a way for a person to pick a strategy and a scenario, click Run, and
-see what came back — nothing more. It does not add a backtest-results
-browser, does not touch Performance Analytics, and does not link into
-"Recent Closed Trades."
+Backtest Runner v1 (decision #128) has been writing real, persisted
+`StrategyOutcomeRecord` rows since it shipped, and decision #130 gave
+`GET /intelligence/strategy-outcomes` real `is_backtest`/
+`backtest_run_id` filtering specifically so those rows would be
+queryable in isolation from (someday) real live trades. Nothing had
+ever rendered them. Before this delivery, seeing what a backtest
+actually did to a `StrategyOutcome` — win/loss, `realized_r`,
+`exit_reason`, the full `evidence`/`market_state_at_entry`/
+`context_at_entry` blobs — meant querying Postgres by hand or hitting
+the route with `curl`. This delivery closes exactly that gap: a new
+"Backtest Results" panel, and nothing else.
 
 ## Files changed
 
-- `frontend/src/components/backtest/BacktestPanel.tsx` — **new.** A
-  fourth collapsible sibling panel, mounted in `App.tsx` alongside
-  `InfoTab`/`FeatureEnginePanel`/`ScannerPanel`, matching
-  `ScannerPanel.tsx`'s own collapsible-width convention verbatim
-  (`MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` = 64/480/36, same resize
-  handle, starts collapsed). Contains the strategy/scenario/symbol form,
-  a live "Running… Nm Ns elapsed" state for the genuinely long
-  synchronous wait, and a results view rendering `BacktestRunResult`'s
-  real fields verbatim.
-- `frontend/src/hooks/useBacktestRun.ts` — **new.** Owns one
-  `POST /backtest/run` call's lifecycle (`idle`/`running`/`done`/`error`)
-  and a real-time-derived elapsed-seconds ticker. Not a polling/WS hook
-  like every other hook in this codebase — there's nothing to keep
-  fresh, just one long-running action to track honestly.
-- `frontend/src/services/api-client.ts` — new `triggerBacktest()`
-  wrapper (POST with query params baked into the URL, matching
-  `subscribeSymbol`'s existing convention exactly — no body, no change
-  needed to this file's `API_BASE_URL`/`fetch` usage for a POST), new
-  `BacktestRunResultWireShape`/`DiscardedSignalWireShape` types, and the
-  hardcoded `BACKTEST_STRATEGY_NAMES`/`BACKTEST_SCENARIOS` lists (see
-  "Real values, hardcoded on purpose" below).
-- `frontend/src/App.tsx` — `<BacktestPanel />` mounted in both workspace
-  shells (`FullWorkspaceShell`/`PoppedOutWindowShell`), directly after
-  `<ScannerPanel />`. No routing change — this app's two fixed shapes
-  (`/` and `/window/:id`) were confirmed as the real, current constraint
-  before writing anything; a new panel, not a new route, is what this
-  app's own architecture calls for.
-- `docs/architecture/strategy-engine-design.md` — §7 (Backtest Runner)
-  gains one new as-built note + one new diagram, directly after the
-  existing decision-#130 note, extending that section rather than
-  duplicating it — the one place a reader tracing "what happened to
-  `POST /backtest/run`" would naturally look next.
+- `frontend/src/hooks/useBacktestOutcomes.ts` — **new.** Calls the
+  already-existing `fetchStrategyOutcomes()` with `isBacktest` fixed
+  `true` by this hook's own default. Deliberately a new, separate hook
+  from `useStrategyOutcomes.ts` (untouched) — that hook backs "Recent
+  Closed Trades," pinned live-only by design, and its own comment
+  already named this exact panel as deferred, separate scope. Exposes a
+  caller-visible `error` state distinct from empty data (the same
+  deliberate deviation `usePerformanceAnalytics.ts` already established
+  over `useStrategyOutcomes.ts`'s own console-and-swallow shape) so a
+  real backend failure never renders identically to "this table/run
+  genuinely has no rows." Keeps the full `StrategyOutcomeWireShape`
+  (not a narrowed display row) since the panel's own expand-in-place
+  view needs `evidence`/`market_state_at_entry`/`market_state_at_exit`/
+  `context_at_entry`/`context_at_exit`, all of which
+  `useStrategyOutcomes.ts`'s own narrower `StrategyOutcomeRow` type
+  drops. One-shot fetch on mount, re-fetches when `backtestRunId`/
+  `limit` change, plus an exposed `refetch()` for a manual "Refresh"
+  action — no WebSocket subscription, since no `OutcomeRecorded`-shaped
+  event exists anywhere in `backend/app/schemas/events/` (grepped, not
+  assumed).
+- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` —
+  **new.** A fifth collapsible sibling panel, mounted in `App.tsx`
+  alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel`/
+  `BacktestPanel`, reusing `ScannerPanel.tsx`'s own
+  `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` (64/480/36) and
+  resize-handle behavior verbatim, starting collapsed like every other
+  sibling. Local component state for collapsed/width — same "no
+  server-side push to sync, no real reason to persist this panel's
+  state across a reload" reasoning `BacktestPanel.tsx`'s own comment
+  already gives for itself, not threaded through `WorkspaceContext.tsx`.
 
-## Real values confirmed directly, not assumed
+  Defaults to `is_backtest=true`, `limit=500` (the route's own hard
+  cap, `Query(50, le=500)`, passed explicitly rather than inherited from
+  the route's live-oriented default of 50), no `run_id` filter —
+  "everything this table currently has," since `strategy_outcomes` has
+  zero real LIVE rows in production today (confirmed directly against
+  the route's own docstring). A free-text `run_id` field (Enter or an
+  Apply button, plus Clear) narrows further, always alongside the fixed
+  `is_backtest=true` — this panel's own state machine has no path to
+  the route's real, enforced 400 (`backtest_run_id` without
+  `is_backtest=true`); only a malformed (non-UUID) `run_id` string can
+  still 400, and that's surfaced via the hook's own `error` state, never
+  rendered as a silently-empty result.
 
-- **7 strategy names**, read straight off each strategy's own
-  `default_config()` in `backend/app/strategy_engine/*_strategy.py`:
-  `ORB`, `Gap`, `Volume Spike` (note the real space — the other six
-  don't have one), `FirstPullback`, `Reversal`, `Momentum`, `VWAP`.
-- **4 scenario names + candle counts**, read straight off
-  `backend/app/backtest_runner/scenarios.py`'s own `_SCENARIO_FILES`:
-  `first_pullback_vwap_dip` (130), `reversal_vwap_break` (140),
-  `vwap_neutral_conquest` (140), `volume_gated_baseline` (120).
-- **Response shape**, read straight off `runner.py`'s real
-  `BacktestRunResult` dataclass and `test_backtest_routes.py`'s own
-  assertions: `run_id`, `sweep_id`, `outcomes_recorded`,
-  `discarded_signals: [{signal_candle_ts, reason, detail}]`.
+  Each row shows `symbol`/`strategy_name`/`direction` (colored the same
+  bull/bear way `AIAnalysisPanel.tsx`'s `OpportunityRow` already
+  colors BUY/SELL), `entry_price`/`exit_price`, `exit_reason`, a
+  human-formatted `holding_seconds`, `entry_filled_at`/`exit_filled_at`,
+  and `realized_pnl`/`realized_r`. The last two render via plain,
+  unrounded `String()` with an explicit `+`/`-` sign rather than
+  `.toFixed(2)` — every other quick-glance summary in this codebase
+  (`InfoTab.tsx`'s `RecentClosedTrades`, `ScannerPanel.tsx`'s feature
+  chips, `AIAnalysisPanel.tsx`'s `structuralTarget`) rounds to 2
+  decimals, the right tradeoff for a glanceable feed; this panel exists
+  specifically to let someone verify what a backtest actually recorded,
+  and the task this delivery closes named these two fields by name
+  ("don't round in a way that hides sign or precision") — a deliberate,
+  narrow divergence, not applied anywhere else in the row.
 
-## Real values, hardcoded on purpose (not fetched)
+  A per-row `▸`/`▾` toggle expands the record in place — evidence/
+  market-state/context blobs a summary row can't show inline, plus
+  every remaining scalar field (`outcome_id`, `opportunity_id`,
+  `backtest_run_id`, timestamps, quantities, `structural_target`/
+  `structural_invalidation`/`final_stop`/`final_target`,
+  `confidence_at_signal`, etc.) in a label/value grid. Expand-in-place
+  was chosen over a modal or separate details pane after checking
+  directly: no modal/dialog/portal pattern exists anywhere in
+  `frontend/src/` today (grepped) — introducing one for this single view
+  would add a UI paradigm this codebase doesn't otherwise use.
 
-Both lists above are hardcoded in `api-client.ts` rather than fetched
-from the backend at runtime. Neither `default_registry()`
-(`scheduler.py`) nor `available_scenarios()` (`scenarios.py`) is
-reachable over HTTP anywhere in this codebase today — exposing either
-would mean adding a new backend route, or editing `scheduler.py` /
-`scenarios.py` directly, both explicitly outside this task's
-frontend-only file boundary (`backend/app/api/routes/backtest.py`,
-`backend/app/backtest_runner/scenarios.py`, and
-`backend/app/strategy_engine/scheduler.py` were read-only reference for
-this delivery). `POST /backtest/run`'s own 400 error body already lists
-the real valid values live, so a future drift between this hardcoded
-list and the backend fails loudly (a clear 400, surfaced as `error` in
-the panel) rather than silently.
+  A genuinely empty result (`{"outcomes": []}`, a normal 200) renders as
+  a plain "no backtest outcomes recorded yet" (or "no outcomes found for
+  that run_id" when a filter is applied) — never an error state, same
+  discipline `BacktestPanel.tsx` already applies to `outcomes_recorded: 0`.
 
-## The 2–2.5 minute wait, handled honestly
+- `frontend/src/App.tsx` — new `BacktestResultsPanel` import, mounted
+  directly after `BacktestPanel` in both `FullWorkspaceShell` and
+  `PoppedOutWindowShell`'s `<main>` (this app has no routing library —
+  both shells mount every sibling panel identically, per `App.tsx`'s own
+  comment on its two fixed shapes).
+- `docs/architecture/strategy-engine-design.md` — one new as-built note
+  + diagram appended to §7, extending (not duplicating) the existing
+  #128/#130 diagrams, showing this delivery's route → hook → panel read
+  path and its three real outcomes (empty / populated / 400).
+- `docs/decisions/confirmed-decisions.md` / `docs/decisions/INDEX.md` —
+  new decision #133. Appending it pushed `confirmed-decisions.md` past
+  the ~100KB rollover trigger, so the same change also performed the
+  sixth rollover: `docs/decisions/archive/122-133.md` is new (decisions
+  #122–#133, moved verbatim with the standard frozen-archive header),
+  `confirmed-decisions.md` was reset to a fresh, empty open file
+  starting at #134, and `INDEX.md`'s file-location column for rows
+  #122–#132 was updated to point at the new archive file in the same
+  change (not a follow-up).
+- `TESTING.md` — deleted and rewritten from scratch as this delivery's
+  own file (the version it replaces was decisions #131/#132's own).
 
-Confirmed directly from `backtest.py`'s own docstring and
-`test_backtest_routes.py`'s own deliberately-slow tests: each replayed
-candle costs a real, measured ~1 second of `EngineBackedReplayStateProducer`
-engine-settle time, so a 120–140 candle scenario is a genuine 2–2.5
-minute synchronous HTTP round trip — not a bug, not a timeout to work
-around. `BacktestPanel.tsx` is built around that being true:
+## What this does NOT do
 
-- The submit control (and every form field) disables itself the instant
-  a run starts — this route's own `engine_singleton_guard.py` would
-  serialize a genuine concurrent call anyway (confirmed directly in that
-  module and exercised by Unit 5's own concurrency test per decision
-  #128), so this is a UI-level courtesy that avoids firing a second,
-  wasted ~2-minute request from the same tab, not a claim that the
-  backend needs it.
-- While running, the panel shows a live `"Running… Nm Ns elapsed"` state
-  derived from a real `Date.now()` delta on each tick (not a naive
-  incrementing counter, which a throttled background tab could
-  understate) — plus the selected scenario's own expected candle count,
-  so the wait has a visible point of reference rather than reading like
-  a stall.
-
-## `outcomes_recorded: 0` — rendered as a fact, not an error
-
-Confirmed directly (`scenarios.py`'s own module docstring, and by
-reading each of the 7 strategies' real MATCH-stage code): 4 of the 7
-strategies (ORB, Gap, Volume Spike, Momentum) hard-gate MATCH on
-`volume_regime_score`, which is structurally always `0.0` in any
-BacktestRunner replay today — no historical-data provider is wired into
-the replay stack. Running any of those four against any scenario, or
-running any strategy against the honest `volume_gated_baseline`
-fallback, is expected to return `outcomes_recorded: 0`. The panel
-renders that value with the same neutral styling regardless of what it
-is — never a red/error treatment, never hidden — matching the route's
-own explicit "this is not a sign anything is broken" framing.
-
-## What was deliberately NOT built
-
-- **No fetched strategy/scenario list.** See "hardcoded on purpose"
-  above — the real blocker is that no backend route exposes either list
-  today, not a preference.
-- **No link into "Recent Closed Trades" / Performance Analytics UI.**
-  Explicitly out of scope, matching the trigger route's own stated
-  boundary (`InfoTab.tsx`, `AIAnalysisPanel.tsx`,
-  `useStrategyOutcomes.ts`, `usePerformanceAnalytics.ts` were untouched
-  and confirmed so by `diff -rq`).
-- **No `WorkspaceContext.tsx` wiring for collapsed/width state.** Local
-  component state instead — see `BacktestPanel.tsx`'s own comment and
-  `strategy-engine-design.md`'s new note for the reasoning. Flagged
-  explicitly as a deliberate, reconsiderable choice, not a silent
-  deviation from the Scanner/FeatureEngine panel pattern.
-- **No decision-log entry.** This task's own brief didn't ask for one,
-  and a parallel session was separately flagged as retroactively
-  documenting the trigger route's own backend delivery — adding a new
-  numbered entry here risked exactly the kind of collision this
-  project's decision log has hit before (#98/#99, #111/#112, #114/#115,
-  #127/#128). `strategy-engine-design.md`'s new note says as much
-  explicitly and leaves folding this into a numbered decision as
-  Saqib's call at merge time.
-- **No edit to `system-design.md` / `trading-intelligence-architecture.md`.**
-  Both were checked directly for a frontend-panel-layout description
-  before writing anything. Neither has a "living" one:
-  `trading-intelligence-architecture.md` has no App.tsx/panel-layout
-  content at all, and `system-design.md`'s own directory tree (§8) is
-  aspirational/stale — it doesn't even list the `components/intelligence/`
-  or `components/scanner/` folders that already exist and are already
-  built, so editing it to add `components/backtest/` would misrepresent
-  a stale tree as current rather than genuinely fix it. Noted here
-  rather than silently patched or silently skipped, same posture
-  decision #130 itself already took for a different pre-existing
-  staleness in the same file.
+- Does not touch `useStrategyOutcomes.ts`, `api-client.ts`,
+  `InfoTab.tsx`, `AIAnalysisPanel.tsx`, or `backtest/BacktestPanel.tsx`
+  — all four were read-only reference per this task's own scope, and
+  confirmed untouched by `diff -rq`.
+- Does not add a `WorkspaceContext.tsx` change, a modal/dialog
+  primitive, pagination, or a backend route/field of any kind — all
+  explicitly out of scope; see `TESTING.md`'s own "What was deliberately
+  NOT built" section for the full list and reasoning.
+- Does not link into `BacktestPanel.tsx` or fetch strategy/scenario
+  lists at runtime — this panel works as a fully standalone screen
+  whether or not `BacktestPanel.tsx` exists in a given checkout, per
+  this task's own required-reading note.
 
 ## Verification
 
-- `npx tsc -b`: clean except the known 4 decision-#35 `GridPresetPicker`
-  errors — confirmed to be exactly those 4 and nothing else by running
-  the identical command against a freshly re-pulled, untouched clone
-  side by side with this delivery's own working copy.
-- `npx vite build`: clean, 88 modules transformed (86 on the untouched
-  baseline clone — exactly +2, the two new files).
-- No backend test suite run — this delivery makes zero backend changes,
-  confirmed by `diff -rq`, so the backend suite is unaffected by
-  construction, not by assumption.
+`npx tsc -b` / `npx vite build` clean, only the four known decision #35
+`GridPresetPicker` errors — confirmed against a freshly re-pulled,
+untouched clone first, then re-confirmed identical after this delivery's
+own changes. Full detail, including manual verification steps for the
+new panel itself, is in `TESTING.md`.
