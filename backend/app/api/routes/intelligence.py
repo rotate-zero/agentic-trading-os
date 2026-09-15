@@ -631,3 +631,146 @@ async def get_expectancy_by_session_type_view(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {"session_expectancy": [asdict(row) for row in rows]}
+
+
+@router.get("/backtest-runs")
+async def get_backtest_runs(
+    limit: int = Query(50, le=500),
+    run_id: str | None = Query(None),
+    strategy_name: str | None = Query(None),
+    sweep_id: str | None = Query(None),
+) -> dict[str, Any]:
+    """
+    Decision #136 — raw recent-rows observability into `backtests`
+    (decision #89/#120), the same "make a built-but-unwired capability
+    visible outside of tests" purpose GET /strategy-outcomes (#122/#123)
+    already served for `strategy_outcomes`. Every real backtest run since
+    decision #128 (Backtest Runner v1) has written a real row here —
+    `run_id`, `sweep_id`, `strategy_name`, `strategy_version`,
+    `config_hash`, `symbol_universe`, `date_range_start/end`,
+    `data_version`, `feature_version`, `walk_forward_fold`, `is_holdout`,
+    `created_at` — and, before this route, not one of those rows had ever
+    been read back by anything: the only way to know a specific run's own
+    metadata was to already have kept the `run_id` from a prior HTTP
+    response. `GET /strategy-outcomes?backtest_run_id=X` shows what a run
+    *produced*; this shows the run's own metadata.
+
+    **Deliberately built here, inline, not as a new `performance_queries.py`
+    function.** That module's own docstring scopes it strictly to
+    `GROUP BY` aggregations over `strategy_outcomes` ("two real queries,
+    exactly two" — win rate by hour, expectancy by session type); this is
+    a raw recent-rows read over a *different* table (`backtests`), with no
+    aggregation, no grouping key, and no invariant to enforce — exactly
+    GET /strategy-outcomes' own shape, not that module's. Following
+    GET /strategy-outcomes' own precedent (a direct SQLAlchemy `select`
+    built inline in the route, validated through the existing Pydantic
+    contract) keeps this route consistent with its closest sibling rather
+    than introducing a second read-side module for a single un-aggregated
+    query.
+
+    Rows are validated through the existing `schemas.performance.
+    BacktestRun` contract (`model_validate(row, from_attributes=True)`)
+    — the same "don't reinvent an adjacent decision's own shape" posture
+    GET /strategy-outcomes already takes toward `schemas.performance.
+    StrategyOutcome`. `BacktestRun`'s own docstring, until this decision,
+    still described itself as "the locked target shape a future Runner
+    writes into" — stale since decision #128; corrected as part of this
+    delivery (see that schema's own docstring, and `BacktestRunRecord`'s,
+    for the correction).
+
+    Ordered by `created_at` descending — `backtests` has no
+    `exit_filled_at`-equivalent field, so `created_at` is this table's own
+    natural recency ordering, matching GET /strategy-outcomes' own
+    "most-recent-first" convention at the equivalent field for its table.
+
+    **Filters, all optional, all applied as an AND (never blended):**
+    - `run_id` — exact match on the primary key. This is the direct
+      answer to this route's own motivating gap above: once a caller has
+      a `run_id` (e.g. from a `POST /backtest/run` response, or from
+      `WorkspaceContext.tsx`'s `lastBacktestRunId` — decision #134,
+      frontend, not touched by this delivery), this is how that run's own
+      metadata gets resolved without needing to have kept the original
+      HTTP response around.
+    - `strategy_name` — exact match, narrows to one strategy's runs.
+    - `sweep_id` — exact match on `BacktestRun.sweep_id`'s own documented
+      purpose ("groups every run belonging to the same grid-search
+      session — a report pulls 'all runs in this sweep'").
+    Both `run_id` and `sweep_id` are real UUID columns — a malformed
+    value for either is a 400, same posture GET /strategy-outcomes
+    already takes for a malformed `backtest_run_id` (not a silently-empty
+    result, which would look identical to a genuinely-empty match).
+
+    `backtests` has real, persisted rows as of decision #128 — the
+    default (no filters, `limit=50`) still honestly returns
+    `{"backtest_runs": []}`, 200, not an error, on a genuinely empty
+    table (e.g. before any backtest has ever been run in a given
+    environment) — same convention every route in this file already
+    follows.
+
+    Import is local to this function, not hoisted to this file's
+    top-of-file import block — same collision-avoidance reasoning every
+    other route below GET /opportunities gives (decision #114 and
+    onward): this route is this delivery's only touch to this file,
+    appended as a single additive block.
+
+    No frontend work in this delivery, deliberately — matching this
+    project's own established backend-then-frontend sequencing
+    (`performance_queries.py` at #122 before #127 exposed it over HTTP;
+    Context Engine's backend-then-frontend split at #98/#125 is the same
+    shape). Frontend surfacing (e.g. showing a selected run's own
+    metadata alongside `BacktestResultsPanel.tsx`'s outcome rows,
+    decision #133/#134) is the natural next step this leaves open, not
+    an oversight.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.trading_intelligence import BacktestRunRecord
+    from app.schemas.performance import BacktestRun
+
+    run_uuid: _uuid.UUID | None = None
+    if run_id is not None:
+        try:
+            run_uuid = _uuid.UUID(run_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"run_id {run_id!r} is not a valid UUID",
+            ) from exc
+
+    sweep_uuid: _uuid.UUID | None = None
+    if sweep_id is not None:
+        try:
+            sweep_uuid = _uuid.UUID(sweep_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"sweep_id {sweep_id!r} is not a valid UUID",
+            ) from exc
+
+    filters = []
+    if run_uuid is not None:
+        filters.append(BacktestRunRecord.run_id == run_uuid)
+    if strategy_name is not None:
+        filters.append(BacktestRunRecord.strategy_name == strategy_name)
+    if sweep_uuid is not None:
+        filters.append(BacktestRunRecord.sweep_id == sweep_uuid)
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            select(BacktestRunRecord)
+            .where(*filters)
+            .order_by(BacktestRunRecord.created_at.desc())
+            .limit(limit)
+        ).scalars().all()
+    finally:
+        session.close()
+
+    backtest_runs = [
+        BacktestRun.model_validate(row, from_attributes=True).model_dump(mode="json")
+        for row in rows
+    ]
+    return {"backtest_runs": backtest_runs}

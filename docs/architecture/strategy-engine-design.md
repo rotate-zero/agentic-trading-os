@@ -646,6 +646,77 @@ setLastBacktestRunId(result.run_id)                           │
 
 ---
 
+**As-built note (decision #136) — `backtests`' own metadata finally gets a reader.** Every real backtest run since decision #128 has written a real row to `backtests` (run-level metadata: `sweep_id`, `strategy_name`, `strategy_version`, `config_hash`, `symbol_universe`, `date_range_start/end`, `data_version`, `feature_version`, `walk_forward_fold`, `is_holdout`, `created_at`) — but before this delivery, nothing had ever read one back. `GET /strategy-outcomes?backtest_run_id=X` (decision #130) shows what a run *produced*; nothing showed the run's *own* metadata without already having kept its `run_id` from a prior `POST /backtest/run` response. This closes that gap: a new `GET /intelligence/backtest-runs` route, backend-only (matching this project's own established backend-then-frontend sequencing — `performance_queries.py` at #122 before #127 exposed it; Context Engine's split at #98/#125 is the same shape). Both `BacktestRunRecord`'s (`app/models/trading_intelligence.py`) and `BacktestRun`'s (`app/schemas/performance.py`) own docstrings — and two further copies of the identical stale claim, one in each of those same files' module-level docstrings — still said "no Backtest Runner writes to this table yet (§7: not built now)" as of decision #128 landing; all four corrected in this delivery, along with one more copy of the same claim in `system-design.md` §4.13 ("backtests ... shape locked, not yet created").
+
+**Not a collision with the historical-provider gap decision directly above** — that delivery's own footprint statement confirms `intelligence.py`/`performance_queries.py` untouched, and this delivery never touches anything under `backend/app/backtest_runner/` or `backend/app/api/routes/backtest.py`, confirmed by `diff -rq`. This entry was originally drafted as decision #135, citing that number throughout; the standing immediate-before-packaging re-check (this log's own established practice — #98/#99, #111/#112, #114/#115, #120/#121, #122/#123, #127/#128, #131, and the historical-provider delivery immediately above all needed exactly this) caught that the historical-provider session had already claimed and merged #135 first. Renumbered to #136 throughout — code docstrings, test file, this note — before packaging.
+
+**Cross-component data flow — `BacktestRunner` → `backtests` → the new route → a caller:**
+
+```
+BacktestRunner.run()  (decision #128, backend/app/backtest_runner/runner.py)
+        │
+        ▼
+_write_backtest_run_record(BacktestRunRecord(...))   ◄── written BEFORE any
+        │                                                  StrategyOutcome row
+        ▼                                                  (backtest_run_id FK
+   backtests  (Postgres table, migration 0008)              ordering requirement)
+        │
+        │   real rows exist here since #128 — this delivery adds the
+        │   FIRST reader, nothing before it ever queried this table
+        ▼
+GET /intelligence/backtest-runs                       ◄── decision #136, THIS
+  ?run_id=<uuid>                                            delivery
+  &strategy_name=<name>
+  &sweep_id=<uuid>
+  &limit=<n>
+        │
+        ▼
+{"backtest_runs": [BacktestRun, ...]}                  ◄── existing Pydantic
+                                                             contract (decision
+                                                             #89), reused as-is
+        │
+        ▼
+A caller with only a run_id (e.g. a future frontend        ◄── no frontend
+reading WorkspaceContext.tsx's lastBacktestRunId,               caller wired
+decision #134 — NOT built here, deliberately) can now            this round —
+resolve that run's own metadata without having kept            see the note
+the original POST /backtest/run response around.                 above
+```
+
+**Internal flow within the changed module (the route itself, `app/api/routes/intelligence.py`):**
+
+```
+GET /intelligence/backtest-runs?run_id=...&strategy_name=...&sweep_id=...&limit=...
+        │
+        ▼
+Parse run_id / sweep_id as UUID, if given
+        │
+        ├── malformed ──► 400 ("... is not a valid UUID")   ◄── same posture
+        │                                                        GET /strategy-
+        ▼                                                        outcomes takes
+Build filters list (AND, never blended):                         for a malformed
+  run_id       → BacktestRunRecord.run_id == run_uuid             backtest_run_id
+  strategy_name → BacktestRunRecord.strategy_name == strategy_name
+  sweep_id     → BacktestRunRecord.sweep_id == sweep_uuid
+        │
+        ▼
+SELECT * FROM backtests WHERE <filters> ORDER BY created_at DESC LIMIT :limit
+        │
+        ▼
+For each row: BacktestRun.model_validate(row, from_attributes=True)
+        │            ◄── existing Pydantic contract (decision #89),
+        │                reused as-is, not reshaped
+        ▼
+{"backtest_runs": [...]}         ◄── [] on a genuinely empty/no-match
+                                       result, 200, never an error —
+                                       same convention every route in
+                                       this file already follows
+```
+
+No `performance_queries.py` change — that module's own docstring scopes it strictly to `GROUP BY` aggregations over `strategy_outcomes` ("two real queries, exactly two"); this is a raw recent-rows read over a different table, with no aggregation and no grouping key, exactly GET /strategy-outcomes' own shape, not that module's. Built inline in `intelligence.py`, same file and pattern as its closest sibling, rather than introducing a second read-side module for one un-aggregated query.
+
+---
+
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation
 
 **Direction-locked (decision #88) — the *model*, not the intelligence.** What ships in v1 is "every strategy acts immediately." What's locked here is the *shape* so that a future strategy can deliberately wait, or abandon a decaying setup, without a schema rework. Two rounds of review corrected the framing before it got here — worth keeping both corrections visible, since each fixes a real mistake, not a style preference.

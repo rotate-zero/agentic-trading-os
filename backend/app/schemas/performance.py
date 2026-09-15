@@ -14,9 +14,13 @@ carried by an `EventEnvelope`, with a corresponding `EventType`
 (`MarketState`, `ContextChanged`, `FeatureSet`, ...). Neither
 `StrategyOutcome` nor `BacktestRun` is ever published as an event — both
 are persistence/API-facing domain contracts, written directly to
-Postgres by `record_strategy_outcome()` (and, for `BacktestRun`, by a
-future Backtest Runner — §7, not built now) and read back by direct
-query. Filing them under `schemas/events/` would misrepresent them as
+Postgres by `record_strategy_outcome()` (and, for `BacktestRun`, by
+Backtest Runner v1's `_write_backtest_run_record()` — decision #128;
+the "future Backtest Runner ... not built now" framing this line
+originally carried is stale as of #128, corrected by decision #136) and
+read back by direct query (`GET /intelligence/strategy-outcomes`,
+decision #122/#123; `GET /intelligence/backtest-runs`, decision #136).
+Filing them under `schemas/events/` would misrepresent them as
 event payloads. `Opportunity` (the other nearby domain schema) lives
 inline in `strategy_engine/base_strategy.py` instead, since it's owned
 by and constructed exclusively inside that one engine; `StrategyOutcome`
@@ -211,12 +215,14 @@ class BacktestRun(BaseModel):
     fold — §7 (decision #89), field-for-field. Persisted to `backtests`
     (app/models/trading_intelligence.py). Not one row per whole
     grid-search sweep: `walk_forward_fold`/`is_holdout` only mean
-    something at this granularity (§7). No Backtest Runner exists to
-    write these yet (§7: "not built now") — this schema and its table
-    are the locked target shape a future Runner writes into, same
-    "build the stable contract now, real callers plug in later"
-    precedent decision #98 already used for `state_snapshot.py`'s read
-    side.
+    something at this granularity (§7). Written by Backtest Runner v1's
+    `_write_backtest_run_record()` (`app/backtest_runner/runner.py`,
+    decision #128) — the "no Backtest Runner exists to write these yet"
+    claim this docstring originally carried is stale as of #128 and
+    corrected here (decision #136), same "build the stable contract now,
+    real callers plug in later" precedent decision #98 already used for
+    `state_snapshot.py`'s read side. Read back via
+    `GET /intelligence/backtest-runs` (decision #136).
     """
 
     run_id: UUID

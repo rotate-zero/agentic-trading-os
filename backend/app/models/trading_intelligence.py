@@ -48,8 +48,12 @@ not because they share a lifecycle with `level_interaction_state`/
   (`state_snapshot.py`).
 - `backtests` — one row per (strategy_version, config_hash) per
   walk-forward fold, the paired Pydantic contract is
-  `app.schemas.performance.BacktestRun`. No Backtest Runner exists yet
-  to write these (§7: "not built now") — same precedent as above.
+  `app.schemas.performance.BacktestRun`. Written by Backtest Runner v1's
+  `_write_backtest_run_record()` (`app/backtest_runner/runner.py`,
+  decision #128) as of that decision — the "not built now" framing this
+  docstring originally carried is stale as of #128 and corrected here
+  (decision #136). Read back via `GET /intelligence/backtest-runs`
+  (decision #136).
 
 These two tables establish two conventions genuinely new to this
 codebase, confirmed absent by grepping every existing model/migration
@@ -175,8 +179,13 @@ class BacktestRunRecord(Base):
     collision with the Pydantic contract in any module that needs to
     import both). Created before `StrategyOutcomeRecord` in this same
     migration (0008) specifically so `strategy_outcomes.backtest_run_id`
-    can be a real, enforced FK to this table's `run_id`. No Backtest
-    Runner writes to this table yet (§7: "not built now")."""
+    can be a real, enforced FK to this table's `run_id`. Written by
+    Backtest Runner v1's `_write_backtest_run_record()`
+    (`app/backtest_runner/runner.py`, decision #128) — the "no Backtest
+    Runner writes to this table yet" claim this docstring originally
+    carried is stale as of #128 and corrected here (decision #136),
+    which also adds this table's first read route:
+    `GET /intelligence/backtest-runs`."""
 
     __tablename__ = "backtests"
 

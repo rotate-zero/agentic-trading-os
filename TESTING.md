@@ -1,229 +1,144 @@
-# TESTING.md — Decision #135: historical-provider gap in Backtest Runner replay
+# TESTING.md — Decision #136: read-only `GET /intelligence/backtest-runs`
 
 ## What this delivery is
 
-Closes a real, structural gap `scenarios.py`'s own module docstring
-named directly: `volume_regime_score`/`volatility_regime_score` were
-`0.0` for every candle in every `BacktestRunner` replay, for any
-symbol, regardless of how a scenario's candles were built — because
-`FeatureEngine`'s Daily Levels/ATR/RVOL refresh never had a real
-`broker_registry.get_historical_provider()` to ask during a replay.
-Four of the seven v1 strategies (ORB, Gap, Volume Spike, Momentum)
-hard-gate their MATCH stage on `volume_regime_score >= 45.0`, so all
-four could never fire in a backtest — not because of their own candle
-shape, but because of this one shared, structural ceiling.
+A new read-only route exposing the `backtests` table — its first
+reader since decision #128 started writing real rows to it. Every real
+backtest run since #128 has written a row (`run_id`, `sweep_id`,
+`strategy_name`, `strategy_version`, `config_hash`, `symbol_universe`,
+`date_range_start/end`, `data_version`, `feature_version`,
+`walk_forward_fold`, `is_holdout`, `created_at`), and before this
+delivery, none of them had ever been read back. `GET /strategy-
+outcomes?backtest_run_id=X` (decision #130) shows what a run
+*produced*; this route shows a run's own metadata.
 
-Full reasoning, including the fork presented to Saqib and how it was
-resolved, the second (write-side-effect) finding also presented and
-resolved, and a genuine decision-number collision with a parallel
-session reconciled per Saqib's own new standing instruction, lives in
-`docs/decisions/confirmed-decisions.md` — decision #135. This file
-covers what to run to verify it and what a reader should know before
-touching this seam again.
+Full reasoning — the fork discussed with Saqib over filters/response
+shape, why this stayed out of `performance_queries.py`, the stale
+docstrings found and fixed, and a decision-number collision with a
+parallel session reconciled per this project's own standing
+three-source re-check — lives in `docs/decisions/confirmed-
+decisions.md`, decision #136. This file covers what to run to verify
+it.
 
-**Zero frontend changes.** This delivery is backend-only.
+**Zero frontend changes.** This delivery is backend-only, deliberately
+— see "What was deliberately NOT built" below.
 
 ## Files changed
 
 **New:**
-- `backend/app/backtest_runner/historical_provider_guard.py` — new.
-  `install_replay_historical_provider()`, an async context manager
-  mirroring `engine_singleton_guard.py`'s own save/install/restore
-  shape exactly: saves whatever `broker_registry.get_historical_
-  provider()` currently returns, installs the run's own
-  `MarketDataProvider` in its place for the duration of the `async
-  with` block, restores the original in `finally` — even on exception.
-  Own `asyncio.Lock`, deliberately not reusing `engine_singleton_
-  guard.py`'s lock, even though the real call path always nests this
-  inside that guard's own lock (see the module's own docstring for
-  why). Never calls `.connect()`/`.disconnect()` on what it installs —
-  see "Why this is safe" below.
-- `backend/app/backtest_runner/fixture_daily_history.py` — new.
-  `build_daily_history_candles(before, num_days=20)` — a deterministic,
-  honestly-synthetic sequence of prior 1-DAY candles, dated on real NYSE
-  trading days (via `MarketClock`'s own weekday/holiday logic) strictly
-  before `before`, timestamped at real NYSE close through a genuine
-  `ZoneInfo("America/New_York")` conversion (DST-safe). 20 days: 15
-  genuinely needed (`feature_engine_atr_period + 1` = Wilder ATR's real
-  requirement), 5 needed for `feature_engine_rvol_lookback_days` — both
-  confirmed by reading `atr.py`/`rvol.py` and their real callers
-  directly. One shared dataset regardless of symbol or named scenario,
-  anchored to the scenario's own start date — extends
-  `FixtureBacktestContextProvider`'s own "same synthetic facts
-  regardless of which symbol" precedent one step further.
+- `backend/tests/test_backtest_runs_route.py` — 9 tests, real
+  Postgres. See "Tests" below.
 
 **Modified:**
-- `backend/app/backtest_runner/fixture_provider.py` —
-  `FixtureCandleProvider.get_historical()`'s timeframe guard widened
-  from `"1m"`-only to `{"1m", "1d"}`. Confirmed by grep across `app/`
-  that these are the only two timeframes any real code in this
-  codebase ever requests from a historical-role provider — not opened
-  further than that.
-- `backend/app/backtest_runner/runner.py` — `BacktestRunner.run()` now
-  nests `install_replay_historical_provider(self._market_data_provider)`
-  inside its existing `install_replay_engines(...)` block. Whatever
-  `MarketDataProvider` a run was constructed with now also temporarily
-  becomes the process's historical-role provider for the run's
-  duration — generic, not fixture-specific; a future real-data provider
-  would get the same behavior automatically.
-- `backend/app/api/routes/backtest.py` — now builds a synthetic daily
-  history (`fixture_daily_history.py`) anchored to the scenario's first
-  replayed trading day, and constructs one `FixtureCandleProvider` with
-  both `(symbol, "1m")` (the existing replay feed) and `(symbol, "1d")`
-  (new) entries. Route and module docstrings corrected: the old
-  "structurally always 0.0" claim is gone, replaced with the real,
-  checked-not-assumed current state (see "What changed for the four
-  volume-gated strategies" below) — plus a new, prominent disclosure
-  about this route now writing into shared `symbols`/`daily_levels_
-  state` tables (see "A genuinely separate finding" below).
-- `backend/app/backtest_runner/scenarios.py` — module docstring's "hard
-  ceiling" section rewritten to describe the gap as resolved, with the
-  real, checked findings per strategy (not a re-assertion of the old
-  ceiling). `volume_gated_baseline`'s own catalog description updated
-  to match.
-- `backend/tests/test_backtest_runner_regression.py` — new section 5,
-  four tests (see "Tests" below).
-- `docs/architecture/strategy-engine-design.md` — §7 gained a new
-  as-built note + diagram for this seam, inserted after the parallel
-  session's own decision #133 note (not replacing it — see "A genuine
-  numbering collision" below). New **D18** row in the D-items table
-  (the write-side-effect finding, left open).
-- `docs/decisions/future-ideas.md` — new entry #25 (a pre-existing,
-  unrelated gap found while checking this seam's own safety: decision
-  #132's live-data guard doesn't check IBKR).
+- `backend/app/api/routes/intelligence.py` — new route
+  `GET /intelligence/backtest-runs`, appended after the existing
+  `/expectancy-by-session-type` route. Nothing else in this file
+  changed.
+- `backend/app/models/trading_intelligence.py` — two docstring
+  corrections (`BacktestRunRecord`'s own class docstring, and the
+  module-level docstring's `backtests` bullet). Both previously said
+  "no Backtest Runner writes to this table yet (§7: not built now)" —
+  false since decision #128.
+- `backend/app/schemas/performance.py` — same two-copy correction, on
+  `BacktestRun`'s own class docstring and this file's module-level
+  docstring.
+- `docs/architecture/system-design.md` — §4.13's line on deferred
+  tables still said `backtests` was "shape locked, not yet created."
+  Found while checking for other copies of the same stale claim (not
+  one of the two named in scope); corrected, since it's the same error
+  in the same category, not a separate cleanup.
+- `docs/architecture/strategy-engine-design.md` — §7 gained one new
+  as-built note with two diagrams (cross-component data flow;
+  the route's own internal request→filter→query→validation→envelope
+  flow), inserted immediately after decision #135's own as-built note
+  (see "A decision-number collision" below) — not overwriting it.
 
-**Confirmed untouched** (checked via `diff -rq` against a freshly
-re-pulled clone, both before writing any code and again immediately
-before packaging): everything under `frontend/`,
-`feature_engine/engine.py`, `replay_state_producer.py`,
-`broker_registry.py`, `engine_singleton_guard.py`,
-`api/routes/intelligence.py`, `trading_intelligence/performance_queries.py`.
+No migration changes. `backtests` already exists
+(`0008_strategy_outcomes_and_backtests.py`, decision #120).
 
-## Why this is safe — read before assuming a broker_registry-wide swap is risky
+## The route
 
-`broker_registry.get_historical_provider()` has exactly three real call
-sites outside `feature_engine/engine.py` itself (confirmed by grep, not
-assumed): two identity-comparison-only reads (`main.py`, `market_data.py`
-— never call `get_historical()`), and one real live-facing read,
-`GET /market/candles` (`market.py`), which gates on
-`adapter.is_connected()` before ever calling `get_historical()`.
-`FeatureEngine` itself never checks `is_connected()`, only `is None` —
-so as long as the seam's installed provider is never `.connect()`ed
-(it never is), `GET /market/candles` keeps returning its existing
-honest 400 throughout a backtest run. No silent fixture-data leak into
-a live-facing route, by construction. Decision #132's Finnhub/Polygon
-409 already means `broker_registry`'s historical role is unclaimed
-going into every valid backtest run today — of the two,
-only Polygon (`market_data.py`) actually claims the historical role on
-connect; Finnhub only ever claims streaming (confirmed by reading
-`finnhub_data.py` directly). See `historical_provider_guard.py`'s own
-module docstring for the full trace, including the one gap this
-doesn't cover (IBKR — pre-existing, `future-ideas.md` #25).
+```
+GET /intelligence/backtest-runs
+    ?limit=<int, default 50, max 500>
+    &run_id=<uuid>
+    &strategy_name=<string>
+    &sweep_id=<uuid>
+```
 
-## What changed for the four volume-gated strategies — checked directly, not assumed
+- All three filters are optional and AND-combined (never blended).
+- Newest-first by `created_at` (this table has no `exit_filled_at`-
+  equivalent field to order by, unlike `strategy_outcomes`).
+- `run_id`/`sweep_id` are real UUID columns — a malformed value for
+  either is a `400` with a message naming which parameter was
+  malformed, not a silently-empty result.
+- Response: `{"backtest_runs": [BacktestRun, ...]}` — the existing
+  Pydantic contract, reused as-is, matching this file's own envelope-
+  naming convention (`outcomes`, `hourly_win_rates`,
+  `session_expectancy`).
+- An empty or no-match result is `{"backtest_runs": []}`, `200` — never
+  an error, same convention every other route in this file follows.
 
-`volume_regime_score`/`volatility_regime_score` can now genuinely be
-non-zero. That does **not** mean every scenario fires for every
-strategy. Ran `volume_gated_baseline` against all four with this seam
-active:
+## Why this stayed out of `performance_queries.py`
 
-- **Momentum now genuinely fires** (`outcomes_recorded=1`) — an
-  unintended side effect of `fixture_daily_history.py`'s specific
-  numbers, not engineered to happen, and not something to rely on.
-- **ORB, Gap, Volume Spike still return `outcomes_recorded=0`** — not
-  blocked by the volume gate anymore, but by their own other MATCH-stage
-  shape requirements (no real opening-range breakout shape, no
-  overnight gap, no spike-shaped volume burst). Building new,
-  deliberately-shaped scenarios for these three is explicitly out of
-  scope for this delivery, per the task's own boundary.
+That module's own docstring scopes it strictly to `GROUP BY`
+aggregations over `strategy_outcomes` ("two real queries, exactly
+two" — win rate by hour, expectancy by session type). This route is a
+raw recent-rows read over a *different* table, with no aggregation and
+no grouping key — exactly `GET /strategy-outcomes`'s own shape (a
+direct SQLAlchemy `select` built inline in the route), not that
+module's. Built inline in `intelligence.py` accordingly.
 
-## A genuinely separate finding — read before choosing a `symbol` for `POST /backtest/run`
+## A decision-number collision, reconciled per this project's own
+## standing three-source re-check
 
-Closing this gap means `FeatureEngine`'s real, unmodified Daily Levels
-reconciliation (`_reconcile_and_persist_daily_levels()`) now actually
-runs during a backtest for the first time — and it writes real rows
-into the SAME shared `symbols`/`daily_levels_state` tables live trading
-reads, under whatever `symbol` label the caller supplies, with no
-`is_backtest` flag on either table. Confirmed by direct execution
-against a real Postgres:
+This delivery's own investigation and implementation were carried out
+citing **#135** throughout, confirmed as the correct next number via
+the standard three-source check at session start. A parallel session
+closing the historical-provider gap in Backtest Runner replay also
+claimed and merged **#135** first, mid-session — not discovered until
+the mandatory re-check immediately before writing the decision-log
+entry. **Final number assigned to this delivery: #136** — every
+internal citation (route docstring, corrected model/schema docstrings,
+the `system-design.md` correction, this file, the test file, and the
+`strategy-engine-design.md` as-built note) was renumbered before
+packaging. `strategy-engine-design.md` §7 was rebased onto the
+freshly re-pulled `main` — this delivery's own note now sits
+immediately after decision #135's real, already-merged as-built note,
+not in place of it.
 
-1. A `symbol` label colliding with a real, live-tracked ticker lands
-   synthetic backtest-derived daily levels in the same rows live
-   trading reads.
-2. Re-running the identical `(symbol, scenario)` pair a second time
-   silently reverts `volume_regime_score`/`volatility_regime_score` to
-   `0.0` for that run — `_maybe_refresh_daily_levels()`'s own
-   pre-existing "restart-survival" short-circuit finds the first run's
-   persisted row and skips the raw-candle-cache population entirely,
-   before ever asking the provider again.
-
-Neither is fixed here — this is orthogonal to which fork option got
-picked (inherent to any historical-provider seam existing at all).
-Presented to Saqib as three options (accept + document; have
-`BacktestRunner` clean up after itself; add real `is_backtest`
-namespacing to the two tables); confirmed: accept + document loudly +
-flag as a new open item (**D18**, `strategy-engine-design.md`), not
-fixed this round. **Practical guidance: pick a `symbol` label that
-doesn't collide with anything live-tracked, and don't rely on
-re-running the same scenario twice to double-check a result.**
-
-## Two genuine numbering collisions in a row, reconciled per Saqib's new process rule
-
-This delivery's own work was carried out citing #133 throughout,
-confirmed correct via the standard three-source check at session start.
-A parallel frontend session (the "Backtest Results" panel) also claimed
-#133 and merged first, mid-session — not discovered until the same
-three-source re-check this log's protocol already requires immediately
-before writing a new entry. Per Saqib's own new standing instruction to
-distinguish "current observed next decision number" from "decision
-number assigned to this delivery": at that first re-check, **observed:
-#134, assigned: #134** — every citation renumbered, `strategy-engine-
-design.md` §7 rebased onto that session's own real content. Before
-packaging finished, a **second** parallel frontend session (linking
-`BacktestPanel.tsx`/`BacktestResultsPanel.tsx` via a shared `run_id`)
-independently also claimed **#134** — caught by a further re-check
-immediately before the actual zip was written, the same discipline
-applied a second time rather than assumed sufficient after the first
-catch. **Final observed: #135. Final assigned: #135** — not #133, not
-#134. Every internal citation across this delivery's code, tests, and
-docs was renumbered accordingly before packaging (`grep -c "#134"`
-returns 0 across every file this delivery touches; the two remaining
-real `"#133"`/`"#134"` references are the two parallel sessions' own,
-legitimate entries, confirmed untouched). `strategy-engine-design.md`
-§7 required two successive rebases, not a copy-over: this session's
-working copy had originally been edited against a base pulled before
-either parallel session's work landed, so it was missing both sessions'
-entire real as-built notes — re-based twice onto freshly re-pulled
-`main`, with this delivery's own note inserted after both of theirs
-each time, never in place of either. Confirmed file-disjoint both ways,
-both times (zero backend files touched by either parallel session,
-zero `frontend/` files touched by this delivery).
+Zero file overlap either way: that delivery's own footprint statement
+lists `intelligence.py`/`performance_queries.py` as untouched by it;
+this delivery never touches anything under
+`backend/app/backtest_runner/` or `backend/app/api/routes/backtest.py`
+— confirmed by `diff -rq` against a freshly re-pulled clone both before
+writing and immediately before packaging.
 
 ## Tests
 
-Four new tests in `backend/tests/test_backtest_runner_regression.py`'s
-new section 5:
+New file `backend/tests/test_backtest_runs_route.py`, 9 tests, real
+Postgres — a separate file, not an extension of
+`test_strategy_outcomes_and_opportunity_conflicts_routes.py`, matching
+this suite's own one-file-per-route-group precedent
+(`test_performance_analytics_routes.py` already sits separately from
+that file despite both testing `intelligence.py` routes).
 
-- `test_historical_provider_guard_serializes_concurrent_installs` /
-  `test_historical_provider_guard_restores_prior_value_even_on_exception`
-  — the same two shapes `test_engine_singleton_guard_*` already covers,
-  applied to this new seam. DB-free (plain sentinel objects — this seam
-  only touches an in-memory global).
-- `test_historical_provider_guard_restores_none_when_nothing_installed_before`
-  — this module's own second restore branch (`prev is None` →
-  `clear_historical_provider()`), which `engine_singleton_guard.py`'s
-  unconditional-reassignment restore never needed.
-- `test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_scores`
-  — real end-to-end regression against real Postgres. Proves every
-  replayed candle's persisted `market_state_history` row now has
-  non-zero `volume_regime_score`/`volatility_regime_score`, where every
-  one was exactly `0.0` before this decision. Uses `len(rows) >=
-  len(candles) - 1`, not strict equality — checked directly against the
-  unmodified baseline before assuming this was a bug in the new seam:
-  the real, pre-existing `MarketStateEngine`/`ReplayStateProducer`
-  pipeline already drops the final candle's persistence before
-  `producer.stop()` completes, true on `main` today, unrelated to this
-  decision.
+- `test_route_reflects_a_real_backtest_runner_write` — drives a real
+  fixture `BacktestRunner.run()` end-to-end (same fast stub-strategy/
+  4-candle pattern `test_backtest_runner.py` already established, on a
+  dedicated synthetic symbol `ZZBTR5`, distinct from that file's own
+  `ZZUNIT4`) and confirms the route reads back, by `run_id`, exactly
+  what the real write path produced. This is the proof that matters:
+  the row under test was genuinely produced by `_write_backtest_run_
+  record()`, not hand-inserted.
+- The remaining 8 tests seed `BacktestRunRecord` rows directly via a
+  local `_insert_backtest_run()` helper (same shape as the sibling test
+  file's own helper of the same name): `strategy_name` filter,
+  `sweep_id` filter, `run_id` filter, newest-first ordering, `limit`
+  capping, honest-empty-collection for an unknown `run_id`, malformed
+  `run_id` → 400, malformed `sweep_id` → 400. Ordering/limit tests use
+  explicit year-2099 `created_at` timestamps so they're
+  deterministically newest regardless of anything else in the table.
 
 ## How to verify
 
@@ -235,56 +150,74 @@ pip install -r requirements.txt --break-system-packages
 # Fresh DB, per this project's standing convention
 psql -c "CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;"
 psql -c "CREATE DATABASE trading_workspace OWNER trading;"
+psql -d trading_workspace -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
 cp .env.example .env
 alembic upgrade head
 
-python -m pytest tests/ -q
+python -m pytest tests/test_backtest_runs_route.py -v   # this delivery's own 9 tests, isolated
+python -m pytest -q                                       # full suite
 ```
 
-Expected: 719 collected. Failures will range from 0 to 3 depending on
-run — every failure you might see belongs to the long-documented,
-4-test #119 flaky cluster (`test_vwap_publishes_even_while_sma_is_still_warming_up`,
+Expected on the isolated run: 9 passed, 9 total.
+
+Expected on the full suite: 728 collected (719 on the current `main`,
+i.e. including decision #135's own 4 new tests, + this delivery's own
+9). Failures will range from 0 to 3 depending on run — every failure
+you might see belongs to the long-documented #119 flaky cluster
+(`test_vwap_publishes_even_while_sma_is_still_warming_up`,
 `test_daily_levels_carry_level_interaction_once_touched`,
 `test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction`,
-`test_feature_engine_backfills_from_persisted_history_on_cold_start`) —
-named across decisions #93/#113/#114/#116-119/#122-133, each
-independently reconfirmed pre-existing and sandbox-timing-sensitive by
-multiple prior sessions, unrelated to `strategy_engine/`/
-`feature_engine/engine.py`. Two full runs during this delivery's own
-verification: one showed 718 passed/1 failed (just the first test
-above), another showed 716 passed/3 failed (three of the four at
-once) — consistent with decision #119's own documented "flickers
-between 1-3 failing per run" signature, not a new or worsened pattern.
-Every individual failure reconfirmed passing in isolation immediately
-after. None of this delivery's own 4 new tests were ever among the
-flickering set, in any run.
+`test_feature_engine_backfills_from_persisted_history_on_cold_start`)
+— named across decisions #93/#113/#114/#116-119/#122-135, unrelated to
+this delivery. Final verification run for this delivery: 728
+collected, 727 passed / 1 failed
+(`test_daily_levels_carry_level_interaction_once_touched` alone — a
+documented member of that cluster). None of this delivery's own 9 new
+tests were ever among the flickering set, confirmed by rerunning
+`test_backtest_runs_route.py` alone multiple times in isolation with
+9/9 passing every time.
 
-**Manually confirming the fix directly** (optional, the automated test
-above already proves this):
+**Manually confirming the route directly** (optional, the automated
+tests above already prove this):
 
 ```bash
-# with the backend running, Finnhub/Polygon both disconnected
-curl -s -X POST "http://localhost:8000/backtest/run?strategy=Momentum&scenario=volume_gated_baseline&symbol=ZDEMO01" | python -m json.tool
-```
+# with the backend running, and at least one real backtest already run
+curl -s "http://localhost:8000/intelligence/backtest-runs?limit=5" | python -m json.tool
 
-`outcomes_recorded` should be `1` (Momentum's own unintended fire — see
-above). Pick a `symbol` that isn't a real ticker you're tracking live,
-and don't re-run this exact command a second time expecting the same
-non-zero regime scores underneath (see "A genuinely separate finding"
-above).
+# a specific run, once you have its run_id from a POST /backtest/run response
+curl -s "http://localhost:8000/intelligence/backtest-runs?run_id=<uuid>" | python -m json.tool
+
+# a malformed id — expect 400
+curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:8000/intelligence/backtest-runs?run_id=not-a-uuid"
+```
 
 ## What was deliberately NOT built
 
-- **No new guaranteed-fire scenarios for ORB/Gap/Volume Spike.**
-  Engineering scenario candles to guarantee a fire for each is real,
-  separate, later work with its own judgment calls — flagged, not
-  built, per this task's own explicit scope boundary.
-- **No fix for the write-side-effect finding.** See "A genuinely
-  separate finding" above — documented and flagged as D18, not
-  resolved this round, per Saqib's own confirmed direction.
-- **No IBKR fix for decision #132's live-data guard.** A pre-existing,
-  unrelated gap, flagged as `future-ideas.md` #25, not fixed here.
-- **No changes to `HistoricalContextProvider`/`context_provider.py`,**
-  or to live-provider vendor selection (`future-ideas.md` #17) — a
-  different, already-documented axis of "historical data," untouched.
-- **No changes under `frontend/`.** This delivery is backend-only.
+- **No frontend work.** Matching this project's own established
+  backend-then-frontend sequencing (`performance_queries.py` at #122
+  before #127 exposed it over HTTP; Context Engine's split at #98/#125
+  is the same shape). Showing a selected run's own metadata — e.g.
+  alongside `BacktestResultsPanel.tsx`'s outcome rows, using
+  `WorkspaceContext.tsx`'s `lastBacktestRunId` (decision #134) as the
+  `run_id` to look up — is the natural next step this leaves open, not
+  an oversight.
+- **No `strategy_name`/`sweep_id` companion-requirement validation.**
+  Unlike `/strategy-outcomes`'s `backtest_run_id`-requires-
+  `is_backtest=true` rule, this route's three filters have no
+  interdependency — each is independently optional, so there was
+  nothing analogous to enforce.
+- **No changes to `performance_queries.py`, `backtest.py`, or anything
+  under `backend/app/backtest_runner/`.** Explicit file boundaries for
+  this task; confirmed untouched by `diff -rq`.
+
+## Manual merge notes
+
+No files this delivery touched are also touched by decision #135
+(the historical-provider-gap delivery merged just before this one) —
+confirmed by that delivery's own stated footprint and this delivery's
+own `diff -rq`, both ways. `strategy-engine-design.md` is the one file
+both deliveries append to, but at genuinely different points (#135's
+own as-built note, then this delivery's, immediately after) — a normal
+git merge of both onto the same base should apply cleanly without a
+manual conflict resolution. No other overlap with any other in-flight
+parallel session is known at the time of this delivery.
