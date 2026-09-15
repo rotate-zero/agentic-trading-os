@@ -316,3 +316,15 @@ Downstream, this becomes **Hypothesis Health**: Position Monitor compares realiz
 **Trigger to revisit:** once SPY/QQQ/IWM cross-symbol state (decision #91) is live and actually informing decisions — if a real gap shows up where "moving with the market but against its own sector" would have changed a call, that's the signal to build this, not before.
 
 **Where it would plug in:** Market State Engine's cross-symbol layer (`trading-intelligence-architecture.md` §4), one new score alongside `CrossSymbolState`'s existing fields — needs a symbol→sector-ETF mapping, itself just a derived join off `symbol_fundamentals.sector`, no new provider.
+
+---
+
+## 25. IBKR connection not checked by `POST /backtest/run`'s live-data guard (decision #132)
+
+**What it is:** decision #132's `_reject_if_live_data_connected()` (`backend/app/api/routes/backtest.py`) refuses to run a backtest with a `409` while Finnhub or Polygon is connected, because `engine_singleton_guard.py`'s process-wide engine-singleton swap is unsafe against live trading in the same process. It never checks IBKR (`backend/app/api/routes/broker.py`) — that route has no public `is_connected()` accessor the way `finnhub_data.py`/`market_data.py` got in decision #132 (confirmed by reading `broker.py` directly), so an IBKR-connected live session isn't blocked by this guard today.
+
+**Why deferred:** found, not built around, while checking decision #135's own historical-provider seam for the same category of risk (`historical_provider_guard.py`'s module docstring has the full trace) — a pre-existing gap in decision #132's own guard, not something decision #135 introduced or needed to fix to close its own, narrower gap. `engine_singleton_guard.py`'s swap of all four engine singletons is already unsafe against a concurrent IBKR session for reasons that have nothing to do with the historical-provider role specifically, so neither decision #132 nor decision #135 changes that exposure one way or the other by leaving it unclosed here.
+
+**Trigger to revisit:** the first time IBKR is a real, regularly-connected live-trading path in this deployment (today it's `broker.py`'s own connect route, unclear how actively used) — add an `is_connected()` accessor to `broker.py` mirroring `finnhub_data.py`/`market_data.py`'s own (decision #132), and extend `_reject_if_live_data_connected()`'s check to include it.
+
+**Where it would plug in:** `backend/app/api/routes/backtest.py`'s `_reject_if_live_data_connected()`, alongside its existing Finnhub/Polygon checks — same shape, one more provider.

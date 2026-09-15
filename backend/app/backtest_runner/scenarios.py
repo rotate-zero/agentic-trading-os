@@ -13,44 +13,64 @@ below was verified empirically — replayed through the real
 `BacktestRunner` against the real strategy it names, not just reasoned
 about from reading the strategy's source — before being checked in.
 
-**The hard ceiling this had to design around, worth restating here since
-it isn't visible from any individual scenario file.** `FeatureEngine`'s
-`rvol`/`atr_14_pct` (and therefore `MarketState.volume_regime_score`/
-`volatility_regime_score`) are populated exclusively from
-`self._daily_candle_cache`, itself populated only by
-`_maybe_refresh_daily_levels()` calling
+**The hard ceiling this used to design around — resolved by decision
+#135, restated here for history since it explains why the scenarios
+below look the way they do.** `FeatureEngine`'s `rvol`/`atr_14_pct` (and
+therefore `MarketState.volume_regime_score`/`volatility_regime_score`)
+are populated exclusively from `self._daily_candle_cache`, itself
+populated only by `_maybe_refresh_daily_levels()` calling
 `broker_registry.get_historical_provider().get_historical(symbol, "1d",
-...)`. `EngineBackedReplayStateProducer` (`replay_state_producer.py`)
-constructs a brand-new `FeatureEngine` with no historical provider wired
-in at all, and `BacktestRunner` never touches `broker_registry` — so
-`volume_regime_score`/`volatility_regime_score` are structurally always
-`0.0` for ANY BacktestRunner replay today, for any symbol, regardless of
-how the fixture candles are built. Confirmed by direct execution (a
-60-candle synthetic uptrend held `volume_regime_score` at `0.00` the
-entire replay), not just by reading the code.
+...)`. Before decision #135, `BacktestRunner` never touched
+`broker_registry` at all, so these two scores were structurally always
+`0.0` for ANY BacktestRunner replay, for any symbol, regardless of how
+the fixture candles were built — confirmed by direct execution at the
+time (a 60-candle synthetic uptrend held `volume_regime_score` at `0.00`
+the entire replay). Decision #135 closed that specific gap
+(`historical_provider_guard.py`/`fixture_daily_history.py`): a real
+synthetic daily-candle history is now installed as `broker_registry`'s
+historical role for every replay, so these two scores are no longer
+structurally zero.
 
-Checked against every real strategy's actual MATCH-stage code (not
-docstrings):
+**What that does, and does NOT, mean for the four volume-gated
+strategies — checked by direct execution against decision #135's own
+seam, not assumed.**
 
   - **ORB, Gap, Volume Spike, Momentum** all hard-gate MATCH on
-    `volume_regime_score >= threshold` (45.0 by default) — structurally
-    unreachable via BacktestRunner today. No amount of candle
-    engineering changes this; it needs a fixture daily-history seam
-    wired into the replay stack, which is real, separate, follow-on
-    work (flagged in decision #131, not attempted here — out of scope
-    for "a route + strategy lookup").
+    `volume_regime_score >= threshold` (45.0 by default). That gate can
+    now genuinely be cleared — it is no longer the structural ceiling it
+    was. Checked directly, one strategy at a time, against the existing
+    `volume_gated_baseline` scenario with decision #135's seam active:
+    **Momentum now genuinely fires** (`outcomes_recorded=1`) — an
+    unintended side effect of the specific daily-history numbers
+    `fixture_daily_history.py` happens to generate, not something
+    engineered to make it fire, and not something to rely on (a future
+    change to that generator's numbers could un-fire it just as
+    accidentally). **ORB, Gap, and Volume Spike still return
+    `outcomes_recorded=0`** against this scenario — not because of the
+    volume gate anymore, but because `volume_gated_baseline`'s 1m candle
+    shape was never built to satisfy any of their OTHER MATCH conditions
+    (no real opening-range breakout shape for ORB, no overnight gap for
+    Gap, no spike-shaped volume burst for Volume Spike — all
+    orthogonal to `volume_regime_score`).
+  - **Building new, deliberately-shaped scenarios to guarantee ORB/Gap/
+    Volume Spike each fire is explicitly out of scope for decision
+    #135** — flagged there as real, separate, follow-on work (which
+    strategy gets which scenario, what magnitude of price/volume shape
+    to target, whether shared or per-strategy) with its own judgment
+    calls, same as it was flagged out of scope for decision #131 before
+    it.
   - **First Pullback, Reversal, VWAP** gate MATCH only on `trend_score`
     (established or neutral) and a real `LevelInteractionEngine`
     touch/resolution — neither depends on the daily-candle cache, so
-    these three CAN genuinely fire, and each has its own guaranteed-fire
-    scenario below.
+    these three could always genuinely fire, and each has its own
+    guaranteed-fire scenario below, unaffected by decision #135 either
+    way.
 
-So `SCENARIOS` intentionally holds one honestly-labeled fallback
-(`volume_gated_baseline`) alongside three guaranteed-fire scenarios,
-rather than four more fake-precision "shaped" scenarios that would
-never fire anyway (a breakout-shaped candle set for ORB is no more
-likely to fire than a flat one, given the gate itself is unreachable —
-building one would look like an attempt, not an honest acknowledgment).
+So `SCENARIOS` still holds one honestly-labeled fallback
+(`volume_gated_baseline`) alongside three guaranteed-fire scenarios —
+"fallback" now means "not purpose-built to guarantee a fire for any
+particular strategy," not "structurally can never fire," which was the
+accurate label before decision #135 and would now be misleading.
 
 **Any (strategy_name, scenario) pair is accepted by the route** — this
 module doesn't enforce "only run FirstPullback against
@@ -103,12 +123,13 @@ _SCENARIO_FILES: dict[str, tuple[str, str]] = {
         "volume_gated_baseline.csv",
         "120 candles (~120s to run). Generic moderate-uptrend session, "
         "NOT engineered to trigger any particular strategy. The only "
-        "scenario available for ORB/Gap/Volume Spike/Momentum, whose "
-        "MATCH conditions hard-gate on volume_regime_score — see this "
-        "module's own docstring for why BacktestRunner can never "
-        "produce a non-zero value for that today. Verified to run "
-        "cleanly (outcomes_recorded=0, no discarded signals, no errors) "
-        "against all four.",
+        "scenario available for ORB/Gap/Volume Spike/Momentum. As of "
+        "decision #135, volume_regime_score is no longer structurally "
+        "zero — checked directly against all four: Momentum now "
+        "genuinely fires here (an unintended side effect of the daily-"
+        "history fixture's numbers, not something engineered), ORB/Gap/"
+        "Volume Spike still return outcomes_recorded=0, for reasons "
+        "unrelated to the volume gate — see this module's own docstring.",
     ),
 }
 

@@ -13,18 +13,47 @@ pipeline replay.
 
 **What a 200 from this route proves, and does not prove — read before
 treating any response as a trading signal.** Every scenario here is
-either synthetic/hand-built (proving the plumbing: real Feature/Level-
+synthetic/hand-built — proving the plumbing (real Feature/Level-
 Interaction/Market-State/Context/Strategy pipeline, real
-`StrategyOutcomeRecord` persistence) or, for four of the seven
-strategies, honestly incapable of ever firing at all today — see
-`scenarios.py`'s own module docstring for exactly why
-(`volume_regime_score`/`volatility_regime_score` are structurally always
-`0.0` in any BacktestRunner replay, which ORB/Gap/Volume Spike/Momentum
-all hard-gate MATCH on). `outcomes_recorded == 0` is therefore an
-entirely expected, non-error response for many (strategy, scenario)
-pairs, not a sign anything is broken — the same honesty
-`fixture_provider.py` itself already models for its own data. Nothing
-here indicates real strategy profitability regardless of the outcome.
+`StrategyOutcomeRecord` persistence), never real strategy profitability,
+regardless of the outcome. As of decision #135,
+`volume_regime_score`/`volatility_regime_score` are no longer
+structurally `0.0` in every replay (see `historical_provider_guard.py`
+and `fixture_daily_history.py`) — but that only means ORB/Gap/Volume
+Spike/Momentum's `volume_regime_score >= 45.0` MATCH gate can now
+genuinely be cleared by REAL price/volume action during a replay; it
+does not mean the existing named scenarios were built to clear it (see
+`scenarios.py`'s own module docstring for the honest, checked answer on
+which of the four currently do). `outcomes_recorded == 0` remains an
+expected, non-error response for a (strategy, scenario) pair that
+genuinely never sets up the conditions a strategy's MATCH stage needs —
+not a sign anything is broken, the same honesty `fixture_provider.py`
+itself already models for its own data.
+
+**This route now writes into shared, live-facing tables under whatever
+`symbol` label the caller passes — decision #135, read before choosing
+one.** Closing the historical-provider gap means `FeatureEngine`'s real,
+unmodified Daily Levels reconciliation (`_reconcile_and_persist_daily_
+levels()`, `feature_engine/engine.py`) now actually runs during a
+backtest, the first time it ever has — and that method's job is to
+create a `symbols` row and persist real `daily_levels_state` rows for
+whatever ticker string it's given. Neither table carries an
+`is_backtest` flag the way `strategy_outcomes`/`backtests` do. Two real
+consequences, confirmed by direct execution against a real Postgres, not
+assumed: (1) if `symbol` collides with a real, live-tracked ticker, this
+backtest's synthetic daily levels land in the same rows live trading
+reads; (2) re-running the identical `(symbol, scenario)` pair a second
+time silently reverts `volume_regime_score`/`volatility_regime_score` to
+`0.0` for that run — `_maybe_refresh_daily_levels()`'s own pre-existing
+"restart-survival" short-circuit (already documented in its own
+docstring for live-process restarts) finds the `daily_levels_state` row
+the first run just persisted and skips the raw-candle-cache population
+entirely, before ever asking the provider again. Neither is fixed here —
+see decision #135's own text for why (a genuinely separate change from
+"wire a historical provider," flagged as a new open item rather than
+folded in). Pick a `symbol` label that doesn't collide with anything
+live-tracked, and don't rely on re-running the same scenario twice to
+double-check a result.
 
 **Latency.** Each replayed candle costs a real, measured ~1 second of
 `EngineBackedReplayStateProducer` engine-settle time (genuine processing
@@ -55,9 +84,11 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.api.routes import finnhub_data, market_data
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
+from app.backtest_runner.fixture_daily_history import build_daily_history_candles
 from app.backtest_runner.fixture_provider import FixtureCandleProvider
 from app.backtest_runner.runner import BacktestRunner
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
+from app.core.market_clock import get_market_clock
 from app.strategy_engine.scheduler import default_registry
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
@@ -177,7 +208,18 @@ async def run_backtest(
     As of decision #132, this is enforced rather than merely documented:
     a Finnhub or Polygon connection currently live in this process
     causes a `409` before any engine is touched, not just a warning to
-    read here.
+    read here. As of decision #135, the same call also temporarily
+    replaces `broker_registry`'s historical-role provider
+    (`historical_provider_guard.py`) — this check's existing Polygon gate
+    already covers that specifically (`market_data.py`'s own `connect()`
+    route is the one that calls `broker_registry.set_historical_provider()`;
+    Finnhub only ever claims the streaming role, confirmed by reading
+    `finnhub_data.py` directly — its own connection state genuinely has
+    no bearing on the historical role, this check just also happens to
+    gate on it for the pre-existing engine-singleton reason above). See
+    `historical_provider_guard.py`'s own module docstring for the one
+    provider this doesn't cover — IBKR, a pre-existing gap, not created
+    here.
 
     See this module's own docstring for what a response does and does
     not prove (several (strategy, scenario) pairs are expected to
@@ -197,7 +239,16 @@ async def run_backtest(
     )
     candles = load_scenario_candles(scenario)
 
-    provider = FixtureCandleProvider.single(symbol, "1m", candles)
+    # (symbol, "1d") entry added alongside the replay's own (symbol, "1m")
+    # entry, decision #135 — the SAME provider instance now also serves
+    # as broker_registry's historical role for FeatureEngine's Daily
+    # Levels/ATR/RVOL refresh (BacktestRunner.run() installs it; see
+    # historical_provider_guard.py). Anchored to the scenario's own
+    # first replayed trading day, not to `symbol` — see
+    # fixture_daily_history.py's own docstring for why.
+    first_day = get_market_clock().trading_day(candles[0].candle_ts)
+    daily_candles = build_daily_history_candles(before=first_day)
+    provider = FixtureCandleProvider({(symbol, "1m"): candles, (symbol, "1d"): daily_candles})
     runner = BacktestRunner(
         strategy=strategy,
         symbol=symbol,

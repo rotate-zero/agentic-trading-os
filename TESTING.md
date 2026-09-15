@@ -1,206 +1,290 @@
-# TESTING.md — Decision #134: Link Backtest Panel and Backtest Results Panel by run_id
+# TESTING.md — Decision #135: historical-provider gap in Backtest Runner replay
 
 ## What this delivery is
 
-Both `BacktestPanel.tsx` (decision #131, the trigger) and
-`BacktestResultsPanel.tsx` (decision #133, the viewer) already worked
-independently. `useBacktestOutcomes.ts`'s own docstring named the gap
-explicitly before this delivery: the Runner is "triggered from a
-separate, unlinked panel ... so a manual refresh is the only way to see
-a just-finished run's rows without a full reload." Today, using both
-panels together meant: run a backtest, get a `run_id` back, select and
-copy it out of a plain `<span>`, click over to the other panel, paste it
-into a free-text field. Every piece of information needed to skip that
-was already sitting in React state on the same page — this delivery
-connects it.
+Closes a real, structural gap `scenarios.py`'s own module docstring
+named directly: `volume_regime_score`/`volatility_regime_score` were
+`0.0` for every candle in every `BacktestRunner` replay, for any
+symbol, regardless of how a scenario's candles were built — because
+`FeatureEngine`'s Daily Levels/ATR/RVOL refresh never had a real
+`broker_registry.get_historical_provider()` to ask during a replay.
+Four of the seven v1 strategies (ORB, Gap, Volume Spike, Momentum)
+hard-gate their MATCH stage on `volume_regime_score >= 45.0`, so all
+four could never fire in a backtest — not because of their own candle
+shape, but because of this one shared, structural ceiling.
 
-Full reasoning lives in `docs/decisions/confirmed-decisions.md` (decision
-#134 — the open file, no archive/rollover involved this time); this file
+Full reasoning, including the fork presented to Saqib and how it was
+resolved, the second (write-side-effect) finding also presented and
+resolved, and a genuine decision-number collision with a parallel
+session reconciled per Saqib's own new standing instruction, lives in
+`docs/decisions/confirmed-decisions.md` — decision #135. This file
 covers what to run to verify it and what a reader should know before
-touching either panel again.
+touching this seam again.
 
-**Zero backend changes.** No route, no wire-shape change, no new hook.
-Confirmed directly (not assumed) before writing anything: everything
-needed was already sitting in `useBacktestRun`'s `result.run_id` and
-`useBacktestOutcomes`'s existing `backtestRunId` param.
+**Zero frontend changes.** This delivery is backend-only.
 
 ## Files changed
 
-**Modified — all frontend:**
+**New:**
+- `backend/app/backtest_runner/historical_provider_guard.py` — new.
+  `install_replay_historical_provider()`, an async context manager
+  mirroring `engine_singleton_guard.py`'s own save/install/restore
+  shape exactly: saves whatever `broker_registry.get_historical_
+  provider()` currently returns, installs the run's own
+  `MarketDataProvider` in its place for the duration of the `async
+  with` block, restores the original in `finally` — even on exception.
+  Own `asyncio.Lock`, deliberately not reusing `engine_singleton_
+  guard.py`'s lock, even though the real call path always nests this
+  inside that guard's own lock (see the module's own docstring for
+  why). Never calls `.connect()`/`.disconnect()` on what it installs —
+  see "Why this is safe" below.
+- `backend/app/backtest_runner/fixture_daily_history.py` — new.
+  `build_daily_history_candles(before, num_days=20)` — a deterministic,
+  honestly-synthetic sequence of prior 1-DAY candles, dated on real NYSE
+  trading days (via `MarketClock`'s own weekday/holiday logic) strictly
+  before `before`, timestamped at real NYSE close through a genuine
+  `ZoneInfo("America/New_York")` conversion (DST-safe). 20 days: 15
+  genuinely needed (`feature_engine_atr_period + 1` = Wilder ATR's real
+  requirement), 5 needed for `feature_engine_rvol_lookback_days` — both
+  confirmed by reading `atr.py`/`rvol.py` and their real callers
+  directly. One shared dataset regardless of symbol or named scenario,
+  anchored to the scenario's own start date — extends
+  `FixtureBacktestContextProvider`'s own "same synthetic facts
+  regardless of which symbol" precedent one step further.
 
-- `frontend/src/state/WorkspaceContext.tsx` — new `lastBacktestRunId:
-  string | null` field on `MainWindowState`, plus `setLastBacktestRunId`,
-  modeled directly on the existing `featureEnginePanelSymbol` /
-  `setFeatureEnginePanelSymbol` pair (same value-plus-setter shape,
-  exposed the same way through `useWorkspace()`, flattened from
-  `activeWindow` the same way). Per-Main-Window, not global — both
-  panels are mounted once per active-window shell in `App.tsx`, exactly
-  the same footprint `featureEnginePanelSymbol` already has, so the same
-  scoping was reused rather than inventing a new one. `makeMainWindow()`
-  seeds it `null`. `normalizeMainWindow()` now back-fills
-  `lastBacktestRunId: w.lastBacktestRunId ?? null` for any session saved
-  before this field existed — previously that function only normalized
-  `subWindows`; this is the first MainWindowState-level field to need
-  its own backfill, added following the same "old localStorage sessions
-  shouldn't throw at render time" principle `normalizeSubWindow()`
-  already established for its own fields.
-- `frontend/src/types/workspace.ts` — `lastBacktestRunId: string | null`
-  added to the `MainWindowState` interface, with a comment pointing back
-  at `featureEnginePanelSymbol` as the pattern it follows.
-- `frontend/src/components/backtest/BacktestPanel.tsx` — `BacktestForm`
-  now calls `setLastBacktestRunId(result.run_id)` in a `useEffect` keyed
-  on `status === "done" && result` — the exact same moment it already
-  renders that value in `ResultsView`, not a separate action or a second
-  code path that could drift from the render logic. `ResultsView` gained
-  one plain, non-interactive line of text noting the run_id is now
-  prefilled in the Results panel's filter. Deliberately **not** a
-  clickable "View in Results" link/button — see "What was deliberately
-  NOT built" below for why.
-- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` —
-  `BacktestResultsBody` gained a two-state `"auto"` / `"manual"` filter
-  mode (see "The one real design decision" below for the full
-  reasoning). `runIdInput`/`appliedRunId` now seed from
-  `useWorkspace().lastBacktestRunId` at mount and keep following it while
-  in `"auto"` mode; Apply or Clear switches to `"manual"` and freezes;
-  a new "↺ Follow latest run" control switches back. A small "auto" badge
-  and a "(auto)" / "(manually set)" suffix on the existing "Showing
-  run_id=..." line make the current mode visible, not just internal
-  state. `useBacktestOutcomes` itself is called exactly as before — same
-  hook, same params shape, no new hook needed.
-- `frontend/src/hooks/useBacktestOutcomes.ts` — docstring only, no
-  behavior change. The paragraph describing the "separate, unlinked
-  panel" gap was rewritten to state precisely what's now closed (the
-  run_id link, and — as an unplanned side effect of this hook's own
-  pre-existing reactive `[limit, backtestRunId]` dependency array — the
-  "manual refresh is the only way" framing too, while a person is
-  auto-following) versus what's still true (manual refresh remains
-  meaningful for a run triggered from a different tab/operator, or while
-  pinned to a different run_id manually).
-- `docs/decisions/confirmed-decisions.md` — decision #134 appended (open
-  file, no rollover — well under the ~100KB trigger at ~7KB).
-- `docs/decisions/INDEX.md` — new #134 row.
-- `docs/architecture/strategy-engine-design.md` — one new as-built note
-  in §7, with two diagrams per this task's own diagram requirement: (1)
-  cross-component data flow — `BacktestPanel` → `WorkspaceContext` →
-  `BacktestResultsPanel`, and (2) the internal `"auto"`/`"manual"` mode
-  state machine inside `BacktestResultsBody`.
+**Modified:**
+- `backend/app/backtest_runner/fixture_provider.py` —
+  `FixtureCandleProvider.get_historical()`'s timeframe guard widened
+  from `"1m"`-only to `{"1m", "1d"}`. Confirmed by grep across `app/`
+  that these are the only two timeframes any real code in this
+  codebase ever requests from a historical-role provider — not opened
+  further than that.
+- `backend/app/backtest_runner/runner.py` — `BacktestRunner.run()` now
+  nests `install_replay_historical_provider(self._market_data_provider)`
+  inside its existing `install_replay_engines(...)` block. Whatever
+  `MarketDataProvider` a run was constructed with now also temporarily
+  becomes the process's historical-role provider for the run's
+  duration — generic, not fixture-specific; a future real-data provider
+  would get the same behavior automatically.
+- `backend/app/api/routes/backtest.py` — now builds a synthetic daily
+  history (`fixture_daily_history.py`) anchored to the scenario's first
+  replayed trading day, and constructs one `FixtureCandleProvider` with
+  both `(symbol, "1m")` (the existing replay feed) and `(symbol, "1d")`
+  (new) entries. Route and module docstrings corrected: the old
+  "structurally always 0.0" claim is gone, replaced with the real,
+  checked-not-assumed current state (see "What changed for the four
+  volume-gated strategies" below) — plus a new, prominent disclosure
+  about this route now writing into shared `symbols`/`daily_levels_
+  state` tables (see "A genuinely separate finding" below).
+- `backend/app/backtest_runner/scenarios.py` — module docstring's "hard
+  ceiling" section rewritten to describe the gap as resolved, with the
+  real, checked findings per strategy (not a re-assertion of the old
+  ceiling). `volume_gated_baseline`'s own catalog description updated
+  to match.
+- `backend/tests/test_backtest_runner_regression.py` — new section 5,
+  four tests (see "Tests" below).
+- `docs/architecture/strategy-engine-design.md` — §7 gained a new
+  as-built note + diagram for this seam, inserted after the parallel
+  session's own decision #133 note (not replacing it — see "A genuine
+  numbering collision" below). New **D18** row in the D-items table
+  (the write-side-effect finding, left open).
+- `docs/decisions/future-ideas.md` — new entry #25 (a pre-existing,
+  unrelated gap found while checking this seam's own safety: decision
+  #132's live-data guard doesn't check IBKR).
 
 **Confirmed untouched** (checked via `diff -rq` against a freshly
 re-pulled clone, both before writing any code and again immediately
-before packaging): everything under `backend/`, `api-client.ts`,
-`useContextSnapshot.ts`, `useOpportunities.ts`,
-`useOpportunityConflicts.ts`, `useStrategyOutcomes.ts`,
-`usePerformanceAnalytics.ts`, `App.tsx` (no new import needed — both
-panels were already mounted), `CHANGES.md`.
+before packaging): everything under `frontend/`,
+`feature_engine/engine.py`, `replay_state_producer.py`,
+`broker_registry.py`, `engine_singleton_guard.py`,
+`api/routes/intelligence.py`, `trading_intelligence/performance_queries.py`.
 
-## The one real design decision this task called for
+## Why this is safe — read before assuming a broker_registry-wide swap is risky
 
-The task's own scope was explicit: `lastBacktestRunId` must be a
-**default**, never a forced value, and a run finishing elsewhere must
-**never silently overwrite an in-progress manual lookup** already sitting
-in the Results panel's filter. A silent default either way (always
-follow / never follow after first paint) would have violated one half or
-the other of that requirement, so this needed a real, stated mechanism:
+`broker_registry.get_historical_provider()` has exactly three real call
+sites outside `feature_engine/engine.py` itself (confirmed by grep, not
+assumed): two identity-comparison-only reads (`main.py`, `market_data.py`
+— never call `get_historical()`), and one real live-facing read,
+`GET /market/candles` (`market.py`), which gates on
+`adapter.is_connected()` before ever calling `get_historical()`.
+`FeatureEngine` itself never checks `is_connected()`, only `is None` —
+so as long as the seam's installed provider is never `.connect()`ed
+(it never is), `GET /market/candles` keeps returning its existing
+honest 400 throughout a backtest run. No silent fixture-data leak into
+a live-facing route, by construction. Decision #132's Finnhub/Polygon
+409 already means `broker_registry`'s historical role is unclaimed
+going into every valid backtest run today — of the two,
+only Polygon (`market_data.py`) actually claims the historical role on
+connect; Finnhub only ever claims streaming (confirmed by reading
+`finnhub_data.py` directly). See `historical_provider_guard.py`'s own
+module docstring for the full trace, including the one gap this
+doesn't cover (IBKR — pre-existing, `future-ideas.md` #25).
 
-`BacktestResultsBody` starts in `"auto"` mode, seeded from whatever
-`lastBacktestRunId` already is at mount (so a page reload or a
-freshly-expanded panel picks up the last known run immediately, not just
-runs that finish after the panel is already open). A `useEffect` keyed on
-`[lastBacktestRunId, mode]` keeps `runIdInput`/`appliedRunId` in sync with
-the shared value for as long as `mode === "auto"`.
+## What changed for the four volume-gated strategies — checked directly, not assumed
 
-The moment the person clicks **Apply** (with typed text) **or Clear**,
-mode switches to `"manual"` and freezes — both are real, deliberate
-choices (Clear's own "show everything" is itself a manual choice, not a
-reset back to auto), and from that point a run finishing elsewhere
-updates the *shared* value (so `BacktestPanel.tsx`'s own "prefilled" note
-stays accurate) but no longer touches *this panel's* filter. A small
-explicit "↺ Follow latest run" button is the only way back to `"auto"` —
-collapsing and re-expanding the panel would also reset it, since
-`BacktestResultsBody` unmounts on collapse, but that's not a discoverable
-way to ask for it, so the explicit control was added rather than relying
-on that side effect alone.
+`volume_regime_score`/`volatility_regime_score` can now genuinely be
+non-zero. That does **not** mean every scenario fires for every
+strategy. Ran `volume_gated_baseline` against all four with this seam
+active:
 
-## What was deliberately NOT built
+- **Momentum now genuinely fires** (`outcomes_recorded=1`) — an
+  unintended side effect of `fixture_daily_history.py`'s specific
+  numbers, not engineered to happen, and not something to rely on.
+- **ORB, Gap, Volume Spike still return `outcomes_recorded=0`** — not
+  blocked by the volume gate anymore, but by their own other MATCH-stage
+  shape requirements (no real opening-range breakout shape, no
+  overnight gap, no spike-shaped volume burst). Building new,
+  deliberately-shaped scenarios for these three is explicitly out of
+  scope for this delivery, per the task's own boundary.
 
-- **No clickable "View in Results" link in `BacktestPanel.tsx`.** Item
-  4 in this task's own scope named this as a genuine either-way call.
-  The Results panel's own collapsed/width state is deliberately local
-  component state, not threaded through `WorkspaceContext.tsx` — its own
-  header comment already states this explicitly, unchanged by this
-  delivery. Making the run_id note "actionable" would have meant either
-  reversing that local-state design (for a convenience this task didn't
-  ask for) or inventing a second, narrower coupling on top of the one
-  piece of shared state this task actually needed. A plain informational
-  note was judged sufficient; automatic prefill already does the real
-  work.
-- **No new hook.** The existing `useBacktestRun`/`useBacktestOutcomes`
-  pair already expressed everything needed — `useBacktestOutcomes`'s own
-  pre-existing reactive params did the rest for free.
-- **No backend changes of any kind.**
-- **No changes to `api-client.ts`, `App.tsx`, or any of the four
-  explicitly-excluded hooks** (`useContextSnapshot.ts`,
-  `useOpportunities.ts`, `useOpportunityConflicts.ts`,
-  `usePerformanceAnalytics.ts`) — confirmed via `diff -rq`.
-- **No persistence changes beyond the one new field.** `lastBacktestRunId`
-  rides the existing `MainWindowState` autosave/backfill machinery
-  unchanged; no new localStorage key, no new cross-tab sync payload
-  shape (`crossTabSync.ts` untouched — it already syncs the whole
-  `mainWindows` array wholesale).
+## A genuinely separate finding — read before choosing a `symbol` for `POST /backtest/run`
+
+Closing this gap means `FeatureEngine`'s real, unmodified Daily Levels
+reconciliation (`_reconcile_and_persist_daily_levels()`) now actually
+runs during a backtest for the first time — and it writes real rows
+into the SAME shared `symbols`/`daily_levels_state` tables live trading
+reads, under whatever `symbol` label the caller supplies, with no
+`is_backtest` flag on either table. Confirmed by direct execution
+against a real Postgres:
+
+1. A `symbol` label colliding with a real, live-tracked ticker lands
+   synthetic backtest-derived daily levels in the same rows live
+   trading reads.
+2. Re-running the identical `(symbol, scenario)` pair a second time
+   silently reverts `volume_regime_score`/`volatility_regime_score` to
+   `0.0` for that run — `_maybe_refresh_daily_levels()`'s own
+   pre-existing "restart-survival" short-circuit finds the first run's
+   persisted row and skips the raw-candle-cache population entirely,
+   before ever asking the provider again.
+
+Neither is fixed here — this is orthogonal to which fork option got
+picked (inherent to any historical-provider seam existing at all).
+Presented to Saqib as three options (accept + document; have
+`BacktestRunner` clean up after itself; add real `is_backtest`
+namespacing to the two tables); confirmed: accept + document loudly +
+flag as a new open item (**D18**, `strategy-engine-design.md`), not
+fixed this round. **Practical guidance: pick a `symbol` label that
+doesn't collide with anything live-tracked, and don't rely on
+re-running the same scenario twice to double-check a result.**
+
+## Two genuine numbering collisions in a row, reconciled per Saqib's new process rule
+
+This delivery's own work was carried out citing #133 throughout,
+confirmed correct via the standard three-source check at session start.
+A parallel frontend session (the "Backtest Results" panel) also claimed
+#133 and merged first, mid-session — not discovered until the same
+three-source re-check this log's protocol already requires immediately
+before writing a new entry. Per Saqib's own new standing instruction to
+distinguish "current observed next decision number" from "decision
+number assigned to this delivery": at that first re-check, **observed:
+#134, assigned: #134** — every citation renumbered, `strategy-engine-
+design.md` §7 rebased onto that session's own real content. Before
+packaging finished, a **second** parallel frontend session (linking
+`BacktestPanel.tsx`/`BacktestResultsPanel.tsx` via a shared `run_id`)
+independently also claimed **#134** — caught by a further re-check
+immediately before the actual zip was written, the same discipline
+applied a second time rather than assumed sufficient after the first
+catch. **Final observed: #135. Final assigned: #135** — not #133, not
+#134. Every internal citation across this delivery's code, tests, and
+docs was renumbered accordingly before packaging (`grep -c "#134"`
+returns 0 across every file this delivery touches; the two remaining
+real `"#133"`/`"#134"` references are the two parallel sessions' own,
+legitimate entries, confirmed untouched). `strategy-engine-design.md`
+§7 required two successive rebases, not a copy-over: this session's
+working copy had originally been edited against a base pulled before
+either parallel session's work landed, so it was missing both sessions'
+entire real as-built notes — re-based twice onto freshly re-pulled
+`main`, with this delivery's own note inserted after both of theirs
+each time, never in place of either. Confirmed file-disjoint both ways,
+both times (zero backend files touched by either parallel session,
+zero `frontend/` files touched by this delivery).
+
+## Tests
+
+Four new tests in `backend/tests/test_backtest_runner_regression.py`'s
+new section 5:
+
+- `test_historical_provider_guard_serializes_concurrent_installs` /
+  `test_historical_provider_guard_restores_prior_value_even_on_exception`
+  — the same two shapes `test_engine_singleton_guard_*` already covers,
+  applied to this new seam. DB-free (plain sentinel objects — this seam
+  only touches an in-memory global).
+- `test_historical_provider_guard_restores_none_when_nothing_installed_before`
+  — this module's own second restore branch (`prev is None` →
+  `clear_historical_provider()`), which `engine_singleton_guard.py`'s
+  unconditional-reassignment restore never needed.
+- `test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_scores`
+  — real end-to-end regression against real Postgres. Proves every
+  replayed candle's persisted `market_state_history` row now has
+  non-zero `volume_regime_score`/`volatility_regime_score`, where every
+  one was exactly `0.0` before this decision. Uses `len(rows) >=
+  len(candles) - 1`, not strict equality — checked directly against the
+  unmodified baseline before assuming this was a bug in the new seam:
+  the real, pre-existing `MarketStateEngine`/`ReplayStateProducer`
+  pipeline already drops the final candle's persistence before
+  `producer.stop()` completes, true on `main` today, unrelated to this
+  decision.
 
 ## How to verify
 
-**Frontend build (this delivery touches nothing else):**
-
 ```bash
-cd frontend
-npm install   # first time only
-npx tsc -b
-npx vite build
+cd backend
+python -m venv .venv && source .venv/bin/activate   # or your usual env
+pip install -r requirements.txt --break-system-packages
+
+# Fresh DB, per this project's standing convention
+psql -c "CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;"
+psql -c "CREATE DATABASE trading_workspace OWNER trading;"
+cp .env.example .env
+alembic upgrade head
+
+python -m pytest tests/ -q
 ```
 
-Expected: `npx tsc -b` reports exactly the four pre-existing decision
-#35 `GridPresetPicker` errors (`GRID_PRESETS` not exported, `preset`/
-`setPreset` not on `WorkspaceContextValue`, one implicit-`any`
-parameter) and nothing else — confirmed against a freshly re-pulled,
-untouched clone immediately before this delivery's own changes were
-made, so these are a known baseline, not a regression. `npx vite build`
-succeeds with no errors or warnings beyond its own standard build
-output.
+Expected: 719 collected. Failures will range from 0 to 3 depending on
+run — every failure you might see belongs to the long-documented,
+4-test #119 flaky cluster (`test_vwap_publishes_even_while_sma_is_still_warming_up`,
+`test_daily_levels_carry_level_interaction_once_touched`,
+`test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction`,
+`test_feature_engine_backfills_from_persisted_history_on_cold_start`) —
+named across decisions #93/#113/#114/#116-119/#122-133, each
+independently reconfirmed pre-existing and sandbox-timing-sensitive by
+multiple prior sessions, unrelated to `strategy_engine/`/
+`feature_engine/engine.py`. Two full runs during this delivery's own
+verification: one showed 718 passed/1 failed (just the first test
+above), another showed 716 passed/3 failed (three of the four at
+once) — consistent with decision #119's own documented "flickers
+between 1-3 failing per run" signature, not a new or worsened pattern.
+Every individual failure reconfirmed passing in isolation immediately
+after. None of this delivery's own 4 new tests were ever among the
+flickering set, in any run.
 
-**Manual check (no backend test suite involved — this delivery has no
-Python changes to test):**
+**Manually confirming the fix directly** (optional, the automated test
+above already proves this):
 
-1. Start the backend and frontend as usual.
-2. Expand both the "Backtest" and "Backtest Results" sidebar panels.
-3. Trigger a backtest run via `BacktestPanel.tsx`. Wait for it to finish.
-4. Confirm the Results panel's `run_id` filter field auto-populates with
-   the just-finished run's `run_id` with no typing/pasting, an "auto"
-   badge appears next to "Filter by run_id," and the results list narrows
-   to that run's rows automatically (no manual "Refresh" click needed).
-5. Manually type a different (or blank) value into the Results panel's
-   filter and press Apply or Clear. Confirm the "auto" badge disappears
-   and a "↺ Follow latest run" button appears.
-6. Trigger a second backtest run. Confirm the Results panel's filter
-   does **not** change while in manual mode — it should still show
-   whatever was set in step 5.
-7. Click "↺ Follow latest run." Confirm the filter jumps to the
-   second run's `run_id` and the "auto" badge returns.
-8. Reload the page. Confirm the Results panel (once expanded) still
-   defaults its filter to the most recent run for this Main Window tab
-   (persistence via the existing session-autosave path).
-9. Open a second Main Window tab (via the `+` tab control). Confirm its
-   own Results panel filter starts independent of the first tab's —
-   per-Main-Window scoping, same as `featureEnginePanelSymbol`.
+```bash
+# with the backend running, Finnhub/Polygon both disconnected
+curl -s -X POST "http://localhost:8000/backtest/run?strategy=Momentum&scenario=volume_gated_baseline&symbol=ZDEMO01" | python -m json.tool
+```
 
-## A note on scope discipline
+`outcomes_recorded` should be `1` (Momentum's own unintended fire — see
+above). Pick a `symbol` that isn't a real ticker you're tracking live,
+and don't re-run this exact command a second time expecting the same
+non-zero regime scores underneath (see "A genuinely separate finding"
+above).
 
-This task's own prompt named a concurrent backend session working a
-historical-data-provider gap in `backend/app/backtest_runner/` and
-likely `backend/app/api/routes/backtest.py`. This delivery is
-frontend-only by construction and shares zero files with that boundary
-list. Re-confirmed directly (not assumed) via a fresh tarball pull and a
-three-source decision-log cross-check (`INDEX.md` last row,
-`confirmed-decisions.md` tail, archive file list) at both session start
-and again immediately before writing decision #134 — no drift either
-time, no collision to reconcile, #134 was free.
+## What was deliberately NOT built
+
+- **No new guaranteed-fire scenarios for ORB/Gap/Volume Spike.**
+  Engineering scenario candles to guarantee a fire for each is real,
+  separate, later work with its own judgment calls — flagged, not
+  built, per this task's own explicit scope boundary.
+- **No fix for the write-side-effect finding.** See "A genuinely
+  separate finding" above — documented and flagged as D18, not
+  resolved this round, per Saqib's own confirmed direction.
+- **No IBKR fix for decision #132's live-data guard.** A pre-existing,
+  unrelated gap, flagged as `future-ideas.md` #25, not fixed here.
+- **No changes to `HistoricalContextProvider`/`context_provider.py`,**
+  or to live-provider vendor selection (`future-ideas.md` #17) — a
+  different, already-documented axis of "historical data," untouched.
+- **No changes under `frontend/`.** This delivery is backend-only.

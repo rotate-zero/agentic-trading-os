@@ -72,6 +72,19 @@ codebase — confirmed by grep before choosing, not guessed):**
     same finding the schema's own docstring already states),
     `signal_confirmed_at=None`, `decided_at=None` (no confirmation/
     decision stage exists).
+
+**As-built: historical-provider seam (decision #135).** `run()` now also
+installs `self._market_data_provider` as `broker_registry`'s historical
+role for the replay's duration (`install_replay_historical_provider()`,
+`historical_provider_guard.py`), nested inside the existing
+`install_replay_engines()` block. Closes the gap `scenarios.py`'s own
+module docstring used to describe as structural: `FeatureEngine`'s Daily
+Levels/ATR/RVOL refresh had never had a real historical provider to ask,
+so `volume_regime_score`/`volatility_regime_score` were always `0.0` in
+any replay, for any symbol. See `historical_provider_guard.py`'s own
+docstring for why this is safe to do (what else reads
+`broker_registry`'s historical role, and why none of it is put at risk),
+and `strategy-engine-design.md` §7 for the diagram.
 """
 from __future__ import annotations
 
@@ -85,6 +98,7 @@ from uuid import UUID, uuid4
 
 from app.backtest_runner.context_provider import BacktestContextProvider
 from app.backtest_runner.engine_singleton_guard import install_replay_engines
+from app.backtest_runner.historical_provider_guard import install_replay_historical_provider
 from app.backtest_runner.fill_simulator import (
     EntryFill,
     ExitFill,
@@ -290,106 +304,120 @@ class BacktestRunner:
                 market_state_engine=producer.market_state_engine,
                 context_engine=producer.context_engine,
             ):
-                # Written BEFORE any outcome — record_strategy_outcome()
-                # enforces backtest_run_id as a real FK into this row, so
-                # this isn't just "nice to do first," it's a hard
-                # ordering requirement.
-                await asyncio.to_thread(
-                    _write_backtest_run_record,
-                    BacktestRunRecord(
-                        run_id=run_id,
-                        sweep_id=sweep_id,
-                        strategy_name=self._strategy.name,
-                        strategy_version=self._strategy.config.version,
-                        config_hash=config_hash,
-                        symbol_universe=[self._symbol],
-                        date_range_start=self._clock.trading_day(candles[0].candle_ts),
-                        date_range_end=self._clock.trading_day(candles[-1].candle_ts),
-                        data_version=self._data_version,
-                        feature_version=self._feature_version,
-                        walk_forward_fold=self._walk_forward_fold,
-                        is_holdout=self._is_holdout,
-                    ),
-                )
+                # Nested inside install_replay_engines()'s own lock,
+                # deliberately (decision #135) — see
+                # historical_provider_guard.py's own module docstring for
+                # why this seam needs its own lock anyway rather than
+                # relying on being nested here to be correct. Installs
+                # THIS run's own market_data_provider (fixture-backed
+                # today; whatever it is generically) as broker_registry's
+                # historical role for exactly this block's duration, so
+                # FeatureEngine's Daily Levels/ATR/RVOL refresh has a real
+                # answer to `get_historical(symbol, "1d", ...)` instead of
+                # silently taking its "no historical provider" branch —
+                # closing the gap `scenarios.py`'s own module docstring
+                # used to describe as structural.
+                async with install_replay_historical_provider(self._market_data_provider):
+                    # Written BEFORE any outcome — record_strategy_outcome()
+                    # enforces backtest_run_id as a real FK into this row, so
+                    # this isn't just "nice to do first," it's a hard
+                    # ordering requirement.
+                    await asyncio.to_thread(
+                        _write_backtest_run_record,
+                        BacktestRunRecord(
+                            run_id=run_id,
+                            sweep_id=sweep_id,
+                            strategy_name=self._strategy.name,
+                            strategy_version=self._strategy.config.version,
+                            config_hash=config_hash,
+                            symbol_universe=[self._symbol],
+                            date_range_start=self._clock.trading_day(candles[0].candle_ts),
+                            date_range_end=self._clock.trading_day(candles[-1].candle_ts),
+                            data_version=self._data_version,
+                            feature_version=self._feature_version,
+                            walk_forward_fold=self._walk_forward_fold,
+                            is_holdout=self._is_holdout,
+                        ),
+                    )
 
-                for i, candle in enumerate(candles):
-                    state = await producer.advance_to(self._symbol, candle)
+                    for i, candle in enumerate(candles):
+                        state = await producer.advance_to(self._symbol, candle)
 
-                    # --- entry side of a pending trade reached? ---------
-                    if pending is not None and i == pending.entry_fill.entry_candle_index:
-                        snapshots = capture_strategy_outcome_snapshots(self._symbol)
-                        if snapshots.market_state is None or snapshots.context is None:
-                            discarded.append(
-                                DiscardedSignal(
-                                    signal_candle_ts=candle.candle_ts,
-                                    reason="D17: entry snapshot unavailable at entry_filled_at",
-                                    detail=f"market_state={snapshots.market_state!r} context={snapshots.context!r}",
-                                )
-                            )
-                            pending = None  # void — never simulated as a real trade, per D17 option (a)
-                        else:
-                            pending.entry_snapshots = snapshots
-
-                    # --- exit side of a pending trade reached? ----------
-                    if pending is not None and i == pending.exit_fill.exit_candle_index:
-                        snapshots = capture_strategy_outcome_snapshots(self._symbol)
-                        if snapshots.market_state is None or snapshots.context is None:
-                            discarded.append(
-                                DiscardedSignal(
-                                    signal_candle_ts=pending.entry_fill.entry_ts,
-                                    reason="D17: exit snapshot unavailable at exit_filled_at",
-                                    detail=f"market_state={snapshots.market_state!r} context={snapshots.context!r}",
-                                )
-                            )
-                        else:
-                            outcome = _build_strategy_outcome(
-                                symbol=self._symbol,
-                                strategy_name=self._strategy.name,
-                                strategy_version=self._strategy.config.version,
-                                run_id=run_id,
-                                pending=pending,
-                                exit_snapshots=snapshots,
-                                clock=self._clock,
-                            )
-                            await asyncio.to_thread(record_strategy_outcome, outcome)
-                            recorded += 1
-                        pending = None  # position closed either way — recorded or honestly discarded
-
-                    # --- evaluate every candle, always — see module docstring ---
-                    gate_ok = gate_conditions_satisfied(self._strategy.config.gate_conditions, state.market_state.candle_ts)
-                    opportunity: Opportunity | None = None
-                    if gate_ok:
-                        opportunity = await self._strategy.evaluate(self._symbol, state.market_state, state.features, state.context)
-
-                    # --- accept a new signal only if no position is open ---
-                    if pending is None and opportunity is not None and opportunity.status == "actionable":
-                        entry_fill = simulate_entry(opportunity, candles, i)
-                        if entry_fill is None:
-                            discarded.append(
-                                DiscardedSignal(
-                                    signal_candle_ts=candle.candle_ts,
-                                    reason="no next candle to fill against",
-                                    detail="signal fired on the last available candle in this replay range",
-                                )
-                            )
-                        else:
-                            try:
-                                exit_fill = simulate_exit(opportunity, entry_fill, candles, self._clock)
-                            except InsufficientReplayDataError as exc:
+                        # --- entry side of a pending trade reached? ---------
+                        if pending is not None and i == pending.entry_fill.entry_candle_index:
+                            snapshots = capture_strategy_outcome_snapshots(self._symbol)
+                            if snapshots.market_state is None or snapshots.context is None:
                                 discarded.append(
                                     DiscardedSignal(
                                         signal_candle_ts=candle.candle_ts,
-                                        reason="InsufficientReplayDataError",
-                                        detail=str(exc),
+                                        reason="D17: entry snapshot unavailable at entry_filled_at",
+                                        detail=f"market_state={snapshots.market_state!r} context={snapshots.context!r}",
+                                    )
+                                )
+                                pending = None  # void — never simulated as a real trade, per D17 option (a)
+                            else:
+                                pending.entry_snapshots = snapshots
+
+                        # --- exit side of a pending trade reached? ----------
+                        if pending is not None and i == pending.exit_fill.exit_candle_index:
+                            snapshots = capture_strategy_outcome_snapshots(self._symbol)
+                            if snapshots.market_state is None or snapshots.context is None:
+                                discarded.append(
+                                    DiscardedSignal(
+                                        signal_candle_ts=pending.entry_fill.entry_ts,
+                                        reason="D17: exit snapshot unavailable at exit_filled_at",
+                                        detail=f"market_state={snapshots.market_state!r} context={snapshots.context!r}",
                                     )
                                 )
                             else:
-                                pending = _PendingTrade(
-                                    opportunity=opportunity,
-                                    opportunity_id=uuid4(),
-                                    entry_fill=entry_fill,
-                                    exit_fill=exit_fill,
+                                outcome = _build_strategy_outcome(
+                                    symbol=self._symbol,
+                                    strategy_name=self._strategy.name,
+                                    strategy_version=self._strategy.config.version,
+                                    run_id=run_id,
+                                    pending=pending,
+                                    exit_snapshots=snapshots,
+                                    clock=self._clock,
                                 )
+                                await asyncio.to_thread(record_strategy_outcome, outcome)
+                                recorded += 1
+                            pending = None  # position closed either way — recorded or honestly discarded
+
+                        # --- evaluate every candle, always — see module docstring ---
+                        gate_ok = gate_conditions_satisfied(self._strategy.config.gate_conditions, state.market_state.candle_ts)
+                        opportunity: Opportunity | None = None
+                        if gate_ok:
+                            opportunity = await self._strategy.evaluate(self._symbol, state.market_state, state.features, state.context)
+
+                        # --- accept a new signal only if no position is open ---
+                        if pending is None and opportunity is not None and opportunity.status == "actionable":
+                            entry_fill = simulate_entry(opportunity, candles, i)
+                            if entry_fill is None:
+                                discarded.append(
+                                    DiscardedSignal(
+                                        signal_candle_ts=candle.candle_ts,
+                                        reason="no next candle to fill against",
+                                        detail="signal fired on the last available candle in this replay range",
+                                    )
+                                )
+                            else:
+                                try:
+                                    exit_fill = simulate_exit(opportunity, entry_fill, candles, self._clock)
+                                except InsufficientReplayDataError as exc:
+                                    discarded.append(
+                                        DiscardedSignal(
+                                            signal_candle_ts=candle.candle_ts,
+                                            reason="InsufficientReplayDataError",
+                                            detail=str(exc),
+                                        )
+                                    )
+                                else:
+                                    pending = _PendingTrade(
+                                        opportunity=opportunity,
+                                        opportunity_id=uuid4(),
+                                        entry_fill=entry_fill,
+                                        exit_fill=exit_fill,
+                                    )
         finally:
             await producer.stop()
 

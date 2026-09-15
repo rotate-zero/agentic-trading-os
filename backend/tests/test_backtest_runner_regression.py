@@ -1,8 +1,10 @@
 """
 Unit 5 — regression tests closing four concrete coverage gaps identified
-against the original Backtest Runner v1 spec. Test-only: no changes to
+against the original Backtest Runner v1 spec, plus (decision #135) a
+fifth section covering the new historical-provider seam's own contract
+tests and a real end-to-end regression proof. Test-only: no changes to
 `backtest_runner/`, strategy implementations, performance query code,
-persistence models, API routes, or the DB schema. Each of the four
+persistence models, API routes, or the DB schema. Each of the five
 sections below is independent; see each section's own docstring for
 exactly what it proves.
 """
@@ -21,12 +23,20 @@ from sqlalchemy import text
 
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.engine_singleton_guard import install_replay_engines
+from app.backtest_runner.fixture_daily_history import build_daily_history_candles
 from app.backtest_runner.fixture_provider import FixtureCandleProvider
+from app.backtest_runner.historical_provider_guard import install_replay_historical_provider
 from app.backtest_runner.runner import BacktestRunner
+from app.backtest_runner.scenarios import load_scenario_candles
 from app.broker_adapters.base import HistoricalDataUnavailableError
 from app.broker_adapters.polygon_provider import PolygonAdapter
+from app.core.market_clock import get_market_clock
 from app.db.session import SessionLocal
+from app.models.market_data import Symbol
+from app.models.market_state import MarketStateHistory
+from app.services import broker_registry
 from app.strategy_engine.base_strategy import Opportunity, Strategy, StrategyConfig, every_candle
+from app.strategy_engine.scheduler import default_registry
 from app.trading_intelligence.state_snapshot import StrategyOutcomeSnapshots
 
 SYMBOL = "ZZUNIT5"
@@ -390,3 +400,171 @@ def test_strategy_file_has_no_conditional_branch_on_backtest_identifiers(filenam
                 "`if backtesting:`). Docstrings/comments mentioning 'backtest' are fine; this check "
                 "only inspects real identifiers in import statements and if-conditions."
             )
+
+
+# =====================================================================
+# 5. historical_provider_guard.py's own contract tests (decision #135) —
+#    same two shapes section 2 above already established for
+#    engine_singleton_guard.py, applied to the new broker_registry
+#    historical-role seam — plus a real end-to-end regression proof that
+#    a `volume_gated_baseline` replay now produces genuinely non-zero
+#    `volume_regime_score`/`volatility_regime_score` throughout, where
+#    every row was exactly `0.00` before this decision (confirmed via
+#    direct execution against a real Postgres during this decision's own
+#    investigation, not reasoned from source — see `historical_provider_
+#    guard.py`'s and `fixture_daily_history.py`'s own module docstrings).
+#
+#    The first two tests below are DB-free, same reasoning as section 2:
+#    install_replay_historical_provider() only touches broker_registry's
+#    in-memory global, so plain sentinel objects are sufficient. The
+#    third is DB-gated — it runs a real replay and inspects real
+#    persisted `market_state_history` rows.
+# =====================================================================
+
+
+async def test_historical_provider_guard_serializes_concurrent_installs():
+    events: list[tuple[str, str, float]] = []
+
+    async def run(name: str, hold_seconds: float) -> None:
+        async with install_replay_historical_provider(object()):
+            events.append((name, "enter", time.monotonic()))
+            await asyncio.sleep(hold_seconds)
+            events.append((name, "exit", time.monotonic()))
+
+    await asyncio.gather(run("A", 0.2), run("B", 0.05))
+
+    intervals = {name: {} for name in ("A", "B")}
+    for name, kind, t in events:
+        intervals[name][kind] = t
+
+    a_enter, a_exit = intervals["A"]["enter"], intervals["A"]["exit"]
+    b_enter, b_exit = intervals["B"]["enter"], intervals["B"]["exit"]
+
+    no_overlap = (a_exit <= b_enter) or (b_exit <= a_enter)
+    assert no_overlap, f"critical sections overlapped: A=[{a_enter}, {a_exit}] B=[{b_enter}, {b_exit}]"
+
+
+async def test_historical_provider_guard_restores_prior_value_even_on_exception():
+    """Same shape as test_engine_singleton_guard_restores_prior_value_
+    even_on_exception (section 2 above), applied to
+    historical_provider_guard.py's own broker_registry seam. Uses a real
+    non-None sentinel as the "prior value" specifically to exercise the
+    `else: broker_registry.set_historical_provider(prev)` branch of the
+    restore, not just the `prev is None` branch (see the next test for
+    that one) — a real code path this module has that
+    engine_singleton_guard.py's own unconditional-reassignment restore
+    never needed."""
+    sentinel_prev = object()
+    broker_registry.set_historical_provider(sentinel_prev)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        async with install_replay_historical_provider(object()):
+            raise RuntimeError("boom")
+
+    assert broker_registry.get_historical_provider() is sentinel_prev
+
+
+async def test_historical_provider_guard_restores_none_when_nothing_installed_before():
+    """The other restore branch — `prev is None` →
+    `broker_registry.clear_historical_provider()`, not a
+    `set_historical_provider(None)` call (that distinction matters:
+    `broker_registry.py`'s own `clear_historical_provider()` is the real,
+    documented way to represent "nothing installed," confirmed by
+    reading `broker_registry.py` directly before writing this seam)."""
+    assert broker_registry.get_historical_provider() is None  # autouse _reset_app_singletons guarantees this
+    async with install_replay_historical_provider(object()):
+        assert broker_registry.get_historical_provider() is not None
+    assert broker_registry.get_historical_provider() is None
+
+
+DAILY_HISTORY_SYMBOL = "ZZUNIT5B"
+
+
+@pytest.fixture()
+def _clean_daily_history_symbol():
+    _clean_test_symbol(DAILY_HISTORY_SYMBOL)
+    yield
+    _clean_test_symbol(DAILY_HISTORY_SYMBOL)
+
+
+@_needs_db
+async def test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_scores(_clean_daily_history_symbol):
+    """The real end-to-end proof decision #135 exists to deliver. Before
+    it, `scenarios.py`'s own module docstring could state directly (and
+    this same check, run against the pre-#135 code during that
+    decision's investigation, confirmed it by direct execution): every
+    `market_state_history` row from ANY BacktestRunner replay had
+    `volume_regime_score == 0.0` and `volatility_regime_score == 0.0`,
+    structurally, for any symbol. This asserts that's no longer true for
+    every single replayed candle in the existing `volume_gated_baseline`
+    scenario — not just the last one, which alone wouldn't catch a bug
+    where the daily-candle cache populates late or is dropped partway
+    through a run.
+
+    Strategy choice (Reversal) is arbitrary and deliberately NOT one of
+    the four volume-gated strategies — `MarketStateEngine` persists
+    `market_state_history` as part of the engine pipeline itself,
+    independent of which strategy is being evaluated against it, so any
+    real `Strategy` proves this."""
+    candles = load_scenario_candles("volume_gated_baseline")
+    first_day = get_market_clock().trading_day(candles[0].candle_ts)
+    daily_candles = build_daily_history_candles(before=first_day)
+    provider = FixtureCandleProvider(
+        {
+            (DAILY_HISTORY_SYMBOL, "1m"): candles,
+            (DAILY_HISTORY_SYMBOL, "1d"): daily_candles,
+        }
+    )
+
+    strategy = next(s for s in default_registry(datetime.now(timezone.utc)) if s.name == "Reversal")
+    runner = BacktestRunner(
+        strategy=strategy,
+        symbol=DAILY_HISTORY_SYMBOL,
+        market_data_provider=provider,
+        start=candles[0].candle_ts,
+        end=candles[-1].candle_ts,
+        context_provider=FixtureBacktestContextProvider(),
+        data_version="decision-135-regression",
+        feature_version="feature_engine_v1",
+    )
+    await runner.run()
+
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(MarketStateHistory)
+            .join(Symbol, Symbol.id == MarketStateHistory.symbol_id)
+            .filter(Symbol.ticker == DAILY_HISTORY_SYMBOL)
+            .order_by(MarketStateHistory.candle_ts)
+            .all()
+        )
+    finally:
+        session.close()
+
+    # NOT `len(rows) == len(candles)` — checked directly against the
+    # UNMODIFIED baseline (no decision #135 seam at all, plain
+    # FixtureCandleProvider.single()): the real, pre-existing
+    # MarketStateEngine/ReplayStateProducer pipeline already persists one
+    # fewer `market_state_history` row than replayed candles for this
+    # exact scenario — the final candle's state update never lands
+    # before `producer.stop()`. Confirmed by direct execution against
+    # `main`, not this delivery's own code — a genuine pre-existing gap,
+    # unrelated to and not introduced by decision #135, out of scope to
+    # fix here (would mean touching `MarketStateEngine`/
+    # `ReplayStateProducer`, not the historical-provider seam). A
+    # non-trivial floor (rather than no count check at all) still
+    # catches a real regression where the seam breaks early and stops
+    # producing state altogether.
+    assert len(rows) >= len(candles) - 1, (
+        f"expected close to one market_state_history row per replayed candle "
+        f"({len(candles)}), got only {len(rows)} — more missing than the one "
+        f"pre-existing, unrelated final-candle gap accounts for"
+    )
+    assert all(float(r.volume_regime_score) != 0.0 for r in rows), (
+        "volume_regime_score was 0.0 for at least one replayed candle — the exact "
+        "decision #135 regression this test exists to catch."
+    )
+    assert all(float(r.volatility_regime_score) != 0.0 for r in rows), (
+        "volatility_regime_score was 0.0 for at least one replayed candle — the exact "
+        "decision #135 regression this test exists to catch."
+    )

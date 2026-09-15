@@ -37,6 +37,20 @@ realistic" (no randomness, no noise model) — synthetic OHLCV chosen
 deliberately to exercise specific strategy MATCH conditions is more
 useful for proving the plumbing than realistic-looking noise would be,
 and is honestly labeled as such either way.
+
+**Also usable as the process's "historical" broker_registry role, not
+just the replay's own 1m feed (decision #135).** `get_historical()`'s
+timeframe guard originally accepted only `"1m"` — the constructor's own
+`dict[(symbol, timeframe), list[Candle]]` shape never actually forced
+that narrowness, only the guard did. Widened to `{"1m", "1d"}` so the
+SAME instance already built for a run's 1m replay feed can also carry a
+`(symbol, "1d")` entry and be installed, via
+`historical_provider_guard.install_replay_historical_provider()`, as
+`broker_registry`'s historical role for the run's duration — closing the
+gap `scenarios.py`'s own module docstring used to describe as
+structural. Still not a historical data source in the sense described
+above — the "1d" candles a caller supplies are exactly as synthetic and
+honestly-labeled as the "1m" ones (see `fixture_daily_history.py`).
 """
 from __future__ import annotations
 
@@ -142,18 +156,27 @@ class FixtureCandleProvider(MarketDataProvider):
     ) -> list[Candle]:
         # Timeframe checked BEFORE symbol existence, deliberately: a
         # request for a timeframe this provider structurally can't ever
-        # serve (v1 fixture data is 1m-only, matching every v1 strategy's
-        # real requirement — they all read 1m FeatureSets, decision #99)
-        # is a capability gap independent of which symbol was asked for —
-        # same "can never work, for any symbol" category
+        # serve is a capability gap independent of which symbol was
+        # asked for — same "can never work, for any symbol" category
         # HistoricalDataUnavailableError's own docstring defines, and
         # PolygonAdapter hits this exact ordering question for the same
         # reason (a bad timeframe on an unresolvable ticker is still a
         # timeframe problem, not evidence the ticker doesn't exist).
-        if timeframe != "1m":
+        #
+        # {"1m", "1d"} — not fully open — deliberately (decision #135):
+        # "1m" is every v1 strategy's real requirement (they all read 1m
+        # FeatureSets, decision #99); "1d" is FeatureEngine's Daily
+        # Levels/ATR/RVOL refresh (`_maybe_refresh_daily_levels`,
+        # `feature_engine/engine.py`), the ONE other timeframe any real
+        # code in this codebase ever requests from a historical-role
+        # provider — confirmed by grep across `app/` before widening
+        # this guard, not assumed. A genuine third real caller (there
+        # isn't one today) is the trigger to widen this further, not a
+        # hypothetical to build against now.
+        if timeframe not in ("1m", "1d"):
             raise HistoricalDataUnavailableError(
                 provider="FixtureCandleProvider",
-                reason=f"fixture data only covers 1m candles, not {timeframe!r}",
+                reason=f"fixture data only covers 1m/1d candles, not {timeframe!r}",
             )
         key = (symbol, timeframe)
         if key not in self._candles:
