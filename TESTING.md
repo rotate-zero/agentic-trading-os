@@ -1,136 +1,231 @@
-# TESTING.md — Decision #137: Strategy Performance Live/Backtest toggle
+# TESTING.md — Stale build-status documentation audit (expanded pass)
 
 ## What this delivery is
 
-`InfoTab.tsx`'s `StrategyPerformanceSummary` can now switch between **Live**
-and **Backtest** performance data. Before this, the section always called
-`usePerformanceAnalytics()` with no arguments, so `isBacktest` was always
-`undefined` and the backend's own default (`false`, live-only) was the only
-thing it could ever request — structurally guaranteed to show "no data yet"
-forever, since no Execution Engine exists, even though real backtest-derived
-`StrategyOutcome` rows have existed since decision #128.
+A documentation-only correction pass. **Zero application code changed** —
+confirmed by `diff -rq` against a freshly re-pulled clone of `main`, both
+immediately before writing anything and again immediately before
+packaging: only the four files listed below differ from an untouched
+clone. Nothing under `backend/` or `frontend/` was touched. No decision-log
+entry was created (see "Decision log" below for why).
 
-Full reasoning — why local state, why the empty-state wording, and a real
-stale-data gap found and fixed while wiring this — lives in
-`docs/decisions/confirmed-decisions.md`, decision #137. This file covers
-what to run to verify it.
+This expands the originally-scoped 6 claims to 9, after a second Claude
+instance's audit found 3 additional instances of the exact same
+underlying staleness while re-verifying the original 6 against current
+`main` and real code. All 9 are corrected in this one delivery, per
+explicit instruction not to leave any confirmed-false implementation-status
+statement for a separate pass.
 
-**Frontend-only.** Zero backend changes. `usePerformanceAnalytics.ts` and
-`api-client.ts` are both unchanged — everything needed already existed.
+## Files changed (4)
 
-## Files changed
+- `docs/architecture/system-design.md`
+- `docs/architecture/daily-levels-design.md`
+- `docs/architecture/strategy-engine-design.md`
+- `docs/architecture/trading-intelligence-architecture.md`
 
-**Modified:**
-- `frontend/src/components/workspace/InfoTab.tsx` — the only code change.
-  `StrategyPerformanceSummary` gained a local `view: "live" | "backtest"`
-  state (default `"live"`), a two-button toggle, an explicit
-  `isBacktest` passed to `usePerformanceAnalytics()`, a widened loading
-  gate (`loading` alone, not `loading && isEmpty`), mode-specific empty-
-  state copy, and an always-visible `— Live`/`— Backtest` header label
-  (plus a small "not live trading results" line in Backtest mode).
-  Nothing else in the file changed.
-- `docs/architecture/strategy-engine-design.md` — §5 (Performance
-  Intelligence) gained one new as-built note with two diagrams
-  (cross-component data flow; the internal toggle/loading-gate state
-  flow), inserted immediately after decision #122's own line about the
-  two `performance_queries.py` functions.
+**Explicitly left unchanged, confirmed already accurate (byte-identical to
+the untouched clone):** `feature-engine-indicator-expansion.md`,
+`feature-engine-chart-migration.md`, `scanner-design.md`.
 
-**New:**
-- This file, `CHANGES.md`, and the matching `confirmed-decisions.md` /
-  `INDEX.md` entries.
+## The 9 corrections
 
-**Explicitly untouched, confirmed by `diff -rq` against a freshly
-re-pulled clone:** everything under `backend/`,
-`frontend/src/services/api-client.ts`,
-`frontend/src/hooks/usePerformanceAnalytics.ts`,
-`frontend/src/components/backtest/BacktestPanel.tsx`,
-`frontend/src/components/backtest-results/BacktestResultsPanel.tsx`,
-`frontend/src/hooks/useBacktestRun.ts`,
-`frontend/src/hooks/useBacktestOutcomes.ts`, and anything under a
-`backtest-runs`-style directory (the parallel session's own scope).
+### Originally-scoped (6)
 
-## What was deliberately deferred
+**1. `system-design.md` — top "Companion documents" blurb, Daily Levels.**
+Was: *"the stage-by-stage plan for the Daily Levels support/resistance
+clustering indicator (confirmed decision #59), direction locked but not
+yet built."* Now: *"...all four stages built (decisions #60–#65)."*
+Evidence: `backend/app/feature_engine/indicators/daily_levels.py` and
+`backend/app/models/daily_levels.py` are real code; decisions #60 (Stage
+1: backend calculation), #63 (Stage 2: identity/persistence, migration
+0003), #64 (Stage 3: Level Interaction integration), #61 (Stage 4:
+frontend rendering) — all four checked off in this same document's own
+§9 Staged plan, which was already accurate before this delivery.
 
-`strategyName`/`strategyVersion` filters — both routes and the hook
-already support them, but there is no existing source of selectable
-strategy names anywhere in this codebase (checked directly). Adding
-selectors now would mean solving that data-source/UX question too, which
-is its own, later task — not a natural extension of a two-state
-provenance toggle. This keeps faith with decision #127's own original
-framing of this section as a minimal surfacing of an existing capability,
-not a new dashboard.
+**2. `system-design.md` — same blurb, Feature Engine indicator
+expansion.** Was: *"the stage-by-stage plan for ATR/Session Change/Gap/
+Regression/KAMA (confirmed decision #67), direction locked but not yet
+built."* Now: *"...all five families built (decisions #67–#71)."*
+Evidence: `backend/app/feature_engine/indicators/{atr,gap,session_change,
+regression,kama}.py` all exist; `feature-engine-indicator-expansion.md`'s
+own status header already correctly read "All five feature families now
+built and tested" — this document's pointer to it just hadn't been
+updated to match.
 
-## How to verify
+**3. `system-design.md` — body text, Feature Engine implementation-status
+paragraph (~line 157).** Was: *"A new Daily Levels indicator ... has its
+direction locked (decision #59) but is not yet built."* This is a
+**second, separate location** with the same staleness as #1 — a prior
+audit of this same document had assumed this body paragraph was already
+correct (it correctly describes ATR/Gap/Session Change/Regression/KAMA/
+RVOL as built) but missed that its own Daily Levels sentence, a few
+clauses later in the same paragraph, was not. Now: *"Daily Levels ... is
+built — all four stages complete (decisions #60–#65)"* — same evidence
+as #1.
 
-### 1. TypeScript / build
+**4. `daily-levels-design.md` — the document's own `Status:` header.**
+Was: *"Stage 0 confirmed ... **No application code has been written
+yet** — this document and decision #59 are the direction lock."* This
+directly contradicted the same document's own §9 (Staged plan), a few
+dozen lines below, which already had all four stages checked off with
+full build detail, test counts, and decision citations. Now: *"Built —
+all four stages complete (decisions #60–#65) ... Originally Stage 0
+only ..."* — the original review-process narrative (three-way review,
+Saqib + Claude + Grok + ChatGPT) is preserved, relabeled as the
+document's original Stage 0 state.
 
-```bash
-cd frontend
-npm install
-npx tsc -b
-npx vite build
-```
+**5. `strategy-engine-design.md` — the document's own `Status:` header.**
+Was: *"Stage 0 confirmed ... **No application code has been written
+yet** — `strategy_engine/` doesn't exist anywhere in the repo."* Directly
+contradicted by the filesystem: `backend/app/strategy_engine/` has 7 real
+strategy files plus `base_strategy.py`/`scheduler.py`/`gate_conditions.py`/
+`scoring_utils.py`/`level_touch_tracking.py` — verified directly
+(`find`/`ls`), not inferred. Also contradicted by this same document's
+own later sections (§12 Staged plan, §14–§18 build walkthroughs),
+already accurate. **Authoritative decisions establishing Strategy
+Engine's current built scope, identified directly from the decision log
+(not from memory, and not from Backtest Runner decisions, which are a
+separately-scoped extension of this same plan and are cited separately
+below):**
+  - #99 — Stage 1: `base_strategy.py` + `orb_strategy.py` (ORB, first
+    strategy)
+  - #104 — Gap Strategy
+  - #105 — Volume Spike Strategy
+  - #109 — First Pullback
+  - #110 — Reversal
+  - #113 — Momentum + VWAP, explicitly "closing out the full planned
+    set" (all 7 v1 strategies)
+  - #114, #115, #116 — Strategy Scheduler (both tracks), fully built and
+    verified end-to-end
+  - #117 — declarative `gate_conditions` enforcement, wired into the
+    Scheduler
 
-Expected `npx tsc -b` output — **exactly** these 4 pre-existing errors,
-confirmed against a freshly re-pulled untouched clone both before and
-after this delivery's change (same baseline, zero new errors):
+  The corrected header cites exactly these, states plainly that Decision
+  Engine's and Governor's evidence-informed logic (§6) remain target-shape
+  only (confirmed: no `decision_engine`/`governor` module exists under
+  `backend/app/`), and points to §7 for Backtest Runner's own separately-
+  cited build account rather than re-deriving or guessing those decision
+  numbers here.
 
-```
-src/components/workspace/GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.
-src/components/workspace/GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.
-src/components/workspace/GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.
-src/components/workspace/GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.
-```
+**6. `trading-intelligence-architecture.md` — top "Companion documents"
+blurb, Strategy Engine.** Was: *"§8–14's direction lock (decisions
+#87–88): ... Concept only, no application code yet."* Directly
+contradicted by this same document's own §8 body text (~line 302), which
+already correctly reads *"Internal design locked; all seven planned v1
+strategies are now built (decisions #99, #104, #105, #109, #110,
+#113)"* — the top blurb just hadn't been updated to match. Now points to
+the corrected `strategy-engine-design.md` status header rather than
+duplicating the citation list a third time.
 
-`npx vite build` — clean, no errors, on both the baseline and this
-delivery's tree.
+### Found via the required sweep, same underlying staleness, additional
+### locations (3)
 
-### 2. Functional checks (manual, in the running app)
+**7. `trading-intelligence-architecture.md` §14, ~line 410.** Was:
+*"Schema direction-locked, not yet built: an atomic `StrategyOutcome`
+record per closed trade ... persists to `strategy_outcomes`."* Directly
+contradicted by decision #120 (`Performance Intelligence's persistence
+layer built — strategy_outcomes + backtests tables ... migration,
+ORM as StrategyOutcomeRecord/BacktestRunRecord`), confirmed against real
+code: `backend/alembic/versions/0008_strategy_outcomes_and_backtests.py`,
+`StrategyOutcomeRecord`/`BacktestRunRecord` in
+`backend/app/models/trading_intelligence.py`. Corrected precisely, not
+rounded to a flat "built": the schema/write path exist, real
+backtest-derived rows exist since decision #128, but there are zero
+live-trading rows since no Execution Engine/Position Monitor exists yet
+to call the write path for a real trade.
 
-No frontend test framework exists in this codebase (no `vitest`/`jest`
-dependency, no `*.test.*` file anywhere under `frontend/` — checked
-directly, consistent with decision #123's own note that this project's
-hooks are exercised by real usage, not a test suite), and this delivery
-doesn't introduce one for a single component's toggle logic — that would
-be a disproportionate, inconsistent change for this task's scope. Verify
-by running the app against a real local backend + Postgres:
+**8. `system-design.md` §4.13 Database, ~line 280.** Was: *"`strategy_
+outcomes` (... no migration yet — the table itself is still not
+built ...)."* Same underlying fact as #7, second file. Corrected with the
+same precision (built, real backtest rows exist, zero live rows yet)
+and the same decision #120/#128 citations.
 
-1. Open the Info tab's General view. **Strategy Performance — Live**
-   should be the default (no clicking required) — confirms the default
-   stays Live.
-2. With no live `StrategyOutcome` rows (the current state of any fresh
-   environment — no Execution Engine exists), Live mode shows *"No live
-   data yet — no Execution Engine exists to write it."*
-3. Click **Backtest**. Header immediately updates to **Strategy
-   Performance — Backtest**, with *"Derived from backtest StrategyOutcome
-   data — not live trading results."* shown beneath it.
-4. While the Backtest request is in flight, confirm the panel shows
-   **"Loading…"** — not the previous Live state's content (there was none
-   to show in a fresh environment, but see the network-tab check below
-   for the case where Live *did* have data first).
-5. If real backtest rows exist (`POST /backtest/run` has been called at
-   least once, decision #131), Backtest mode should show real win-rate/
-   expectancy numbers under the Backtest label. If none exist yet,
-   confirm the honest empty state: *"No backtest data yet — run a
-   backtest to populate this."*
-6. Open the browser's network tab and confirm the two requests fired on
-   toggle are `GET /intelligence/win-rate-by-hour?is_backtest=true` and
-   `GET /intelligence/expectancy-by-session-type?is_backtest=true`; on
-   switching back to Live, confirm `is_backtest=false` on both (never
-   omitted, never blended).
-7. To directly observe the stale-data fix: seed at least one real Live
-   `StrategyOutcome` row (needs a live Execution Engine, or a direct DB
-   insert for testing), switch to Live, confirm the numbers render, then
-   click Backtest with the network artificially throttled — confirm the
-   panel shows "Loading…" rather than continuing to display the Live
-   numbers under a "— Backtest" header.
+**9. `strategy-engine-design.md` §8, ~line 856.** Was: *"Market State
+Engine (where Participation — buyer/seller control — would live) isn't
+built."* Directly contradicted by decisions #92/#93/#96/#97 (Market
+State Engine built) — already correctly described as built elsewhere in
+`system-design.md` itself. The genuinely-still-true surrounding point
+("nothing computed today is sub-1-minute") was preserved and given its
+own citation (decision #103 — Market State Engine's per-symbol recompute
+is keyed to 1m `FeaturesUpdated` arrivals specifically, never faster);
+only the false "isn't built" clause was corrected.
 
-### Why no automated query-string test was added
+## Intentionally retained historical/still-accurate wording (not
+## changed, checked directly, not assumed)
 
-No live backend/Postgres was available to exercise the full round trip
-in this delivery's own environment. The `is_backtest=<bool>` query-string
-construction (`_performanceAnalyticsQuery` in `api-client.ts`, unchanged
-by this decision) was verified by direct source trace against both
-`{ isBacktest: true }` and `{ isBacktest: false }` rather than by
-observing a live network call — same reasoning as item 6 above, to be
-confirmed against a real running app when one is available.
+- **Stage 0 checklist entries** in `daily-levels-design.md` §9,
+  `strategy-engine-design.md` §12, and `feature-engine-indicator-
+  expansion.md` (`"Stage 0 — Lock the direction in writing (no
+  application code)"`) — these are `[x]`-checked historical stage
+  entries describing what Stage 0 itself consisted of, immediately
+  followed by every later stage also checked off. Left alone: accurate,
+  clearly historical, not a current-status claim.
+- **`trading-intelligence-architecture.md` ~line 191** ("`MarketState`
+  doesn't exist yet ... M2 isn't built") — explicitly labeled "M1 build
+  note (decision #92)" describing that milestone's temporary state, with
+  its own "goes back on once M2 lands" framing. Already properly dated
+  and qualified. Left alone.
+- **`trading-intelligence-architecture.md` ~line 320** (Decision
+  Engine's evidence-informed arbitration, "direction-locked, not yet
+  built") — still genuinely accurate. Confirmed directly: no
+  `decision_engine` module exists under `backend/app/`. Left alone.
+- **`trading-intelligence-architecture.md` ~line 435** ("WorldView
+  (still not built)") — still genuinely accurate, no such module exists.
+  Left alone.
+- **`strategy-engine-design.md` ~line 307** ("Automatic reweighting ...
+  isn't built now") — still genuinely accurate; only human-reviewed
+  promotion exists. Properly framed as real, triggerable future work.
+  Left alone.
+- **`strategy-engine-design.md` §7 (~lines 424–540)**, the Backtest
+  Runner section's original prospective design narrative and its own
+  "As-built note (decision #128)"/"(decision #130)" annotations — this
+  section was already confirmed accurate in a prior pass and is not
+  touched here; it's the source cited by fix #5 above rather than
+  duplicated.
+- **`feature-engine-indicator-expansion.md`, `feature-engine-chart-
+  migration.md`, `scanner-design.md`** — all three confirmed already
+  accurate (own status headers correctly describe current build state,
+  including `feature-engine-chart-migration.md`'s explicit remaining-work
+  list and `scanner-design.md`'s sequential revision-note structure).
+  Byte-identical to the untouched clone; not part of this delivery.
+
+## Documentation/link validation performed
+
+- Every markdown companion-doc link touched by this delivery
+  (`` [`name.md`](./name.md) `` syntax) re-checked for balanced
+  brackets/parens after editing — all intact.
+- Every file referenced by a companion-doc link in the two edited
+  top-of-document blurbs (`system-design.md`, `trading-intelligence-
+  architecture.md`) confirmed to actually exist on disk at the
+  referenced path.
+- No new links added or removed — only surrounding prose/citations
+  changed.
+
+## No application code changed — confirmation
+
+`diff -rq` against a freshly re-pulled clone of `main`, run twice (once
+immediately before editing, once immediately before packaging this
+delivery): the only differences in both runs are the 4 files listed
+above plus this file. Nothing under `backend/` or `frontend/` appears in
+either diff.
+
+## Decision log
+
+**No new decision-log entry was created.** Re-checked the protocol in
+`docs/decisions/README.md` directly rather than assuming one was needed:
+its "Rule of thumb" ties `confirmed-decisions.md` entries to actual
+settled decisions (arguments resolved, work done), and its own
+established practice — confirmed by reading real prior entries, not
+assumed — is to fold a stale-caption correction into a decision entry
+that's *also* doing substantive work as a side note (decision #98:
+"`system-design.md` §4.8's stale 'not yet built' caption for Market
+State/Context corrected"; decision #102: "`premarket-accumulator-
+design.md`'s stale 'DRAFT, no code' status line ... corrected in this
+same change"; decision #119: "Also fixes a stale §13 line claiming First
+Pullback/Reversal were unbuilt") — never as a standalone numbered entry
+for the correction alone. This delivery does no code work to attach such
+a note to, so no entry was created, per explicit instruction not to
+create one unless the protocol requires it. Decision-log tail re-checked
+against a fresh clone both before and after this delivery: still `#137`,
+unchanged, confirming this delivery didn't need to account for any
+parallel-session numbering collision either.
