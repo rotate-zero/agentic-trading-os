@@ -150,7 +150,8 @@ function formatHourEt(hourEt: number): string {
 type StrategyPerformanceView = "live" | "backtest";
 
 function StrategyPerformanceSummary() {
-  const [view, setView] = useState<StrategyPerformanceView>("live");
+  // Decision #138: backtests currently produce the only persisted outcomes.
+  const [view, setView] = useState<StrategyPerformanceView>("backtest");
   const isBacktest = view === "backtest";
   const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics({ isBacktest });
   const isEmpty = winRateByHour.length === 0 && sessionExpectancy.length === 0;
@@ -162,8 +163,8 @@ function StrategyPerformanceSummary() {
   // row (a fixable, per-run fact, not a structural one).
   const emptyMessage =
     view === "live"
-      ? "No live data yet — no Execution Engine exists to write it."
-      : "No backtest data yet — run a backtest to populate this.";
+      ? "No live performance data is available yet — no Execution Engine exists to write it."
+      : "No matching backtest performance data is available yet — run a backtest to populate this.";
 
   return (
     <div className="flex flex-col gap-1">
@@ -194,11 +195,11 @@ function StrategyPerformanceSummary() {
           </button>
         </div>
       </div>
-      {view === "backtest" && (
-        <div className="text-[10px] text-text-muted">
-          Derived from backtest StrategyOutcome data — not live trading results.
-        </div>
-      )}
+      <div className="text-[10px] text-text-muted">
+        {view === "backtest"
+          ? "Backtest-derived performance from simulated StrategyOutcome data."
+          : "Live-trading-derived performance from live StrategyOutcome data."}
+      </div>
       {loading ? (
         <p className="p-1 text-[11px] text-text-muted">Loading…</p>
       ) : error ? (

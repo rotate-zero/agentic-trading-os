@@ -44,6 +44,8 @@ Every module in this system falls into one of two categories. Naming the categor
 
 ## 3. The Full Pipeline
 
+The ASCII chart below is the conceptual target pipeline. For the actual live communication and dependencies, plus flowcharts inside each built unit, see the [trading intelligence flowcharts](../diagrams/trading-intelligence-overview.md). In the current backend, Context Engine runs independently of Market State Engine, and the on-demand Scanner does not feed Strategy Scheduler.
+
 ```
                     Market Data (Broker Adapter)
                                 │

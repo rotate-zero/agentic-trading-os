@@ -94,3 +94,13 @@ Decision #127 built `GET /win-rate-by-hour`/`GET /expectancy-by-session-type` wi
     **Footprint, confirmed by `diff -rq` against a freshly re-pulled clone immediately before packaging.** Modified: `backend/app/api/routes/intelligence.py` (new route, appended), `backend/app/models/trading_intelligence.py` (two docstring corrections), `backend/app/schemas/performance.py` (two docstring corrections), `docs/architecture/system-design.md` (§4.13 correction), `docs/architecture/strategy-engine-design.md` (§7 as-built note/diagrams). New: `backend/tests/test_backtest_runs_route.py` — plus this entry, its matching `INDEX.md` row, and `TESTING.md`. No migration change — the `backtests` table already exists (migration `0008_strategy_outcomes_and_backtests.py`, decision #120). Confirmed untouched: everything under `backend/app/backtest_runner/`, `backend/app/api/routes/backtest.py`, and every file under `frontend/`.
 
 ---
+
+### 138. Strategy Performance defaults to Backtest and names the selected data source
+
+Decision #137 connected the section to the existing `isBacktest` analytics filter, but kept Live as its default. Before #137 the hook was called without filters, so the backend's `is_backtest=false` default also made the section live-only. With no live Execution Engine yet, only Backtest Runner writes performance outcomes; defaulting this section to Backtest makes its aggregate win rate and expectancy useful immediately. Live remains selectable for future live outcomes.
+
+The mode remains local `StrategyPerformanceSummary` state because no other workspace component consumes this aggregate view selection. Each selection passes `isBacktest: true` or `isBacktest: false` explicitly to the existing hook, which refreshes both analytics endpoints. The header and a persistent source line identify backtest-derived simulated performance or live-trading-derived performance even when numbers are displayed. Separate empty messages distinguish absent matching backtest performance from absent live performance. Strategy-name and strategy-version controls remain deferred: the section retains its existing aggregate scope, and choosing a strategy is a separate UI decision. No backend, API-client, or hook contract changes are needed.
+
+This decision corrects #137's default and presentation; its existing read path and diagrams remain accurate. Verification and the untouched-main comparison are recorded in `TESTING.md`.
+
+---

@@ -332,12 +332,15 @@ async def test_sma_ema_slope_family_groups_under_the_owning_period_and_is_exclud
                     resp = await client.get("/intelligence/state", params={"symbol": ticker})
                     candidate = resp.json()
                     node = candidate.get("timeframes", {}).get("1m", {}).get("units", {}).get("sma", {}).get("9")
-                    if node is not None and "slope" in node:
+                    # Feature and interaction snapshots advance on separate
+                    # workers; slope readiness alone can precede the base
+                    # price level's interaction state.
+                    if node is not None and "slope" in node and "level_interaction" in node:
                         body = candidate
                         break
                     await asyncio.sleep(0.05)
                 if body is None:
-                    raise AssertionError(f"sma_9's slope sub-object never appeared for {ticker} within 8.0s")
+                    raise AssertionError(f"sma_9's slope and level_interaction never both appeared for {ticker} within 8.0s")
             await _wait_until_candles_persisted(ticker, expected_count=17)
 
             units = body["timeframes"]["1m"]["units"]
@@ -799,11 +802,15 @@ async def test_daily_levels_carry_level_interaction_once_touched():
                     resp = await client.get("/intelligence/state", params={"symbol": ticker})
                     candidate = resp.json()
                     levels = candidate.get("daily_levels", [])
-                    if levels and levels[0].get("level_interaction"):
+                    # The first, distant candle already publishes an "above"
+                    # interaction. Wait for the second candle's touch before
+                    # checking the route's final state.
+                    interaction = levels[0].get("level_interaction", {}).get("1m", {}) if levels else {}
+                    if interaction.get("zone") == "inside_aura":
                         body = candidate
                         break
                     await asyncio.sleep(0.05)
-                assert body is not None, "level_interaction never appeared on the daily_levels entry within 8s"
+                assert body is not None, "daily_levels touch interaction never appeared within 8s"
 
                 level = body["daily_levels"][0]
                 assert "1m" in level["level_interaction"]
