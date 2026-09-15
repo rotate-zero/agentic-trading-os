@@ -97,29 +97,114 @@ function RecentClosedTrades() {
 // RecentClosedTrades, a request failure renders as its own distinct
 // error state rather than folding into "no data yet": see
 // usePerformanceAnalytics's own docstring for why that distinction
-// matters here specifically. No filter UI (strategy/backtest dropdowns)
-// — this is explicitly a minimal surfacing of an existing capability,
-// not a new dashboard; both routes stay fully filterable for a future,
-// separately-considered UI.
+// matters here specifically.
+//
+// Decision #137 — Live/Backtest toggle. Until this decision,
+// usePerformanceAnalytics() was always called with no arguments, so
+// isBacktest was always undefined and the backend's own default
+// (false, live-only) was the only thing this section could ever show —
+// structurally guaranteed to read "no data yet" forever, since no
+// Execution Engine exists, even though real backtest-derived
+// StrategyOutcome rows exist today (decision #128 onward). Local
+// component state (`view`), not WorkspaceContext — this selection
+// isn't shared across panels the way featureEnginePanelSymbol/
+// lastBacktestRunId are; StrategyPerformanceSummary is the only
+// consumer of isBacktest filtering anywhere in the UI. Both hook calls
+// now pass an explicit isBacktest (true/false), never undefined — a
+// strict either/or selector, matching useStrategyOutcomes.ts's own
+// precedent of pinning isBacktest explicitly rather than relying on
+// the backend's implicit default.
+//
+// strategyName/strategyVersion (also supported by the hook/route)
+// deliberately NOT exposed here — kept to the same "minimal surfacing
+// of an existing capability, not a new dashboard" posture decision
+// #127 itself established. There is no existing source of selectable
+// strategy names anywhere in this codebase (checked directly); adding
+// selectors would mean solving that data-source/UX question too,
+// which is a separate, later task, not a natural extension of a
+// two-state provenance toggle. Deliberate deferral, not an omission.
+//
+// Found while wiring the toggle, not part of the original ask: with a
+// static filters argument (the only way this hook was ever called
+// before), usePerformanceAnalytics's own load() — which sets
+// loading=true but does NOT clear winRateByHour/sessionExpectancy
+// until the new fetch actually resolves — could never visibly show
+// stale data, since nothing ever re-triggered it after mount. A
+// toggle-driven isBacktest change makes that a real, visible gap:
+// flipping Live -> Backtest would keep rendering the previous Live
+// numbers, under a header that now reads "Backtest", for the duration
+// of the new in-flight request — exactly the "label says one thing,
+// data says another" state this project's honest-state discipline
+// forbids, however briefly. Fixed locally, without touching
+// usePerformanceAnalytics.ts: the loading branch below now gates on
+// `loading` alone (previously `loading && isEmpty`), so ANY in-flight
+// fetch — including a toggle switch — shows "Loading…" instead of a
+// mismatched render. `usePerformanceAnalytics.ts`/`api-client.ts`/the
+// backend are otherwise completely untouched by this decision.
 function formatHourEt(hourEt: number): string {
   const period = hourEt < 12 ? "AM" : "PM";
   const hour12 = hourEt % 12 === 0 ? 12 : hourEt % 12;
   return `${hour12} ${period} ET`;
 }
 
+type StrategyPerformanceView = "live" | "backtest";
+
 function StrategyPerformanceSummary() {
-  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics();
+  const [view, setView] = useState<StrategyPerformanceView>("live");
+  const isBacktest = view === "backtest";
+  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics({ isBacktest });
   const isEmpty = winRateByHour.length === 0 && sessionExpectancy.length === 0;
+
+  // Honest, view-specific absence — "no live data" and "no backtest
+  // data" are different facts, not one collapsed message: the former
+  // because no Execution Engine exists to write live rows at all; the
+  // latter because no backtest run happens to have produced a matching
+  // row (a fixable, per-run fact, not a structural one).
+  const emptyMessage =
+    view === "live"
+      ? "No live data yet — no Execution Engine exists to write it."
+      : "No backtest data yet — run a backtest to populate this.";
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="text-[11px] uppercase tracking-wide text-text-muted">Strategy Performance</div>
-      {loading && isEmpty ? (
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-[11px] uppercase tracking-wide text-text-muted">
+          Strategy Performance <span className="text-text-primary">— {view === "live" ? "Live" : "Backtest"}</span>
+        </div>
+        <div className="flex gap-1">
+          <button
+            onClick={() => setView("live")}
+            className={`rounded px-2 py-0.5 font-mono text-[10px] ${
+              view === "live"
+                ? "bg-base-bg text-text-primary ring-1 ring-text-muted"
+                : "text-text-muted hover:bg-base-bg"
+            }`}
+          >
+            Live
+          </button>
+          <button
+            onClick={() => setView("backtest")}
+            className={`rounded px-2 py-0.5 font-mono text-[10px] ${
+              view === "backtest"
+                ? "bg-base-bg text-text-primary ring-1 ring-text-muted"
+                : "text-text-muted hover:bg-base-bg"
+            }`}
+          >
+            Backtest
+          </button>
+        </div>
+      </div>
+      {view === "backtest" && (
+        <div className="text-[10px] text-text-muted">
+          Derived from backtest StrategyOutcome data — not live trading results.
+        </div>
+      )}
+      {loading ? (
         <p className="p-1 text-[11px] text-text-muted">Loading…</p>
       ) : error ? (
         <p className="p-1 text-[11px] text-bear">Couldn't load performance data — {error}</p>
       ) : isEmpty ? (
-        <p className="p-1 text-[11px] text-text-muted">No performance data yet.</p>
+        <p className="p-1 text-[11px] text-text-muted">{emptyMessage}</p>
       ) : (
         <div className="flex flex-col gap-2">
           {winRateByHour.length > 0 && (

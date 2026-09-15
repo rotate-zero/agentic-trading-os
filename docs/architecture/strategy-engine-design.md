@@ -310,6 +310,84 @@ Persists to the `strategy_outcomes` table (renamed from `strategy_performance` �
 
 ---
 
+**As-built note (decision #137) — the read side finally has a live consumer that can show BOTH live and backtest evidence, not just whichever one the backend happened to default to.** Decision #127 routed `get_win_rate_by_hour()`/`get_expectancy_by_session_type()` to `GET /win-rate-by-hour`/`GET /expectancy-by-session-type`, both with a real `is_backtest` selector; `usePerformanceAnalytics.ts` accepted an `isBacktest` filter from the start. But `InfoTab.tsx`'s `StrategyPerformanceSummary` called the hook with no arguments at all, so `isBacktest` was always `undefined` and the backend's own default (`false`) was the only thing ever requested — structurally empty forever, since no Execution Engine exists to write a live row, even though real `is_backtest=True` rows have existed since decision #128. This decision adds a Live/Backtest toggle (local component state, default `"live"`) so the same section can show either. Frontend-only — `usePerformanceAnalytics.ts`, `api-client.ts`, and every route/query function above are unchanged.
+
+**Cross-component data flow — toggle click → explicit filter → the same unchanged read path decision #127 already built:**
+
+```
+Click "Live" / "Backtest"  (InfoTab.tsx, StrategyPerformanceSummary)
+              │
+              ▼
+   Local state: view: "live" | "backtest"        ◄── NOT WorkspaceContext —
+              │                                        no other panel reads this
+              ▼
+   isBacktest = view === "backtest"               ◄── always an explicit true/false,
+              │                                        never undefined (unlike before
+              ▼                                        this decision)
+   usePerformanceAnalytics({ isBacktest })         ◄── decision #127's hook, UNCHANGED
+              │                                        (filters arg always existed,
+              ▼                                        just never driven by anything)
+   fetchWinRateByHour(filters)
+   fetchExpectancyBySessionType(filters)            ◄── api-client.ts, UNCHANGED
+              │
+              ▼
+   GET /win-rate-by-hour?is_backtest=<bool>
+   GET /expectancy-by-session-type?is_backtest=<bool>   ◄── intelligence.py, UNCHANGED
+              │
+              ▼
+   get_win_rate_by_hour() / get_expectancy_by_session_type()   ◄── performance_queries.py,
+              │                                                     UNCHANGED (#122/#124)
+              ▼
+   strategy_outcomes  (is_backtest=True rows exist since #128;
+                        is_backtest=False rows: none yet — no
+                        Execution Engine — an honest empty result,
+                        not an error)
+```
+
+**Internal state flow — inside `StrategyPerformanceSummary`, where the real gap this decision closes actually lived:**
+
+```
+view changes (Live <-> Backtest)
+        │
+        ▼
+isBacktest = view === "backtest"  ──► usePerformanceAnalytics re-fetches
+        │                              (hook's own [strategyName,
+        │                               strategyVersion, isBacktest]
+        │                               dependency array — #127 — already
+        │                               reacts to this, no change needed)
+        ▼
+loading = true
+        │
+        │   ◄── render gate WIDENED from `loading && isEmpty` to
+        │       `loading` alone (the actual fix this decision made) —
+        │       the hook's own load() doesn't clear winRateByHour/
+        │       sessionExpectancy until the fetch resolves, so without
+        │       this widening a toggle switch would keep rendering the
+        │       OTHER mode's numbers under the NEW mode's own header
+        │       label for the duration of the in-flight request
+        ▼
+"Loading…" shown — never the previous mode's stale numbers
+        │
+        ▼
+fetch resolves
+        │
+        ├── error  → distinct error state (unchanged from #127)
+        ├── empty  → mode-specific message:
+        │            Live: "No live data yet — no Execution Engine
+        │                   exists to write it."
+        │            Backtest: "No backtest data yet — run a backtest
+        │                   to populate this."
+        └── data   → existing win-rate/expectancy rows, always under
+                      an explicit "Strategy Performance — Live" /
+                      "— Backtest" header; Backtest mode also shows
+                      "Derived from backtest StrategyOutcome data —
+                      not live trading results."
+```
+
+`strategyName`/`strategyVersion` — also real filters on the same hook/routes — deliberately NOT exposed by this toggle: no source of selectable strategy names exists anywhere in this codebase today (checked directly), and building one is a separate UI/data-source design question, not a natural extension of a two-state provenance toggle. Stays real, deferred future work, same as `future-ideas.md`'s own pattern for named-but-not-yet-triggered ideas.
+
+---
+
 ## 6. Decision Engine and Governor — two different questions over the same evidence
 
 **Not a single "decision and adjustment" module — two distinct questions, each already owned by an existing stage:**
