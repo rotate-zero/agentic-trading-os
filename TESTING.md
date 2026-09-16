@@ -1,21 +1,61 @@
-# Strategy Performance Backtest default verification
+# Decision-log integrity correction — ordering, headers, CHANGES.md backfill
 
-The inherited `TESTING.md` was deleted before this task-specific record was written.
+Documentation-only. No code, tests, or architecture docs touched.
 
-## Untouched GitHub `main` baseline
+## What changed
 
-Fresh `main` tarball downloaded from `https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main` and extracted under `/tmp/strategy-performance-main`. Its frontend used the repository's existing `frontend/node_modules` via a temporary symlink.
+1. **`docs/decisions/confirmed-decisions.md`** — physically reordered so entries
+   read `134 → 135 → 136 → 137 → 138` top to bottom (was
+   `134 → 137 → 135 → 136 → 138`). Entries #135 and #136 also had their opening
+   line reformatted from `N. **long lead sentence**` to `### N. long lead
+   sentence` (a real markdown heading, dropping the now-redundant bold markers),
+   matching the `### N. Title` convention already used by #134/#137/#138. No
+   other entry's structure changed.
+2. **`CHANGES.md`** — replaced with a backfilled entry for decision #138 (was
+   still showing #137's entry; #138 never overwrote it). See the note at the top
+   of that file for how it was reconstructed.
 
-- `cd /tmp/strategy-performance-main/frontend && npx tsc -b` — exit 1, exactly four decision #35 `GridPresetPicker.tsx` errors: missing `GRID_PRESETS`, missing `preset`, missing `setPreset`, and implicit-any `p`.
-- `cd /tmp/strategy-performance-main/frontend && npx vite build` — exit 0, 90 modules transformed.
+## What did NOT change
 
-## Changed tree
+No word of any decision's substance was altered. Verified programmatically:
+stripped every entry (`###`/plain numbering, bold markers, `---` rules,
+whitespace) from both the original and corrected `confirmed-decisions.md` and
+compared per-decision-number, not as one concatenated blob (since reordering
+necessarily changes concatenated-string position) — **all five entries (#134–
+#138) are identical after stripping structural markup.** The pre-existing
+4-space indentation inside several of #135's and #136's internal paragraphs
+(present in the original, not something this delivery introduced or corrected)
+was left exactly as found — out of this delivery's stated scope.
 
-- `cd frontend && npx tsc -b` — exit 1, the identical four `GridPresetPicker.tsx` errors and no new TypeScript errors.
-- `cd frontend && npx vite build` — exit 0, 90 modules transformed.
+`docs/decisions/INDEX.md` was not touched — it was already in correct order
+(confirmed during the original audit) and required no fix.
 
-Direct source trace: `StrategyPerformanceSummary` initializes `view` to `"backtest"`; its `isBacktest` expression is true in Backtest and false in Live; both values are passed explicitly to `usePerformanceAnalytics({ isBacktest })`. The hook's `[isBacktest]` dependency refreshes both fetches on selection change. The unchanged API client sends `is_backtest=true` and `is_backtest=false` to both routes. The header and persistent source line identify the selected provenance while loading, empty, and populated. The two empty messages have separate, mode-specific wording. The existing win-rate and expectancy row renderers remain unchanged; loading hides previous-mode figures during a refetch. No frontend test framework is configured, so this UI wiring was checked by build and direct source trace.
+## Root-cause note (for the record, not re-litigated here)
 
-## Boundary comparison
+Commit timestamps on `confirmed-decisions.md` (via GitHub's own commit history
+for that path) show #135 and #136 both merged to `main` before #137 did. #137's
+own text was spliced in directly after #134's entry — consistent with that
+session writing against a local copy of the file that predated #135/#136's
+merges, despite correctly claiming the number 137 for itself. The number was
+re-checked before writing; the physical file position was not.
 
-Immediately before packaging, another fresh GitHub `main` tarball was extracted under `/tmp/strategy-performance-final-main`. `diff -rq --exclude=.git --exclude=node_modules --exclude=dist --exclude='*.tsbuildinfo' /tmp/strategy-performance-final-main .` found task changes only in `frontend/src/components/workspace/InfoTab.tsx`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, and this `TESTING.md` replacement. It also found pre-existing, uncommitted changes in `backend/tests/test_intelligence_routes.py`, `docs/architecture/trading-intelligence-architecture.md`, `docs/diagrams/README.md`, and `docs/diagrams/trading-intelligence-overview.md`; these were present in `git status` before task edits and are excluded from delivery. Local environment/cache files were also excluded from delivery. The archive itself is accounted for separately.
+## Verification performed
+
+- Per-entry structural-diff check described above (script-based, not visual).
+- `grep -nE "^### [0-9]+\." docs/decisions/confirmed-decisions.md` on the
+  corrected file returns exactly `134, 135, 136, 137, 138`, in that order, no
+  gaps, no duplicates.
+- `diff -rq` against a freshly re-pulled clone of current `main`, confirming the
+  only two files that differ anywhere in the repository are
+  `docs/decisions/confirmed-decisions.md` and `CHANGES.md`.
+
+## Deliberately not covered
+
+- No new decision-log entry was minted for this correction itself. Project
+  convention mints a new entry for corrections to a decision's *substance*; this
+  is a structural/packaging fix to entries whose substance is unchanged. Flagged
+  for Saqib to decide whether a correction entry is still wanted for the audit
+  trail — not added unilaterally here, since assigning a real decision number is
+  explicitly reserved for exactly that kind of judgment call.
+- The pre-existing 4-space-indent quirk inside #135/#136's internal paragraphs
+  (noted above) — unrelated to what was asked, not touched.
