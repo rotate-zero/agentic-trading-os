@@ -8,9 +8,11 @@ works.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from app.context_engine.engine import ContextEngine
 from app.context_engine.fundamentals_refresh import FundamentalsRefreshJobs
@@ -23,7 +25,7 @@ from app.models.daily_levels import DailyLevelState
 from app.models.market_data import Candle, Symbol
 from app.models.scanner import ScannerUniverseSymbol
 from app.models.symbol_fundamentals import SymbolFundamentals
-from app.models.trading_intelligence import LevelInteractionState
+from app.models.trading_intelligence import BacktestRunRecord, LevelInteractionState
 from app.scanner.universe import DbUniverseProvider, list_universe_symbols, remove_symbol_from_universe
 from app.services.candle_recorder import CandleRecorder
 from app.services.candle_store import get_latest_recorded_candle, get_recent_closes, get_recorded_candles
@@ -61,6 +63,7 @@ def _clean(ticker: str) -> None:
                 text(f"DELETE FROM {table} WHERE symbol_id IN (SELECT id FROM symbols WHERE ticker = :ticker)"),
                 {"ticker": ticker},
             )
+        session.execute(text("DELETE FROM backtests WHERE :ticker = ANY(symbol_universe)"), {"ticker": ticker})
         session.execute(text("DELETE FROM symbols WHERE ticker = :ticker"), {"ticker": ticker})
         session.commit()
     finally:
@@ -75,17 +78,48 @@ def _pair(session, ticker: str) -> tuple[Symbol, Symbol]:
     return live, backtest
 
 
+def _add_backtest_run(session, ticker: str) -> UUID:
+    run_id = uuid4()
+    session.add(
+        BacktestRunRecord(
+            run_id=run_id,
+            sweep_id=uuid4(),
+            strategy_name="namespace-test",
+            strategy_version="v1",
+            config_hash="0" * 64,
+            symbol_universe=[ticker],
+            date_range_start=date(2026, 8, 12),
+            date_range_end=date(2026, 8, 12),
+            data_version="test",
+            feature_version="test",
+            walk_forward_fold=None,
+            is_holdout=False,
+        )
+    )
+    session.flush()
+    return run_id
+
+
+def test_feature_engine_requires_run_identity_exactly_for_backtest_mode():
+    with pytest.raises(ValueError, match="backtest_run_id exactly when is_backtest=True"):
+        FeatureEngine(EventBus(), is_backtest=True)
+    with pytest.raises(ValueError, match="backtest_run_id exactly when is_backtest=True"):
+        FeatureEngine(EventBus(), backtest_run_id=uuid4())
+
+
 def test_feature_engine_reads_and_writes_its_selected_namespace_only():
     ticker = "ZZNSFE"
     _clean(ticker)
     session = SessionLocal()
     try:
         live, backtest = _pair(session, ticker)
+        run_id = _add_backtest_run(session, ticker)
         for symbol, is_backtest, price in ((live, False, 101.0), (backtest, True, 202.0)):
             session.add(
                 DailyLevelState(
                     symbol_id=symbol.id,
                     is_backtest=is_backtest,
+                    backtest_run_id=run_id if is_backtest else None,
                     level_id=f"{ticker}-DL-{symbol.id}",
                     price=price,
                     strength=2,
@@ -98,11 +132,112 @@ def test_feature_engine_reads_and_writes_its_selected_namespace_only():
         session.commit()
 
         live_engine = FeatureEngine(EventBus())
-        backtest_engine = FeatureEngine(EventBus(), is_backtest=True)
+        backtest_engine = FeatureEngine(EventBus(), is_backtest=True, backtest_run_id=run_id)
         assert live_engine._get_or_create_symbol_id(session, ticker) == live.id
         assert backtest_engine._get_or_create_symbol_id(session, ticker) == backtest.id
         assert [level.price for level in live_engine._load_confirmed_daily_levels_for_today(ticker, date(2026, 8, 12))] == [101.0]
         assert [level.price for level in backtest_engine._load_confirmed_daily_levels_for_today(ticker, date(2026, 8, 12))] == [202.0]
+    finally:
+        session.close()
+        _clean(ticker)
+
+
+def test_daily_levels_database_rejects_mismatched_origin_and_run_identity():
+    ticker = "ZZNSPAIR"
+    _clean(ticker)
+    session = SessionLocal()
+    try:
+        live, backtest = _pair(session, ticker)
+        run_id = _add_backtest_run(session, ticker)
+        session.commit()
+        live_id = live.id
+        backtest_id = backtest.id
+
+        session.add(
+            DailyLevelState(
+                symbol_id=live_id,
+                is_backtest=False,
+                backtest_run_id=run_id,
+                level_id=f"{ticker}-LIVE-WITH-RUN",
+                price=101.0,
+                strength=2,
+                distinct_candle_count=2,
+                status="active",
+                first_seen_day=date(2026, 8, 12),
+                last_confirmed_day=date(2026, 8, 12),
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+
+        session.add(
+            DailyLevelState(
+                symbol_id=backtest_id,
+                is_backtest=True,
+                backtest_run_id=None,
+                level_id=f"{ticker}-BACKTEST-WITHOUT-RUN",
+                price=202.0,
+                strength=2,
+                distinct_candle_count=2,
+                status="active",
+                first_seen_day=date(2026, 8, 12),
+                last_confirmed_day=date(2026, 8, 12),
+            )
+        )
+        with pytest.raises(IntegrityError):
+            session.commit()
+        session.rollback()
+    finally:
+        session.close()
+        _clean(ticker)
+
+
+def test_deleting_backtest_run_cascades_only_its_daily_levels():
+    ticker = "ZZNSCASCADE"
+    _clean(ticker)
+    session = SessionLocal()
+    try:
+        live, backtest = _pair(session, ticker)
+        run_id = _add_backtest_run(session, ticker)
+        session.add_all(
+            [
+                DailyLevelState(
+                    symbol_id=live.id,
+                    is_backtest=False,
+                    backtest_run_id=None,
+                    level_id=f"{ticker}-LIVE",
+                    price=101.0,
+                    strength=2,
+                    distinct_candle_count=2,
+                    status="active",
+                    first_seen_day=date(2026, 8, 12),
+                    last_confirmed_day=date(2026, 8, 12),
+                ),
+                DailyLevelState(
+                    symbol_id=backtest.id,
+                    is_backtest=True,
+                    backtest_run_id=run_id,
+                    level_id=f"{ticker}-BACKTEST",
+                    price=202.0,
+                    strength=2,
+                    distinct_candle_count=2,
+                    status="active",
+                    first_seen_day=date(2026, 8, 12),
+                    last_confirmed_day=date(2026, 8, 12),
+                ),
+            ]
+        )
+        session.commit()
+
+        session.execute(text("DELETE FROM backtests WHERE run_id = :run_id"), {"run_id": run_id})
+        session.commit()
+        remaining = session.execute(
+            select(DailyLevelState).where(DailyLevelState.symbol_id.in_([live.id, backtest.id]))
+        ).scalars().all()
+        assert [(row.level_id, row.is_backtest, row.backtest_run_id) for row in remaining] == [
+            (f"{ticker}-LIVE", False, None)
+        ]
     finally:
         session.close()
         _clean(ticker)

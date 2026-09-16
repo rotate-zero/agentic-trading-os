@@ -617,3 +617,89 @@ async def test_backtest_runner_namespace_preserves_live_levels_and_repeat_runs_k
         "volatility_regime_score was 0.0 for at least one replayed candle — the exact "
         "decision #135 regression this test exists to catch."
     )
+
+
+RUN_ISOLATION_SYMBOL = "ZZD19RUN"
+
+
+@pytest.fixture()
+def _clean_run_isolation_symbol():
+    _clean_test_symbol(RUN_ISOLATION_SYMBOL)
+    yield
+    _clean_test_symbol(RUN_ISOLATION_SYMBOL)
+
+
+@_needs_db
+async def test_backtest_runs_keep_independent_daily_level_rows(_clean_run_isolation_symbol):
+    """Two runs of the identical scenario/ticker must never reconcile
+    through one another's Daily Levels rows. The first run's complete DB
+    state is snapshotted before run two starts, then compared afterward
+    including ``updated_at`` so even an otherwise value-identical UPDATE
+    is detected. Distinct row and level identities prove each run minted
+    its own state instead of carrying the prior run's identity forward."""
+    candles = load_scenario_candles("volume_gated_baseline")
+    first_day = get_market_clock().trading_day(candles[0].candle_ts)
+    provider = FixtureCandleProvider(
+        {
+            (RUN_ISOLATION_SYMBOL, "1m"): candles,
+            (RUN_ISOLATION_SYMBOL, "1d"): build_daily_history_candles(before=first_day),
+        }
+    )
+
+    async def run_once():
+        strategy = next(s for s in default_registry(datetime.now(timezone.utc)) if s.name == "Reversal")
+        return await BacktestRunner(
+            strategy=strategy,
+            symbol=RUN_ISOLATION_SYMBOL,
+            market_data_provider=provider,
+            start=candles[0].candle_ts,
+            end=candles[-1].candle_ts,
+            context_provider=FixtureBacktestContextProvider(),
+            data_version="d19-run-isolation",
+            feature_version="feature_engine_v1",
+        ).run()
+
+    def snapshot(run_id):
+        session = SessionLocal()
+        try:
+            rows = (
+                session.execute(
+                    select(DailyLevelState)
+                    .where(DailyLevelState.backtest_run_id == run_id)
+                    .order_by(DailyLevelState.id)
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                (
+                    row.id,
+                    row.level_id,
+                    float(row.price),
+                    row.strength,
+                    row.distinct_candle_count,
+                    row.status,
+                    row.first_seen_day,
+                    row.last_confirmed_day,
+                    row.archived_day,
+                    row.updated_at,
+                )
+                for row in rows
+            ]
+        finally:
+            session.close()
+
+    first = await run_once()
+    first_before_second_run = snapshot(first.run_id)
+    assert first_before_second_run
+
+    second = await run_once()
+    first_after_second_run = snapshot(first.run_id)
+    second_rows = snapshot(second.run_id)
+
+    assert first.run_id != second.run_id
+    assert first_after_second_run == first_before_second_run
+    assert second_rows
+    assert {row[0] for row in first_after_second_run}.isdisjoint(row[0] for row in second_rows)
+    assert {row[1] for row in first_after_second_run}.isdisjoint(row[1] for row in second_rows)
+    assert all(row[5] == "active" and row[8] is None for row in first_after_second_run + second_rows)

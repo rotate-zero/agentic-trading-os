@@ -10,6 +10,7 @@ ReplaySettleTimeout firing honestly rather than returning stale state.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
@@ -106,7 +107,10 @@ async def test_advance_to_settles_state_to_the_replayed_candle_ts_not_wall_clock
     start = datetime(2026, 1, 28, 14, 30, tzinfo=timezone.utc)  # real Wednesday, real FOMC date
     candles = _fixture_candles(3, start)
 
-    producer = EngineBackedReplayStateProducer(context_provider=FixtureBacktestContextProvider())
+    producer = EngineBackedReplayStateProducer(
+        context_provider=FixtureBacktestContextProvider(),
+        backtest_run_id=uuid4(),
+    )
     await producer.start()
     try:
         for candle in candles:
@@ -132,7 +136,10 @@ async def test_d17_snapshots_available_once_engines_installed_as_singleton():
     start = datetime(2026, 1, 28, 14, 30, tzinfo=timezone.utc)
     candle = _fixture_candles(1, start)[0]
 
-    producer = EngineBackedReplayStateProducer(context_provider=FixtureBacktestContextProvider())
+    producer = EngineBackedReplayStateProducer(
+        context_provider=FixtureBacktestContextProvider(),
+        backtest_run_id=uuid4(),
+    )
     await producer.start()
     try:
         # Before installation: the real capture functions must not
@@ -172,7 +179,10 @@ async def test_engine_singleton_guard_restores_prior_value_even_on_exception():
     import app.market_state_engine.engine as market_state_engine_module
 
     sentinel_prev = market_state_engine_module._market_state_engine
-    producer = EngineBackedReplayStateProducer(context_provider=FixtureBacktestContextProvider())
+    producer = EngineBackedReplayStateProducer(
+        context_provider=FixtureBacktestContextProvider(),
+        backtest_run_id=uuid4(),
+    )
 
     with pytest.raises(RuntimeError, match="boom"):
         async with install_replay_engines(
@@ -196,6 +206,7 @@ async def test_replay_settle_timeout_raised_honestly_not_stale_state_returned():
 
     producer = EngineBackedReplayStateProducer(
         context_provider=FixtureBacktestContextProvider(),
+        backtest_run_id=uuid4(),
         settle_timeout_seconds=0.001,  # shorter than MarketStateEngine's real 1.0s debounce floor
         settle_poll_interval_seconds=0.0005,
     )

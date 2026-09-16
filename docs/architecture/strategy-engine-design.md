@@ -870,6 +870,44 @@ all pre-existing, decision #134, unchanged by this delivery)
                                         is_holdout, created_at)
 ```
 
+**As-built note (decision #141) — D19 isolates Daily Levels state per backtest run without reopening D18.** Decision #140 correctly separated live and backtest symbol/Daily Levels rows, but direct execution found that two distinct runs of the same ticker still shared the one `is_backtest=True` active-row pool: run 2 reused all ten of run 1's database IDs and `level_id` values and advanced every row's `updated_at`. Migration `0010` adds nullable `daily_levels_state.backtest_run_id`; a database CHECK requires exactly `(live, NULL)` or `(backtest, non-NULL)`, and a real FK targets `backtests.run_id`. `BacktestRunner` already creates the UUID before constructing `EngineBackedReplayStateProducer`, so the identity now flows into `FeatureEngine` before any Daily Levels write. Reconciliation selects only the current run's active rows. The existing `(symbol_id, is_backtest, level_id)` unique constraint remains unchanged; the old `(symbol_id, status)` index is replaced by `(symbol_id, is_backtest, backtest_run_id, status)`, matching the actual predicate.
+
+```
+BacktestRunner.run()
+  run_id = uuid4()
+        │
+        ▼
+EngineBackedReplayStateProducer(backtest_run_id=run_id)
+        │
+        ▼
+FeatureEngine(is_backtest=True, backtest_run_id=run_id)
+        │
+        ├── provider fetch still runs every replay
+        │   (#140 restart-survival skip unchanged)
+        ▼
+daily_levels_state
+  symbol_id + is_backtest + backtest_run_id + status
+        │
+        ├── run A sees only run A active rows
+        └── run B sees only run B active rows
+```
+
+```
+DailyLevelState write
+        │
+        ▼
+CHECK origin/run pairing
+  live     ──► is_backtest=false AND backtest_run_id=NULL
+  backtest ──► is_backtest=true  AND backtest_run_id=<UUID>
+        │
+        ▼
+FK backtest_run_id ──► backtests.run_id ON DELETE CASCADE
+        │
+        └── deleting a run removes only its derived Daily Levels rows
+```
+
+The cascade is deliberate and narrower than `strategy_outcomes.backtest_run_id`'s migration-`0008` FK, which has the default `NO ACTION`: outcomes are durable analytical records, while these Daily Levels rows are derived run checkpoints. Current `backend/app` has no code path that deletes a `backtests` row, and no table has an FK to `daily_levels_state.id`, both confirmed directly before choosing the cascade. Migration `0010` deletes only pre-migration `is_backtest=True` Daily Levels rows because no honest run UUID can be reconstructed for them; it does not touch Market State, Level Interaction, candles, scanner-universe, fundamentals, or symbols. `_load_confirmed_daily_levels_for_today()` remains unreachable for backtest engines under #140's gate, but its query includes `backtest_run_id` anyway so a future restart-survival re-enable cannot silently restore another run's checkpoint.
+
 ---
 
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation
@@ -1048,6 +1086,7 @@ Everything above, connected — the learning loop this design is actually buildi
 | D16 | Remove the v1 strategies' now-redundant inline session GATE checks (`gap_strategy.py`, `momentum_strategy.py`, `volume_spike_strategy.py`'s explicit `MarketClock.is_regular_session()` calls), now that decision #118 makes `StrategyScheduler`/`gate_conditions.py` the sole enforcement authority | **Resolved — decision #119, a standalone cleanup pass per decision #118's own trigger condition (Saqib's direct call, not a deferral).** **Correction to this row's original framing:** only 3 strategies had a removable inline check, not 4 — `gap_strategy.py`, `momentum_strategy.py`, `volume_spike_strategy.py`. `orb_strategy.py` has no `is_regular_session()` call anywhere; its `minutes_since_open()` usage is load-bearing MATCH logic (opening-range formation timing), not a duplicate session gate, and `orb_strategy.py` was correctly left completely untouched, code-wise. The two-line inline check removed from each of the 3 files; `clock = get_market_clock()` stays live in all three (reused for `trading_day()`, and in Gap's case `minutes_since_open()` inside `match_direction()`). Each file's `default_config()` `gate_conditions` comment and module docstring's "Session scope" section updated to point to central `StrategyScheduler`/`gate_conditions.py` enforcement instead of claiming self-enforcement (Gap/Volume Spike had a stale `default_config()` comment claiming self-enforcement; Momentum did not have one to begin with — verified per-file, not assumed uniform). The 3 corresponding `test_outside_regular_session_never_fires` tests removed (not rewritten) — the behavior they asserted no longer exists at the strategy layer by design, and rewriting them to call `evaluate()` directly would re-legitimize the bypass path #118 closed; existing coverage in `test_gate_conditions.py` (10 tests) and `test_strategy_scheduler.py` (incl. a real-engine end-to-end case) already proves the real contract — an out-of-session candle never reaches a strategy's `evaluate()` at all. MATCH/SCORE/PROPOSE logic confirmed byte-for-byte unchanged in all three files via diff against an untouched clone. Full details: decision #119. |
 | D17 | §5 locks `market_state_at_entry`/`market_state_at_exit`/`context_at_entry`/`context_at_exit` (`StrategyOutcome`) as REQUIRED `dict` fields, but `state_snapshot.py`'s (#98) `capture_market_state_snapshot()`/`capture_context_snapshot()` can each honestly return `None` on a cold-start symbol — a real gap between a locked persistence contract and its own upstream capture behavior | **Open, deliberately not resolved by decision #120.** Surfaced while building `strategy_outcomes`' persistence layer (#120): that task's own scope is implementing §5 exactly as locked, not revising it, so all four fields stay required, exactly as §5 states — `state_snapshot.py`'s `StrategyOutcomeSnapshots` is likewise untouched. The gap is real, not hypothetical: whichever future module wires a real caller to `record_strategy_outcome()` (Execution Engine/Position Monitor) will need to either (a) only call it once both snapshots are confirmed non-`None`, or (b) trigger a real revisit of §5's nullability. Not decided here, and no code anywhere resolves it either way yet — this row exists so it's found deliberately, not rediscovered as a bug once a real caller is finally built. |
 | D18 | Backtest replay writes real `symbols`/`daily_levels_state` rows under an arbitrary caller-supplied `symbol` label, with no `is_backtest` flag on either table — surfaced building decision #135's historical-provider seam | **Resolved — decision #140. Real live/backtest namespacing is built.** `symbols` and `daily_levels_state` now carry `is_backtest`; `symbols` identifies a ticker by `(ticker, is_backtest)`, and `daily_levels_state` uses a composite `(symbol_id, is_backtest)` foreign key so a checkpoint cannot be attached to a symbol in the opposite namespace. The run-scoped Feature, Market State, and Level Interaction engines use `is_backtest=True`; all nine production files found by a fresh grep of actual `Symbol.ticker` call sites explicitly select `is_backtest=False` on the live path: `feature_engine/engine.py`, `market_state_engine/engine.py`, `trading_intelligence/level_interaction_engine.py`, `scanner/universe.py`, `services/candle_recorder.py`, `services/candle_store.py`, `context_engine/engine.py`, `context_engine/fundamentals_refresh.py`, and `context_engine/providers/fundamentals.py`. Backtest Feature Engines also bypass live restart-survival recovery at the start of each run, forcing the replay's provider fetch to repopulate the raw daily-candle cache; identical repeat runs therefore retain non-zero `volume_regime_score`/`volatility_regime_score`. Option (c), real namespacing, was chosen over option (b), `finally` cleanup. Inspection showed cleanup was not actually the smaller change: a replay-created `symbols` row is referenced by Daily Levels, Market State, Level Interaction, candles, scanner-universe, and fundamentals tables, so deleting it requires a cross-table cascade; a colliding live symbol also requires snapshot-and-restore of rows reconciliation updates or archives, remains contaminated while the replay is running, can overwrite concurrent live changes during restoration, and is left contaminated if the process dies before `finally`. Namespacing prevents the collision at write/read time instead. Migration `0009` backfills existing rows to live (`false`) and removes replay-derived namespace rows on downgrade because the legacy one-row-per-ticker schema cannot represent them. Verified against real PostgreSQL: baseline 728 passed/0 failed; final 737 passed/0 failed; `0009 → 0008 → 0009` round-trip passed; a same-ticker live sentinel remained unchanged across two identical replays while both runs retained non-zero regime scores; fresh-main overlay showed exactly 19 changed files, all under `backend/`. This resolution unblocks the pre-market async-prewarm fix and the D4 readiness check. |
+| D19 | Decision #140 isolates live state from backtest state, but `daily_levels_state` still used one shared `is_backtest=True` active-row pool for every run of the same ticker — found by direct two-run execution after #140 | **Resolved — decision #141.** `daily_levels_state.backtest_run_id` now scopes every replay reconciliation to its own `backtests.run_id`; `BacktestRunner` threads the UUID through `EngineBackedReplayStateProducer` into `FeatureEngine`. PostgreSQL enforces exactly `(live, NULL)` or `(backtest, non-NULL)` and enforces the run FK with `ON DELETE CASCADE`; the cascade is intentional for derived checkpoints and differs from durable `strategy_outcomes`' default `NO ACTION` FK. The existing level-identity unique constraint is unchanged. The reconciliation index now matches `(symbol_id, is_backtest, backtest_run_id, status)`. Migration `0010` removes only legacy backtest Daily Levels rows that cannot be assigned honestly; no Symbol or other symbol-dependent table changes. `_load_confirmed_daily_levels_for_today()` also filters by run ID despite being unreachable for backtests today, preventing an inconsistent future restart-survival re-enable. Two identical runs now mint disjoint row/level IDs and leave run 1 byte-for-value unchanged; #140's existing regression still passes unchanged. |
 
 ---
 

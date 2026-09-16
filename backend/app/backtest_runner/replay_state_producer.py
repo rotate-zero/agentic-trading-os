@@ -45,6 +45,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import UUID
 
 from app.backtest_runner.context_provider import BacktestContextProvider
 from app.broker_adapters.base import Candle
@@ -172,12 +173,19 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
     `ReplayStateProducer` seam existing so that future work doesn't
     require touching `BacktestRunner` at all) — not something this task
     solves by redesigning `DebounceScheduler`.
+
+    ``backtest_run_id`` is required at construction and passed only to
+    Feature Engine, whose Daily Levels checkpoint is run-scoped. Market
+    State and Level Interaction retain decision #140's live/backtest
+    namespace because neither table is part of Daily Levels identity
+    reconciliation and this change does not alter their schemas.
     """
 
     def __init__(
         self,
         *,
         context_provider: BacktestContextProvider,
+        backtest_run_id: UUID,
         settle_timeout_seconds: float = 5.0,
         settle_poll_interval_seconds: float = 0.05,
     ) -> None:
@@ -186,7 +194,11 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
         self._settle_poll_interval = settle_poll_interval_seconds
 
         self.bus = EventBus()
-        self.feature_engine = FeatureEngine(self.bus, is_backtest=True)
+        self.feature_engine = FeatureEngine(
+            self.bus,
+            is_backtest=True,
+            backtest_run_id=backtest_run_id,
+        )
         self.level_interaction_engine = LevelInteractionEngine(self.bus, is_backtest=True)
         self.market_state_engine = MarketStateEngine(self.bus, is_backtest=True)
         providers, symbol_providers = context_provider.build_engine_providers()

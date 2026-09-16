@@ -93,6 +93,11 @@ domain object; only database symbol identity is separated, so strategy
 behavior and persisted outcome labels remain unchanged while live
 `symbols`/Daily Levels/Market State/Level Interaction rows stay
 untouched.
+
+**Backtest Daily Levels run isolation.** `run_id` is generated before
+the replay producer is constructed and is passed into it. Feature Engine
+uses that UUID for every backtest `daily_levels_state` read and write, so
+two runs of the same ticker cannot reconcile through one another's rows.
 """
 from __future__ import annotations
 
@@ -299,7 +304,10 @@ class BacktestRunner:
         sweep_id = uuid4()  # "a sweep of one" — see this task's earlier design note, confirmed
         config_hash = _compute_config_hash(self._strategy.config.gate_conditions, self._strategy.config.params)
 
-        producer = EngineBackedReplayStateProducer(context_provider=self._context_provider)
+        producer = EngineBackedReplayStateProducer(
+            context_provider=self._context_provider,
+            backtest_run_id=run_id,
+        )
         discarded: list[DiscardedSignal] = []
         recorded = 0
         pending: _PendingTrade | None = None

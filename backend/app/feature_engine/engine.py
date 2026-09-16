@@ -161,6 +161,7 @@ import logging
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -230,9 +231,15 @@ class FeatureEngine:
         kama_configs: list[dict] | None = None,
         kama_seed_multiplier: int | None = None,
         is_backtest: bool = False,
+        backtest_run_id: UUID | None = None,
     ) -> None:
+        if is_backtest != (backtest_run_id is not None):
+            raise ValueError(
+                "FeatureEngine requires backtest_run_id exactly when is_backtest=True"
+            )
         self._bus = bus
         self._is_backtest = is_backtest
+        self._backtest_run_id = backtest_run_id
         self._sma_periods = sma_periods if sma_periods is not None else get_settings().feature_engine_sma_periods
         self._ema_periods = ema_periods if ema_periods is not None else get_settings().feature_engine_ema_periods
         self._ema_seed_multiplier = (
@@ -813,6 +820,13 @@ class FeatureEngine:
         result — a bounded, one-time-per-restart inefficiency for a rare
         edge case, not a correctness bug, and not worth a second query
         against archived_day to close.
+
+        The caller currently invokes this only for live engines (the
+        ``if not self._is_backtest`` gate in
+        ``_maybe_refresh_daily_levels``), but the query still includes
+        ``backtest_run_id`` deliberately. Live engines bind NULL; if
+        restart-survival is ever re-enabled for replay, the method is
+        already incapable of restoring a different run's checkpoint.
         """
         session = SessionLocal()
         try:
@@ -830,6 +844,7 @@ class FeatureEngine:
                     .where(
                         DailyLevelState.symbol_id == symbol_id,
                         DailyLevelState.is_backtest.is_(self._is_backtest),
+                        DailyLevelState.backtest_run_id == self._backtest_run_id,
                         DailyLevelState.status == "active",
                         DailyLevelState.last_confirmed_day == today,
                     )
@@ -870,6 +885,10 @@ class FeatureEngine:
         fresh row's DB identity. Any active row that matched nothing gets
         archived (status/archived_day set), not deleted — design doc §4's
         own "unmatched survivor is archived, not deleted" language.
+
+        For live engines, ``backtest_run_id`` is NULL. For replay engines,
+        it is the current runner's UUID, so the active pool contains only
+        this run's rows and a later replay cannot update or archive them.
         """
         session = SessionLocal()
         try:
@@ -879,6 +898,7 @@ class FeatureEngine:
                     select(DailyLevelState).where(
                         DailyLevelState.symbol_id == symbol_id,
                         DailyLevelState.is_backtest.is_(self._is_backtest),
+                        DailyLevelState.backtest_run_id == self._backtest_run_id,
                         DailyLevelState.status == "active",
                     )
                 )
@@ -918,6 +938,7 @@ class FeatureEngine:
                     new_row = DailyLevelState(
                         symbol_id=symbol_id,
                         is_backtest=self._is_backtest,
+                        backtest_run_id=self._backtest_run_id,
                         level_id="",  # placeholder — real id derived from this row's own PK right after flush, below
                         price=cluster.price,
                         strength=cluster.strength,

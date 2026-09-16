@@ -22,9 +22,25 @@ doc §4's own "unmatched survivor is archived, not deleted" language).
 """
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Boolean, Date, ForeignKeyConstraint, Identity, Integer, Numeric, String, UniqueConstraint, false, func
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Date,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Identity,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    false,
+    func,
+)
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -49,11 +65,26 @@ class DailyLevelState(Base):
         UniqueConstraint(
             "symbol_id", "is_backtest", "level_id", name="uq_daily_level_state_symbol_namespace_level_id"
         ),
+        CheckConstraint(
+            "(is_backtest IS FALSE AND backtest_run_id IS NULL) OR "
+            "(is_backtest IS TRUE AND backtest_run_id IS NOT NULL)",
+            name="ck_daily_levels_state_origin_run_pair",
+        ),
+        Index(
+            "ix_daily_levels_state_reconcile_scope",
+            "symbol_id",
+            "is_backtest",
+            "backtest_run_id",
+            "status",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     symbol_id: Mapped[int] = mapped_column(Integer, nullable=False)
     is_backtest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("backtests.run_id", ondelete="CASCADE"), nullable=True
+    )
     level_id: Mapped[str] = mapped_column(String(64), nullable=False)
 
     price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
