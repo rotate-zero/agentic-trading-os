@@ -411,12 +411,18 @@ export async function fetchStrategyOutcomes(
 
 // Matches GET /intelligence/backtest-runs's response shape (decision
 // #136). Field names/types copied directly from `schemas/performance.py`'s
-// `BacktestRun` (re-verified against that file's current contents) — same
-// "route validates every ORM row through the exact Pydantic contract
-// before returning it" posture `StrategyOutcomeWireShape` above documents
-// for its own sibling route. `run_id`/`sweep_id` serialize as plain
-// strings (JSON has no UUID type); `date_range_start`/`date_range_end` as
-// "YYYY-MM-DD"; `created_at` as a full ISO 8601 string.
+// `BacktestRun` (re-verified against that file's current contents) — the
+// route validates every ORM row through that exact Pydantic contract
+// before returning it (`model_validate(row, from_attributes=True).
+// model_dump(mode="json")`), same posture StrategyOutcomeWireShape's own
+// comment above already documents for its route. `run_id`/`sweep_id`
+// serialize as plain strings (JSON has no UUID type); `date_range_start`/
+// `date_range_end` as "YYYY-MM-DD"; `created_at` as a full ISO 8601
+// string. This is run-LEVEL metadata (one row per backtest run) — a
+// different table (`backtests`) and a different granularity than
+// StrategyOutcomeWireShape above (one row per closed trade a run
+// produced); the two are related only via `run_id`/`backtest_run_id`,
+// never merged into one shape.
 export interface BacktestRunWireShape {
   run_id: string;
   sweep_id: string;
@@ -438,28 +444,25 @@ export interface BacktestRunsWireShape {
 }
 
 /**
- * GET /intelligence/backtest-runs — decision #136. Raw recent-rows read
- * over `backtests`, most recent `created_at` first, capped by `limit`
- * (backend default 50 when omitted, hard cap 500 — same
- * `Query(default, le=cap)` convention as fetchStrategyOutcomes's `limit`
- * above). `run_id` is an exact match on the primary key (at most one row
- * can ever come back for a given `run_id`); `strategyName`/`sweepId`
- * narrow further, all three AND-combined, never blended, per the route's
- * own docstring. `run_id`/`sweep_id` are real UUID columns — a malformed
- * value for either is a 400 (surfaced here as a thrown `ApiError`, not a
- * silently-empty result), same posture fetchStrategyOutcomes already
- * takes for a malformed `backtestRunId`.
+ * GET /intelligence/backtest-runs (decision #136) — this table's first
+ * frontend reader. Newest-first by `created_at`, capped by `limit`
+ * (backend default 50, hard cap 500 — same `Query(default, le=cap)`
+ * convention `fetchStrategyOutcomes`'s own `limit` already follows).
+ * `runId`/`strategyName`/`sweepId` are independent, optional, AND-combined
+ * filters, matching the route's own filter semantics exactly — same
+ * conditional-append query construction `fetchStrategyOutcomes` above
+ * already uses, not a new pattern. `runId`/`sweepId` are real UUID
+ * columns server-side; a malformed value for either throws `ApiError`
+ * with the backend's real 400 detail (surfaced, not swallowed), same
+ * posture `fetchStrategyOutcomes` already takes for a malformed
+ * `backtestRunId`.
  *
- * Kept as four independent, individually-optional positional params
- * rather than a filters object — this function has exactly one caller
- * today (`useBacktestRunMeta.ts`), so an object-shape rewrite would be
- * pure restructuring with no caller it actually helps, the same "smallest
- * change that fits" reasoning fetchStrategyOutcomes's own comment gives
- * for its own positional shape (its closest sibling route/function).
- *
- * `backtests` has real, persisted rows as of decision #128 — an empty
- * `backtest_runs` array is still the honest, expected response on a
- * genuinely empty table or non-matching filter, not an error.
+ * `run_id` is `BacktestRunRecord`'s own primary key (confirmed directly
+ * against `backend/app/models/trading_intelligence.py`), so passing
+ * `runId` alone can only ever resolve zero or one row — the shape this
+ * function's one real caller (`useBacktestRuns.ts`) relies on to treat
+ * `backtest_runs[0]` as "the" run rather than picking arbitrarily from a
+ * genuine list.
  */
 export async function fetchBacktestRuns(
   limit?: number,

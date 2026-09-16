@@ -1,34 +1,65 @@
-# Backtest run metadata surfacing — verification
+# TESTING — decision #139 (surface-backtest-runs-metadata)
 
-The inherited `TESTING.md` was deleted before this task-specific record was written.
+Frontend-only delivery. No backend files touched, no migration, no API-contract change — `GET /intelligence/backtest-runs` (decision #136) is consumed exactly as it already exists.
 
-## Rebase note
+## No frontend test framework
 
-This delivery was originally verified against `main` commit `6bb7189`. Before packaging, `main` had moved to `6d1b3ce` ("Doc Sequence edited" — reordered decisions #135/#137 into strict numeric sequence in `confirmed-decisions.md`, normalized their heading style, and backfilled #138's own `CHANGES.md`; no code changed, `INDEX.md` untouched). All three of this delivery's own code files, `docs/decisions/INDEX.md`, and `docs/architecture/strategy-engine-design.md` were confirmed byte-identical between `6bb7189` and `6d1b3ce` (direct `diff`, not assumed), so none needed rebasing. Only `docs/decisions/confirmed-decisions.md`'s append point moved; that file's own entry was rebased onto the corrected version. `tsc -b`/`vite build` were re-run on the final, rebased tree (below) rather than trusting the pre-rebase run.
+Confirmed, not assumed: no `vitest`/`jest`/any test runner in `frontend/package.json`'s `devDependencies`, no `*.test.*` or `*.spec.*` file anywhere under `frontend/src/`. Consistent with every prior frontend-only delivery in this log (#123, #137, #138). Verification below is direct source trace of the actual shipped logic, same posture those deliveries already took — not a placeholder for tests that should exist.
 
-## Untouched GitHub `main` baseline
+## Source-trace verification
 
-Fresh `main` clone (`git clone --depth 1`, commit `6d1b3ce`) via `npm install`d frontend dependencies fresh.
+**`fetchBacktestRuns()` (`api-client.ts`)** — traced against `GET /intelligence/backtest-runs`'s real implementation (`backend/app/api/routes/intelligence.py`) and its `BacktestRun` schema (`backend/app/schemas/performance.py`), both re-read in full this session, not from memory:
+- Query params (`limit`, `run_id`, `strategy_name`, `sweep_id`) conditionally appended only when defined, matching `fetchStrategyOutcomes`'s established pattern and the route's own optional/AND-combined filter semantics exactly.
+- Non-2xx → `ApiError` with the real backend detail, never swallowed.
+- Every `BacktestRunWireShape` field name/type checked one-for-one against `BacktestRun`'s current field list — no invented or stale field.
 
-- `cd frontend && npx tsc -b` — exit 1, exactly four decision #35 `GridPresetPicker.tsx` errors: missing `GRID_PRESETS`, missing `preset`, missing `setPreset`, and implicit-any `p`.
-- `cd frontend && npx vite build` — exit 0, 90 modules transformed.
+**`useBacktestRuns.ts`**:
+- `runId === undefined` → no fetch issued, `backtestRun`/`error` both `null`, `loading` `false`. Traced directly in `load()`'s early return — confirmed no network call is constructible in this branch.
+- `runId` defined → fetch issued with `runId` only (`limit`/`strategyName`/`sweepId` all `undefined`), consistent with the route resolving to exactly the rows matching that single `run_id`.
+- Success path: `backtestRun = wire.backtest_runs[0] ?? null`. Safe because `run_id` is `BacktestRunRecord`'s own primary key (confirmed directly against `backend/app/models/trading_intelligence.py`'s column definition, not assumed) — the array can only ever hold 0 or 1 element when filtered by `run_id` alone.
+- Error path: `ApiError` message surfaced as `error`; `backtestRun` reset to `null` (never left stale from a previous, different `runId`).
+- `runId` change mid-flight: `cancelled` flag set on cleanup, stale in-flight responses discarded — same pattern `useBacktestOutcomes.ts` already uses for its own equivalent race.
 
-## Changed tree (post-rebase)
+**`RunMetadataCard` (`BacktestResultsPanel.tsx`)**:
+- Only rendered when `appliedRunId` is truthy (traced at the call site inside `BacktestResultsBody`'s render) — the "everything" default view renders nothing new.
+- Four mutually-exclusive render branches confirmed structurally exhaustive: `loading` → `error` → `!backtestRun` (empty) → populated fields grid. No branch can silently render nothing when data is actually present or actually missing.
+- Fields grid traced field-by-field against `BacktestRunWireShape`: all 11 non-`run_id` fields rendered (`run_id` itself omitted from the grid since it's already shown verbatim in the filter bar's own "Showing run_id=..." line directly above, confirmed at the call site — not omitted by oversight).
+- `walk_forward_fold === null` renders `"—"`, matching this codebase's existing null-field convention (`OutcomeDetail`'s own optional-field rendering, same file).
 
-- `cd frontend && npx tsc -b` — exit 1, the identical four `GridPresetPicker.tsx` errors and no new TypeScript errors.
-- `cd frontend && npx vite build` — exit 0, 91 modules transformed (exactly +1, the new `useBacktestRunMeta.ts` hook file).
+## Build verification
 
-## Manual verification — no frontend test framework exists in this codebase
+Baseline established on a freshly re-pulled, untouched `main` (`git stash` this delivery's changes, not a separate clone, per this project's "re-pull rather than re-clone within a session" convention):
 
-Confirmed by grep (no `vitest`/`jest` dependency, no `*.test.*` file anywhere under `frontend/`), consistent with every prior frontend-only decision's own note. Verified by direct source trace instead:
+```
+npx tsc -b
+```
+→ exactly the 4 known, pre-existing `GridPresetPicker.tsx` errors (`#35` baseline — `GRID_PRESETS` export, `preset`/`setPreset` properties, one implicit-`any` parameter). Confirmed pre-existing on untouched `main`, not attributed to this delivery without that check.
 
-- **Query construction (`fetchBacktestRuns`)** — `limit`/`run_id`/`strategy_name`/`sweep_id` are each appended to the query string only when defined, matching `fetchStrategyOutcomes`'s own conditional-append pattern; traced against all 2^4 presence/absence combinations by inspection, none conflict.
-- **`useBacktestRunMeta` reactivity** — `useEffect`'s dependency array is `[runId]`; an empty/undefined `runId` short-circuits before any fetch and resets `run`/`loading`/`error` to their absent state, so clearing the panel's filter correctly clears the banner rather than leaving a stale prior run's metadata on screen.
-- **Three-state rendering (`RunMetaBanner`)** — traced each of loading / error / absent (`run === null`, no error) / present against the component's own conditional JSX; each renders mutually exclusively, and only the present state renders the expand toggle.
-- **run_id linkage** — confirmed `RunMetaBanner`'s `runId` prop is always `BacktestResultsBody`'s own `appliedRunId` (the same value passed to `useBacktestOutcomes`'s `backtestRunId` param), so the banner and the outcomes list can never show two different runs at once, in both auto (following `lastBacktestRunId`) and manual (typed/cleared) filter modes.
+This delivery's tree, same command:
+```
+npx tsc -b
+```
+→ **identical 4 errors, zero new.**
 
-No running backend/Postgres was available in this delivery's own environment to exercise the full round trip end-to-end (matching decision #137's own note for the same reason).
+```
+npx vite build
+```
+→ clean, `dist/` build artifact removed afterward (not part of the delivery).
 
-## Boundary comparison
+`frontend/tsconfig.tsbuildinfo` (a tracked build-cache artifact, not this delivery's own content) was reverted to its committed state after the `tsc -b` runs — not included in this delivery's diff.
 
-Immediately before packaging: `main` re-fetched (`6d1b3ce`, confirmed current), and `diff -rq --exclude=.git --exclude=node_modules --exclude=dist --exclude='*.tsbuildinfo'` run against a fresh clone of it. Task changes found in exactly: `frontend/src/services/api-client.ts`, `frontend/src/components/backtest-results/BacktestResultsPanel.tsx`, `frontend/src/hooks/useBacktestRunMeta.ts` (new), `docs/architecture/strategy-engine-design.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, `CHANGES.md`, and this `TESTING.md` replacement — nothing else. Nothing under `backend/` touched.
+## Footprint (confirmed by `diff -rq` against a freshly re-pulled clone immediately before packaging)
+
+Modified:
+- `frontend/src/services/api-client.ts`
+- `frontend/src/components/backtest-results/BacktestResultsPanel.tsx`
+- `docs/architecture/strategy-engine-design.md`
+- `docs/decisions/confirmed-decisions.md`
+- `docs/decisions/INDEX.md`
+
+New:
+- `frontend/src/hooks/useBacktestRuns.ts`
+- `TESTING.md` (this file)
+- `CHANGES.md`
+
+Confirmed untouched: everything under `backend/`, any migration, `WorkspaceContext.tsx`, `useBacktestOutcomes.ts`, `useStrategyOutcomes.ts`, and every other frontend file not listed above.
