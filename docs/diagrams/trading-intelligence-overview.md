@@ -174,4 +174,4 @@ flowchart TD
 
 The outcome schema, capture function, write path, and read queries exist; live fill and exit callers do not.
 
-Detailed contracts: [trading intelligence architecture](../architecture/trading-intelligence-architecture.md), [system design](../architecture/system-design.md), [Daily Levels design](../architecture/daily-levels-design.md), and [strategy design](../architecture/strategy-engine-design.md).
+Detailed contracts: [trading intelligence architecture](../architecture/trading-intelligence-architecture.md), [system design](../architecture/system-design.md), [Daily Levels design](../architecture/daily-levels-design.md), and [strategy design](../architecture/strategy-engine-design.md) (plus its siblings [backtest runner design](../architecture/backtest-runner-design.md), [open decisions](../architecture/strategy-engine-open-decisions.md), and [build history](../architecture/strategy-engine-build-history.md)).

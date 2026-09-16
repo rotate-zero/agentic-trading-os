@@ -1,36 +1,29 @@
-# TESTING — decision #141 (D19 Daily Levels run isolation)
+# TESTING — decision #142 (architecture doc rollover: strategy-engine-design.md split into four files)
 
-All database validation used real local PostgreSQL.
+No application tests apply — this is a documentation-only reorganization, no `backend/`/`frontend/` code changed. Per Saqib's own instruction, verification here is programmatic and structural rather than a test suite.
 
-## Empirical confirmation
+## Pre-work verification
 
-Before implementation, two identical runs generated distinct `run_id` values but reused all ten Daily Levels database IDs and `level_id` values. Every row's `updated_at` advanced during run 2. No row archived because the identical fixture matched every cluster; the same shared active-row pool fed the existing unmatched-row archive loop.
+- Fresh `git clone --depth 1` at the start of this task, and a second fresh clone immediately before assigning the decision number, both landing on the same commit (`7311671`) — confirms no parallel session moved past decision #141 during this work.
+- Three-source decision-number check (`confirmed-decisions.md` tail, `INDEX.md` tail, `docs/decisions/archive/` file list) run twice — once at task start, once immediately before assignment — both times agreeing on `#141` as latest, `#142` as next available.
+- Repo-wide grep for every reference to `strategy-engine-design.md` (86 hits) before making any change, and specifically for markdown anchor links (`.md#...`) and line-number-style references — zero of either found anywhere in the repo, which is why no clickable link needed repair, only prose citations.
 
-Decision #140's unchanged regression passed during this investigation, confirming its live/backtest isolation and non-zero repeat-run regime-score guarantees still held.
+## Split correctness — proven programmatically, not by inspection
 
-## Full-suite comparison
+A Python script located every `## N.` top-level header by regex (not hand-counted line numbers), computed exact `[start, end)` line ranges for §0–§18, and used those ranges for every extraction and every check below:
 
-- Fresh pre-change database through migration `0009`: `737 passed, 0 failed` in 552.38s.
-- Fresh final database through migration `0010`: `741 passed, 0 failed` in 788.11s.
-- The four-test increase covers Feature Engine constructor pairing, the database CHECK's two invalid combinations, cascading deletion, and two-run end-to-end isolation.
+1. **Coverage:** `sorted(core_sections + moved_sections) == list(range(19))` — every section 0–18 appears in exactly one of the four output files; none missing, none duplicated.
+2. **Byte-identical moved bodies:** for §7, §10, and §14–§18, `raw_original_section in new_file_content` and `new_file_content.endswith(raw_original_section)` — the moved content is a literal Python substring check, not a visual diff, confirming zero edits inside any moved body.
+3. **Full reconstruction:** concatenating `raw(0)` through `raw(18)` in original order reproduces the original file's body **exactly** (`==`, not diff) — proves the split didn't drop or duplicate so much as one byte anywhere across all four output files combined.
+4. **Kept-content integrity:** the 21 internal citation fixes applied to the retained core file were captured as an explicit (old_string, new_string) list; each target was asserted to match **exactly once** before being applied. Reversing all 21 fixes on the final core-file content and comparing to the raw, unedited concatenation of its kept sections (§0–§6, §8–§9, §11–§13) produces an **exact** match — proves no other edit landed anywhere in the 66KB of retained content beyond the 21 approved, reviewed fixes.
 
-## Focused verification
+## Reference-update verification
 
-- New two-run regression: `1 passed` in 237.08s. Two identical ticker/scenario runs produced disjoint database IDs and `level_id` values; every run-1 field, including `updated_at`, remained unchanged after run 2; neither run's rows were archived.
-- Existing #140 live-sentinel/non-zero-regime regression passed unchanged.
-- Daily Levels, replay producer, and namespace modules: `30 passed`.
-- Namespace module after adding the database invariant and cascade checks: `11 passed`; final module count is 12 with the constructor-pairing test.
-- Python compilation and `git diff --check -- backend` passed.
+- Repo-wide grep for `strategy-engine-design.md §(7|10|14|15|16|17|18)` across the five living docs plus the new core file itself, after all edits: zero matches — confirms no stale citation to a moved section remains anywhere it was in scope to fix.
+- Confirmed via `git diff --stat` that `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, `docs/decisions/archive/*.md`, `docs/decisions/future-ideas.md`, `docs/roadmap/phase-roadmap.md`, and `docs/README.md` show **zero** diff from this delivery (the first three deliberately, as immutable decision content; the latter three because their existing citations needed no change).
+- A repo-wide Python markdown-link resolver (walks every `.md` file under `docs/`, resolves every relative `](...)` link against the filesystem) found exactly one broken link in the whole tree: a pre-existing relative-path bug inside immutable `docs/decisions/archive/001-060.md`, confirmed via `git diff --stat` to be untouched by this delivery — zero broken links introduced.
 
-## Migration round-trip
+## Final review
 
-The `0010` fixture contained same-ticker live and backtest Daily Levels rows plus the referenced `backtests` row.
-
-1. `alembic downgrade 0009` succeeded. `backtest_run_id`, its FK/CHECK, and the widened index disappeared; the old `(symbol_id, status)` index returned; both Daily Levels rows remained.
-2. `alembic upgrade head` succeeded. The live row remained with `backtest_run_id=NULL`; only the unassignable legacy backtest Daily Levels row was removed; its unrelated `backtests` row remained; the FK, CHECK, and widened index returned.
-
-## Safety and footprint
-
-Source inspection confirmed `backend/app` has no code path that deletes a `backtests` row and no table has an FK to `daily_levels_state.id`. Migration `0010` contains no mutation of Market State, Level Interaction, candles, scanner-universe, fundamentals, or symbols.
-
-The implementation changes eight backend files: one new migration; four runtime/model files; and three test files. Documentation changes are limited to `docs/architecture/strategy-engine-design.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, `TESTING.md`, and `CHANGES.md`. A fresh-main overlay compared by `diff -rq` produced exactly these 13 files. Nothing under `frontend/` changed.
+- `git status --short`: 4 files modified (`strategy-engine-design.md`, `system-design.md`, `trading-intelligence-architecture.md`, `trading-intelligence-overview.md`), 3 files created (`backtest-runner-design.md`, `strategy-engine-open-decisions.md`, `strategy-engine-build-history.md`), plus this decision/`INDEX.md`/`CHANGES.md`/`TESTING.md` — nothing else.
+- `git diff --stat`: 40 insertions, 928 deletions across the 4 modified files (the deletions are §7/§10/§14–18 leaving the core file; the new files carry that content forward, not shown as "changed" since they're new).

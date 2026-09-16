@@ -1,9 +1,19 @@
 # Strategy Engine — Design & Lifecycle
-**Status:** Built — all seven v1 strategies complete and wired end-to-end (decisions #99, #104, #105, #109, #110, #113 for the strategies themselves — #99 built `base_strategy.py` plus ORB, #113's "closing out the full planned set" is the completion point; decisions #114–#117 for the Scheduler + `gate_conditions` enforcement that dispatches them; see §12's Staged plan below and §14–§18 for the full build accounts). `strategy_engine/` is a real, substantial module — verified directly against the repository: `base_strategy.py`, seven strategy files (`orb_strategy.py`, `gap_strategy.py`, `volume_spike_strategy.py`, `first_pullback_strategy.py`, `reversal_strategy.py`, `momentum_strategy.py`, `vwap_strategy.py`), plus `scheduler.py`, `gate_conditions.py`, `scoring_utils.py`, `level_touch_tracking.py`. This plan's separately-scoped Backtest Runner extension (§7) is also built — see §7 for its own full account and citations, not repeated here. Decision Engine's and Governor's evidence-informed arbitration/derating (§6) remain the target shape only, not yet built — confirmed directly, no corresponding module exists under `backend/app/`. **Originally Stage 0 only** (`confirmed-decisions.md` #87, refined by #88 — concept locked across a two-round review, Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly, same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59; §8's timing model went through a further two-round refinement, ChatGPT's "opportunity lifecycle" critique → Claude's schema-gap findings → ChatGPT's "ACT/WAIT/ABANDON, not bar-close" correction, adopted). This line previously read "No application code has been written yet — `strategy_engine/` doesn't exist anywhere in the repo," true when originally written, stale since decisions #99–#117 landed; corrected here.
+**Status:** Built — all seven v1 strategies complete and wired end-to-end (decisions #99, #104, #105, #109, #110, #113 for the strategies themselves — #99 built `base_strategy.py` plus ORB, #113's "closing out the full planned set" is the completion point; decisions #114–#117 for the Scheduler + `gate_conditions` enforcement that dispatches them; see §12's Staged plan below and `strategy-engine-build-history.md`'s §14–§18 for the full build accounts). `strategy_engine/` is a real, substantial module — verified directly against the repository: `base_strategy.py`, seven strategy files (`orb_strategy.py`, `gap_strategy.py`, `volume_spike_strategy.py`, `first_pullback_strategy.py`, `reversal_strategy.py`, `momentum_strategy.py`, `vwap_strategy.py`), plus `scheduler.py`, `gate_conditions.py`, `scoring_utils.py`, `level_touch_tracking.py`. This plan's separately-scoped Backtest Runner extension is also built — see `backtest-runner-design.md`'s §7 for its own full account and citations, not repeated here. Decision Engine's and Governor's evidence-informed arbitration/derating (§6) remain the target shape only, not yet built — confirmed directly, no corresponding module exists under `backend/app/`. **Originally Stage 0 only** (`confirmed-decisions.md` #87, refined by #88 — concept locked across a two-round review, Saqib + Claude, with a consulted ChatGPT review of that same write-up incorporated directly, same reviewed-external-opinion pattern Daily Levels used with Grok, decision #59; §8's timing model went through a further two-round refinement, ChatGPT's "opportunity lifecycle" critique → Claude's schema-gap findings → ChatGPT's "ACT/WAIT/ABANDON, not bar-close" correction, adopted). This line previously read "No application code has been written yet — `strategy_engine/` doesn't exist anywhere in the repo," true when originally written, stale since decisions #99–#117 landed; corrected here.
 **Owner:** Saqib
-**Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) (§8 Strategy Engine, §9 Opportunity Engine, §10 Decision Engine, §11 Trade Planning Engine, §12 Governor, §14 Performance Intelligence — every section this plan extends, not replaces), [`system-design.md`](./system-design.md) (§4.5 Feature Engine — the sole data source every strategy reads; §4.8's `Strategy`/`Opportunity` interfaces, extended in §4 below), [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#5 Replay Engine — the interface §7's Backtest Runner reuses; #7 TimescaleDB trigger — checked, not yet hit; #11 `governor/position_sizing.py` — the eventual home for §6's Governor extension; #20 Time-to-Target Estimator — the eventual source of a temporal expectation on `Opportunity`/`StrategyConfig` (§3/§4), deferred pending real `StrategyOutcome` data), [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#87 — this plan's own direction lock).
+**Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) (§8 Strategy Engine, §9 Opportunity Engine, §10 Decision Engine, §11 Trade Planning Engine, §12 Governor, §14 Performance Intelligence — every section this plan extends, not replaces), [`system-design.md`](./system-design.md) (§4.5 Feature Engine — the sole data source every strategy reads; §4.8's `Strategy`/`Opportunity` interfaces, extended in §4 below), [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#5 Replay Engine — the interface `backtest-runner-design.md`'s §7 Backtest Runner reuses; #7 TimescaleDB trigger — checked, not yet hit; #11 `governor/position_sizing.py` — the eventual home for §6's Governor extension; #20 Time-to-Target Estimator — the eventual source of a temporal expectation on `Opportunity`/`StrategyConfig` (§3/§4), deferred pending real `StrategyOutcome` data), [`backtest-runner-design.md`](./backtest-runner-design.md) (this document's former §7), [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (former §10, D1–D19), [`strategy-engine-build-history.md`](./strategy-engine-build-history.md) (former §14–§18), [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#87 — this plan's own direction lock).
 
 **Why this doc exists:** same reason `daily-levels-design.md` and `feature-engine-indicator-expansion.md` exist — too large for one sitting, and genuinely new ground for this codebase (the first real design pass at Strategy Engine internals, not an extension of an already-built module). If a session ends mid-build, the next session should read this doc plus `confirmed-decisions.md`'s most recent entries before touching anything, rather than re-deriving the concept from a diff.
+
+**Where content moved (split `split-strategy-engine-design-doc`, decision #142):** this document used to run §0–§18 in one file (175KB). Three growing parts were pulled into their own files — section numbers and D-item numbers are unchanged, only the file changed, and each moved body is untouched by the split:
+
+| Was | Now lives in |
+|---|---|
+| §7 Backtest Runner | [`backtest-runner-design.md`](./backtest-runner-design.md) |
+| §10 Open decisions (D1–D19) | [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) |
+| §14–§18 (per-strategy build history) | [`strategy-engine-build-history.md`](./strategy-engine-build-history.md) |
+
+Everything else — §0–§6 (including the complete §5), §8–§9, §11–§13 — stays in this file.
 
 ---
 
@@ -115,7 +125,7 @@ Planned initial strategy set unchanged from trading-intelligence-architecture.md
 
 **Gate ≠ ranking** — worth stating as a standing principle: a gate answers "is this strategy allowed to participate right now," never "which strategy is best right now." That second question belongs to §5/§6.
 
-**`gate_conditions` is declarative; `StrategyScheduler` is its sole enforcement authority — decision #118, made explicit once real implementation (decision #117) existed to make the distinction concrete.** `StrategyConfig.gate_conditions` is configuration data, nothing more. `app/strategy_engine/gate_conditions.py` plus `StrategyScheduler` are the only code permitted to interpret it — a `Strategy` subclass may declare `gate_conditions` on its own config, but must never independently interpret the dict, invent a new key's meaning, or enforce a gate itself. The risk this closes: absent this rule, nothing stops a future strategy from reading its own `gate_conditions` inside `evaluate()` and re-implementing (or subtly redefining) a condition the Scheduler already enforces — silently forking one precondition into two implementations that can drift apart, exactly the duplication risk (b) above exists to prevent, just reintroduced one layer down. Matters most as more strategies are added, not less. See §10 D16 (resolved, decision #119) for the cleanup this made necessary — 3 of the 7 v1 strategies' own inline `is_regular_session()` calls (not 4; `orb_strategy.py`'s `minutes_since_open()` was always load-bearing MATCH logic, never a duplicate session gate) have been removed, so `gate_conditions.py`/`StrategyScheduler` are now this codebase's sole session-gate enforcement, with no remaining exception.
+**`gate_conditions` is declarative; `StrategyScheduler` is its sole enforcement authority — decision #118, made explicit once real implementation (decision #117) existed to make the distinction concrete.** `StrategyConfig.gate_conditions` is configuration data, nothing more. `app/strategy_engine/gate_conditions.py` plus `StrategyScheduler` are the only code permitted to interpret it — a `Strategy` subclass may declare `gate_conditions` on its own config, but must never independently interpret the dict, invent a new key's meaning, or enforce a gate itself. The risk this closes: absent this rule, nothing stops a future strategy from reading its own `gate_conditions` inside `evaluate()` and re-implementing (or subtly redefining) a condition the Scheduler already enforces — silently forking one precondition into two implementations that can drift apart, exactly the duplication risk (b) above exists to prevent, just reintroduced one layer down. Matters most as more strategies are added, not less. See `strategy-engine-open-decisions.md` §10 D16 (resolved, decision #119) for the cleanup this made necessary — 3 of the 7 v1 strategies' own inline `is_regular_session()` calls (not 4; `orb_strategy.py`'s `minutes_since_open()` was always load-bearing MATCH logic, never a duplicate session gate) have been removed, so `gate_conditions.py`/`StrategyScheduler` are now this codebase's sole session-gate enforcement, with no remaining exception.
 
 ---
 
@@ -222,7 +232,7 @@ class StrategyOutcome(BaseModel):
     strategy_version: str                 # §3's immutable version — never blended across versions
     symbol: str
     origin: Literal["auto", "manual"]     # mirrors trades.origin (trading-intelligence-architecture.md §18)
-    is_backtest: bool                     # §7 — never blended with live in a live query
+    is_backtest: bool                     # see `backtest-runner-design.md` §7 — never blended with live in a live query
     backtest_run_id: UUID | None          # FK -> backtests, see below
 
     # B. Timing — all instants UTC; trading_day is the one ET-calendar concession
@@ -283,9 +293,9 @@ class StrategyOutcome(BaseModel):
                                            # exact FeatureSet without duplicating it into this row
 ```
 
-**Why `_at_entry`, not `_at_signal`, and why only one snapshot per side.** Signal and entry are the same instant for every v1-planned strategy — `allows_waiting` defaults `False` everywhere (§3, §10 D2/D5). A genuine signal-vs-entry gap only exists once a real waiting-capable strategy ships. Capturing two full duplicate snapshot dicts for a distinction that doesn't bite yet would be exactly the generality §11 already argues against deferring. `evidence.conditions` (captured at signal time, inside `evidence` above) already preserves the thesis snapshot; `market_state_at_entry`/`context_at_entry` capture the moment money was actually on the line, which is the more decision-relevant instant regardless. Revisit — reintroducing a separate `_at_signal` pair — only when D5 (§10) stops being deferred. Tracked as D7 below.
+**Why `_at_entry`, not `_at_signal`, and why only one snapshot per side.** Signal and entry are the same instant for every v1-planned strategy — `allows_waiting` defaults `False` everywhere (§3, `strategy-engine-open-decisions.md` §10 D2/D5). A genuine signal-vs-entry gap only exists once a real waiting-capable strategy ships. Capturing two full duplicate snapshot dicts for a distinction that doesn't bite yet would be exactly the generality §11 already argues against deferring. `evidence.conditions` (captured at signal time, inside `evidence` above) already preserves the thesis snapshot; `market_state_at_entry`/`context_at_entry` capture the moment money was actually on the line, which is the more decision-relevant instant regardless. Revisit — reintroducing a separate `_at_signal` pair — only when D5 (`strategy-engine-open-decisions.md` §10) stops being deferred. Tracked as D7 there.
 
-**These four fields have a real capture contract (decision #98, M4) AND, as of decision #120, a real table and a real (unwired) writer.** `app/trading_intelligence/state_snapshot.py`'s `capture_market_state_snapshot`/`capture_context_snapshot`/`capture_strategy_outcome_snapshots` read `MarketStateEngine`/`ContextEngine`'s new `get_snapshot()` accessors and shape the result to match `market_state_at_entry`/`_at_exit`/`context_at_entry`/`_at_exit` exactly. The `strategy_outcomes` migration (0008) and its paired ORM/Pydantic/write-path (`app/models/trading_intelligence.py`'s `StrategyOutcomeRecord`, `app/schemas/performance.py`'s `StrategyOutcome`, `app/trading_intelligence/performance.py`'s `record_strategy_outcome()`) now exist — decision #120. What still doesn't exist: whatever future Execution/Position Monitor fill handler actually calls `record_strategy_outcome()` at `entry_filled_at`/`exit_filled_at` — that's real, later work (§10/§12 below), not something #120 built just to exercise this function. Decision #120 also surfaced a real, deliberately unresolved gap between this section's REQUIRED typing for these four fields and `state_snapshot.py`'s honest-`None` capture behavior — see new open item **D17** in §10.
+**These four fields have a real capture contract (decision #98, M4) AND, as of decision #120, a real table and a real (unwired) writer.** `app/trading_intelligence/state_snapshot.py`'s `capture_market_state_snapshot`/`capture_context_snapshot`/`capture_strategy_outcome_snapshots` read `MarketStateEngine`/`ContextEngine`'s new `get_snapshot()` accessors and shape the result to match `market_state_at_entry`/`_at_exit`/`context_at_entry`/`_at_exit` exactly. The `strategy_outcomes` migration (0008) and its paired ORM/Pydantic/write-path (`app/models/trading_intelligence.py`'s `StrategyOutcomeRecord`, `app/schemas/performance.py`'s `StrategyOutcome`, `app/trading_intelligence/performance.py`'s `record_strategy_outcome()`) now exist — decision #120. What still doesn't exist: whatever future Execution/Position Monitor fill handler actually calls `record_strategy_outcome()` at `entry_filled_at`/`exit_filled_at` — that's real, later work (`strategy-engine-open-decisions.md` §10 / §12 below), not something #120 built just to exercise this function. Decision #120 also surfaced a real, deliberately unresolved gap between this section's REQUIRED typing for these four fields and `state_snapshot.py`'s honest-`None` capture behavior — see new open item **D17** in `strategy-engine-open-decisions.md` §10.
 
 Persists to the `strategy_outcomes` table (renamed from `strategy_performance` — decision #89; system-design.md §4.13), while a record is still atomic, singular, and pre-migration is the cheapest possible time to fix a name that read as an aggregate. "Rank," "expectancy by regime," "win rate by time-of-day" — every one of these is a `GROUP BY` over this table, computed on demand, never a value stored on the strategy itself:
 
@@ -417,496 +427,7 @@ fetch resolves
 
 **The boundary, stated precisely so it can't drift:** Governor may derate or delay an individual trade using performance evidence. Governor may **not** retire, disable, or modify a `StrategyConfig`. One is a real-time risk judgment on one trade (Governor's actual job); the other is changing what's live (§5's human-approval principle). If live derating on a config looks bad enough that retirement seems warranted, that's a signal for Saqib to review, not a threshold Governor crosses on its own.
 
-**Open, not resolved here — see §10's table:** Saqib has raised the possibility of merging Decision Engine and Governor into one component outright. Not decided either way in this document; both responsibilities above hold regardless of whether they end up as one component or two — a structure question, not a logic question, and it doesn't need resolving before Strategy Engine work can proceed.
-
----
-
-## 7. Backtest Runner — extends the already-deferred Replay Engine, doesn't duplicate it
-
-**Not a new capability from scratch.** `future-ideas.md` #5 already defers a Replay Engine (`broker_adapters/replay_provider.py` implementing `MarketDataProvider`) for interactive historical review. A Backtest Runner is the same interface, consumed headlessly: no real-time throttle, wrapped in an outer parameter-search loop over `StrategyConfig` candidates.
-
-**Non-negotiable design constraint, worth baking in now since `strategy_engine/` doesn't exist yet:** `Strategy.evaluate()` must run byte-identical in backtest and live — no `if backtesting:` branches. Every strategy must derive "now" from the event/candle timestamp via `MarketClock`, never `datetime.now()` directly. Retrofitting this after several strategies already exist would mean auditing each one for live-only assumptions; building it in from the first strategy costs nothing.
-
-**Search is automated; promotion is not (§5's principle, applied to this specific mechanism):**
-
-```
-   Historical Data (5yr, N symbols)
-              │
-              ▼
-      Backtest Runner            ◄── outer loop over StrategyConfig
-   (replay_provider.py, no          candidates (grid search)
-    real-time throttle)
-              │
-              ▼
-   StrategyOutcome rows
-   (is_backtest=True, backtest_run_id set)
-              │
-              ▼
-   Walk-forward / holdout validation     ◄── never a single in-sample pass
-              │
-              ▼
-   Performance Intelligence report        ◄── expectancy + robustness (below),
-              │                               never expectancy alone
-              ▼
-   ┌─────────────────────┐
-   │   HUMAN REVIEW        │   ◄── Saqib, per §5's principle
-   │   (Saqib)              │
-   └──────────┬───────────┘
-              ▼
-      Promote (new StrategyConfig,
-       active_from = today)  /  Reject
-```
-
-**Run-level metadata — `backtests` table, shape locked (decision #89).** `StrategyOutcome.backtest_run_id` needs somewhere to resolve to, or §7's own "consistency across years/symbols/regimes" and parameter-sensitivity requirements below can't actually be produced from the outcome rows alone. `system-design.md` §4.13 already reserves the table name; this is its shape. One row = one specific `(strategy_version, config_hash)` tested against one walk-forward fold — not one row per whole grid-search sweep, since `walk_forward_fold`/`is_holdout` only mean something at that granularity:
-
-```python
-class BacktestRun(BaseModel):
-    run_id: UUID
-    sweep_id: UUID                        # groups every run belonging to the same grid-search session —
-                                           # a report pulls "all runs in this sweep," not an inline
-                                           # candidate list on one bloated row
-    strategy_name: str
-    strategy_version: str                 # §3's immutable version being tested
-    config_hash: str                      # sub-version identifier for tuning within strategy_version,
-                                           # pre-promotion — never itself a promoted StrategyConfig
-    symbol_universe: list[str]
-    date_range_start: date
-    date_range_end: date
-    data_version: str                     # market-data snapshot/provider version this run read from
-    feature_version: str                  # Feature Engine version this run computed indicators with —
-                                           # without this and data_version, two backtests can look
-                                           # identical and produce different results for reasons that
-                                           # have nothing to do with the strategy being tested — a
-                                           # reproducibility gap worth closing before Stage 1, not after
-    walk_forward_fold: int | None
-    is_holdout: bool                      # in-sample vs. out-of-sample — required, not inferred
-    created_at: datetime
-```
-
-**Required output, not optional — robustness over raw expectancy.** A single in-sample optimization pass will always find a config that looks best on the exact data it was tuned against; that's not the same as a config that's actually good. The comparison report must include, alongside expectancy: trade count, consistency across years/symbols/regimes/time-of-day, and a parameter-sensitivity curve (expectancy vs. the threshold being tuned, across a range) — a smooth curve suggests a robust setting, a spiky one flags overfitting risk. "Best backtested expectancy" alone is not sufficient evidence for promotion.
-
-**Scale check, done rather than assumed:** 5 years of 1m candles, regular session only, ≈490K rows/symbol; even 30–40 symbols stays well within current plain-Postgres monthly partitioning. Doesn't trigger the Timescale-migration question (`future-ideas.md` #7) at the symbol counts discussed — revisit only if the backtest universe grows substantially past that.
-
-Not built now. Constrains how the first strategy gets written (pure `evaluate()`, `MarketClock`-only timing); the harness itself is real, deferred work.
-
----
-
-**As-built note (decision #128) — v1 is the vertical slice above the dashed line only, nothing below it.** Everything above described the eventual full system prospectively, before any of `backend/app/backtest_runner/` existed. What actually got built (Units 1-5) is the first vertical slice — proving the plumbing works end-to-end — not the outer grid-search/walk-forward/promotion loop described above, which remains real, deferred, future work exactly as originally scoped:
-
-```
-                    IMPLEMENTED (v1, decision #127)
-   ┌──────────────────────────────────────────────────────────┐
-   │  Fixture Candle Data                                       │
-   │  (FixtureCandleProvider — plumbing proof, NOT real          │
-   │   historical-market validation)                             │
-   │            │                                                │
-   │            ▼                                                │
-   │  ReplayStateProducer                                        │
-   │  (real EventBus/FeatureEngine/LevelInteractionEngine/       │
-   │   MarketStateEngine — zero modification to any of them)     │
-   │            │                                                │
-   │            ▼                                                │
-   │  Feature / Market State  ──────┐                            │
-   │            │                    │                           │
-   │            ▼                    ▼                           │
-   │      Context Engine      (BacktestContextProvider boundary  │
-   │  (FixtureBacktestContextProvider — fixture/calendar only,   │
-   │   NOT point-in-time historical context fidelity)            │
-   │            │                                                │
-   │            ▼                                                │
-   │  Strategy.evaluate()  (real, unmodified — every candle)     │
-   │            │                                                │
-   │            ▼                                                │
-   │  Fill Simulator (pure, MarketClock-derived)                  │
-   │            │                                                │
-   │            ▼                                                │
-   │  StrategyOutcome rows (is_backtest=True, backtest_run_id)   │
-   │            │                                                │
-   │            ▼                                                │
-   │  Performance Intelligence (decisions #120/#122 — read-only) │
-   └──────────────────────────────────────────────────────────┘
-                             │
-   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
-                             ▼
-                    FUTURE (not built, real prerequisites remain)
-   Real minute-level historical data (paid Polygon tier or another
-   vendor — future-ideas.md #17) + point-in-time historical context
-   (HistoricalContextProvider, a documented but unbuilt extension
-   point) + multi-symbol replay + outer grid-search/walk-forward loop
-   + robustness/parameter-sensitivity report + human review + promotion
-   — the full flow diagrammed earlier in this section, unchanged.
-```
-
-`HistoricalContextProvider` (`backend/app/backtest_runner/context_provider.py`) already exists as a named, documented extension point for the Context half of the future boundary above — deliberately unbuilt (`NotImplementedError`), not a stub pretending to work. `BacktestContextProvider` is the seam a real implementation plugs into without `BacktestRunner` itself changing. See decision #128 for the full as-built record, including why entry/exit snapshots are captured at `entry_filled_at`/`exit_filled_at` rather than the signal candle — a correction to this section's own original, less precise framing.
-
-**As-built note (decision #130) — the read side of the diagram above had a real gap.** `StrategyOutcome rows (is_backtest=True, backtest_run_id)` above feeds into the *same* `strategy_outcomes` table live rows will eventually land in — one table, one schema, distinguished only by `is_backtest`. `GET /intelligence/strategy-outcomes` (decision #123, feeding "Recent Closed Trades" in `InfoTab.tsx`) shipped before this table had any writer at all, so it never filtered on `is_backtest` — harmless until decision #128 gave it a real writer. Decision #130 closed that gap:
-
-```
-                         strategy_outcomes  (one table, one schema)
-                                   │
-                  ┌────────────────┴────────────────┐
-                  │                                   │
-         is_backtest = False                 is_backtest = True
-     (real, live-executed trades —          (Backtest Runner v1 output —
-      no writer yet, table is honestly       decision #128, real rows
-      empty of these today)                  today, not fabricated)
-                  │                                   │
-   GET /strategy-outcomes                  GET /strategy-outcomes
-   (default — is_backtest omitted           ?is_backtest=true
-    or explicit `false`)                    [&backtest_run_id=<run>]
-                  │
-                  ▼
-   "Recent Closed Trades" (InfoTab.tsx)
-   — can now never silently render a
-     backtest row as a real closed trade
-```
-
-`performance_queries.py`'s `_common_filters()` (decision #122) already enforced this exact discipline for the two `GROUP BY` queries next to this route; decision #130 brings `/strategy-outcomes` in line with it via the equivalent single predicate, since this route's raw-row shape doesn't share `_common_filters()`'s `GROUP BY`-oriented signature. `backtest_run_id` is additive-only — it always requires `is_backtest=true` alongside it (a live row never carries one), enforced as a 400, not a silently-empty result.
-
-**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #130) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response.
-
-```
-BacktestPanel.tsx (form: strategy_name / scenario / symbol)
-            │
-            ▼
-   POST /backtest/run                 ◄── fully synchronous, ~1s/candle,
-   (useBacktestRun.ts)                     ~120-140s per scenario — the
-            │                              panel shows a live "Nm Ns
-            ▼                              elapsed" state, not a bare
-   BacktestRunResult, rendered              spinner, while this is in
-   verbatim: run_id / sweep_id /            flight
-   outcomes_recorded / discarded_signals[]
-            │
-            ▼
-   outcomes_recorded=0 renders as a plain, neutral fact — four of the
-   seven strategies are structurally unreachable in any BacktestRunner
-   replay today (this section's own note above), so a zero here is
-   expected for many (strategy, scenario) pairs, not an error state.
-   No link into "Recent Closed Trades" / Performance Analytics UI —
-   explicitly out of scope, matching this route's own stated boundary.
-```
-
-Strategy names (`ORB`/`Gap`/`Volume Spike`/`FirstPullback`/`Reversal`/`Momentum`/`VWAP`) and scenario names/descriptions are hardcoded in `api-client.ts` rather than fetched at runtime — `default_registry()`/`available_scenarios()` are Python-only, not reachable over HTTP anywhere in this codebase, and exposing either would mean adding a new backend route or editing `scheduler.py`/`scenarios.py` directly, both outside this delivery's own frontend-only file boundary; the route's own 400 error body remains the live source of truth if either list ever drifts. The panel's own collapsed/width state is local component state, not threaded through `WorkspaceContext.tsx` the way Scanner/FeatureEngine panels' persisted, cross-tab-synced state is — a run's in-flight/finished state belongs to the one browser tab that started it and has no server-side push to sync from, so extending `WorkspaceContextValue`/`MainWindowState`'s localStorage schema for it would add persistence with no real use — flagged as a deliberate, reconsiderable choice in the component's own comment, not a silent deviation from the established pattern. No decision-log entry accompanies this note (see this delivery's own `CHANGES.md` for why); Saqib may fold it into a numbered decision at merge time if he wants one.
-
-**As-built note (decision #133) — the read path finally gets a viewer.** Every note above this one describes either the write side (Backtest Runner v1 itself) or a trigger for it (`BacktestPanel.tsx`); nothing before this note rendered a single `StrategyOutcome` row. Decision #130's own diagram above ends at "`GET /strategy-outcomes` `?is_backtest=true[&backtest_run_id=<run>]`" with no consumer drawn past it — this delivery is that consumer, closing the read side the same narrow way `BacktestPanel.tsx` closed the trigger side: frontend-only, zero new backend surface, reusing what already exists rather than adding to it.
-
-```
-BacktestResultsPanel.tsx (free-text run_id filter, Apply/Clear)
-            │
-            ▼
-   useBacktestOutcomes.ts             ◄── isBacktest FIXED true here, never
-   (limit=500, backtestRunId?)             caller-toggleable — this hook's
-            │                              whole reason to exist is showing
-            ▼                              the one currently-nonempty half
-   GET /intelligence/strategy-outcomes     of `strategy_outcomes`
-   ?is_backtest=true[&backtest_run_id=…]
-            │
-            ├── 200, outcomes: []  ──────► honest "no backtest outcomes
-            │                              recorded yet" / "no outcomes
-            │                              for that run_id" — never an
-            │                              error state
-            │
-            ├── 200, outcomes: [...]  ───► one row per StrategyOutcome,
-            │                              summary fields always visible;
-            │                              ▸ toggle expands the full
-            │                              record in place (evidence /
-            │                              market_state_at_*/context_at_*
-            │                              blobs a summary row can't show)
-            │
-            └── 400 (malformed run_id —    surfaced as a distinct error
-                the is_backtest=false +     state (useBacktestOutcomes.ts's
-                backtest_run_id            own `error`), never rendered as
-                combination this route     a silently-empty result — this
-                itself 400s on is          panel's own is_backtest=true
-                unreachable from this      fix means only a malformed UUID
-                panel's own state          can reach this branch at all
-                machine)
-```
-
-No new route, no change to `fetchStrategyOutcomes()`/`StrategyOutcomeWireShape` (both already covered every field this panel needed), no change to `useStrategyOutcomes.ts` (that hook's own comment already named this exact panel as its deferred, separate scope — this delivery is that deferral being picked up, not a reason to touch the hook it was deferred from).
-
-**As-built note (decision #134) — the two Backtest panels stop needing a copy-paste between them.** Both panels above already worked independently; `useBacktestOutcomes.ts`'s own comment named the gap explicitly (see that file directly) — this delivery closes exactly that connection and nothing else. Frontend-only, no backend/API change. New shared state on `WorkspaceContext.tsx`/`MainWindowState` — `lastBacktestRunId` / `setLastBacktestRunId` — modeled directly on `featureEnginePanelSymbol`'s own established "one panel writes, a sibling reads" pattern (decision #48), not a new mechanism. Scoped per-Main-Window, same as `featureEnginePanelSymbol`, since both panels are mounted once per active-window shell (`App.tsx`), not globally or per-sub-window.
-
-```
-BacktestPanel.tsx (BacktestForm)              BacktestResultsPanel.tsx (BacktestResultsBody)
-        │                                                    │
-   run() → POST /backtest/run resolves                       │
-   status === "done", result.run_id                          │
-        │                                                    │
-        ▼                                                    │
-setLastBacktestRunId(result.run_id)                           │
-        │                                                    │
-        ▼                                                    │
-  WorkspaceContext.tsx                                        │
-  MainWindowState.lastBacktestRunId  ─── useWorkspace() ──────►
-  (persisted via the existing                    │
-   session-autosave path, same                   ▼
-   as every other MainWindowState        mode === "auto"?
-   field — normalizeMainWindow()            │           │
-   back-fills it for pre-#134             yes           no
-   sessions that predate it)                │           │
-                                             ▼           ▼
-                              runIdInput/appliedRunId   left exactly as the
-                              synced to the new value   person set it — a
-                                             │           run finishing
-                                             ▼           elsewhere never
-                          useBacktestOutcomes({ backtestRunId })  clobbers an
-                          — its own [limit, backtestRunId]        in-progress
-                          dependency array (unchanged by this     manual lookup
-                          task) already refetches reactively,
-                          so the just-finished run's rows
-                          appear with no new fetch logic
-```
-
-**Internal flow within the changed module (`BacktestResultsBody`, inside `BacktestResultsPanel.tsx`)** — the "don't silently overwrite a manual lookup" requirement this task's own prompt called out explicitly, resolved as a small two-state mode machine local to this component:
-
-```
-                 mount (mode = "auto", seeded from
-                 whatever lastBacktestRunId already is)
-                              │
-                              ▼
-             ┌───────────►  AUTO  ◄──────────────────┐
-             │      (runIdInput/appliedRunId follow    │
-             │       lastBacktestRunId on every          │
-             │       change, incl. new runs finishing     │
-             │       while this panel is already open)     │
-             │                    │                      │
-             │   person clicks Apply OR Clear      person clicks
-             │   (typing a run_id, or explicitly   "↺ Follow latest run"
-             │    clearing to "show everything" —   (the only way back
-             │    both are real, deliberate          to auto — collapsing/
-             │    manual choices, both freeze)        re-expanding the panel
-             │                    ▼                   also resets to auto,
-             └────────────  MANUAL  ────────────────► since this component
-                    (frozen: lastBacktestRunId          unmounts on collapse,
-                     keeps changing in shared state       but that's not a
-                     as new runs finish, but this          discoverable path,
-                     panel's own filter no longer           so this control
-                     follows it — exactly the                is explicit)
-                     "don't clobber" requirement)
-```
-
----
-
-*(Correction, decision #135 — documentation only, no file under `frontend/` touched by this correction.)* The diagram in decision #128's own as-built note earlier in this section stated "four of the seven strategies are structurally unreachable in any BacktestRunner replay today" — decision #135 closed that specific gap; see the as-built note directly below for what changed and what didn't. `outcomes_recorded=0` remains an expected, non-error rendering for many (strategy, scenario) pairs regardless — see this section's own decision #135 note for why.
-
-**As-built note (decision #135) — the historical-provider gap decision #128's diagram (above) described as a hard ceiling is closed.** `FeatureEngine`'s Daily Levels/ATR/RVOL refresh had never had a real `broker_registry.get_historical_provider()` to ask during a replay, so `volume_regime_score`/`volatility_regime_score` were always `0.0`, structurally, for any symbol. `historical_provider_guard.py` (new, mirroring `engine_singleton_guard.py`'s own save/install/restore shape exactly) now installs the run's own `MarketDataProvider` as that role for the replay's duration; `fixture_provider.py`'s `FixtureCandleProvider` — already the source of the replay's `(symbol, "1m")` feed — now also carries a `(symbol, "1d")` entry (`fixture_daily_history.py`, new: a synthetic, real-NYSE-calendar-aware trailing daily history) and serves both roles from one instance.
-
-```
-   Fixture Candle Data (FixtureCandleProvider, one instance, two roles)
-   (symbol, "1m") — replay feed          (symbol, "1d") — NEW, decision #135
-   (unchanged since decision #128)        (fixture_daily_history.py)
-            │                                       │
-            ▼                                       ▼
-   BacktestRunner.run()                  broker_registry historical role
-   candle-by-candle replay               install_replay_historical_provider()
-   (unchanged)                           — new, nested INSIDE the existing
-            │                            install_replay_engines() block,
-            │                            same save/install/restore shape,
-            │                            own asyncio.Lock
-            │                                       │
-            ▼                                       │
-   FeatureEngine._maybe_refresh_daily_levels() ◄─────┘
-   (real, unmodified — reads broker_registry.get_historical_provider()
-    exactly as it always has; gets a real answer instead of None)
-            │
-            ▼
-   self._daily_candle_cache[symbol] populated → rvol / atr_14_pct real
-            │
-            ▼
-   MarketState.volume_regime_score / volatility_regime_score
-   — no longer structurally 0.0 (decision #128's diagram above, corrected)
-```
-
-**Two real, checked-not-assumed safety properties of the new seam — see `historical_provider_guard.py`'s own module docstring for the full reasoning.** (1) The installed provider is never `.connect()`ed, so `GET /market/candles` keeps returning its existing honest 400 throughout a backtest run — no silent fixture-data leak into that live-facing route. (2) Decision #132's Finnhub/Polygon 409 already means `broker_registry`'s historical role is unclaimed going into every valid run; one pre-existing, unrelated gap flagged rather than fixed here — decision #132's guard has no IBKR accessor, so an IBKR-connected session isn't blocked by it (`docs/decisions/future-ideas.md`, new entry).
-
-**A genuinely separate finding, not fixed by this decision, documented loudly rather than silently patched or silently accepted — see `backtest.py`'s own route docstring for the full disclosure given to callers.** Closing this gap means `FeatureEngine`'s real, unmodified Daily Levels reconciliation now actually runs during a backtest for the first time — and it writes into the SAME shared `symbols`/`daily_levels_state` tables live trading reads, under whatever `symbol` label the caller supplies, with no `is_backtest` flag on either table to distinguish origin. Confirmed by direct execution against a real Postgres: a second run against the identical `(symbol, scenario)` pair silently reverts `volume_regime_score`/`volatility_regime_score` to `0.0` for that run — `_maybe_refresh_daily_levels()`'s own pre-existing "restart-survival" short-circuit finds the `daily_levels_state` row the first run just persisted and skips the raw-candle-cache population before ever asking the provider again. Flagged as a new open item below (D18), not folded into this decision — a genuinely separate change from "wire a historical provider."
-
----
-
-**As-built note (decision #136) — `backtests`' own metadata finally gets a reader.** Every real backtest run since decision #128 has written a real row to `backtests` (run-level metadata: `sweep_id`, `strategy_name`, `strategy_version`, `config_hash`, `symbol_universe`, `date_range_start/end`, `data_version`, `feature_version`, `walk_forward_fold`, `is_holdout`, `created_at`) — but before this delivery, nothing had ever read one back. `GET /strategy-outcomes?backtest_run_id=X` (decision #130) shows what a run *produced*; nothing showed the run's *own* metadata without already having kept its `run_id` from a prior `POST /backtest/run` response. This closes that gap: a new `GET /intelligence/backtest-runs` route, backend-only (matching this project's own established backend-then-frontend sequencing — `performance_queries.py` at #122 before #127 exposed it; Context Engine's split at #98/#125 is the same shape). Both `BacktestRunRecord`'s (`app/models/trading_intelligence.py`) and `BacktestRun`'s (`app/schemas/performance.py`) own docstrings — and two further copies of the identical stale claim, one in each of those same files' module-level docstrings — still said "no Backtest Runner writes to this table yet (§7: not built now)" as of decision #128 landing; all four corrected in this delivery, along with one more copy of the same claim in `system-design.md` §4.13 ("backtests ... shape locked, not yet created").
-
-**Not a collision with the historical-provider gap decision directly above** — that delivery's own footprint statement confirms `intelligence.py`/`performance_queries.py` untouched, and this delivery never touches anything under `backend/app/backtest_runner/` or `backend/app/api/routes/backtest.py`, confirmed by `diff -rq`. This entry was originally drafted as decision #135, citing that number throughout; the standing immediate-before-packaging re-check (this log's own established practice — #98/#99, #111/#112, #114/#115, #120/#121, #122/#123, #127/#128, #131, and the historical-provider delivery immediately above all needed exactly this) caught that the historical-provider session had already claimed and merged #135 first. Renumbered to #136 throughout — code docstrings, test file, this note — before packaging.
-
-**Cross-component data flow — `BacktestRunner` → `backtests` → the new route → a caller:**
-
-```
-BacktestRunner.run()  (decision #128, backend/app/backtest_runner/runner.py)
-        │
-        ▼
-_write_backtest_run_record(BacktestRunRecord(...))   ◄── written BEFORE any
-        │                                                  StrategyOutcome row
-        ▼                                                  (backtest_run_id FK
-   backtests  (Postgres table, migration 0008)              ordering requirement)
-        │
-        │   real rows exist here since #128 — this delivery adds the
-        │   FIRST reader, nothing before it ever queried this table
-        ▼
-GET /intelligence/backtest-runs                       ◄── decision #136, THIS
-  ?run_id=<uuid>                                            delivery
-  &strategy_name=<name>
-  &sweep_id=<uuid>
-  &limit=<n>
-        │
-        ▼
-{"backtest_runs": [BacktestRun, ...]}                  ◄── existing Pydantic
-                                                             contract (decision
-                                                             #89), reused as-is
-        │
-        ▼
-A caller with only a run_id (e.g. a future frontend        ◄── no frontend
-reading WorkspaceContext.tsx's lastBacktestRunId,               caller wired
-decision #134 — NOT built here, deliberately) can now            this round —
-resolve that run's own metadata without having kept            see the note
-the original POST /backtest/run response around.                 above
-```
-
-**Internal flow within the changed module (the route itself, `app/api/routes/intelligence.py`):**
-
-```
-GET /intelligence/backtest-runs?run_id=...&strategy_name=...&sweep_id=...&limit=...
-        │
-        ▼
-Parse run_id / sweep_id as UUID, if given
-        │
-        ├── malformed ──► 400 ("... is not a valid UUID")   ◄── same posture
-        │                                                        GET /strategy-
-        ▼                                                        outcomes takes
-Build filters list (AND, never blended):                         for a malformed
-  run_id       → BacktestRunRecord.run_id == run_uuid             backtest_run_id
-  strategy_name → BacktestRunRecord.strategy_name == strategy_name
-  sweep_id     → BacktestRunRecord.sweep_id == sweep_uuid
-        │
-        ▼
-SELECT * FROM backtests WHERE <filters> ORDER BY created_at DESC LIMIT :limit
-        │
-        ▼
-For each row: BacktestRun.model_validate(row, from_attributes=True)
-        │            ◄── existing Pydantic contract (decision #89),
-        │                reused as-is, not reshaped
-        ▼
-{"backtest_runs": [...]}         ◄── [] on a genuinely empty/no-match
-                                       result, 200, never an error —
-                                       same convention every route in
-                                       this file already follows
-```
-
-No `performance_queries.py` change — that module's own docstring scopes it strictly to `GROUP BY` aggregations over `strategy_outcomes` ("two real queries, exactly two"); this is a raw recent-rows read over a different table, with no aggregation and no grouping key, exactly GET /strategy-outcomes' own shape, not that module's. Built inline in `intelligence.py`, same file and pattern as its closest sibling, rather than introducing a second read-side module for one un-aggregated query.
-
----
-
-**As-built note (decision #139) — `backtests`' own metadata reaches the frontend for the first time.** Decision #136 (directly above) built the reader but shipped backend-only, deliberately, naming this exact next step in its own docstring and diagram: "a caller with only a run_id (e.g. ... `WorkspaceContext.tsx`'s `lastBacktestRunId`, decision #134) can now resolve that run's own metadata" and "showing a selected run's own metadata alongside `BacktestResultsPanel.tsx`'s outcome rows (decision #133/#134) is the natural next step this leaves open." This closes it. Frontend-only — `GET /intelligence/backtest-runs` itself, `intelligence.py`, and every backend file are unchanged.
-
-New `frontend/src/hooks/useBacktestRuns.ts` — deliberately a NEW, separate hook from `useBacktestOutcomes.ts`, not an extension of it: that hook reads `strategy_outcomes` (one row per closed trade a run produced); this one reads `backtests` (one row per run's own settings) — a different table, a different granularity, related only via `run_id`/`backtest_run_id`. Naming mirrors that hook's own, the same pairing precedent `useStrategyOutcomes`/`useBacktestOutcomes` already set. Exposes only `runId`, even though the underlying `fetchBacktestRuns()` also supports `strategyName`/`sweepId`/`limit` (matching the route's full filter set) — this hook's one real caller (`BacktestResultsPanel.tsx`) only ever has a run_id to resolve against, so exposing the rest would be building ahead of an actual need. Deliberately skips the fetch entirely when `runId` is undefined — unlike `useBacktestOutcomes.ts` (which still fetches "everything" with no `backtestRunId` filter), there is no single run's metadata to show in that state. `run_id` is `BacktestRunRecord`'s own primary key (confirmed against `backend/app/models/trading_intelligence.py`), so resolving `backtest_runs[0] ?? null` is safe — never an arbitrary pick from a genuine multi-row list. Same caller-visible `error`-distinct-from-empty posture `useBacktestOutcomes.ts`/`usePerformanceAnalytics.ts` already established: a malformed (non-UUID) run_id — reachable here since this panel's filter is free-text — surfaces as `error`, never conflated with a well-formed, genuinely-unmatched run_id.
-
-New `BacktestRunWireShape` / `BacktestRunsWireShape` / `fetchBacktestRuns()` in `api-client.ts`, matching `StrategyOutcomeWireShape`/`fetchStrategyOutcomes`'s own established shape and pattern exactly — same conditional-append query construction, same `ApiError`-on-non-2xx posture, field names/types copied directly from `schemas/performance.py`'s `BacktestRun` (re-verified against that file's current contents, not guessed).
-
-New `RunMetadataCard` inside `BacktestResultsPanel.tsx` — reuses `BacktestResultsBody`'s existing `appliedRunId` (decision #134's own auto/manual filter-mode state, entirely unchanged) with zero new shared state: `WorkspaceContext.tsx` is untouched, since `appliedRunId` already carries the exact run_id linkage both data sources need. Rendered only when `appliedRunId` is set — the panel's "everything" default view (no run_id filter applied) shows no metadata card, since there is no single well-defined run to describe in that state. Independent loading/error/empty rendering from the `StrategyOutcome` rows list beside it — a metadata-fetch failure never renders identically to "this run has no outcomes," and vice versa, the same never-conflate-two-data-sources'-honest-state discipline this panel's own outcomes-list error handling already established.
-
-```
-BacktestResultsBody (BacktestResultsPanel.tsx)
-        │
-        │  appliedRunId  (decision #134's own auto/manual state —
-        │                 unchanged, no new WorkspaceContext field)
-        ▼
-useBacktestRuns({ runId: appliedRunId })       ◄── NEW, this delivery
-        │
-        │  skips the fetch entirely when appliedRunId is undefined
-        ▼
-fetchBacktestRuns(undefined, runId)            ◄── NEW, api-client.ts
-        │
-        ▼
-GET /intelligence/backtest-runs?run_id=<uuid>   ◄── decision #136,
-        │                                            unchanged
-        ▼
-{"backtest_runs": [BacktestRun] | []}
-        │
-        ▼
-backtestRun = backtest_runs[0] ?? null         ◄── safe: run_id is
-        │                                           BacktestRunRecord's
-        ▼                                           own primary key —
-RunMetadataCard renders strategy_name/version,       0 or 1 row, never
-config_hash, symbol_universe, date_range,            an arbitrary pick
-data_version/feature_version, walk_forward_fold,
-is_holdout, created_at — alongside, never merged
-with, the existing StrategyOutcome rows list below,
-both keyed to the same appliedRunId
-```
-
-**Internal flow within the changed module (`BacktestResultsBody`, inside `BacktestResultsPanel.tsx`):**
-
-```
-appliedRunId changes (Apply / Clear / auto-follow —
-all pre-existing, decision #134, unchanged by this delivery)
-        │
-        ▼
-   appliedRunId === undefined?
-        │                     │
-       yes                    no
-        │                     │
-        ▼                     ▼
- no RunMetadataCard    RunMetadataCard mounts/refetches
- rendered — nothing    (useBacktestRuns's own [runId]
- specific to describe  dependency array, mirroring
- in this state         useBacktestOutcomes.ts's shape)
-                              │
-                              ▼
-                    loading?  ──yes──► "Loading run metadata…"
-                              │ no
-                              ▼
-                    error?    ──yes──► "Failed to load run metadata: …"
-                              │ no
-                              ▼
-                    backtestRun === null?
-                              │            │
-                             yes           no
-                              │            │
-                              ▼            ▼
-                   "No run metadata    render fields grid (strategy_name,
-                   found for run_id     strategy_version, config_hash,
-                   <id>."               sweep_id, symbol_universe,
-                                        date_range, data_version,
-                                        feature_version, walk_forward_fold,
-                                        is_holdout, created_at)
-```
-
-**As-built note (decision #141) — D19 isolates Daily Levels state per backtest run without reopening D18.** Decision #140 correctly separated live and backtest symbol/Daily Levels rows, but direct execution found that two distinct runs of the same ticker still shared the one `is_backtest=True` active-row pool: run 2 reused all ten of run 1's database IDs and `level_id` values and advanced every row's `updated_at`. Migration `0010` adds nullable `daily_levels_state.backtest_run_id`; a database CHECK requires exactly `(live, NULL)` or `(backtest, non-NULL)`, and a real FK targets `backtests.run_id`. `BacktestRunner` already creates the UUID before constructing `EngineBackedReplayStateProducer`, so the identity now flows into `FeatureEngine` before any Daily Levels write. Reconciliation selects only the current run's active rows. The existing `(symbol_id, is_backtest, level_id)` unique constraint remains unchanged; the old `(symbol_id, status)` index is replaced by `(symbol_id, is_backtest, backtest_run_id, status)`, matching the actual predicate.
-
-```
-BacktestRunner.run()
-  run_id = uuid4()
-        │
-        ▼
-EngineBackedReplayStateProducer(backtest_run_id=run_id)
-        │
-        ▼
-FeatureEngine(is_backtest=True, backtest_run_id=run_id)
-        │
-        ├── provider fetch still runs every replay
-        │   (#140 restart-survival skip unchanged)
-        ▼
-daily_levels_state
-  symbol_id + is_backtest + backtest_run_id + status
-        │
-        ├── run A sees only run A active rows
-        └── run B sees only run B active rows
-```
-
-```
-DailyLevelState write
-        │
-        ▼
-CHECK origin/run pairing
-  live     ──► is_backtest=false AND backtest_run_id=NULL
-  backtest ──► is_backtest=true  AND backtest_run_id=<UUID>
-        │
-        ▼
-FK backtest_run_id ──► backtests.run_id ON DELETE CASCADE
-        │
-        └── deleting a run removes only its derived Daily Levels rows
-```
-
-The cascade is deliberate and narrower than `strategy_outcomes.backtest_run_id`'s migration-`0008` FK, which has the default `NO ACTION`: outcomes are durable analytical records, while these Daily Levels rows are derived run checkpoints. Current `backend/app` has no code path that deletes a `backtests` row, and no table has an FK to `daily_levels_state.id`, both confirmed directly before choosing the cascade. Migration `0010` deletes only pre-migration `is_backtest=True` Daily Levels rows because no honest run UUID can be reconstructed for them; it does not touch Market State, Level Interaction, candles, scanner-universe, fundamentals, or symbols. `_load_confirmed_daily_levels_for_today()` remains unreachable for backtest engines under #140's gate, but its query includes `backtest_run_id` anyway so a future restart-survival re-enable cannot silently restore another run's checkpoint.
+**Open, not resolved here — see `strategy-engine-open-decisions.md` §10's table:** Saqib has raised the possibility of merging Decision Engine and Governor into one component outright. Not decided either way in this document; both responsibilities above hold regardless of whether they end up as one component or two — a structure question, not a logic question, and it doesn't need resolving before Strategy Engine work can proceed.
 
 ---
 
@@ -955,7 +476,7 @@ A 5m candle closing is *one possible reason* evidence might improve — not the 
              └───────────┬───────────┘
                          ▼
               Is waiting still worth it?
-              (not modeled yet — §10 D5)
+              (not modeled yet — `strategy-engine-open-decisions.md` §10 D5)
 ```
 
 Sometimes waiting strengthens the hypothesis. Sometimes it does nothing. Sometimes it costs entry quality faster than it adds confidence. Sometimes it outright invalidates the setup. An architecture that treats "wait for confirmation" as universally superior — waiting by default whenever the data exists — drifts toward what's worth naming and avoiding explicitly: a confirmation fetish, where every strategy waits simply because it can, not because waiting is actually worth it for that setup.
@@ -1002,17 +523,17 @@ Both gaps stay bounded by the existing `LiveTickRelay` cap — "observed live st
 
 **The observed-live vs. confirmed-closed distinction is the same discipline this codebase already applies to data, extended to time.** §11's "honest state over fabricated state" rule already says an engine never emits a plausible-looking value for something not yet computed. A forming candle's shape is real information but not yet a settled fact — the same rule, applied to *when* a fact becomes true rather than *whether* it exists. `evidence.basis` (§4) is the field that carries this distinction once it's ever wired up: `"live"` for a condition read off `PriceSnapshot`, `"closed"` for one read off a settled `FeatureSet`. Nothing sets `"live"` today — there's no consumer of `PriceSnapshot` yet — but the field exists so a future strategy's evidence is honest about which kind of fact it acted on.
 
-**The mechanism, reshaped from the earlier draft:** no `confirmation_timeframe` enum. Instead, `StrategyConfig.allows_waiting: bool` (§3) is a bare capability flag, default `False`. A strategy with it set to `True` may, inside its own `evaluate()`, return an `Opportunity` with `status="waiting"` and a free-form `wait_reason` instead of `None` or an actionable `Opportunity` — the *reason* for waiting is whatever that strategy's own evidence-sufficiency judgment produces at that moment, never a fixed per-version setting. **Where the pending state lives, since a stateless `evaluate()` has nowhere to keep "still waiting" between one trigger fire and the next:** each `Strategy` instance holds its own small pending set internally, re-checked on its own next trigger fire — not a new shared "Opportunity Tracker" engine. This keeps every strategy independently testable, costs nothing until a strategy actually sets `allows_waiting=True`, and composes cleanly with §7's identical-live/backtest constraint as long as transitions are driven by candle/event timestamps, never wall-clock.
+**The mechanism, reshaped from the earlier draft:** no `confirmation_timeframe` enum. Instead, `StrategyConfig.allows_waiting: bool` (§3) is a bare capability flag, default `False`. A strategy with it set to `True` may, inside its own `evaluate()`, return an `Opportunity` with `status="waiting"` and a free-form `wait_reason` instead of `None` or an actionable `Opportunity` — the *reason* for waiting is whatever that strategy's own evidence-sufficiency judgment produces at that moment, never a fixed per-version setting. **Where the pending state lives, since a stateless `evaluate()` has nowhere to keep "still waiting" between one trigger fire and the next:** each `Strategy` instance holds its own small pending set internally, re-checked on its own next trigger fire — not a new shared "Opportunity Tracker" engine. This keeps every strategy independently testable, costs nothing until a strategy actually sets `allows_waiting=True`, and composes cleanly with `backtest-runner-design.md` §7's identical-live/backtest constraint as long as transitions are driven by candle/event timestamps, never wall-clock.
 
-**Deliberately not this document's job to decide whether Decision Engine and Governor should merge.** Waiting happens *before* an Opportunity is even actionable — it never reaches Decision Engine while `status="waiting"`. Decision Engine still only ever arbitrates finalized opportunities; Governor still only ever derates one already-planned trade. This section adds a stage upstream of both, not an argument for merging them — §10 D1 stays exactly as open as it already was.
+**Deliberately not this document's job to decide whether Decision Engine and Governor should merge.** Waiting happens *before* an Opportunity is even actionable — it never reaches Decision Engine while `status="waiting"`. Decision Engine still only ever arbitrates finalized opportunities; Governor still only ever derates one already-planned trade. This section adds a stage upstream of both, not an argument for merging them — `strategy-engine-open-decisions.md` §10 D1 stays exactly as open as it already was.
 
 **Explicitly deferred — real work, not built now:**
-- The waiting-value model itself (is this specific wait worth its cost) — §10 D5.
-- Wiring any consumer to `PriceSnapshot` at all — §10 D6.
+- The waiting-value model itself (is this specific wait worth its cost) — `strategy-engine-open-decisions.md` §10 D5.
+- Wiring any consumer to `PriceSnapshot` at all — `strategy-engine-open-decisions.md` §10 D6.
 - Reusable candle-shape helper functions (wick ratio, body ratio, position-in-range) — OHLC exists on the 1m `FeatureSet` now (decision #99), but no strategy has needed these specific helpers yet; still not written.
 - A candle-pattern library, an automatic confirmation selector, or any dedicated "Timing Engine"/"Confirmation Engine" — premature architecture until a real strategy needs more than the flag above. Same "defer generality until a concrete gap appears" discipline this codebase already applies everywhere else (Redis, Replay, uncertainty propagation, the playbook-as-data rejection in §1).
 
-**This becomes a backtestable question, same as every other tunable in this design.** "ORB v4, `allows_waiting=False`" vs. "ORB v5, `allows_waiting=True`" are two versions (§3); Performance Intelligence (§5) can eventually report not just expectancy per version but entry-quality degradation alongside it — waiting that improves expectancy by degrading median entry price enough to not be worth it is exactly the kind of trade-off §7's backtest report is required to surface, not hide behind a single expectancy number.
+**This becomes a backtestable question, same as every other tunable in this design.** "ORB v4, `allows_waiting=False`" vs. "ORB v5, `allows_waiting=True`" are two versions (§3); Performance Intelligence (§5) can eventually report not just expectancy per version but entry-quality degradation alongside it — waiting that improves expectancy by degrading median entry price enough to not be worth it is exactly the kind of trade-off `backtest-runner-design.md` §7's backtest report is required to surface, not hide behind a single expectancy number.
 
 ---
 
@@ -1053,7 +574,7 @@ Everything above, connected — the learning loop this design is actually buildi
                     New StrategyConfig version (§3)
                                 │
                                 ▼
-                   Backtest Runner (§7) — search + validate
+                   Backtest Runner (`backtest-runner-design.md` §7) — search + validate
                                 │
                                 ▼
                           HUMAN REVIEW  (Saqib)
@@ -1061,32 +582,6 @@ Everything above, connected — the learning loop this design is actually buildi
                                 ▼
                               LIVE
 ```
-
----
-
-## 10. Open decisions — still genuinely open
-
-| # | Decision needed | Status |
-|---|---|---|
-| D1 | Merge Decision Engine and Governor into one component, or keep as two | **Open.** Saqib has raised this as a real possibility. §6 states both responsibilities regardless of eventual component boundary; §8 confirms timing doesn't add a new argument either way. Doesn't block Strategy Engine work. |
-| D2 | Entry timing mechanism (§8) | **Resolved (decision #88):** ACT/WAIT/ABANDON model locked, `confirmation_timeframe` rejected in favor of a bare `allows_waiting` capability flag (§3) plus dynamic, strategy-produced wait reasons (§4/§8). The *model* is locked; the *intelligence* (D5 below) is not. |
-| D3 | When automatic (vs. human-reviewed) reweighting/retirement graduates from future work to real (§5) | **Open, deferred.** Trigger: enough closed trades per `StrategyConfig` version for a reweight to not be noise — no specific count set yet. |
-| D4 | Exact "Candidate Selection Score" formula (Performance × Context Fit × Confidence × Robustness) | **Still deliberately not decided.** Agreed directly (Saqib + Claude + the consulted ChatGPT review) not to lock a scoring formula before real outcome data exists to check it against. **Decision #121** built a narrower, non-scoring capability adjacent to this item — `app/trading_intelligence/opportunity_view.py`, a pure read-side view classifying which symbols currently have multiple cached `Opportunity`s agreeing vs. conflicting on direction. It answers "is there more than one opportunity here, and do they agree" — it does not answer, and was explicitly built not to answer, "which one should win," so it does not resolve, narrow, or presuppose an answer to this row. This row stays OPEN. |
-| D5 | The waiting-value model itself — how a strategy actually decides "is waiting worth it" (§8) | **Open, deferred.** No strategy needs this yet (`allows_waiting` defaults `False` everywhere in v1); build when a real strategy wants to wait, not speculatively. |
-| D6 | Wiring any consumer to `PriceSnapshot` for live/forming-bar structure (§8) | **Open, deferred.** The data already exists (`LiveTickRelay`, decision #72); no Strategy or Feature Engine module reads it. Needs its own design pass — `evaluate()`'s signature would need to change — not assumed as a side effect of anything above. |
-| D7 | Whether `StrategyOutcome` needs a separate `market_state_at_signal`/`context_at_signal` pair, distinct from `_at_entry` (§5) | **Open, deferred, tied to D5.** Signal and entry are the same instant while `allows_waiting` defaults `False` everywhere — no current strategy makes them diverge. Revisit only once D5 stops being deferred and a real waiting-capable strategy exists. |
-| D8 | Whether `StrategyOutcome.trading_day` (§5, decision #89) stays a single `date` field once swing/overnight holding exists | **Open, flagged not resolved.** The single-value simplification was explicitly justified by "day-trading only, no overnight holds" — Saqib has since clarified the platform is day-trading-*focused* but not day-trading-*limited*. Nothing needs to change today; every real trade is still intraday. The trigger is concrete: the first time a position is intentionally held overnight, `trading_day` needs to split into `entry_trading_day`/`exit_trading_day`, and `exit_reason`'s `eod_flatten` value stops being universal (a forced-by-rule exit only for trades actually subject to the day-trading rule). Caught here so it isn't rediscovered as a bug later. |
-| D9 | How a `Strategy` reads `LevelInteractionEngine` state (§16, decisions #107/#108) | **Resolved for v1, narrowly.** First Pullback/Reversal call `get_level_interaction_engine().get_snapshot(symbol)` directly inside `evaluate()` — same free-function-singleton precedent `orb_strategy.py` already uses for `get_market_clock()` — rather than changing `evaluate()`'s signature or wiring `on_event(LevelInteractionChanged)` through a Scheduler that doesn't exist yet (§13 item 4 / `base_strategy.py`'s own "NOT BUILT HERE" note). `seconds_in_zone` deliberately never read — it's wall-clock `datetime.now()`-derived (`level_interaction_engine.py`'s `get_snapshot()`, decision #47, built for the UI panel), which would violate §7's backtest-safety invariant. Staleness (a design review finding, decision #108): `get_snapshot()` is fed by an async queue/worker, with no built-in guarantee it reflects the candle a strategy is currently evaluating — resolved by exposing `last_applied_candle_ts` per entry, checked before either strategy calls into the resolution-reconstruction logic. **Still open:** a future strategy that genuinely needs the authoritative `status`/`observed_via` fields (gap-through vs. dwell) rather than a one-candle-late zone-transition inference would need real event wiring — not decided here, no strategy has hit that need yet. |
-| D10 | Sequencing and scope for Stage 2 — the Strategy Scheduler/wiring milestone (decision #112, renumbered from a collision at #111 — see §13 item 9) | **Resolved and now COMPLETE, both tracks.** Two calls made directly by Saqib during a status review, prompted by "this thread's strategies are built — what's next": (1) **wait for Momentum/VWAP to land** before starting Stage 2, rather than building the Scheduler against 5 strategies and retrofitting the other 2 in later; (2) **Stage 2's scope is wiring only** — instantiate built strategies against their `StrategyConfig`s, read each one's `ScheduleTrigger` and subscribe it to the live event bus, call `evaluate()` with real `MarketStateEngine`/`ContextEngine` snapshots (M4, decision #98) plus the triggering `FeatureSet`, and publish the result as a new `OpportunityCreated` event with a `get_snapshot()` read-side — same shape as every other engine's read pattern (decision #47). Two adjacent pieces explicitly did NOT get pulled into this scope: **declarative `gate_conditions` enforcement (§2b)** — every v1 strategy still does its own inline GATE check, so `StrategyConfig.gate_conditions` (e.g. ORB's `{"session": "regular"}`) stays set-but-unenforced by any shared code for now — and **Opportunity Engine's cross-strategy ranking (§9)** — a separate, later consumer of whatever `OpportunityCreated` starts publishing, not part of getting strategies running live in the first place. **Track A (the write side — `scheduler.py`) landed as decision #114.** **Track B (the read side — `opportunity_cache.py`) built in a parallel session, ALSO logged as that session's own #114 — a genuine numbering collision, not caught until this entry** (decision #115): Track B's own decision-log entries were lost when Track A's delivery was applied over them, and the `main.py`/`conftest.py` wiring Track A's own #114 explicitly flagged as a manual-merge point was never actually completed — `OpportunityCache` existed, fully tested in isolation, but was never subscribed in the live app. Both fixed in decision #115: Track B's record restored (renumbered, collision noted, same pattern as #98/#99 and #111/#112), the wiring gap closed and verified by running (not just reading) — a real publish through the actual app lifespan confirmed empty on the unfixed push, populated after the fix. |
-| D11 | `ESTABLISHED_TREND_SCORE_THRESHOLD` (`scoring_utils.py`) is one authoritative constant shared by `reversal_strategy.py` (fires when established) and `vwap_strategy.py` (fires when NOT) so the two partition every `trend_score` reading with no gap and no overlap (§18, decision #113) | **Open.** The shared constant only guarantees the two strategies' DEFAULTS match — `StrategyConfig.params` stays independently overridable per strategy, per its own versioning (§3), and nothing structurally stops Reversal's or VWAP's `trend_score_threshold` from being retuned to different values in a later config version, silently reopening either a gap or an overlap between them. No cross-strategy-config validation mechanism exists anywhere else in this codebase either — not decided here whether one is worth building, or whether "don't retune one without the other" stays a documentation-only discipline until a concrete incident makes the case for more. |
-| D12 | Which live event should trigger `StrategyScheduler.evaluate()` calls — `FeaturesUpdated` (the original plan, per D10) or `MarketStateChanged` (decision #114) | **Resolved, found by testing rather than planned.** The first version of `scheduler.py` subscribed to `FeaturesUpdated` directly, on the reasoning that "every_candle" means "react to the candle-close event." A real-`EventBus`/real-`MarketStateEngine` integration test caught this failing every time: `MarketStateEngine._on_features_updated` only enqueues a debounced recompute (`core/debounce_scheduler.py`) — the actual compute + `asyncio.to_thread` persist + cache happens later, in a separate `_worker_loop` task, with no ordering guarantee relative to any OTHER subscriber of that same `FeaturesUpdated` event. Fixed by subscribing to `MarketStateChanged` instead — `_worker_loop`'s own inline comment already documents the guarantee this relies on ("Cache before publish (decision #98) — a subscriber reacting to the event that's about to go out can immediately call get_snapshot() and see this exact state"), just attached to the wrong event in the original design. Reading `market_state` straight off `MarketStateChanged`'s own payload (no `get_snapshot()` call needed for it at all) turned out simpler than the original plan, too. Second-order finding along the way: `FeatureEngine.get_snapshot()` (decision #47) can't be used to reconstruct the `FeatureSet` `evaluate()` needs, because its shape predates decision #99's `open`/`high`/`low`/`volume` fields and was never extended to carry them — doing so would have silently hidden real OHLC from every strategy exactly the way decision #99's own schema comment warns against. Resolved by caching the real `FeaturesUpdated` payload directly (keyed `(symbol, timeframe)`) rather than reconstructing it from anywhere. See `scheduler.py`'s module docstring for the full reasoning, and `test_strategy_scheduler.py`'s real-engine integration test, kept explicitly as a regression test for this exact failure mode. |
-| D13 | Where `Opportunity` (currently defined on `strategy_engine/base_strategy.py`) should live once it's published as `OpportunityCreated`'s payload — import it directly, or mirror/move it into `schemas/events/opportunity.py` to match the convention `MarketState`/`ContextChanged`/`FeatureSet` already follow (§4). **Originally logged as D12 in a parallel session (Track B) — renumbered here after colliding with the D12 above, same decision #115 collision as D10's own note describes.** | **Resolved: import directly, do not move.** Decided by Saqib directly. `MarketState`/`ContextChanged`/`FeatureSet` earn their `schemas/events/` separation because they're genuinely imported across module boundaries — checked directly: all three are pulled in by their producing engine AND every strategy file, and `FeatureSet` additionally by `scanner/runner.py`/`scanner/scorer.py`. `Opportunity` has no such cross-module consumer today — only `base_strategy.py` (defines it) and the 7 strategy files (construct it), both inside `strategy_engine/`; `OpportunityCache` itself does not import the class (it trusts the raw `envelope.payload` dict — see D10's note on Track B). `scheduler.py`'s own delivery independently confirms this default in practice: it imports `Opportunity` only via `Strategy`/`base_strategy.py`, never from a mirrored location. No code change required by this resolution either way. Revisit if/when a real cross-module consumer (the Opportunity Engine, §9) actually needs to import the class directly rather than trust an envelope dict — not preemptively. |
-| D14 | Whether `StrategyScheduler` enforces `StrategyConfig.active_from`/`active_to` before calling `evaluate()` | **Resolved — decision #116. Activation-window enforcement is OUT of scope for Stage 2.** `StrategyScheduler` MUST NOT compare `features.candle_ts` (or any other timestamp) against `active_from`/`active_to` in Stage 2 — every registered strategy is called on every matching trigger regardless of its config's activation window, same treatment `gate_conditions` already got in D10. Stage 2's job is scheduling/evaluation/publication, not enforcing a strategy's complete temporal eligibility model. **The two instructions that looked contradictory are reconciled, not in tension:** (1) "out of scope for now, same as gate_conditions" (confirmed directly, Track A's own thread) is the authoritative architectural decision for what Stage 2 builds. (2) "use event/market timestamps, never wall-clock `now`" (Track B's own thread) is a constraint on HOW enforcement must be implemented **if and when** it's ever brought into scope in a future stage — it was never permission to build it now, and `features.candle_ts` remaining available on every `evaluate()` call does not by itself imply the Scheduler must currently act on it for this purpose. A future session must not reopen this item merely because it encounters `active_from`, `active_to`, or `candle_ts` in the code — those fields existing is expected and intentional; using them for activation-window enforcement is what's deferred. If a future stage does bring enforcement into scope, the correct comparison is `active_from <= ts` and (`active_to is None or ts < active_to`) against `features.candle_ts` (or `market_state`'s own timestamp) — never `datetime.now()`, per §7's existing invariant — but that implementation doesn't exist yet and this entry is not authorization to add it. `scheduler.py` is unchanged by this resolution — it was already built consistent with "out of scope" (D10/decision #114), so no code follows from closing this item, only the documentation catching up to confirm that was the right call. |
-| D15 | Whether `StrategyScheduler` enforces `StrategyConfig.gate_conditions` (§2b) before calling `evaluate()` — the other item D10 deferred alongside D14/`active_from`/`active_to` | **Resolved — decision #117. Enforced, closing this item on its own terms (`active_from`/`active_to` stays separately closed by D14 — not reopened here).** New `app/strategy_engine/gate_conditions.py` — a small key/value registry plus one pure check function — validated once per strategy at `StrategyScheduler.__init__` (raises `ValueError` for anything unrecognized, a deliberately harder failure than D12's own `after_time`/`on_event` "registered but unreachable" precedent) and evaluated once per strategy per candle, immediately before `evaluate()`, using `market_state.candle_ts` (never wall-clock, same §7 invariant D14 already enforces). v1 supports exactly `{"session": "regular"}` — confirmed by grep to be the only condition any of the 7 real `StrategyConfig`s declares; §3's own illustrative `vix_min` example confirmed, also by grep, to correspond to no real field anywhere in this codebase, so no support was built for it. Found, not assumed: 3 of the 7 strategies (First Pullback, Reversal, VWAP) had declared this exact precondition with **zero enforcement anywhere** before this change — the other 4 already self-gate on session inline and are now redundant with the central check, left untouched (removing an inline check is separate, later work). Full reasoning, including the timestamp-source and fail-loud calls: decision #117. |
-| D16 | Remove the v1 strategies' now-redundant inline session GATE checks (`gap_strategy.py`, `momentum_strategy.py`, `volume_spike_strategy.py`'s explicit `MarketClock.is_regular_session()` calls), now that decision #118 makes `StrategyScheduler`/`gate_conditions.py` the sole enforcement authority | **Resolved — decision #119, a standalone cleanup pass per decision #118's own trigger condition (Saqib's direct call, not a deferral).** **Correction to this row's original framing:** only 3 strategies had a removable inline check, not 4 — `gap_strategy.py`, `momentum_strategy.py`, `volume_spike_strategy.py`. `orb_strategy.py` has no `is_regular_session()` call anywhere; its `minutes_since_open()` usage is load-bearing MATCH logic (opening-range formation timing), not a duplicate session gate, and `orb_strategy.py` was correctly left completely untouched, code-wise. The two-line inline check removed from each of the 3 files; `clock = get_market_clock()` stays live in all three (reused for `trading_day()`, and in Gap's case `minutes_since_open()` inside `match_direction()`). Each file's `default_config()` `gate_conditions` comment and module docstring's "Session scope" section updated to point to central `StrategyScheduler`/`gate_conditions.py` enforcement instead of claiming self-enforcement (Gap/Volume Spike had a stale `default_config()` comment claiming self-enforcement; Momentum did not have one to begin with — verified per-file, not assumed uniform). The 3 corresponding `test_outside_regular_session_never_fires` tests removed (not rewritten) — the behavior they asserted no longer exists at the strategy layer by design, and rewriting them to call `evaluate()` directly would re-legitimize the bypass path #118 closed; existing coverage in `test_gate_conditions.py` (10 tests) and `test_strategy_scheduler.py` (incl. a real-engine end-to-end case) already proves the real contract — an out-of-session candle never reaches a strategy's `evaluate()` at all. MATCH/SCORE/PROPOSE logic confirmed byte-for-byte unchanged in all three files via diff against an untouched clone. Full details: decision #119. |
-| D17 | §5 locks `market_state_at_entry`/`market_state_at_exit`/`context_at_entry`/`context_at_exit` (`StrategyOutcome`) as REQUIRED `dict` fields, but `state_snapshot.py`'s (#98) `capture_market_state_snapshot()`/`capture_context_snapshot()` can each honestly return `None` on a cold-start symbol — a real gap between a locked persistence contract and its own upstream capture behavior | **Open, deliberately not resolved by decision #120.** Surfaced while building `strategy_outcomes`' persistence layer (#120): that task's own scope is implementing §5 exactly as locked, not revising it, so all four fields stay required, exactly as §5 states — `state_snapshot.py`'s `StrategyOutcomeSnapshots` is likewise untouched. The gap is real, not hypothetical: whichever future module wires a real caller to `record_strategy_outcome()` (Execution Engine/Position Monitor) will need to either (a) only call it once both snapshots are confirmed non-`None`, or (b) trigger a real revisit of §5's nullability. Not decided here, and no code anywhere resolves it either way yet — this row exists so it's found deliberately, not rediscovered as a bug once a real caller is finally built. |
-| D18 | Backtest replay writes real `symbols`/`daily_levels_state` rows under an arbitrary caller-supplied `symbol` label, with no `is_backtest` flag on either table — surfaced building decision #135's historical-provider seam | **Resolved — decision #140. Real live/backtest namespacing is built.** `symbols` and `daily_levels_state` now carry `is_backtest`; `symbols` identifies a ticker by `(ticker, is_backtest)`, and `daily_levels_state` uses a composite `(symbol_id, is_backtest)` foreign key so a checkpoint cannot be attached to a symbol in the opposite namespace. The run-scoped Feature, Market State, and Level Interaction engines use `is_backtest=True`; all nine production files found by a fresh grep of actual `Symbol.ticker` call sites explicitly select `is_backtest=False` on the live path: `feature_engine/engine.py`, `market_state_engine/engine.py`, `trading_intelligence/level_interaction_engine.py`, `scanner/universe.py`, `services/candle_recorder.py`, `services/candle_store.py`, `context_engine/engine.py`, `context_engine/fundamentals_refresh.py`, and `context_engine/providers/fundamentals.py`. Backtest Feature Engines also bypass live restart-survival recovery at the start of each run, forcing the replay's provider fetch to repopulate the raw daily-candle cache; identical repeat runs therefore retain non-zero `volume_regime_score`/`volatility_regime_score`. Option (c), real namespacing, was chosen over option (b), `finally` cleanup. Inspection showed cleanup was not actually the smaller change: a replay-created `symbols` row is referenced by Daily Levels, Market State, Level Interaction, candles, scanner-universe, and fundamentals tables, so deleting it requires a cross-table cascade; a colliding live symbol also requires snapshot-and-restore of rows reconciliation updates or archives, remains contaminated while the replay is running, can overwrite concurrent live changes during restoration, and is left contaminated if the process dies before `finally`. Namespacing prevents the collision at write/read time instead. Migration `0009` backfills existing rows to live (`false`) and removes replay-derived namespace rows on downgrade because the legacy one-row-per-ticker schema cannot represent them. Verified against real PostgreSQL: baseline 728 passed/0 failed; final 737 passed/0 failed; `0009 → 0008 → 0009` round-trip passed; a same-ticker live sentinel remained unchanged across two identical replays while both runs retained non-zero regime scores; fresh-main overlay showed exactly 19 changed files, all under `backend/`. This resolution unblocks the pre-market async-prewarm fix and the D4 readiness check. |
-| D19 | Decision #140 isolates live state from backtest state, but `daily_levels_state` still used one shared `is_backtest=True` active-row pool for every run of the same ticker — found by direct two-run execution after #140 | **Resolved — decision #141.** `daily_levels_state.backtest_run_id` now scopes every replay reconciliation to its own `backtests.run_id`; `BacktestRunner` threads the UUID through `EngineBackedReplayStateProducer` into `FeatureEngine`. PostgreSQL enforces exactly `(live, NULL)` or `(backtest, non-NULL)` and enforces the run FK with `ON DELETE CASCADE`; the cascade is intentional for derived checkpoints and differs from durable `strategy_outcomes`' default `NO ACTION` FK. The existing level-identity unique constraint is unchanged. The reconciliation index now matches `(symbol_id, is_backtest, backtest_run_id, status)`. Migration `0010` removes only legacy backtest Daily Levels rows that cannot be assigned honestly; no Symbol or other symbol-dependent table changes. `_load_confirmed_daily_levels_for_today()` also filters by run ID despite being unreachable for backtests today, preventing an inconsistent future restart-survival re-enable. Two identical runs now mint disjoint row/level IDs and leave run 1 byte-for-value unchanged; #140's existing regression still passes unchanged. |
 
 ---
 
@@ -1098,7 +593,7 @@ Everything above, connected — the learning loop this design is actually buildi
 - **Invariants enforced at write time, not just documented (decision #89)** — `entry_qty == exit_qty` for a fully closed `StrategyOutcome` row is asserted before the row is written, same "assertion-guarded, not just narrated" discipline already used for multi-site structural edits elsewhere in this project.
 - **Real Postgres, not mocks**, once `strategy_outcomes` (renamed from `strategy_performance` — decision #89) has real rows to query against — same standard as every other module in this codebase.
 - **Docs updated in the same change as code** — once Strategy Engine code exists, this document and `confirmed-decisions.md` update alongside it, not after.
-- **Architecture questions surfaced before code** — §10's open items get resolved (or explicitly deferred with a trigger condition) before the corresponding code is written, not silently decided mid-implementation.
+- **Architecture questions surfaced before code** — `strategy-engine-open-decisions.md` §10's open items get resolved (or explicitly deferred with a trigger condition) before the corresponding code is written, not silently decided mid-implementation.
 - **Defer generality until a concrete gap appears** — no dedicated "Timing Engine" or "Confirmation Engine" (§8), no generic rule engine for MATCH (§1), until a real strategy's needs outgrow the flag/dict-based approach already in place. Same reasoning kept `_at_signal`/`_at_entry` as one snapshot pair, not two, in §5.
 
 ---
@@ -1107,412 +602,29 @@ Everything above, connected — the learning loop this design is actually buildi
 
 - [x] **Stage 0 — Lock the direction in writing (no application code).** This document + `confirmed-decisions.md` #87, refined by #88 (§8's ACT/WAIT/ABANDON model), refined again by #89 (§5's `StrategyOutcome`/`backtests` schema: field groups, `strategy_outcomes` rename, `eod_flatten`, `slippage_entry`, write-time invariants).
 - [x] **Stage 1 — ORB built (decision #99).** `base_strategy.py` (`Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger`) and `orb_strategy.py` — the first concrete strategy. An earlier, undocumented attempt at this stage (`momentum_strategy.py`/`vwap_strategy.py`, built by a concurrent session against a `base_strategy.py` that didn't exist yet, decision-log entry lost to a numbering collision with #98) was found orphaned and discarded rather than built on top of — see decision #99 for the full account. Momentum and VWAP are being rebuilt fresh, assigned to a separate session, against this now-real interface.
-- [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see §15 below for both.
-- [x] **Stage 1 (continued) — First Pullback and Reversal built (decisions #107-#110).** Design-reviewed before code (decision #108: gap-through/cold-start handling, `get_snapshot()`'s new `last_applied_candle_ts` staleness field, MATCH/SCORE boundary tightened). `first_pullback_strategy.py`, `reversal_strategy.py`, and shared `level_touch_tracking.py` — see §16 for the full walkthrough. All 7 v1 strategies from trading-intelligence-architecture.md §8 are now either built (ORB, Gap, Volume Spike, First Pullback, Reversal) or assigned (Momentum, VWAP — a separate session's thread).
+- [x] **Stage 1 (continued) — Gap and Volume Spike built (decisions #104, #105).** `gap_strategy.py` and `volume_spike_strategy.py`, the second and third concrete strategies against the real interface — see `strategy-engine-build-history.md` §15 for both.
+- [x] **Stage 1 (continued) — First Pullback and Reversal built (decisions #107-#110).** Design-reviewed before code (decision #108: gap-through/cold-start handling, `get_snapshot()`'s new `last_applied_candle_ts` staleness field, MATCH/SCORE boundary tightened). `first_pullback_strategy.py`, `reversal_strategy.py`, and shared `level_touch_tracking.py` — see `strategy-engine-build-history.md` §16 for the full walkthrough. All 7 v1 strategies from trading-intelligence-architecture.md §8 are now either built (ORB, Gap, Volume Spike, First Pullback, Reversal) or assigned (Momentum, VWAP — a separate session's thread).
 - [x] **Stage 1 (continued) — Gap/Volume Spike design review's six changes made, `scoring_utils.py` extracted (decision #111).** `regular_open` moved to Feature Engine, Gap bounded to `max_minutes_since_open`, Volume Spike gained `min_absolute_volume`/`min_body_ratio`, shared `clamp`/`trend_magnitude`/`validate_mirror_threshold` adopted by all 5 built strategies, `Opportunity.expected_horizon_minutes` added.
-- [x] **Stage 1 complete — Momentum and VWAP built (decision #113).** `momentum_strategy.py`, `vwap_strategy.py` — the sixth and seventh, and last, v1 strategies. Externally reviewed before code (same practice as #107/#108); `ESTABLISHED_TREND_SCORE_THRESHOLD` extracted to `scoring_utils.py`, `reversal_strategy.py` refactored onto it. See §18 for the full walkthrough. **All 7 v1 strategies from `trading-intelligence-architecture.md` §8 are now built.**
+- [x] **Stage 1 complete — Momentum and VWAP built (decision #113).** `momentum_strategy.py`, `vwap_strategy.py` — the sixth and seventh, and last, v1 strategies. Externally reviewed before code (same practice as #107/#108); `ESTABLISHED_TREND_SCORE_THRESHOLD` extracted to `scoring_utils.py`, `reversal_strategy.py` refactored onto it. See `strategy-engine-build-history.md` §18 for the full walkthrough. **All 7 v1 strategies from `trading-intelligence-architecture.md` §8 are now built.**
 - [x] **Stage 2 — fully built and verified, both tracks (decisions #114/#115/#116).** **Track A — Strategy Scheduler:** `scheduler.py` instantiates all 7 built strategies, subscribes `FeaturesUpdated` (caches the real payload — see decision #114 for why) and `MarketStateChanged` (the actual `evaluate()` trigger — also decision #114, a real correction found by testing, not the original plan), publishes `OpportunityCreated`. **Track B — OpportunityCreated read-side** (cache + `GET /intelligence/opportunities`), built in a parallel session; collided with Track A on decision number #114 (lost from the log when Track A's delivery was applied) and its own `main.py`/`conftest.py` wiring was flagged but never finished — both restored/completed in decision #115, verified end-to-end by running the real app lifespan (a directly-published `OpportunityCreated` correctly reaches `GET /intelligence/opportunities`). Full suite with a real local Postgres: 577 passed, 1 failed (`test_vwap_publishes_even_while_sma_is_still_warming_up`, pre-existing, unrelated). Opportunity Engine's ranking (§9) remains deliberately OUT of Stage 2's scope. `active_from`/`active_to` enforcement — also OUT of scope, canonically closed, not merely deferred pending clarification — see decision #116/D14. Declarative `gate_conditions` enforcement (§2b), originally deferred alongside `active_from`/`active_to`, was closed SEPARATELY and is now built — see decision #117/D15.
 - [x] **Stage 2 (continued) — `gate_conditions` enforcement built (decision #117/D15).** `app/strategy_engine/gate_conditions.py` (new) — registry/validation/check for §2b's declarative preconditions, wired into `scheduler.py` centrally, before `evaluate()`. v1 supports exactly `{"session": "regular"}`, the only condition any real `StrategyConfig` declares. Closed a real, live gap for 3 of 7 strategies (First Pullback/Reversal/VWAP had no session enforcement anywhere before this). 20 new tests, real local Postgres, zero regressions.
-- [x] **Performance Intelligence's persistence layer built — `strategy_outcomes` + `backtests` tables (decision #120).** §5/§7's shape (decision #89), Stage 0 since #89, now has a real migration (0008), ORM (`app/models/trading_intelligence.py`'s `StrategyOutcomeRecord`/`BacktestRunRecord`), Pydantic contract (new `app/schemas/performance.py`), and a real but unwired write path (`app/trading_intelligence/performance.py`'s `record_strategy_outcome()`, asserting `entry_qty == exit_qty` before every write, raising rather than swallowing per §11). Establishes this codebase's first JSONB and native-UUID-PK/FK conventions. `feature_snapshot_id`/`opportunity_id` stay unenforced UUID references — their target tables don't exist yet; `backtest_run_id` is a real FK to `backtests`, built in the same migration. Surfaced a genuine, deliberately unresolved gap between §5's required-dict typing and `state_snapshot.py`'s (#98) honest-`None` capture behavior — tracked as new open item D17, not silently patched. No Execution Engine/Position Monitor exists yet to call `record_strategy_outcome()` for real — same "build the stable contract now, real callers plug in later" precedent decision #98 set for the read side. 8 new tests, real local Postgres, 100% stable across repeated runs.
+- [x] **Performance Intelligence's persistence layer built — `strategy_outcomes` + `backtests` tables (decision #120).** §5's shape / `backtest-runner-design.md` §7's shape (decision #89), Stage 0 since #89, now has a real migration (0008), ORM (`app/models/trading_intelligence.py`'s `StrategyOutcomeRecord`/`BacktestRunRecord`), Pydantic contract (new `app/schemas/performance.py`), and a real but unwired write path (`app/trading_intelligence/performance.py`'s `record_strategy_outcome()`, asserting `entry_qty == exit_qty` before every write, raising rather than swallowing per §11). Establishes this codebase's first JSONB and native-UUID-PK/FK conventions. `feature_snapshot_id`/`opportunity_id` stay unenforced UUID references — their target tables don't exist yet; `backtest_run_id` is a real FK to `backtests`, built in the same migration. Surfaced a genuine, deliberately unresolved gap between §5's required-dict typing and `state_snapshot.py`'s (#98) honest-`None` capture behavior — tracked as new open item D17, not silently patched. No Execution Engine/Position Monitor exists yet to call `record_strategy_outcome()` for real — same "build the stable contract now, real callers plug in later" precedent decision #98 set for the read side. 8 new tests, real local Postgres, 100% stable across repeated runs.
 - [x] **`strategy_outcomes` and the opportunity conflict view (#120/#121) exposed via routes — `GET /intelligence/strategy-outcomes`, `GET /intelligence/opportunity-conflicts` (decision #123).** Both #120 and #121 deliberately shipped without a route, each citing the same parallel-track collision risk on `app/api/routes/intelligence.py`; that risk is gone now, closing the gap the same way `GET /intelligence/opportunities` did for `OpportunityCache` back in Stage 2. `/strategy-outcomes` is a raw recent-rows read (`ORDER BY exit_filled_at DESC`, `limit`-capped) through #120's own `StrategyOutcome` Pydantic contract — not an aggregate, and not dependent on #122's `performance_queries.py` (that module's own `GROUP BY` queries remain unrouted, by design, per #122's own entry). `/opportunity-conflicts` is a genuinely thin wrapper over #121's `get_opportunity_conflicts()`. Minimal frontend surfacing: a per-symbol "conflict/agreement" section next to the existing opportunities list (`AIAnalysisPanel.tsx`), and a global "Recent Closed Trades" section in the market-wide view (`InfoTab.tsx`'s `GeneralContent`, since `strategy_outcomes` has no `symbol` filter) — no new page or panel type. `strategy_outcomes` still has zero real LIVE rows in production (no Execution Engine/Position Monitor exists to write one) — the empty state is rendered honestly, not hidden. *(As of decision #130: this route had no `is_backtest` filter at all until then — harmless at the time this entry was written since nothing wrote backtest rows either, but a real gap once Backtest Runner v1 (#128) started producing genuine `is_backtest=True` rows. See #130 for the fix and the corrected route docstring.)*
 
 ---
 
 ## 13. How to resume this in a new session
 
-1. Read this file in full, then `confirmed-decisions.md`'s most recent entries — check whether §10's open items have moved before re-deciding them.
+1. Read this file in full, then `confirmed-decisions.md`'s most recent entries — check whether `strategy-engine-open-decisions.md` §10's open items have moved before re-deciding them. This document split into four files at `split-strategy-engine-design-doc` (decision #142) — see the moved-sections map above; the other three are only needed when the work at hand actually touches Backtest Runner, an open D-item, or a specific strategy's build history.
 2. `strategy_engine/base_strategy.py` now exists (decision #99) — any new strategy should import the real `Strategy`/`StrategyConfig`/`Opportunity`/`ScheduleTrigger` from it, not re-guess the interface the way the discarded momentum/vwap attempt had to.
 3. §8's ACT/WAIT/ABANDON *model* is locked (decision #88) — don't re-litigate whether `confirmation_timeframe` should come back. What's still genuinely open there is D5 (the waiting-value model itself) and D6 (wiring a consumer to `PriceSnapshot`) — build either only when a real strategy needs it, not speculatively.
 4. Before building on Stage 1, know what M4 (decision #98) already prepared: `MarketStateEngine.get_snapshot()`, `ContextEngine.get_snapshot()`, and `app/trading_intelligence/state_snapshot.py`'s three capture functions all exist and are tested (`backend/tests/test_strategy_integration_contract.py`) — a strategy should call these, not re-derive its own read path against either engine. Also worth knowing: `ContextChanged` has no domain-safe timestamp (§4's providers are timer-triggered, not candle-triggered) — decision #98 left this open rather than inventing one; don't assume it got solved.
 5. `FeatureSet` now carries `open`/`high`/`low`/`volume` (decision #99) — but ONLY on the 1m `FeatureSet`; a 5m/15m/1h `FeatureSet`'s open/high/low/volume are `None` (true aggregated-bucket OHLC isn't tracked anywhere yet — see `schemas/events/features.py`'s `FeatureSet` docstring for why passing through the last constituent 1m candle's OHLC would be dishonest, not just incomplete). A strategy reading these on anything other than a 1m `FeatureSet` needs to handle `None`, not assume they're populated.
 6. `Strategy.evaluate()`'s real signature takes `symbol: str` as its first argument (decision #99) — the illustrative 3-arg sketch (system-design.md §4.8) had no way for a strategy to know which symbol it's being asked about, which only mattered once a strategy needed its own per-symbol memory (ORB's opening range does; the discarded Momentum draft's stateless MATCH logic never hit this gap). Any new strategy's `evaluate()` must match the real 4-arg signature.
-7. First Pullback and Reversal (§16, decisions #107-#110) are now built — `first_pullback_strategy.py`/`reversal_strategy.py` call `get_level_interaction_engine().get_snapshot(symbol)` directly (D9), never read its `seconds_in_zone` field (wall-clock, not `candle_ts`-derived), and re-derive rejected-vs-conquered one candle late from each strategy's own private per-symbol state rather than assuming `LevelInteractionChanged`'s `status` field is reachable — no Scheduler wires `on_event(...)` triggers to anything yet. *(Corrected — this point previously said "design-locked but unbuilt," stale as of decision #109/#110; caught during a status review, decision #112.)*
+7. First Pullback and Reversal (`strategy-engine-build-history.md` §16, decisions #107-#110) are now built — `first_pullback_strategy.py`/`reversal_strategy.py` call `get_level_interaction_engine().get_snapshot(symbol)` directly (D9), never read its `seconds_in_zone` field (wall-clock, not `candle_ts`-derived), and re-derive rejected-vs-conquered one candle late from each strategy's own private per-symbol state rather than assuming `LevelInteractionChanged`'s `status` field is reachable — no Scheduler wires `on_event(...)` triggers to anything yet. *(Corrected — this point previously said "design-locked but unbuilt," stale as of decision #109/#110; caught during a status review, decision #112.)*
 8. **All 7 v1 strategies are now built** (ORB, Gap, Volume Spike, First Pullback, Reversal, Momentum, VWAP — decision #113 closed out the last two). **Stage 2 (the Scheduler/wiring milestone, decision #112/D10) is now unblocked** and is this thread's next work — nothing further needs to land in Strategy Engine itself first.
 9. A numbering collision happened at #111: a docs-only decision drafted in an earlier session (Stage 2 sequencing/scope, D10) was queued but never actually applied to git before Saqib separately committed different, unrelated work (the Gap/Volume Spike design-review changes) as #111. Same category of collision decision #99 already documents happening once before with #98 — resolved the same way: the queued content wasn't discarded, just renumbered and re-applied as #112, with this note as the record of what happened. If a THIRD such collision is ever found, it's worth asking whether the decision-log's queue/apply handoff between sessions needs an actual fix rather than another one-off renumbering.
-10. Momentum and VWAP (§18, decisions #113) are now built — `momentum_strategy.py`/`vwap_strategy.py`. `reversal_strategy.py` was touched too (refactored onto `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD`, no behavior change). A local Postgres was actually provisioned for this session's own verification (`apt-get install postgresql`, `alembic upgrade head`) rather than relying on DB-free tests alone — worth doing again for any future session touching `LevelInteractionEngine`-dependent strategies, since the two most logically intricate VWAP tests (the same-zone-repeat suppression, the day-rollover reset) would otherwise only be trace-verified by hand.
+10. Momentum and VWAP (`strategy-engine-build-history.md` §18, decisions #113) are now built — `momentum_strategy.py`/`vwap_strategy.py`. `reversal_strategy.py` was touched too (refactored onto `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD`, no behavior change). A local Postgres was actually provisioned for this session's own verification (`apt-get install postgresql`, `alembic upgrade head`) rather than relying on DB-free tests alone — worth doing again for any future session touching `LevelInteractionEngine`-dependent strategies, since the two most logically intricate VWAP tests (the same-zone-repeat suppression, the day-rollover reset) would otherwise only be trace-verified by hand.
 
 ---
 
-## 14. ORB — Stage 1's first strategy, and what actually happened getting there (decision #99)
-
-**What was found before any of this was built:** `momentum_strategy.py` and `vwap_strategy.py` already existed in the repo, from an earlier concurrent session — undocumented. Both imported a `base_strategy.py` that didn't exist anywhere. Their own docstrings admitted this and flagged three unverified interface assumptions. A `TESTING.md` at the repo root claimed decision #98 for that work — but the real decision #98 in `confirmed-decisions.md` is the M4 integration milestone, a different piece of work entirely. Two concurrent sessions minted the same decision number; only the M4 session's doc updates actually landed. The momentum/vwap code was orphaned, silently, with no working `pytest` collection possible. Discarded rather than built on top of — see the session's own discussion for the full reasoning. *(Historical note, as of decision #99: Momentum was assigned to be rebuilt fresh, by a separate session, against the now-real interface below. Both it and VWAP are since built — decision #113, §18 — against this same interface, discarded draft not consulted.)*
-
-**GATE/MATCH/SCORE/PROPOSE, applied to ORB's actual state machine** (not the discarded sketch's time-boxed trigger — see `orb_strategy.py`'s module docstring, correction #1):
-
-```
- every 1m candle, all session long (trigger = every_candle("1m"))
-      │
-      ▼
- ┌─────────────────────────┐   minutes_since_open      ┌──────────────────────────┐
- │  FORMING                │ ─────< or_minutes ───────▶│  accumulate this         │
- │  (0 candles..or_minutes)│                            │  candle's high/low into  │
- └─────────────────────────┘                            │  the running OR;         │
-      │                                                  │  return None             │
-      │ minutes_since_open >= or_minutes                └──────────────────────────┘
-      ▼
- ┌─────────────────────────┐   candles_seen < or_minutes
- │  freeze the range        │──────────────────────────▶ return None, permanently,
- │  (or_formed = True)      │   (gap / late start)        for the rest of this day
- └─────────────────────────┘   — honest absence,          (module docstring's
-      │                          not a fabricated range    accepted limitation)
-      │ candles_seen == or_minutes
-      ▼
- ┌─────────────────────────┐
- │  GATE passed — MATCH:    │   close > or_high & trend/volume confirm  ──▶ BUY
- │  breakout test against   │
- │  the frozen or_high/low  │   close < or_low  & trend/volume confirm  ──▶ SELL
- └─────────────────────────┘
-      │
-      │ direction not in fired_directions (else: already proposed today, return None)
-      ▼
- SCORE (trend + volume + breakout-strength blend) → PROPOSE an Opportunity,
- mark direction as fired for today. Reset entirely at the next trading_day
- (MarketClock-derived, never wall-clock).
-```
-
-**State is symbol-keyed inside the strategy instance, never published.** One `ORBStrategy` instance serves every symbol (same singleton-with-internal-keying shape `FeatureEngine`/`MarketStateEngine`/`LevelInteractionEngine` already use) — `evaluate()` takes `symbol: str` explicitly so that keying is possible (base_strategy.py's own docstring, assumption #4). The opening range itself is Saqib's explicit call to keep private rather than publish to `FeatureSet` — accepted trade-off: no persistence, no restart-survival mid-day (see `orb_strategy.py`'s module docstring for the full accounting of that limitation).
-
-**Verification:** `backend/tests/test_base_strategy.py` (9 tests) + `backend/tests/test_orb_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus a full multi-day, multi-symbol `evaluate()` simulation (formation → freeze → breakout → fire-once → reversal → day rollover → independent per-symbol state → honest absence on missing OHLC or a missed formation window). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures in a sandbox with no local Postgres, 91 skipped, both unchanged) plus these 27 new tests passing — zero regressions from the `FeatureSet`/`feature_engine/engine.py` OHLC threading.
-
-**A second reconciliation, from an independent set of concurrent-session findings, folded in before this was finalized.** A separate session (assigned Momentum) reviewed the discarded `momentum_strategy.py`/`vwap_strategy.py` in place rather than rebuilding fresh, and found two real bugs plus one Feature Engine documentation gap — see decision #99's full account for all three, and `match_direction()`'s own docstring in `orb_strategy.py` for the one applied directly here (a threshold-mirroring guard). The `MarketStateEngine._latest_features` per-symbol timeframe race those reviews found remains open, flagged for Saqib, not fixed by this build.
-
----
-
-## 15. Gap and Volume Spike — the second and third strategies after ORB (decisions #104, #105)
-
-Both built against the real `base_strategy.py`, after decision #103 closed the `MarketStateEngine` per-symbol timeframe race §14 flagged — neither has the shared-slot exposure ORB/Momentum/VWAP each had to reason about. Full reasoning for every design choice below lives in each module's own docstring (`gap_strategy.py`, `volume_spike_strategy.py`) and decisions #104/#105 — this section is a summary and a diagram, not a duplicate of either.
-
-**Gap — is today's opening gap holding (continuation), or already given back (reversal)?**
-
-```
- every 1m candle, regular session only (trigger = every_candle("1m"))
-      │
-      ▼
- gap_pct / gap_dollars / pdc present in features.features?
-      │ no ──▶ return None (no gap yet, or no prior trading day — honest absence)
-      │ yes
-      ▼
- already fired today for this symbol?
-      │ yes ──▶ return None (gap_pct's sign is frozen for the day — only one
-      │          possible direction, unlike ORB's two-sided range)
-      │ no
-      ▼
- regular_open = pdc + gap_dollars        (reconstructed, not separately tracked)
-      │
-      ▼
- MATCH: |gap_pct| >= min_gap_pct  &  volume_regime_score confirms  &
-        gap_pct > 0 → close > regular_open & trend_score confirms   ──▶ BUY
-        gap_pct < 0 → close < regular_open & trend_score confirms   ──▶ SELL
-      │
-      ▼
- SCORE (trend + volume + gap-size blend) → PROPOSE an Opportunity,
- invalidation = regular_open (the same level MATCH just tested against),
- mark fired for today. Reset entirely at the next trading_day.
-```
-
-**Volume Spike — did this candle print unusually heavy volume, and which way did the market move on it?**
-
-```
- every 1m candle, regular session only (trigger = every_candle("1m"))
-      │
-      ▼
- open/high/low/volume all present? ── no ──▶ return None (pre-#99 shape,
-      │ yes                                   or an aggregated FeatureSet)
-      ▼
- rolling baseline has lookback_bars samples yet?
-      │ no ──▶ push this candle's volume, return None (honest warm-up,
-      │         same discipline as ORB's candles_seen < or_minutes)
-      │ yes
-      ▼
- baseline = mean(prior lookback_bars volumes)   (this candle NOT included)
- volume_ratio = this candle's volume / baseline
- push this candle into the window for the NEXT candle's baseline
-      │
-      ▼
- within cooldown_minutes of the last fire for this symbol?
-      │ yes ──▶ return None (floor against re-firing the same still-elevated move)
-      │ no
-      ▼
- MATCH: volume_ratio >= spike_ratio_threshold  &  volume_regime_score confirms  &
-        close > open → trend_score confirms   ──▶ BUY
-        close < open → trend_score confirms   ──▶ SELL
-      │
-      ▼
- SCORE (trend + volume + spike-excess blend) → PROPOSE an Opportunity,
- invalidation = this candle's own low/high (the same bar MATCH just tested),
- record last_fired_ts. Reset the whole baseline + cooldown at the next trading_day.
-```
-
-**Three design choices worth naming, since each deliberately diverges from ORB's own precedent rather than copying it wholesale:**
-
-1. **Gap's `_GapState.fired` is a plain `bool`, not ORB's `fired_directions: set`.** A gap's direction is fixed by `gap_pct`'s own sign for the whole day (`_update_gap`, decisions #67/#68) — there is never a second, opposite direction for a reversal to test against the way ORB's fixed range allows both sides.
-2. **Volume Spike uses a per-symbol cooldown timer, not a fired-once-per-day flag.** Unlike Gap (one fixed daily event) or ORB (one fixed daily range), a volume spike is a recurring pattern — a busy session can produce several genuine, independent spikes hours apart, so a once-per-day cap would discard real signal. The cooldown only floors against re-firing the immediate next candle or two of the *same* still-elevated move.
-3. **Volume Spike needed genuinely new per-symbol state (a rolling volume baseline) that no other engine provides — the same "strategy-private state" precedent ORB's own opening range already established, not new territory.** `rvol` (Feature Engine, decision #71) is a day-level, time-of-day-normalized proxy; Market State's `volume_regime_score` already interprets it. Neither answers "was THIS candle anomalous relative to this symbol's own last N bars" — a narrower, single-candle claim nothing else in the codebase computes.
-
-**Verification:** `backend/tests/test_gap_strategy.py` (15 tests) + `backend/tests/test_volume_spike_strategy.py` (18 tests) — pure GATE/MATCH/SCORE math plus end-to-end multi-day, multi-symbol `evaluate()` simulations for each (session gating, day rollover, independent per-symbol state, honest absence on missing data). Full existing suite re-run against this change: identical pass/fail signature to the pre-change baseline (40 pre-existing DB-connectivity failures, 91 skipped, both unchanged) plus these 33 new tests passing — zero regressions.
-
----
-
-## 16. First Pullback and Reversal — design, review, and build (decisions #107, #108, #109, #110)
-
-The last two strategies from trading-intelligence-architecture.md §8's planned v1 set (ORB, Gap, Volume Spike built; Momentum still assigned elsewhere). **Built** — `first_pullback_strategy.py`/`reversal_strategy.py`, plus a small shared `level_touch_tracking.py` module both depend on. The design below (decision #107) went through an external design review before any code was written, per Saqib's own "short design note first, then code" instruction; the review's findings and this file's response to them are decision #108, folded into the sections below rather than kept as a separate narrative — see "What the design review changed" near the end of this section for the review itself and how each point was resolved. Both strategies read `LevelInteractionEngine`'s touch/holding/rejected/conquered vocabulary (decision #46) as a settled input — same "consume, don't rebuild" boundary discipline `orb_strategy.py` already applies to `trend_score`/`volume_regime_score`. Neither strategy re-derives zone classification, Aura width, or touch counting — that's `LevelInteractionEngine`'s own job.
-
-**Shared mechanism both strategies build on: private per-symbol touch tracking, one candle late.**
-
-`get_snapshot()` (decision #47) only exposes the CURRENT steady `zone` — by the time a touch resolves and `zone` moves on, the transient `status` ("rejected"/"conquered") that produced it is already gone from the snapshot; it only ever existed on the `LevelInteractionChanged` event itself, which neither strategy can subscribe to yet (see the D9 callout below). Both strategies work around this identically: while `zone == "inside_aura"`, remember `entered_from` in a small private dataclass keyed by symbol; on a later candle, once `zone` is no longer `"inside_aura"`, compare the resolved zone to the remembered `entered_from` — equal means REJECTED (bounced back out the side it came from), different means CONQUERED (broke through) — the exact same rule `level_interaction_engine.py`'s own module docstring defines, just re-derived one candle after the fact instead of read off the authoritative event.
-
-```
- watching?  (private per-symbol state: level_key, entered_from, trading_day)
-      │
-      no ──▶ zone == "inside_aura" this candle?
-      │            │ no  ──▶ nothing to watch yet, return None
-      │            │ yes ──▶ remember entered_from + trading_day, start watching, return None
-      │
-      yes ──▶ zone still "inside_aura"?
-                   │ yes ──▶ still resolving, return None (no allows_waiting yet — see below)
-                   │ no  ──▶ resolved. compare resolved zone to remembered entered_from:
-                                  equal      → REJECTED (bounced back)
-                                  not equal  → CONQUERED (broke through)
-                              stop watching this touch either way
-```
-
-**First Pullback — is this the trend's first pullback to a key reference level today, and did the level hold?**
-
-```
- every 1m candle (trigger = every_candle("1m"))
-      │
-      ▼
- features.timeframe == "1m"?  ── no ──▶ return None
-      │ yes
-      ▼
- established trend? |trend_score - 50| past trend_score_threshold
- (mirror-around-50, threshold > 50 — same guard as match_direction(), decision #99)
-      │ no ──▶ return None (no trend, nothing to pull back within)
-      │ yes  →  direction = BUY if trend_score ≥ threshold, SELL if ≤ 100-threshold
-      ▼
- get_level_interaction_engine().get_snapshot(symbol)
-   .get(timeframe, {}).get(level_key)
-      │ missing ──▶ return None (level not tracked yet — honest absence, not an error)
-      ▼
- touch_count_today == 1?  (the FIRST pullback specifically — a later touch is a
-      │                     different, not-yet-built strategy family)
-      │ no ──▶ return None
-      ▼
- [shared touch-tracking mechanism above] → resolved REJECTED, in trend's favor?
-      │ CONQUERED, or not yet resolved ──▶ return None (see mechanism diagram)
-      │ REJECTED
-      ▼
- already fired today for this symbol?  ── yes ──▶ return None
-      │ no
-      ▼
- SCORE (trend + volume_regime_score + resolution distance_pct blend) → PROPOSE,
- invalidation = anchor_price (the level's own value when the touch began —
- a re-test failing below/above that same value falsifies the thesis),
- mark fired for today.
-```
-
-**Reversal — has an established trend's key level just been conquered against it?**
-
-Same touch-tracking mechanism, opposite confirming outcome, and deliberately NOT restricted to the first touch — a reversal is often the second or third test that finally breaks, not the first, so `touch_count_today` is read for SCORE but never gates MATCH the way it does for First Pullback.
-
-```
- every 1m candle (trigger = every_candle("1m"))
-      │
-      ▼
- features.timeframe == "1m"?  ── no ──▶ return None
-      │ yes
-      ▼
- trend_score still shows the OLD, about-to-be-tested direction past threshold?
-      │ no ──▶ return None (no established direction left to reverse)
-      │ yes  →  the trend being tested is BUY-side if trend_score ≥ threshold, SELL-side if ≤ 100-threshold
-      ▼
- get_level_interaction_engine().get_snapshot(symbol).get(timeframe, {}).get(level_key)
-      │ missing ──▶ return None
-      ▼
- [shared touch-tracking mechanism above] → resolved this candle?
-      │ not yet, or REJECTED (level held, trend intact) ──▶ return None, keep counting touches
-      │ CONQUERED
-      ▼
- already fired a reversal today for this symbol?  ── yes ──▶ return None
-      │ no
-      ▼
- MATCH confirmed — direction is the MIRROR of the trend just broken
- (an established uptrend conquered downward proposes SELL, not BUY)
-      │
-      ▼
- SCORE (broken-trend strength + volume_regime_score + touch_count_today blend —
- a break after several prior holds is stronger evidence than a break on the
- very first test) → PROPOSE,
- invalidation = anchor_price, mark fired for today.
-```
-
-**`level_key` is a `StrategyConfig.params` value (v1 default `"vwap"`), not a hardcoded constant — same "not its own strategy class" precedent §3 already sets for SMA 9/20.** A second `StrategyConfig` version pointed at `"sma_20"` gives a second First Pullback variant for free, no new code.
-
-**D9 — why neither strategy reads `LevelInteractionChanged`'s `status` field directly, and why `base_strategy.py` doesn't change.** The clean, event-driven design would be `trigger = on_event("LevelInteractionChanged")` with the event payload passed into `evaluate()` — but `base_strategy.py`'s own docstring already flags that no Scheduler exists to wire `on_event(...)` triggers to anything live, and `evaluate()`'s fixed 4-argument signature (`symbol`, `market_state`, `features`, `context`) has no slot for an arbitrary triggering event's payload regardless. Building that wiring for two strategies, ahead of ORB/Gap/Volume Spike ever needing it, would be exactly the kind of speculative generality §11 already argues against. Both strategies instead call `get_level_interaction_engine().get_snapshot(symbol)` directly inside `evaluate()` — the same free-function-singleton pattern `orb_strategy.py` already uses for `get_market_clock()` — and accept the one-candle-late re-derivation described above as the cost of not touching the shared interface. Full open item logged as §10's D9.
-
-**`allows_waiting` stays `False` for both, v1.** First Pullback's "touch just started, not yet resolved" moment (the `watching` state in the mechanism diagram above) is a natural fit for a `status="waiting"` Opportunity under §8's ACT/WAIT/ABANDON model, rather than silently returning `None` until resolution. But D5 (the waiting-value model itself) is explicitly deferred until a real strategy needs it, and `allows_waiting` defaults `False` everywhere in v1 — First Pullback would be the first real trigger for D5, not decided here. Flagged rather than built speculatively, same restraint §11 asks for.
-
-**Not yet decided, still open after the build:** the exact SCORE blend weights and `trend_score_threshold` default (v1 guess, unvalidated against real score distributions, same caveat every other strategy's calibration constants already carry).
-
----
-
-### What the design review changed (decision #108)
-
-Before any code was written, this design went to an external review (Saqib's standing practice of consulting multiple AI systems before bringing consolidated direction back — see the project's own "Approach & patterns"). The review's five points and this file's response, in the order raised:
-
-1. **"Make sure the strategy's reconstruction is exactly equivalent to `LevelInteractionEngine`'s own definition — inspect the real implementation, don't assume."** It wasn't equivalent as first drafted. Reading `level_interaction_engine.py`'s actual `_process_level`/`_process_one` against the original "watch while `inside_aura`, compare on resolution" sketch found two real gaps, both now fixed in `level_touch_tracking.py` (see its own module docstring for the full mechanism): **gap-through** (a zone jumping straight between `below`/`above` with `inside_aura` never observed — the engine still counts it as a touch and always calls it `conquered`; the original sketch would never have seen it at all, since it only started watching on an `inside_aura` observation) and **cold-start-unknown-origin** (`entered_from is None`, the engine's own "can't determine which side" case, decision #46 — the original sketch would have guessed a direction instead of declining to classify). Both are now handled identically to the engine's own rules, not approximated.
-
-2. **A third issue, not raised by the review, surfaced by that same source-reading: `get_snapshot()` is fed by an async queue + `asyncio.to_thread` worker (`_worker_loop`/`_process_one`), not computed synchronously on the triggering `FeaturesUpdated`.** A strategy reading `get_snapshot()` right after publishing a candle has no built-in guarantee the engine has finished processing that exact candle yet — and unlike Context Engine's `get_snapshot()` (which exposes `evaluated_at`), `LevelInteractionEngine.get_snapshot()` exposed no recency signal at all. Resolved by exposing `last_applied_candle_ts` per entry (`level_interaction_engine.py`, this decision) — the same `_last_applied_ts` value `_process_one`'s own out-of-order guard already tracked internally, now surfaced rather than computed fresh. Both strategies check it before ever calling into `level_touch_tracking.observe_resolution()`, and skip the candle entirely (not just return early with a stale trust) on a lagging read — see either strategy's own GATE section and `level_touch_tracking.py`'s module docstring for why feeding a stale entry through the tracker would corrupt its own zone history.
-
-3. **"Keep interaction detection separate from strategy recognition"** — confirmed clean, with one adjustment: rather than each strategy independently re-deriving `entered_from`/`anchor_price`, `level_touch_tracking.py` reads those verbatim from `get_snapshot()`'s own `holding` dict and never recomputes them; the ONE thing genuinely reconstructed is the final "same side or opposite side" comparison the engine's own `status` field would answer directly if a strategy could reach it. `LevelInteractionEngine` still owns `zone`/`touch_count_today`/`entered_from`/`anchor_price`/`trading_day` outright.
-
-4. **"Do not build event infrastructure speculatively."** Agreed, unchanged — `base_strategy.py` was never modified; the `get_level_interaction_engine().get_snapshot(symbol)` polling pattern (D9) stands as designed, and `level_touch_tracking.py` is deliberately isolated so it can be deleted outright, no other file touched, the day real `on_event(LevelInteractionChanged)` wiring exists.
-
-5. **"Separate MATCH from SCORE strictly."** Confirmed already the shape both strategies were designed with — `volume_regime_score`, resolution distance, and touch count were already SCORE-only in the original sketch. Flagged explicitly in both files' own module docstrings: this is a deliberate divergence from `orb_strategy.py`'s `match_direction()`, which DOES use `volume_regime_score` as a MATCH-stage participation floor. Not retrofitted onto ORB/Gap/Volume Spike — a live open question for whoever next touches any of the three, not resolved here.
-
-6. **Invalidation semantics.** `structural_invalidation = anchor_price` kept, with the framing tightened rather than the logic changed: both files' docstrings now say explicitly that this is a THESIS boundary ("falsified if a later candle closes back through this value"), not an executable stop price — that translation is Trade Planning Engine/Position Monitor's job downstream (neither built yet), matching `Opportunity.structural_invalidation`'s own field comment in `base_strategy.py`.
-
-7. **First Pullback vs. Reversal touch-count gating, and `level_key` configurability.** Both already matched the review's description exactly (First Pullback gates on `touch_count_today == 1`, Reversal never does; `level_key` a params default) — confirmed, no change.
-
-### The build itself
-
-`level_touch_tracking.py` — the shared resolution-reconstruction module described above, its own file so the two strategies never carry two subtly different copies of "rejected vs. conquered." `first_pullback_strategy.py` and `reversal_strategy.py` — both follow `orb_strategy.py`'s GATE → MATCH → SCORE → PROPOSE shape exactly, `_FirstPullbackState`/`_ReversalState` mirroring `_ORBState`'s per-symbol dict shape. One asymmetry worth flagging: Reversal's MATCH condition (CONQUERED) genuinely includes gap-throughs, which never have an `anchor_price` to invalidate against — falls back to `features.features.get(level_key)` (the level's live current value, read straight off the same `FeaturesUpdated` already in hand) rather than failing to propose. First Pullback never hits this path (it only ever fires on `rejected`, and gap-throughs are unconditionally `conquered`), so no equivalent fallback was needed there.
-
-**Verification:** `backend/tests/test_level_touch_tracking.py` (13 tests, pure — every scenario in that module's own docstring: normal reject/conquer, both gap-through directions, both cold-start flavors, day rollover) + `backend/tests/test_first_pullback_strategy.py` (16 tests) + `backend/tests/test_reversal_strategy.py` (12 tests) — each strategy's suite covers pure GATE/MATCH/SCORE math, the staleness guard in isolation (a stubbed engine, no DB needed to prove that branch), and end-to-end `evaluate()` runs against a REAL `EventBus` + REAL `LevelInteractionEngine` + REAL Postgres (same posture `test_level_interaction_engine.py` already established — skipped as a whole, not failed, if Postgres isn't reachable), publishing genuine `FeaturesUpdated` sequences and reading genuine engine-computed zone transitions rather than a hand-rolled substitute. Full suite re-run against this change: 486 passed, 0 failed (up from the pre-change 445 passed baseline — the 41 new tests, zero regressions).
-
----
-
-## 17. Gap/Volume Spike design review, and the six changes it produced (decision #111)
-
-A structured design-level review of decisions #104/#105 (not a code/test review — an explicit audit of layer ownership, trading semantics, timing/entry model, `Opportunity` semantics, state lifecycle, and multi-symbol/multi-day isolation). Full review reasoning isn't reproduced here — it lives in this session's own record — this section covers what changed as a result and why, for future sessions that need the "what's different now and why" without the full review transcript.
-
-**Six items, all six made:**
-
-1. **`regular_open` published by Feature Engine, no longer reconstructed.** `gap_strategy.py`'s own `pdc + gap_dollars` algebra is gone — `_update_gap` (`feature_engine/engine.py`) now publishes `regular_open` as its own `features` key, the same generic-market-fact category as `pdc`/`pdh`/`pdl`, independent of whether `gap_pct`/`gap_dollars` are also present (known the moment today's regular session opens, even without a prior day to compare against).
-
-2. **Gap bounded to `max_minutes_since_open` (v1 default 60, unvalidated).** MATCH now refuses past this window regardless of how confirming everything else is — a real gap the original build had no answer for (nothing stopped a 2pm reclaim of `regular_open` from reading identically to a clean 9:30 hold). Computed via `MarketClock.minutes_since_open()` in `evaluate()`'s own orchestration, passed into `match_direction()` as a plain value — the pure function itself stays clock-free. Does NOT resolve the deeper, still-open question of whether an instantaneous `close` vs. `regular_open` comparison actually proves "holding" rather than "currently on the right side" — deliberately deferred pending real outcome data.
-
-3. **Volume Spike gained `min_absolute_volume` (v1 default 500 shares) and `min_body_ratio` (v1 default 0.3).** Two concrete MATCH-stage gaps closed: a ratio-only test can't tell a genuine spike from a small order against a thin/illiquid baseline; a huge-volume, razor-thin-body candle previously passed as directional on `close != open` alone. `body_ratio = abs(close-open)/(high-low)`, computed from OHLC already on the candle, safe by construction (`close != open` already guarantees `high > low`). Deliberately NOT addressed: whether high volume + directional close actually means continuation vs. exhaustion, and whether sizing the stop off the spike candle's own wick can produce an impractically wide risk/target — both flagged as needing real outcome data, not a guessed fix.
-
-4. **`scoring_utils.py` — new shared module (`clamp`, `trend_magnitude`, `validate_mirror_threshold`).** `_clamp()` and the `trend_score_threshold > 50.0` mirror-guard had been copy-pasted, near-verbatim, across `orb_strategy.py`, `gap_strategy.py`, `volume_spike_strategy.py` — extracted, with each strategy's own MATCH conditions and SCORE weights staying exactly where they were. **Mid-change discovery:** a `git pull` immediately before this item found `first_pullback_strategy.py`/`reversal_strategy.py` (decisions #107–#110, merged concurrently) had independently duplicated the identical pattern a fourth and fifth time — folded into the same extraction rather than left half-finished, verified behavior-neutral against their own test suites.
-
-5. **`Opportunity.expected_horizon_minutes: int | None = None` added to `base_strategy.py`.** Every strategy had an implicit, un-encoded expectation of how long its setup should take — lost the moment `evaluate()` returned, since nothing on the schema carried it. Optional, honest-absence default. Deliberately not an expiry mechanism (`wait_expires_at` already owns that, WAITING-path only) — descriptive metadata for a future Decision Engine to reason with. Populated by ORB (45 min), Gap (60 min), Volume Spike (15 min) — each a v1 guess. Deliberately left unpopulated on First Pullback/Reversal, that thread's own call to make.
-
-6. Renumbering only — this was drafted as decision #107 before the concurrent First Pullback/Reversal work (which claimed #107–#110) was pulled; became #111 with no content change.
-
-**Verification:** `backend/tests/test_scoring_utils.py` (new, 11 tests), plus 8 new tests across `test_gap_strategy.py` (18, was 15) and `test_volume_spike_strategy.py` (22, was 18) pinning the two new Volume Spike checks and the Gap window against the exact failure modes the review described, plus one new `test_base_strategy.py` test for the schema addition. Full suite: 346 passed, 40 pre-existing DB failures (unchanged), 119 skipped (unchanged) — 327-passed baseline + these 19 new tests, zero regressions, including confirmation that the `scoring_utils.py` fold-in left First Pullback/Reversal's own (skipped, DB-gated) suites unaffected.
-
----
-
-## 18. Momentum and VWAP — design, external review, and build (decision #113)
-
-The sixth and seventh, and last, v1 strategies from `trading-intelligence-architecture.md` §8's planned set. Went through an external (ChatGPT) design review before any code was written — same "design note first, then code" practice §16 already documents for First Pullback/Reversal. Full review transcript isn't reproduced here; this section covers what was decided and built.
-
-### Momentum
-
-**Question:** is an existing directional move accelerating, right now, regardless of time of day or any specific price level? Deliberately not time-boxed or level-based — that distinction is what keeps this genuinely different from ORB (§14), not a restatement of it. First real consumer of `MarketState.acceleration_score` — checked directly against `market_state_engine/scoring.py` rather than assumed from the field's name: it's `trend_score`'s own rate of change, no volume folded in.
-
-```
- every 1m candle, all regular session
-      │
-      ▼
- ┌───────────────────────────┐
- │ 1. GATE                   │  regular session, high/low present,
- │    is it worth checking?  │  acceleration_score not null, swing
- │                           │  window warmed up, not in cooldown
- └─────────────┬─────────────┘
-               │ pass
-               ▼
- ┌───────────────────────────┐
- │ 2. MATCH                  │  volume floor (participation) →
- │    accelerating +         │  acceleration off-neutral in one
- │    directional + backed   │  direction (PRIMARY) → trend_score
- │                           │  leaning the same way (lighter
- │                           │  CONTEXT bar, not "established")
- └─────────────┬─────────────┘
-               │ true
-               ▼
- ┌───────────────────────────┐
- │ 3. SCORE                  │  0.45×acceleration + 0.25×trend
- │    → confidence           │  + 0.30×volume — same hierarchy
- │                           │  as MATCH, numerically
- └─────────────┬─────────────┘
-               │
-               ▼
- ┌───────────────────────────┐
- │ 4. PROPOSE                │  invalidation = prior N-bar swing
- │    → Opportunity          │  low/high (own private state);
- │                           │  target = mechanical R-multiple
- └───────────────────────────┘
-```
-
-Trend's MATCH-stage threshold (`DEFAULT_TREND_CONTEXT_THRESHOLD = 55.0`, own params key `trend_context_threshold`) is deliberately NOT `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` — a lighter, distinct question ("at least leaning the right way") from Reversal/VWAP's "established" claim; reusing the shared 60/40 bar here would filter out exactly the earliest, most valuable part of a fresh move, where `trend_score` is still crossing the low-50s while `acceleration_score` is already extreme.
-
-Invalidation is a new private rolling swing lookback (`DEFAULT_LOOKBACK_BARS = 10`), not ATR, not `LevelInteractionEngine` — the review's own preferred framing ("the structure supporting the move failed" vs. "price moved X against me"). `FeatureSet` publishes no swing-high/low, so this needed genuinely new per-symbol state, same category as ORB's opening range / Volume Spike's rolling baseline. During the first `lookback_bars` minutes of each trading day per symbol, this file simply doesn't fire — honest-absence, same precedent Volume Spike's own baseline warm-up already set, deliberately not the review's suggested ATR-during-warm-up fallback (one fewer code path, and the warm-up window is small enough that "don't fire yet" is a fully acceptable v1 answer).
-
-Cadence is `volume_spike_strategy.py`'s exact cooldown precedent (`DEFAULT_COOLDOWN_MINUTES = 5`), not once-per-day (ORB/Gap) — Momentum's whole point is catching multiple genuinely independent acceleration phases across a session. The review's further refinement (recognizing "still the same episode" rather than treating every cooldown-cleared candle as brand new) was explicitly NOT built — acceptable for v1 per the review's own conclusion, deferred until real live behavior shows the plain cooldown is insufficient.
-
-**Momentum vs. ORB — co-firing accepted directly, no arbitration added.** Confirmed by both Saqib and the review: the two ask genuinely different questions (a specific morning-range level breaking vs. the market already moving and gaining force, independent of any level), and nothing in either file or `base_strategy.py` should arbitrate between them — matching `base_strategy.py`'s own framing that strategy competition is downstream (Opportunity/Decision Engine's job), not this layer's.
-
-### VWAP
-
-**Question:** has intraday VWAP-side control transitioned, before an established trend exists? Two candidate designs were considered and rejected first:
-
-- **Relationship persistence** (`vwap_relationship_score` confirming strength + trend agreeing, no `LevelInteractionEngine`) — rejected: risked being "Momentum with a different gating field," not a genuinely different trading question.
-- **Naive two-candle cross** (`close` vs. `vwap`, no engine) — rejected as too primitive: would false-trigger on exactly the chop `LevelInteractionEngine`'s Aura band already exists to absorb, and would be a second, cruder, silently-drifting definition of "meaningful move" alongside the engine's own authoritative one.
-
-What shipped instead — a genuine `conquered` resolution, reused verbatim from `level_touch_tracking.observe_resolution()` (decisions #107/#108, zero new touch/cross-detection code), gated to `trend_score`'s neutral band:
-
-```
- every 1m candle
-      │
-      ▼
- ┌───────────────────────────┐
- │ 1. GATE                   │  snapshot fresh (last_applied_
- │    is it worth checking?  │  candle_ts staleness guard, D9),
- │                           │  resolution == "conquered"
- └─────────────┬─────────────┘
-               │ pass
-               ▼
- ┌───────────────────────────┐
- │ 2. MATCH                  │  trend_score in the NEUTRAL band
- │    control transitioned,  │  only (D11's shared constant,
- │    no established trend   │  Reversal's exact complement) →
- │                           │  direction = the RESOLVED zone
- │                           │  itself, never a mirror of trend
- └─────────────┬─────────────┘
-               │ true
-               ▼
- ┌───────────────────────────┐
- │ 3. SCORE                  │  0.55×distance_pct (transition
- │    → confidence           │  strength) + 0.45×volume;
- │                           │  touch_count logged, not scored
- └─────────────┬─────────────┘
-               │
-               ▼
- ┌───────────────────────────┐
- │ 4. PROPOSE                │  invalidation = anchor_price
- │    → Opportunity          │  (live level value if gap-through);
- │                           │  target = mechanical R-multiple
- └───────────────────────────┘
-```
-
-**Direction is the structural opposite of Reversal's own `match_direction()`.** Reversal bets against whichever trend is established — its direction comes from mirroring `trend_score`, never from which way the conquest itself moved. VWAP has no established trend to mirror against by construction (the neutral-band gate guarantees that), so direction comes from the conquest's own resolved `zone` instead. This is the strongest evidence the two strategies ask genuinely different questions rather than the same one with a relabeled gate.
-
-**Disjoint from Reversal by construction, not left to downstream arbitration — Saqib's explicit call**, made directly rather than "co-firing is fine" (the accepted answer for Momentum/ORB above): VWAP and Reversal read the exact same underlying event and would otherwise near-duplicate each other on almost every candle with opposite direction conventions, which is a meaningfully higher correlation than the Momentum/ORB case and worth a real gate. `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` (promoted out of Reversal's own former private constant) is the single number both strategies read, so the neutral-band/established-band partition has no gap and no overlap by construction — see D11 for what this does NOT guarantee (the two configs can still drift if retuned independently later).
-
-**Cadence — fires on a genuine control transition, via `_VWAPState.last_fired_zone`.** Checked directly against `level_touch_tracking.py`'s own classification rule (`"rejected" if current_zone == entered_from else "conquered"`): two consecutive `conquered` resolutions in the engine's own unbroken stream always alternate zones by construction, so raw same-zone-twice-in-a-row can't happen there. The real, reachable repeat case is more specific: VWAP only sees the conquests that land in the neutral band, so it never observes the conquests that happen while trend is established (Reversal's window) — the zone can drift back to a value VWAP already fired for while VWAP wasn't watching. `last_fired_zone` catches exactly that; `test_vwap_strategy.py` proves both directions — the repeat is suppressed, and a genuinely new zone immediately afterward still fires.
-
-**SCORE uses `distance_pct`, not `touch_count_today`.** `get_snapshot()`'s `distance_pct`, on a resolved zone, was confirmed (by reading `level_interaction_engine.py` directly) to be computed from `_latest_close`/`_latest_level_value` — candle-derived, not `seconds_in_zone`'s wall-clock `datetime.now()` — so it's backtest-safe per §7's invariant. `touch_count_today` is logged for future calibration but not weighted: unlike Reversal, where more prior touches before a break is straightforwardly stronger evidence, the sign of that relationship for a VWAP conquest isn't obvious (could mean a well-tested level finally giving way, or an already-choppy session) — flagged rather than guessed.
-
-### `structural_target` — a schema constraint both strategies hit the same way
-
-The review's recommendation for both strategies was "don't force a strategy-specific projection; Trade Planning decides target/risk/sizing downstream." `Opportunity.structural_target: float` is currently REQUIRED (not `Optional`) on `base_strategy.py` — changing that schema would be a bigger, cross-cutting change touching all 5 other built strategies, out of scope for this build. Reconciled by using the same mechanical R-multiple (`close ± target_r_multiple * risk`, default 2.0) every other v1 strategy already computes — a schema-completeness value, not a claim that the number is meaningful trading advice.
-
-### The build itself
-
-`momentum_strategy.py` and `vwap_strategy.py`, both following `orb_strategy.py`'s GATE → MATCH → SCORE → PROPOSE shape exactly. `scoring_utils.py` gained `ESTABLISHED_TREND_SCORE_THRESHOLD` and `trend_established_side()` (D11); `reversal_strategy.py` refactored onto both — behavior unchanged, its own `match_direction()` now delegates to the shared helper rather than repeating the same `>=`/`<=` classification a second file also needed verbatim. One stale comment in `orb_strategy.py` corrected in the same change — it cited the discarded draft's momentum threshold value (decision #99) as precedent for a number this rebuild deliberately doesn't reuse.
-
-**Verification — against a real local Postgres, not DB-free-only.** Unlike most entries in this log, this session provisioned PostgreSQL 16 directly and ran `alembic upgrade head`, so every DB-gated test in this delivery actually ran rather than being skipped — including the two most logically intricate VWAP scenarios (the same-zone-repeat suppression across an established-trend window, the day-rollover reset) that would otherwise only be trace-verified by hand. `backend/tests/test_momentum_strategy.py` (new, 18 tests, no DB dependency), `backend/tests/test_vwap_strategy.py` (new, 19 tests, DB-gated, all run and passed), `backend/tests/test_scoring_utils.py` (+6, now 17), `backend/tests/test_reversal_strategy.py` (all 11 re-run unchanged, confirming the refactor is behavior-neutral). Full suite: 546 passed; 2 pre-existing failures (`test_feature_engine.py::test_vwap_publishes_even_while_sma_is_still_warming_up`, `test_intelligence_routes.py::test_daily_levels_carry_level_interaction_once_touched`) confirmed identical against a completely untouched second clone of `main` — pre-existing, unrelated to this change, not investigated further here.
-
-**Stage 2 (decision #112/D10) is now unblocked** — see §12.
