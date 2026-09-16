@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Identity, Numeric, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, ForeignKey, Identity, Numeric, String, UniqueConstraint, false, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -33,9 +33,14 @@ from app.db.base import Base
 
 class Symbol(Base):
     __tablename__ = "symbols"
+    __table_args__ = (
+        UniqueConstraint("ticker", "is_backtest", name="uq_symbols_ticker_is_backtest"),
+        UniqueConstraint("id", "is_backtest", name="uq_symbols_id_is_backtest"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    ticker: Mapped[str] = mapped_column(String(16), unique=True, nullable=False, index=True)
+    ticker: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    is_backtest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     name: Mapped[str | None] = mapped_column(String(128))
     exchange: Mapped[str | None] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)

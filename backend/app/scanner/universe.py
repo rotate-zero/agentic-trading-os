@@ -64,6 +64,7 @@ class DbUniverseProvider:
             rows = session.execute(
                 select(Symbol.ticker)
                 .join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+                .where(Symbol.is_backtest.is_(False))
                 .order_by(ScannerUniverseSymbol.added_at)
             ).scalars().all()
             return list(rows)
@@ -104,12 +105,20 @@ def _get_or_create_symbol_id(session: Session, ticker: str) -> int:
     private copies of this — not shared as a common utility in this
     codebase yet, so this follows that existing (if duplicated)
     convention rather than introducing a new shared one unprompted."""
-    existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+    existing = session.execute(
+        select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+    ).scalar_one_or_none()
     if existing is not None:
         return existing
-    session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+    session.execute(
+        pg_insert(Symbol)
+        .values(ticker=ticker, is_backtest=False)
+        .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+    )
     session.commit()
-    return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+    return session.execute(
+        select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+    ).scalar_one()
 
 
 def list_universe_symbols(session_factory: Callable[[], Session]) -> list[dict]:
@@ -120,6 +129,7 @@ def list_universe_symbols(session_factory: Callable[[], Session]) -> list[dict]:
         rows = session.execute(
             select(Symbol.ticker, ScannerUniverseSymbol.added_at)
             .join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+            .where(Symbol.is_backtest.is_(False))
             .order_by(ScannerUniverseSymbol.added_at)
         ).all()
         return [{"symbol": ticker, "added_at": added_at.isoformat()} for ticker, added_at in rows]
@@ -159,7 +169,9 @@ def remove_symbol_from_universe(session_factory: Callable[[], Session], symbol: 
     symbol = symbol.strip().upper()
     session = session_factory()
     try:
-        symbol_id = session.execute(select(Symbol.id).where(Symbol.ticker == symbol)).scalar_one_or_none()
+        symbol_id = session.execute(
+            select(Symbol.id).where(Symbol.ticker == symbol, Symbol.is_backtest.is_(False))
+        ).scalar_one_or_none()
         if symbol_id is None:
             return False
         result = session.execute(delete(ScannerUniverseSymbol).where(ScannerUniverseSymbol.symbol_id == symbol_id))

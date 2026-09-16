@@ -30,30 +30,18 @@ genuinely never sets up the conditions a strategy's MATCH stage needs —
 not a sign anything is broken, the same honesty `fixture_provider.py`
 itself already models for its own data.
 
-**This route now writes into shared, live-facing tables under whatever
-`symbol` label the caller passes — decision #135, read before choosing
-one.** Closing the historical-provider gap means `FeatureEngine`'s real,
-unmodified Daily Levels reconciliation (`_reconcile_and_persist_daily_
-levels()`, `feature_engine/engine.py`) now actually runs during a
-backtest, the first time it ever has — and that method's job is to
-create a `symbols` row and persist real `daily_levels_state` rows for
-whatever ticker string it's given. Neither table carries an
-`is_backtest` flag the way `strategy_outcomes`/`backtests` do. Two real
-consequences, confirmed by direct execution against a real Postgres, not
-assumed: (1) if `symbol` collides with a real, live-tracked ticker, this
-backtest's synthetic daily levels land in the same rows live trading
-reads; (2) re-running the identical `(symbol, scenario)` pair a second
-time silently reverts `volume_regime_score`/`volatility_regime_score` to
-`0.0` for that run — `_maybe_refresh_daily_levels()`'s own pre-existing
-"restart-survival" short-circuit (already documented in its own
-docstring for live-process restarts) finds the `daily_levels_state` row
-the first run just persisted and skips the raw-candle-cache population
-entirely, before ever asking the provider again. Neither is fixed here —
-see decision #135's own text for why (a genuinely separate change from
-"wire a historical provider," flagged as a new open item rather than
-folded in). Pick a `symbol` label that doesn't collide with anything
-live-tracked, and don't rely on re-running the same scenario twice to
-double-check a result.
+**Backtest persistence is namespaced from live state (D18).** The
+run-scoped Feature, Level Interaction, and Market State engines resolve
+`symbols` through `is_backtest=True`; every live call site explicitly
+uses `is_backtest=False`. `daily_levels_state` carries the same namespace
+and a composite foreign key prevents a row from being attached to a
+symbol of the opposite origin. A caller may therefore replay the exact
+same ticker that live trading tracks without either side reading or
+mutating the other's rows. Backtest Feature Engines also bypass the live
+restart-survival short-circuit at the start of every run: each replay
+fetches its fixture daily history and fills the raw-candle cache, so an
+identical second run retains real `volume_regime_score` and
+`volatility_regime_score` values instead of reverting both to `0.0`.
 
 **Latency.** Each replayed candle costs a real, measured ~1 second of
 `EngineBackedReplayStateProducer` engine-settle time (genuine processing

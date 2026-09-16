@@ -64,7 +64,11 @@ async def test_evaluate_reads_back_a_populated_row():
     _clean_test_symbol(ticker)
     session = SessionLocal()
     try:
-        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.execute(
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=False)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.commit()
         symbol_id = session.execute(text("SELECT id FROM symbols WHERE ticker = :t"), {"t": ticker}).scalar_one()
 

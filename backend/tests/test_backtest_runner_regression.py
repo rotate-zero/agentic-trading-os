@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 from polygon.exceptions import BadResponse
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.engine_singleton_guard import install_replay_engines
@@ -32,6 +32,7 @@ from app.broker_adapters.base import HistoricalDataUnavailableError
 from app.broker_adapters.polygon_provider import PolygonAdapter
 from app.core.market_clock import get_market_clock
 from app.db.session import SessionLocal
+from app.models.daily_levels import DailyLevelState
 from app.models.market_data import Symbol
 from app.models.market_state import MarketStateHistory
 from app.services import broker_registry
@@ -488,18 +489,21 @@ def _clean_daily_history_symbol():
 
 
 @_needs_db
-async def test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_scores(_clean_daily_history_symbol):
-    """The real end-to-end proof decision #135 exists to deliver. Before
+async def test_backtest_runner_namespace_preserves_live_levels_and_repeat_runs_keep_nonzero_regime_scores(
+    _clean_daily_history_symbol,
+):
+    """The real end-to-end proof decisions #135 and D18 require. Before
     it, `scenarios.py`'s own module docstring could state directly (and
     this same check, run against the pre-#135 code during that
     decision's investigation, confirmed it by direct execution): every
     `market_state_history` row from ANY BacktestRunner replay had
     `volume_regime_score == 0.0` and `volatility_regime_score == 0.0`,
     structurally, for any symbol. This asserts that's no longer true for
-    every single replayed candle in the existing `volume_gated_baseline`
+    every replayed candle on two consecutive runs of the existing `volume_gated_baseline`
     scenario — not just the last one, which alone wouldn't catch a bug
-    where the daily-candle cache populates late or is dropped partway
-    through a run.
+    where the daily-candle cache populates late, is dropped partway through
+    a run, or is skipped because the prior replay left a checkpoint. It also
+    proves a colliding live Daily Levels row remains unchanged.
 
     Strategy choice (Reversal) is arbitrary and deliberately NOT one of
     the four volume-gated strategies — `MarketStateEngine` persists
@@ -516,30 +520,75 @@ async def test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_sco
         }
     )
 
-    strategy = next(s for s in default_registry(datetime.now(timezone.utc)) if s.name == "Reversal")
-    runner = BacktestRunner(
-        strategy=strategy,
-        symbol=DAILY_HISTORY_SYMBOL,
-        market_data_provider=provider,
-        start=candles[0].candle_ts,
-        end=candles[-1].candle_ts,
-        context_provider=FixtureBacktestContextProvider(),
-        data_version="decision-135-regression",
-        feature_version="feature_engine_v1",
-    )
-    await runner.run()
+    # A real live checkpoint with the exact caller-supplied ticker must
+    # survive both replays byte-for-byte at the field level.
+    session = SessionLocal()
+    try:
+        live_symbol = Symbol(ticker=DAILY_HISTORY_SYMBOL, is_backtest=False)
+        session.add(live_symbol)
+        session.flush()
+        session.add(
+            DailyLevelState(
+                symbol_id=live_symbol.id,
+                is_backtest=False,
+                level_id=f"{DAILY_HISTORY_SYMBOL}-LIVE-SENTINEL",
+                price=987.654321,
+                strength=7,
+                distinct_candle_count=9,
+                status="active",
+                first_seen_day=first_day,
+                last_confirmed_day=first_day,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    for _ in range(2):
+        strategy = next(s for s in default_registry(datetime.now(timezone.utc)) if s.name == "Reversal")
+        runner = BacktestRunner(
+            strategy=strategy,
+            symbol=DAILY_HISTORY_SYMBOL,
+            market_data_provider=provider,
+            start=candles[0].candle_ts,
+            end=candles[-1].candle_ts,
+            context_provider=FixtureBacktestContextProvider(),
+            data_version="decision-135-regression",
+            feature_version="feature_engine_v1",
+        )
+        await runner.run()
 
     session = SessionLocal()
     try:
         rows = (
             session.query(MarketStateHistory)
             .join(Symbol, Symbol.id == MarketStateHistory.symbol_id)
-            .filter(Symbol.ticker == DAILY_HISTORY_SYMBOL)
+            .filter(Symbol.ticker == DAILY_HISTORY_SYMBOL, Symbol.is_backtest.is_(True))
             .order_by(MarketStateHistory.candle_ts)
             .all()
         )
+        namespaces = {
+            row.is_backtest for row in session.execute(select(Symbol).where(Symbol.ticker == DAILY_HISTORY_SYMBOL)).scalars()
+        }
+        live_level = session.execute(
+            select(DailyLevelState).where(
+                DailyLevelState.level_id == f"{DAILY_HISTORY_SYMBOL}-LIVE-SENTINEL",
+                DailyLevelState.is_backtest.is_(False),
+            )
+        ).scalar_one()
     finally:
         session.close()
+
+    assert namespaces == {False, True}
+    assert (
+        float(live_level.price),
+        live_level.strength,
+        live_level.distinct_candle_count,
+        live_level.status,
+        live_level.first_seen_day,
+        live_level.last_confirmed_day,
+        live_level.archived_day,
+    ) == (987.654321, 7, 9, "active", first_day, first_day, None)
 
     # NOT `len(rows) == len(candles)` — checked directly against the
     # UNMODIFIED baseline (no decision #135 seam at all, plain
@@ -555,9 +604,9 @@ async def test_backtest_runner_volume_gated_baseline_produces_nonzero_regime_sco
     # non-trivial floor (rather than no count check at all) still
     # catches a real regression where the seam breaks early and stops
     # producing state altogether.
-    assert len(rows) >= len(candles) - 1, (
-        f"expected close to one market_state_history row per replayed candle "
-        f"({len(candles)}), got only {len(rows)} — more missing than the one "
+    assert len(rows) >= 2 * (len(candles) - 1), (
+        f"expected close to one market_state_history row per replayed candle on each of two runs "
+        f"({len(candles)} candles each), got only {len(rows)} — more missing than the one-per-run "
         f"pre-existing, unrelated final-candle gap accounts for"
     )
     assert all(float(r.volume_regime_score) != 0.0 for r in rows), (

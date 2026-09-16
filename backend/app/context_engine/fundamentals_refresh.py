@@ -195,7 +195,9 @@ class FundamentalsRefreshJobs:
         session = SessionLocal()
         try:
             rows = session.execute(
-                select(Symbol.ticker).join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+                select(Symbol.ticker)
+                .join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+                .where(Symbol.is_backtest.is_(False))
             ).scalars().all()
             return list(rows)
         finally:
@@ -216,13 +218,21 @@ class FundamentalsRefreshJobs:
             session.close()
 
     def _get_or_create_symbol_id(self, session, ticker: str) -> int:
-        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        existing = session.execute(
+            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+        ).scalar_one_or_none()
         if existing is not None:
             return existing
-        stmt = pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"])
+        stmt = (
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=False)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.execute(stmt)
         session.commit()
-        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+        return session.execute(
+            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+        ).scalar_one()
 
 
 _fundamentals_refresh_jobs: FundamentalsRefreshJobs | None = None

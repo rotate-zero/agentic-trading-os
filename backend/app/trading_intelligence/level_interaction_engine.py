@@ -316,9 +316,10 @@ def classify_zone(close: float, level_value: float, aura_pct: float) -> str:
 
 
 class LevelInteractionEngine:
-    def __init__(self, bus: EventBus, aura_pct: float | None = None) -> None:
+    def __init__(self, bus: EventBus, aura_pct: float | None = None, *, is_backtest: bool = False) -> None:
         self._bus = bus
         self._aura_pct = aura_pct if aura_pct is not None else get_settings().trading_intelligence_aura_pct
+        self._is_backtest = is_backtest
 
         self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()  # object half is _STOP_SENTINEL only
         self._worker_task: asyncio.Task | None = None
@@ -707,6 +708,7 @@ class LevelInteractionEngine:
                 .join(Symbol, Symbol.id == LevelInteractionState.symbol_id)
                 .where(
                     Symbol.ticker == symbol,
+                    Symbol.is_backtest.is_(self._is_backtest),
                     LevelInteractionState.timeframe == timeframe,
                     LevelInteractionState.level_key == level_key,
                 )
@@ -780,14 +782,28 @@ class LevelInteractionEngine:
             session.close()
 
     def _get_or_create_symbol_id(self, session, ticker: str) -> int:
-        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        existing = session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one_or_none()
         if existing is not None:
             return existing
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.execute(
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=self._is_backtest)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.commit()
-        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+        return session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one()
 
 
 _level_interaction_engine: LevelInteractionEngine | None = None

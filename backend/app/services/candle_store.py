@@ -45,6 +45,7 @@ def get_recorded_candles(symbol: str, timeframe: str, start: datetime, end: date
                 .join(Symbol, Symbol.id == CandleRow.symbol_id)
                 .where(
                     Symbol.ticker == symbol,
+                    Symbol.is_backtest.is_(False),
                     CandleRow.timeframe == timeframe,
                     CandleRow.candle_ts >= start,
                     CandleRow.candle_ts <= end,
@@ -90,7 +91,11 @@ def get_latest_recorded_candle(symbol: str, timeframe: str) -> Candle | None:
             session.execute(
                 select(CandleRow)
                 .join(Symbol, Symbol.id == CandleRow.symbol_id)
-                .where(Symbol.ticker == symbol, CandleRow.timeframe == timeframe)
+                .where(
+                    Symbol.ticker == symbol,
+                    Symbol.is_backtest.is_(False),
+                    CandleRow.timeframe == timeframe,
+                )
                 .order_by(CandleRow.candle_ts.desc())
                 .limit(1)
             )
@@ -144,6 +149,7 @@ def get_recent_closes(
                 .join(Symbol, Symbol.id == CandleRow.symbol_id)
                 .where(
                     Symbol.ticker == symbol,
+                    Symbol.is_backtest.is_(False),
                     CandleRow.timeframe == timeframe,
                     ts_filter,
                 )

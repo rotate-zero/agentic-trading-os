@@ -153,8 +153,9 @@ _STOP_SENTINEL = object()
 
 
 class MarketStateEngine:
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, *, is_backtest: bool = False) -> None:
         self._bus = bus
+        self._is_backtest = is_backtest
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
 
@@ -490,14 +491,28 @@ class MarketStateEngine:
             session.close()
 
     def _get_or_create_symbol_id(self, session, ticker: str) -> int:
-        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        existing = session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one_or_none()
         if existing is not None:
             return existing
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.execute(
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=self._is_backtest)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.commit()
-        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+        return session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one()
 
 
 _market_state_engine: MarketStateEngine | None = None

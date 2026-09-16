@@ -174,7 +174,9 @@ def _reset_broker_registry():
 def _delete_daily_levels_rows_for(ticker: str) -> None:
     session = SessionLocal()
     try:
-        symbol_id = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        symbol_id = session.execute(
+            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+        ).scalar_one_or_none()
         if symbol_id is not None:
             session.execute(DailyLevelState.__table__.delete().where(DailyLevelState.symbol_id == symbol_id))
             session.execute(Symbol.__table__.delete().where(Symbol.id == symbol_id))
@@ -589,7 +591,12 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
         from sqlalchemy import select, update
 
         session = SessionLocal()
-        symbol_id = session.execute(select(Symbol.id).where(Symbol.ticker == "__TEST_DL_FLKY__")).scalar_one()
+        symbol_id = session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == "__TEST_DL_FLKY__",
+                Symbol.is_backtest.is_(False),
+            )
+        ).scalar_one()
         session.execute(
             update(DailyLevelState)
             .where(DailyLevelState.symbol_id == symbol_id)

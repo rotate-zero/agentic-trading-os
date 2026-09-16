@@ -35,7 +35,7 @@ class FundamentalsProvider(SymbolContextProvider):
             row = session.execute(
                 select(SymbolFundamentals)
                 .join(Symbol, Symbol.id == SymbolFundamentals.symbol_id)
-                .where(Symbol.ticker == symbol)
+                .where(Symbol.ticker == symbol, Symbol.is_backtest.is_(False))
             ).scalar_one_or_none()
             if row is None:
                 # No refresh job has ever run for this symbol yet — every

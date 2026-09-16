@@ -163,7 +163,9 @@ class CandleRecorder:
             session.close()
 
     def _get_or_create_symbol_id(self, session: Session, ticker: str) -> int:
-        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        existing = session.execute(
+            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+        ).scalar_one_or_none()
         if existing is not None:
             return existing
         # This class' writer task is the only caller that ever inserts
@@ -171,6 +173,12 @@ class CandleRecorder:
         # concurrent-insert race to defend against — ON CONFLICT DO
         # NOTHING + re-select is cheap insurance, not a load-bearing
         # requirement.
-        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.execute(
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=False)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.commit()
-        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+        return session.execute(
+            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
+        ).scalar_one()

@@ -186,9 +186,9 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
         self._settle_poll_interval = settle_poll_interval_seconds
 
         self.bus = EventBus()
-        self.feature_engine = FeatureEngine(self.bus)
-        self.level_interaction_engine = LevelInteractionEngine(self.bus)
-        self.market_state_engine = MarketStateEngine(self.bus)
+        self.feature_engine = FeatureEngine(self.bus, is_backtest=True)
+        self.level_interaction_engine = LevelInteractionEngine(self.bus, is_backtest=True)
+        self.market_state_engine = MarketStateEngine(self.bus, is_backtest=True)
         providers, symbol_providers = context_provider.build_engine_providers()
         self.context_engine = ContextEngine(self.bus, providers=providers, symbol_providers=symbol_providers)
 

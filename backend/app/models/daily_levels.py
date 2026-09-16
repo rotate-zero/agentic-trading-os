@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, ForeignKey, Identity, Integer, Numeric, String, UniqueConstraint, func
+from sqlalchemy import Boolean, Date, ForeignKeyConstraint, Identity, Integer, Numeric, String, UniqueConstraint, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -40,10 +40,20 @@ class DailyLevelState(Base):
     its price drifts or its rank among other levels changes."""
 
     __tablename__ = "daily_levels_state"
-    __table_args__ = (UniqueConstraint("symbol_id", "level_id", name="uq_daily_level_state_symbol_level_id"),)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["symbol_id", "is_backtest"],
+            ["symbols.id", "symbols.is_backtest"],
+            name="fk_daily_levels_state_symbol_namespace",
+        ),
+        UniqueConstraint(
+            "symbol_id", "is_backtest", "level_id", name="uq_daily_level_state_symbol_namespace_level_id"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
-    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_backtest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
     level_id: Mapped[str] = mapped_column(String(64), nullable=False)
 
     price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)

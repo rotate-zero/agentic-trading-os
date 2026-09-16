@@ -229,8 +229,10 @@ class FeatureEngine:
         regression_configs: list[dict] | None = None,
         kama_configs: list[dict] | None = None,
         kama_seed_multiplier: int | None = None,
+        is_backtest: bool = False,
     ) -> None:
         self._bus = bus
+        self._is_backtest = is_backtest
         self._sma_periods = sma_periods if sma_periods is not None else get_settings().feature_engine_sma_periods
         self._ema_periods = ema_periods if ema_periods is not None else get_settings().feature_engine_ema_periods
         self._ema_seed_multiplier = (
@@ -581,10 +583,16 @@ class FeatureEngine:
         # read for this symbol until the next natural per-day refresh —
         # a minor gap, not a correctness issue for either, and not worth
         # persisting ~360 raw candles per symbol just to close it.
-        persisted_today = await asyncio.to_thread(self._load_confirmed_daily_levels_for_today, symbol, today)
-        if persisted_today is not None:
-            self._daily_levels_state[symbol] = {"for_day": today, "levels": persisted_today}
-            return
+        # A backtest engine is run-scoped. Its previous run's persisted
+        # checkpoint must never short-circuit this run's provider fetch:
+        # doing so leaves the raw daily-candle cache empty and collapses
+        # ATR/RVOL regime scores to zero on an otherwise identical replay
+        # (D18's repeat-run symptom). Live engines keep restart survival.
+        if not self._is_backtest:
+            persisted_today = await asyncio.to_thread(self._load_confirmed_daily_levels_for_today, symbol, today)
+            if persisted_today is not None:
+                self._daily_levels_state[symbol] = {"for_day": today, "levels": persisted_today}
+                return
 
         provider = broker_registry.get_historical_provider()
         if provider is None:
@@ -808,7 +816,12 @@ class FeatureEngine:
         """
         session = SessionLocal()
         try:
-            symbol_id = session.execute(select(Symbol.id).where(Symbol.ticker == symbol)).scalar_one_or_none()
+            symbol_id = session.execute(
+                select(Symbol.id).where(
+                    Symbol.ticker == symbol,
+                    Symbol.is_backtest.is_(self._is_backtest),
+                )
+            ).scalar_one_or_none()
             if symbol_id is None:
                 return None  # never persisted anything for this symbol — nothing to restore
             rows = (
@@ -816,6 +829,7 @@ class FeatureEngine:
                     select(DailyLevelState)
                     .where(
                         DailyLevelState.symbol_id == symbol_id,
+                        DailyLevelState.is_backtest.is_(self._is_backtest),
                         DailyLevelState.status == "active",
                         DailyLevelState.last_confirmed_day == today,
                     )
@@ -862,7 +876,11 @@ class FeatureEngine:
             symbol_id = self._get_or_create_symbol_id(session, symbol)
             active_rows = (
                 session.execute(
-                    select(DailyLevelState).where(DailyLevelState.symbol_id == symbol_id, DailyLevelState.status == "active")
+                    select(DailyLevelState).where(
+                        DailyLevelState.symbol_id == symbol_id,
+                        DailyLevelState.is_backtest.is_(self._is_backtest),
+                        DailyLevelState.status == "active",
+                    )
                 )
                 .scalars()
                 .all()
@@ -899,6 +917,7 @@ class FeatureEngine:
                 else:
                     new_row = DailyLevelState(
                         symbol_id=symbol_id,
+                        is_backtest=self._is_backtest,
                         level_id="",  # placeholder — real id derived from this row's own PK right after flush, below
                         price=cluster.price,
                         strength=cluster.strength,
@@ -936,14 +955,28 @@ class FeatureEngine:
         than shared, matching how this codebase already has this exact
         helper twice; a third small copy here is consistent with that
         existing choice, not a new one."""
-        existing = session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one_or_none()
+        existing = session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one_or_none()
         if existing is not None:
             return existing
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-        session.execute(pg_insert(Symbol).values(ticker=ticker).on_conflict_do_nothing(index_elements=["ticker"]))
+        session.execute(
+            pg_insert(Symbol)
+            .values(ticker=ticker, is_backtest=self._is_backtest)
+            .on_conflict_do_nothing(index_elements=["ticker", "is_backtest"])
+        )
         session.commit()
-        return session.execute(select(Symbol.id).where(Symbol.ticker == ticker)).scalar_one()
+        return session.execute(
+            select(Symbol.id).where(
+                Symbol.ticker == ticker,
+                Symbol.is_backtest.is_(self._is_backtest),
+            )
+        ).scalar_one()
 
     def get_daily_levels(self, symbol: str, lookback_days: int | None = None) -> list[DailyLevel]:
         """

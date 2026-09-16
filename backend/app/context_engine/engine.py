@@ -216,7 +216,9 @@ class ContextEngine:
         session = SessionLocal()
         try:
             rows = session.execute(
-                select(Symbol.ticker).join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+                select(Symbol.ticker)
+                .join(ScannerUniverseSymbol, ScannerUniverseSymbol.symbol_id == Symbol.id)
+                .where(Symbol.is_backtest.is_(False))
             ).scalars().all()
             return list(rows)
         finally:

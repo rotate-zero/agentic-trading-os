@@ -85,6 +85,14 @@ any replay, for any symbol. See `historical_provider_guard.py`'s own
 docstring for why this is safe to do (what else reads
 `broker_registry`'s historical role, and why none of it is put at risk),
 and `strategy-engine-design.md` §7 for the diagram.
+
+**D18 isolation.** `EngineBackedReplayStateProducer` constructs its
+three persistence-capable engines in the backtest symbol namespace.
+This runner continues to pass the caller's real ticker through every
+domain object; only database symbol identity is separated, so strategy
+behavior and persisted outcome labels remain unchanged while live
+`symbols`/Daily Levels/Market State/Level Interaction rows stay
+untouched.
 """
 from __future__ import annotations
 

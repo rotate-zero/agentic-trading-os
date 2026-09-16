@@ -60,14 +60,27 @@
 
 ## 6. Documentation must move with the code
 
-* Code changes and required documentation updates belong in the same task.
-* Update existing canonical documentation rather than creating competing documentation.
-* Keep documentation consistent with the actual implementation.
-* For architectural work, include/update diagrams showing:
+- Code changes and required documentation updates belong in the same task.
+- Update existing canonical documentation rather than creating competing documents.
+- Keep documentation consistent with the actual implementation.
+- Every delivery must update `CHANGES.md` and `TESTING.md`.
+- When a decision or architecture changes, also update `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, and the relevant architecture document in the same delivery.
 
-  * data flow between affected components/modules;
-  * relevant internal flow inside changed modules.
-* Diagrams should explain the system, not decorate the documentation.
+### Decision-log integrity
+
+- Immediately before assigning or writing a decision number, re-check the latest GitHub `main`.
+- Confirm that `docs/decisions/INDEX.md`, the tail of `confirmed-decisions.md`, and the decision archive filenames agree on the latest number.
+- Append each new decision at the true end of `confirmed-decisions.md`, in numerical order, using the heading format `### N. Title`.
+- Existing decision content is immutable. Correct a decision by adding a new entry that references the original; never rewrite its substance.
+- Formatting or physical-order repairs must preserve the existing decision body exactly and must be documented by a new correction entry.
+
+### Architecture diagrams
+
+- Architectural changes require diagrams showing:
+  - data flow between affected components or modules;
+  - relevant internal flow inside changed modules.
+- Use the repository’s established ASCII code-fence diagram style.
+- Diagrams must explain the system and must not be added merely as decoration.
 
 ## 7. Decision-log discipline
 
