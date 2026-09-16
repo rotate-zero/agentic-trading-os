@@ -409,6 +409,77 @@ export async function fetchStrategyOutcomes(
   return (await res.json()) as StrategyOutcomesWireShape;
 }
 
+// Matches GET /intelligence/backtest-runs's response shape (decision
+// #136). Field names/types copied directly from `schemas/performance.py`'s
+// `BacktestRun` (re-verified against that file's current contents) — same
+// "route validates every ORM row through the exact Pydantic contract
+// before returning it" posture `StrategyOutcomeWireShape` above documents
+// for its own sibling route. `run_id`/`sweep_id` serialize as plain
+// strings (JSON has no UUID type); `date_range_start`/`date_range_end` as
+// "YYYY-MM-DD"; `created_at` as a full ISO 8601 string.
+export interface BacktestRunWireShape {
+  run_id: string;
+  sweep_id: string;
+  strategy_name: string;
+  strategy_version: string;
+  config_hash: string;
+  symbol_universe: string[];
+  date_range_start: string;
+  date_range_end: string;
+  data_version: string;
+  feature_version: string;
+  walk_forward_fold: number | null;
+  is_holdout: boolean;
+  created_at: string;
+}
+
+export interface BacktestRunsWireShape {
+  backtest_runs: BacktestRunWireShape[];
+}
+
+/**
+ * GET /intelligence/backtest-runs — decision #136. Raw recent-rows read
+ * over `backtests`, most recent `created_at` first, capped by `limit`
+ * (backend default 50 when omitted, hard cap 500 — same
+ * `Query(default, le=cap)` convention as fetchStrategyOutcomes's `limit`
+ * above). `run_id` is an exact match on the primary key (at most one row
+ * can ever come back for a given `run_id`); `strategyName`/`sweepId`
+ * narrow further, all three AND-combined, never blended, per the route's
+ * own docstring. `run_id`/`sweep_id` are real UUID columns — a malformed
+ * value for either is a 400 (surfaced here as a thrown `ApiError`, not a
+ * silently-empty result), same posture fetchStrategyOutcomes already
+ * takes for a malformed `backtestRunId`.
+ *
+ * Kept as four independent, individually-optional positional params
+ * rather than a filters object — this function has exactly one caller
+ * today (`useBacktestRunMeta.ts`), so an object-shape rewrite would be
+ * pure restructuring with no caller it actually helps, the same "smallest
+ * change that fits" reasoning fetchStrategyOutcomes's own comment gives
+ * for its own positional shape (its closest sibling route/function).
+ *
+ * `backtests` has real, persisted rows as of decision #128 — an empty
+ * `backtest_runs` array is still the honest, expected response on a
+ * genuinely empty table or non-matching filter, not an error.
+ */
+export async function fetchBacktestRuns(
+  limit?: number,
+  runId?: string,
+  strategyName?: string,
+  sweepId?: string,
+): Promise<BacktestRunsWireShape> {
+  const parts: string[] = [];
+  if (limit !== undefined) parts.push(`limit=${encodeURIComponent(limit)}`);
+  if (runId !== undefined) parts.push(`run_id=${encodeURIComponent(runId)}`);
+  if (strategyName !== undefined) parts.push(`strategy_name=${encodeURIComponent(strategyName)}`);
+  if (sweepId !== undefined) parts.push(`sweep_id=${encodeURIComponent(sweepId)}`);
+  const url = `${API_BASE_URL}/intelligence/backtest-runs${parts.length > 0 ? `?${parts.join("&")}` : ""}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BacktestRunsWireShape;
+}
+
 // Matches GET /intelligence/opportunity-conflicts's response shape
 // (decision #123) — a genuinely thin passthrough of
 // `opportunity_view.get_opportunity_conflicts()` (decision #121); see

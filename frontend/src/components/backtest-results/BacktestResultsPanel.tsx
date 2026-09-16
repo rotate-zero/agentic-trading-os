@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { useBacktestOutcomes } from "../../hooks/useBacktestOutcomes";
+import { useBacktestRunMeta } from "../../hooks/useBacktestRunMeta";
 import { useWorkspace } from "../../state/WorkspaceContext";
-import type { StrategyOutcomeWireShape } from "../../services/api-client";
+import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -206,6 +207,86 @@ function OutcomeRow({ outcome }: { outcome: StrategyOutcomeWireShape }) {
   );
 }
 
+// Decision #136's own metadata (`backtests`, not `strategy_outcomes`),
+// surfaced alongside this panel's existing outcome-level view rather
+// than as a separate sub-view — `runId` is always `BacktestResultsBody`'s
+// own `appliedRunId`, so this banner stays in lockstep with whichever
+// run the filter below is currently applied to (auto-following or
+// manually set) with no new shared state (see useBacktestRunMeta.ts's
+// own docstring for the full reasoning). Only rendered when a specific
+// run_id IS applied — "everything" (no filter) has no single run's
+// metadata to show, so nothing renders in that case, the same
+// honest-absence posture this panel already takes elsewhere.
+function RunMetaDetail({ run }: { run: BacktestRunWireShape }) {
+  const scalarFields: Array<[string, string]> = [
+    ["run_id", run.run_id],
+    ["sweep_id", run.sweep_id],
+    ["config_hash", run.config_hash],
+    ["symbol_universe", run.symbol_universe.join(", ")],
+    ["data_version", run.data_version],
+    ["feature_version", run.feature_version],
+    ["walk_forward_fold", run.walk_forward_fold === null ? "—" : String(run.walk_forward_fold)],
+    ["is_holdout", String(run.is_holdout)],
+    ["created_at", formatDateTime(run.created_at)],
+  ];
+
+  return (
+    <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-0.5 border-t border-base-border bg-base-bg/40 p-2 font-mono text-[10px]">
+      {scalarFields.map(([label, value]) => (
+        <Fragment key={label}>
+          <span className="text-text-muted">{label}</span>
+          <span className="truncate text-text-primary" title={value}>
+            {value}
+          </span>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+// Compact summary + expand-in-place toggle for the rest — reusing
+// OutcomeRow/OutcomeDetail's own established pattern immediately above
+// rather than introducing a second expand mechanism in this same file.
+function RunMetaBanner({ runId }: { runId?: string }) {
+  const { run, loading, error } = useBacktestRunMeta(runId);
+  const [expanded, setExpanded] = useState(false);
+
+  if (!runId) return null;
+
+  return (
+    <div className="rounded border border-base-border">
+      <div className="flex items-center justify-between gap-2 px-2 py-1.5">
+        {error && <span className="truncate font-mono text-[10px] text-bear">Run info: {error}</span>}
+        {!error && loading && <span className="font-mono text-[10px] text-text-muted">Loading run info…</span>}
+        {!error && !loading && !run && (
+          <span className="truncate font-mono text-[10px] text-text-muted">
+            No run metadata found for this run_id.
+          </span>
+        )}
+        {!error && !loading && run && (
+          <>
+            <div className="min-w-0 truncate font-mono text-[10px] text-text-primary">
+              <span className="text-text-muted">{run.strategy_name}</span> {run.strategy_version} ·{" "}
+              {run.date_range_start} → {run.date_range_end} ·{" "}
+              <span className="text-text-muted" title={run.sweep_id}>
+                sweep {run.sweep_id.slice(0, 8)}
+              </span>
+            </div>
+            <button
+              onClick={() => setExpanded(!expanded)}
+              title={expanded ? "Hide run details" : "Show run details"}
+              className="shrink-0 rounded px-1 py-0.5 font-mono text-[10px] text-text-muted hover:bg-base-bg hover:text-text-primary"
+            >
+              {expanded ? "▾" : "▸"}
+            </button>
+          </>
+        )}
+      </div>
+      {run && expanded && <RunMetaDetail run={run} />}
+    </div>
+  );
+}
+
 // Decision #134's own filter-mode split. `lastBacktestRunId` (shared
 // WorkspaceContext state, set by BacktestPanel.tsx when a run finishes)
 // is a DEFAULT, never a forced value — the task's own scope explicitly
@@ -322,6 +403,11 @@ function BacktestResultsBody() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-2">
+        {appliedRunId && (
+          <div className="mb-2">
+            <RunMetaBanner runId={appliedRunId} />
+          </div>
+        )}
         {error && (
           <div className="rounded border border-bear/40 px-2 py-3 font-mono text-[11px] text-bear">
             Failed to load: {error}

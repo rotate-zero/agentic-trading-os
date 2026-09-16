@@ -795,6 +795,73 @@ No `performance_queries.py` change — that module's own docstring scopes it str
 
 ---
 
+**As-built note (frontend surfacing of decision #136) — `GET /intelligence/backtest-runs` gets its first caller.** Decision #136 deliberately shipped backend-only, naming "showing a selected run's own metadata alongside `BacktestResultsPanel.tsx`'s outcome rows" as the natural next step, not built there. This delivery is exactly that: `BacktestResultsPanel.tsx` gains a `RunMetaBanner`, rendered only when `BacktestResultsBody`'s own `appliedRunId` (decision #134 — the same value already driving `useBacktestOutcomes`'s `backtestRunId` param, auto-following `lastBacktestRunId` or manually set) is a specific run, never when the panel is showing "everything." No new shared state: `appliedRunId` already exists and already means "the one run this panel is currently about," so the new banner reads it directly rather than introducing a second `WorkspaceContext.tsx` field.
+
+**One real design fork, presented to Saqib before any code was written.** Three placements were possible: (1) inline in `BacktestResultsPanel.tsx`, tied to the existing `appliedRunId` filter; (2) a new sub-view/tab for browsing recent runs independently of any outcome filter; (3) elsewhere entirely. Saqib confirmed (1) — the same placement decision #136's own note already pointed toward, and the one that needed zero new state versus (2)'s independent run-browsing UI and its own filter mechanics duplicating what the panel already has.
+
+**Compact summary + expand-in-place, not a new UI pattern.** `RunMetaBanner` reuses `OutcomeRow`/`OutcomeDetail`'s own established expand-in-place convention (a toggle revealing a detail block below it) rather than introducing a second expand mechanism in the same file: a one-line summary (`strategy_name`/`strategy_version` · `date_range_start → date_range_end` · truncated `sweep_id`) with a `▸`/`▾` toggle revealing the rest (`run_id`, `sweep_id` in full, `config_hash`, `symbol_universe`, `data_version`, `feature_version`, `walk_forward_fold`, `is_holdout`, `created_at`).
+
+**Three honest states, not two.** Because `run_id` is an exact match on `backtests`' own primary key, at most one row can ever come back. A syntactically valid UUID with no matching row renders "No run metadata found for this run_id." (absent, not an error) — kept genuinely distinct from a malformed (non-UUID) `run_id`, reachable here since the panel's `run_id` field is free text, which renders as its own error line, separate from the existing outcomes-fetch error banner. This mirrors `useBacktestOutcomes.ts`'s own error/empty split for the identical reason: a real backend 400 must never render identically to a genuinely absent row.
+
+**New `useBacktestRunMeta.ts` hook, sibling to `useBacktestOutcomes.ts`, not an extension of it.** Takes `runId?: string`; makes no request at all when `runId` is empty/undefined (a run's own metadata is only meaningful for one specific run — fetching against an unfiltered view would mean an arbitrary, meaningless `limit=1` row). No `refetch` exposed, unlike `useBacktestOutcomes.ts`: a `backtests` row is written once, before any `StrategyOutcome` row for that run exists (`BacktestRunner.run()`'s own FK-ordering requirement), and never updated afterward, so a `runId` change already triggers everything a manual refresh could.
+
+**New `api-client.ts` additions — `BacktestRunWireShape`/`BacktestRunsWireShape`/`fetchBacktestRuns()`.** Field names/types copied directly from `schemas/performance.py`'s `BacktestRun` (re-verified against that file's current contents), the same "route validates every ORM row through the exact Pydantic contract" posture `StrategyOutcomeWireShape` already documents for its sibling route. `fetchBacktestRuns(limit?, runId?, strategyName?, sweepId?)` keeps `fetchStrategyOutcomes`'s own positional-params shape (one caller today, so an object-shape rewrite would be pure restructuring with no caller it helps) and its conditional-append query-building pattern. A malformed `run_id`/`sweep_id` is a 400, thrown as `ApiError`, same posture as the backend route and as `fetchStrategyOutcomes`'s own `backtestRunId`.
+
+**Cross-component data flow — `appliedRunId` → hook → route → banner:**
+
+```
+BacktestResultsBody's own appliedRunId          ◄── decision #134 (auto/manual
+(same value already driving                          mode machine), unchanged
+useBacktestOutcomes's backtestRunId)                  by this delivery
+        │
+        ▼
+<RunMetaBanner runId={appliedRunId} />          ◄── only rendered when
+        │                                             appliedRunId is set
+        ▼
+useBacktestRunMeta(runId)                       ◄── new hook, this delivery
+  no runId  → no fetch, run=null
+  runId set → fetchBacktestRuns(1, runId)
+        │
+        ▼
+GET /intelligence/backtest-runs?run_id=<uuid>&limit=1   ◄── decision #136,
+        │                                                     unchanged
+        ▼
+{"backtest_runs": [BacktestRun] | []}
+        │
+        ├── [] (valid UUID, no match)  → "No run metadata found for this run_id."
+        ├── 400 (malformed run_id)     → error line, distinct from the above
+        └── [BacktestRun]              → summary line + expand-in-place detail
+```
+
+**Internal flow inside the changed component (`RunMetaBanner`/`RunMetaDetail`, `BacktestResultsPanel.tsx`):**
+
+```
+RunMetaBanner({ runId })
+        │
+        ├── !runId ──► render nothing
+        │
+        ▼
+useBacktestRunMeta(runId) → { run, loading, error }
+        │
+        ├── loading        → "Loading run info…"
+        ├── error           → "Run info: <message>"           ◄── distinct from
+        ├── !run (no error) → "No run metadata found..."             outcomes'
+        └── run             → summary line                            own error
+                 │                                                     banner
+                 ▼
+        [▸/▾] toggle (local `expanded` state, per-instance,
+                       same OutcomeRow/OutcomeDetail pattern)
+                 │
+                 ▼
+        expanded && <RunMetaDetail run={run} />   ◄── scalar field grid,
+                                                        same layout OutcomeDetail
+                                                        already uses
+```
+
+**Footprint, confirmed by `diff -rq` against a freshly re-pulled clone.** Modified: `frontend/src/services/api-client.ts` (new types + `fetchBacktestRuns`), `frontend/src/components/backtest-results/BacktestResultsPanel.tsx` (`RunMetaBanner`/`RunMetaDetail`, wired into `BacktestResultsBody`). New: `frontend/src/hooks/useBacktestRunMeta.ts`. Confirmed untouched: everything under `backend/`, `frontend/src/state/WorkspaceContext.tsx`, `frontend/src/types/workspace.ts`, `frontend/src/hooks/useBacktestOutcomes.ts`, `frontend/src/hooks/useBacktestRun.ts`, `frontend/src/components/backtest/BacktestPanel.tsx`. `npx tsc -b`/`npx vite build` clean, only the known #35 `GridPresetPicker` errors — verified against a freshly re-pulled `main` baseline immediately before this delivery's own run, not assumed.
+
+---
+
 ## 8. Entry timing — ACT / WAIT / ABANDON, not bar-close confirmation
 
 **Direction-locked (decision #88) — the *model*, not the intelligence.** What ships in v1 is "every strategy acts immediately." What's locked here is the *shape* so that a future strategy can deliberately wait, or abandon a decaying setup, without a schema rework. Two rounds of review corrected the framing before it got here — worth keeping both corrections visible, since each fixes a real mistake, not a style preference.

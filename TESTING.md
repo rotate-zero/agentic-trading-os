@@ -1,61 +1,34 @@
-# Decision-log integrity correction — ordering, headers, CHANGES.md backfill
+# Backtest run metadata surfacing — verification
 
-Documentation-only. No code, tests, or architecture docs touched.
+The inherited `TESTING.md` was deleted before this task-specific record was written.
 
-## What changed
+## Rebase note
 
-1. **`docs/decisions/confirmed-decisions.md`** — physically reordered so entries
-   read `134 → 135 → 136 → 137 → 138` top to bottom (was
-   `134 → 137 → 135 → 136 → 138`). Entries #135 and #136 also had their opening
-   line reformatted from `N. **long lead sentence**` to `### N. long lead
-   sentence` (a real markdown heading, dropping the now-redundant bold markers),
-   matching the `### N. Title` convention already used by #134/#137/#138. No
-   other entry's structure changed.
-2. **`CHANGES.md`** — replaced with a backfilled entry for decision #138 (was
-   still showing #137's entry; #138 never overwrote it). See the note at the top
-   of that file for how it was reconstructed.
+This delivery was originally verified against `main` commit `6bb7189`. Before packaging, `main` had moved to `6d1b3ce` ("Doc Sequence edited" — reordered decisions #135/#137 into strict numeric sequence in `confirmed-decisions.md`, normalized their heading style, and backfilled #138's own `CHANGES.md`; no code changed, `INDEX.md` untouched). All three of this delivery's own code files, `docs/decisions/INDEX.md`, and `docs/architecture/strategy-engine-design.md` were confirmed byte-identical between `6bb7189` and `6d1b3ce` (direct `diff`, not assumed), so none needed rebasing. Only `docs/decisions/confirmed-decisions.md`'s append point moved; that file's own entry was rebased onto the corrected version. `tsc -b`/`vite build` were re-run on the final, rebased tree (below) rather than trusting the pre-rebase run.
 
-## What did NOT change
+## Untouched GitHub `main` baseline
 
-No word of any decision's substance was altered. Verified programmatically:
-stripped every entry (`###`/plain numbering, bold markers, `---` rules,
-whitespace) from both the original and corrected `confirmed-decisions.md` and
-compared per-decision-number, not as one concatenated blob (since reordering
-necessarily changes concatenated-string position) — **all five entries (#134–
-#138) are identical after stripping structural markup.** The pre-existing
-4-space indentation inside several of #135's and #136's internal paragraphs
-(present in the original, not something this delivery introduced or corrected)
-was left exactly as found — out of this delivery's stated scope.
+Fresh `main` clone (`git clone --depth 1`, commit `6d1b3ce`) via `npm install`d frontend dependencies fresh.
 
-`docs/decisions/INDEX.md` was not touched — it was already in correct order
-(confirmed during the original audit) and required no fix.
+- `cd frontend && npx tsc -b` — exit 1, exactly four decision #35 `GridPresetPicker.tsx` errors: missing `GRID_PRESETS`, missing `preset`, missing `setPreset`, and implicit-any `p`.
+- `cd frontend && npx vite build` — exit 0, 90 modules transformed.
 
-## Root-cause note (for the record, not re-litigated here)
+## Changed tree (post-rebase)
 
-Commit timestamps on `confirmed-decisions.md` (via GitHub's own commit history
-for that path) show #135 and #136 both merged to `main` before #137 did. #137's
-own text was spliced in directly after #134's entry — consistent with that
-session writing against a local copy of the file that predated #135/#136's
-merges, despite correctly claiming the number 137 for itself. The number was
-re-checked before writing; the physical file position was not.
+- `cd frontend && npx tsc -b` — exit 1, the identical four `GridPresetPicker.tsx` errors and no new TypeScript errors.
+- `cd frontend && npx vite build` — exit 0, 91 modules transformed (exactly +1, the new `useBacktestRunMeta.ts` hook file).
 
-## Verification performed
+## Manual verification — no frontend test framework exists in this codebase
 
-- Per-entry structural-diff check described above (script-based, not visual).
-- `grep -nE "^### [0-9]+\." docs/decisions/confirmed-decisions.md` on the
-  corrected file returns exactly `134, 135, 136, 137, 138`, in that order, no
-  gaps, no duplicates.
-- `diff -rq` against a freshly re-pulled clone of current `main`, confirming the
-  only two files that differ anywhere in the repository are
-  `docs/decisions/confirmed-decisions.md` and `CHANGES.md`.
+Confirmed by grep (no `vitest`/`jest` dependency, no `*.test.*` file anywhere under `frontend/`), consistent with every prior frontend-only decision's own note. Verified by direct source trace instead:
 
-## Deliberately not covered
+- **Query construction (`fetchBacktestRuns`)** — `limit`/`run_id`/`strategy_name`/`sweep_id` are each appended to the query string only when defined, matching `fetchStrategyOutcomes`'s own conditional-append pattern; traced against all 2^4 presence/absence combinations by inspection, none conflict.
+- **`useBacktestRunMeta` reactivity** — `useEffect`'s dependency array is `[runId]`; an empty/undefined `runId` short-circuits before any fetch and resets `run`/`loading`/`error` to their absent state, so clearing the panel's filter correctly clears the banner rather than leaving a stale prior run's metadata on screen.
+- **Three-state rendering (`RunMetaBanner`)** — traced each of loading / error / absent (`run === null`, no error) / present against the component's own conditional JSX; each renders mutually exclusively, and only the present state renders the expand toggle.
+- **run_id linkage** — confirmed `RunMetaBanner`'s `runId` prop is always `BacktestResultsBody`'s own `appliedRunId` (the same value passed to `useBacktestOutcomes`'s `backtestRunId` param), so the banner and the outcomes list can never show two different runs at once, in both auto (following `lastBacktestRunId`) and manual (typed/cleared) filter modes.
 
-- No new decision-log entry was minted for this correction itself. Project
-  convention mints a new entry for corrections to a decision's *substance*; this
-  is a structural/packaging fix to entries whose substance is unchanged. Flagged
-  for Saqib to decide whether a correction entry is still wanted for the audit
-  trail — not added unilaterally here, since assigning a real decision number is
-  explicitly reserved for exactly that kind of judgment call.
-- The pre-existing 4-space-indent quirk inside #135/#136's internal paragraphs
-  (noted above) — unrelated to what was asked, not touched.
+No running backend/Postgres was available in this delivery's own environment to exercise the full round trip end-to-end (matching decision #137's own note for the same reason).
+
+## Boundary comparison
+
+Immediately before packaging: `main` re-fetched (`6d1b3ce`, confirmed current), and `diff -rq --exclude=.git --exclude=node_modules --exclude=dist --exclude='*.tsbuildinfo'` run against a fresh clone of it. Task changes found in exactly: `frontend/src/services/api-client.ts`, `frontend/src/components/backtest-results/BacktestResultsPanel.tsx`, `frontend/src/hooks/useBacktestRunMeta.ts` (new), `docs/architecture/strategy-engine-design.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, `CHANGES.md`, and this `TESTING.md` replacement — nothing else. Nothing under `backend/` touched.
