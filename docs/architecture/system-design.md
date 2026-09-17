@@ -103,6 +103,86 @@ class BrokerAdapter(ABC):
 
 `IBKRAdapter` and `AlpacaAdapter` implement this. The Market Data Engine and Execution Engine depend only on `BrokerAdapter`, never on a concrete class. Adding a new broker = one new adapter file, zero changes elsewhere.
 
+**IBKR connection management reaches the frontend for the first time (decision `broker-connection-panel`, number TBD — see that log entry).** `POST /broker/connect`, `POST /broker/subscribe`, `POST /broker/unsubscribe`, `GET /broker/status`, `POST /broker/disconnect` (`app/api/routes/broker.py`) are five real, working routes with zero UI representation before this — only `curl` could connect IBKR, check its status, or subscribe a symbol. A new `<main>` sibling panel now sits alongside `ScannerPanel`/`FeatureEnginePanel`/`BacktestPanel`/`BacktestResultsPanel` in both `App.tsx` shells (`FullWorkspaceShell` and `PoppedOutWindowShell`):
+
+```
+IB Gateway / TWS                    BrokerPanel.tsx
+(external process, on your          (frontend/src/components/broker)
+ own machine — never auto-           │
+ started by this backend)            │ connect() / disconnect() /
+       ▲          ▲                  │ subscribe(sym) / unsubscribe(sym)
+       │          │                  ▼
+       │          │        useBrokerStatus.ts (frontend/src/hooks)
+       │          │        — 10s poll of GET /broker/status
+       │          │          (only source of truth; no push
+       │          │           channel exists for this — confirmed
+       │          │           via channels.py's own EVENT_TO_CHANNEL)
+       │          │                  │
+       │  ib_async socket            │ fetch() — connect/disconnect/
+       │  (local TWS API port)       │ subscribe/unsubscribe/status
+       │          │                  ▼
+┌──────┴──────────┴───────────────────────────────┐
+│ IBKRAdapter (broker_adapters/ibkr_adapter.py)    │
+│  .connect() / .disconnect() / .subscribe()       │
+│  .unsubscribe() / .is_connected()                │
+└──────────────────────┬────────────────────────────┘
+                        │ take_over_streaming() +
+                        │ set_historical_provider()
+                        ▼
+              broker_registry (app/services)
+    — same two-role (streaming/historical) registry
+      Finnhub/Polygon auto-connect into at startup;
+      a manual POST /broker/connect here takes over
+      BOTH roles from whichever of those was streaming
+```
+
+`POST /broker/connect`'s real, expected failure mode — a `502` whose `detail` names the actual `ib_async` connection error and points at `backend/README.md`'s IBKR setup section — surfaces to the person close to verbatim rather than behind a generic "connection failed," since this sandbox (and most real sessions before Gateway is up) genuinely can't connect: "not connected" is IBKR's normal resting state here, not an edge case to design around. Confirmed live against this backend directly (no Gateway running, no mocks): `GET /broker/status` → `{"connected": false}`; `POST /broker/connect` → real `502` with the exact "Is IB Gateway running and logged in?" detail text; `POST /broker/subscribe`/`unsubscribe` before any connection → real `400`s; `POST /broker/disconnect` → `200` unconditionally. Also confirmed live, correcting an assumption in this task's own prompt: `symbol` on `/broker/subscribe`/`/broker/unsubscribe` is a FastAPI **query** parameter, not a JSON body — a JSON-body attempt returns a real `422` ("Field required", `loc: [\"query\", \"symbol\"]`) — matching `broker.py`'s actual route signatures (`async def subscribe(symbol: str)`, no `Body(...)` annotation) rather than the prompt's "body: symbol" description.
+
+Internal flow inside the new hook/component pair:
+
+```
+mount ──► refetchStatus() ──► setInterval(refetchStatus, 10_000)
+             │
+             ▼
+  GET /broker/status ──fulfilled──► setConnected(bool)
+             │                       (prev true → false transition
+             │                        detected here too: an external/
+             │                        unexpected drop also clears
+             │                        subscribedSymbols — a disconnected
+             │                        adapter has zero subscriptions
+             │                        no matter what disconnected it)
+             └──rejected──► statusError set; PREVIOUS connected
+                             reading kept as-is (a failed poll is
+                             "no fresh read," never fabricated into
+                             "disconnected")
+
+BrokerPanel "Connect" click ──► connect()
+                                    │
+                                POST /broker/connect
+                                    │
+                        success ─┬─ "connected"        → clear subscribedSymbols
+                                 └─ "already_connected" → leave subscribedSymbols as-is
+                        failure ── connectError shown ~verbatim (real 502 detail);
+                                   refetchStatus() runs either way
+
+BrokerPanel "Subscribe <SYM>" click ──► subscribe(symbol)
+                                            │
+                                POST /broker/subscribe?symbol=SYM
+                                            │
+                        success ── appended to subscribedSymbols
+                                   (THIS PANEL'S OWN local record of
+                                    what it has asked the backend to
+                                    subscribe — not an authoritative
+                                    read of everything IBKR is actually
+                                    streaming; no GET route exists for
+                                    that today)
+                        failure ── symbolActionError shown (backend's
+                                   real detail — "Not connected", or a
+                                   SymbolNotFoundError message)
+```
+
+Deliberately local component state for this panel's own collapsed/widthPx chrome (not threaded through `WorkspaceContext.tsx`) — same reasoning `BacktestPanel.tsx`/`BacktestResultsPanel.tsx` already established for themselves: the real connection state lives on the backend and is independently, correctly re-polled by every mounted instance of this panel regardless of which Main Window it's in, so there's no correctness gap from keeping just the resize/collapse chrome unsynced.
+
 ### 4.2 Market Data Engine
 The only module allowed to talk to a broker for data.
 

@@ -10,6 +10,7 @@ import { ScannerPanel } from "./components/scanner/ScannerPanel";
 import { BacktestPanel } from "./components/backtest/BacktestPanel";
 import { BacktestResultsPanel } from "./components/backtest-results/BacktestResultsPanel";
 import { DataFeedStatus } from "./components/header/DataFeedStatus";
+import { BrokerPanel } from "./components/broker/BrokerPanel";
 
 // Minimal hand-rolled routing — the only two shapes this app needs: "/"
 // (the full multi-tab workspace) and "/window/:id" (one Main Window,
@@ -54,6 +55,7 @@ function FullWorkspaceShell() {
         <ScannerPanel />
         <BacktestPanel />
         <BacktestResultsPanel />
+        <BrokerPanel />
       </main>
     </div>
   );
@@ -118,6 +120,7 @@ function PoppedOutWindowShell({ windowId }: { windowId: string }) {
         <ScannerPanel />
         <BacktestPanel />
         <BacktestResultsPanel />
+        <BrokerPanel />
       </main>
     </div>
   );

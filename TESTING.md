@@ -1,49 +1,81 @@
-# TESTING — pending decision (temp id: `data-feed-status-indicator`) — Finnhub/Polygon data feed status surfaced in the header
+# TESTING — pending decision (temp id: `broker-connection-panel`) — IBKR broker connection management surfaced as a new panel
 
-Frontend-only delivery. No `backend/` files touched, so no backend test run applies here.
+Frontend-only delivery. No `backend/` files touched, so no backend `pytest` run applies — but all five routes this delivery surfaces were exercised live against a real, locally-run instance of this exact backend (see "Live route verification" below), not just read from source or reasoned about.
 
 ## Pre-work verification
 
 - Fresh tarball pull (`codeload.github.com/.../refs/heads/main`) at task start.
-- Three-source decision-number check (`INDEX.md` tail, `confirmed-decisions.md` tail, `docs/decisions/archive/` file list) at task start: all three agreed the latest decision is #142, next available is #143.
-- `grep -rn "reconnect|retry|on_close|on_disconnect|auto"` across `backend/app/broker_adapters/finnhub_provider.py` / `polygon_provider.py`, and a direct read of both files' `connect()`/`disconnect()`/`is_connected()` methods, to confirm the real, current reconnect gap before proposing the Finnhub-only "Reconnect" button (see this delivery's decision-log entry for the finding and Saqib's confirmation).
-- Direct read of `backend/app/main.py`'s lifespan startup block — confirmed Finnhub/Polygon auto-connect on startup if their API keys are configured, each soft-failing independently (missing key or a real connect error never crashes the app).
-- `grep -n "EventType\." backend/app/event_bus/*.py backend/app/api/websocket/channels.py | grep -i "provider|connect|status"` — confirmed zero matches, i.e. no WebSocket event exists for a provider connecting/disconnecting, which is why `useDataFeedStatus.ts` is pure-poll rather than WebSocket-primary-with-poll-fallback like `useContextSnapshot.ts`.
+- Read, in order: `docs/decisions/README.md`, `INDEX.md`'s tail; `backend/app/api/routes/broker.py` in full including its module docstring; `backend/app/broker_adapters/base.py`'s `BrokerAdapter`/`SymbolNotFoundError` docstrings; `backend/app/broker_adapters/ibkr_adapter.py`'s module docstring plus `connect()`/`disconnect()`/`subscribe()`/`unsubscribe()`/`is_connected()`/`_qualify()`/`_on_disconnected()`; `frontend/src/App.tsx` in full; `frontend/src/components/scanner/ScannerPanel.tsx` in full as structural template; `frontend/src/services/api-client.ts`'s existing wrapper conventions (all exports enumerated via grep); `frontend/src/hooks/useBacktestRun.ts` and `useContextSnapshot.ts` for the trigger/poll-reasoning references named in this task's own prompt.
+- Mid-task re-pull (the user's own "git is updated" signal) surfaced that the parallel Finnhub/Polygon `data-feed-status-indicator` delivery had already landed on `main`. Re-read the new/changed files it introduced (`App.tsx`'s diff, `api-client.ts`'s diff, its own `CHANGES.md`/`TESTING.md`/decision-log entry, `system-design.md` §4.2's new note) before writing any code of my own, to build on top of the current state rather than a stale one.
 
 ## Immediately before writing/packaging
 
-- Re-pulled a fresh tarball and compared `md5sum` of every file this task could touch (`frontend/src/App.tsx`, `frontend/src/services/api-client.ts`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`) against the hashes captured at the very first pull, before making any edit: **byte-identical on all four** — confirms `main` did not move during this task, and specifically that the parallel IBKR-panel session (if it landed) touched neither shared file in a way that reached `main` yet.
-- Re-ran the three-source decision-number check immediately before writing the decision-log entry: unchanged, #142 still latest, #143 still next available. Per Saqib's standing rule, this delivery does **not** mint #143 as a real number — the entry is appended under the temp slug `data-feed-status-indicator`, flagged for whoever merges to finalize after their own re-check.
+- Three-source decision-number check (`INDEX.md` tail, `confirmed-decisions.md` tail, `docs/decisions/archive/` file list): all three agree the latest real number is #142; the `data-feed-status-indicator` entry immediately above mine already identified 143 as next-available at its own packaging time, and nothing has moved since — this delivery's own PENDING entry states the same number for the same reason, not assumed to be a re-derivation.
+- Re-checked `App.tsx` and `api-client.ts` for overlap with the already-landed parallel delivery: confirmed disjoint by inspection (that delivery edits `<header>` only in `App.tsx`; mine edits `<main>` only) and by diff (that delivery's `api-client.ts` block ends at line 1030; mine is appended after it, lines 1031+, no shared lines).
+
+## Live route verification
+
+The task's own material was explicit that a live IBKR connection can't be verified in this sandbox — but the five routes themselves (their status codes, error shapes, and parameter conventions) don't need a real Gateway to test, only a running instance of this backend. Installed `backend/requirements.txt` and ran `uvicorn app.main:app` locally with **no Postgres, no IBKR Gateway, and no API keys configured** — confirmed this boots cleanly (per `app/main.py`'s own documented soft-fail startup posture) — then hit all five routes directly:
+
+```
+$ curl -s http://127.0.0.1:8123/broker/status
+{"connected":false}
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://127.0.0.1:8123/broker/connect
+{"detail":"IBKR connect failed: [Errno 111] Connection refused. Is IB Gateway running
+and logged in? See backend/README.md's IBKR connection setup section."}
+HTTP_STATUS:502
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/subscribe?symbol=NVDA"
+{"detail":"Not connected — call POST /broker/connect first"}
+HTTP_STATUS:400
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/unsubscribe?symbol=NVDA"
+{"detail":"Not connected"}
+HTTP_STATUS:400
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://127.0.0.1:8123/broker/disconnect
+{"status":"disconnected"}
+HTTP_STATUS:200
+
+$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/subscribe" \
+    -H "Content-Type: application/json" -d '{"symbol":"NVDA"}'
+{"detail":[{"type":"missing","loc":["query","symbol"],"msg":"Field required","input":null}]}
+HTTP_STATUS:422
+```
+
+This directly confirms every status code/error-shape assumption `api-client.ts`'s wrappers and `BrokerPanel.tsx`'s rendering make, and **decisively settles the query-param-vs-body question** this task's own prompt got wrong: the JSON-body attempt fails with a real `422` naming the missing `query` field, not a body field.
 
 ## Type-check / build
 
-- `npx tsc -b`: clean except the four pre-existing `GridPresetPicker.tsx` errors (decision #35). Confirmed these are pre-existing and not introduced by this delivery by running the identical command against a separately, freshly pulled untouched clone — byte-identical error list, same four lines.
-- `npx vite build`: clean, no errors or warnings. `dist/` output produced successfully (93 modules transformed).
+- `npx tsc -b`: clean except the four pre-existing `GridPresetPicker.tsx` errors (decision #35). Confirmed pre-existing (not introduced by this delivery, and not introduced by the already-merged parallel delivery either) by running the identical command against a separately, freshly pulled, completely untouched clone — byte-identical four-line error list.
+- `npx vite build`: clean, no errors or warnings. `dist/` output produced successfully (95 modules transformed — the parallel delivery's own reported 93, plus this delivery's 2 new files: `BrokerPanel.tsx`, `useBrokerStatus.ts`).
 
 ## Footprint verification
 
-`diff -rq` between this delivery and a freshly pulled, untouched clone (excluding `node_modules/`, `dist/`, and `tsconfig.tsbuildinfo` — the last is a local TypeScript build cache regenerated by running `tsc`, not a source change, and differs on any two independent `tsc` runs regardless of source content) shows exactly:
+`diff -rq` between this delivery and a freshly pulled clone (post-parallel-delivery `main`; excluding `node_modules/`, `dist/`, `tsconfig.tsbuildinfo`, and the backend's installed Python packages, none of which are source) shows exactly:
 
 **Modified:**
-- `frontend/src/App.tsx` — two additive hunks (one import line, one `<DataFeedStatus />` mount per header). No existing line removed, reordered, or changed beyond wrapping the existing `<LayoutsMenu />`/`<GridPicker />` group in one new flex container for spacing.
-- `frontend/src/services/api-client.ts` — one additive block appended after the existing `triggerBacktest()` (the file's last export before this change). No existing export changed.
-- `docs/architecture/system-design.md` — one new as-built paragraph + two ASCII diagrams inserted into §4.2, immediately before §4.3's existing header. No existing content in this file changed or removed.
-- `docs/decisions/confirmed-decisions.md` — one new entry appended after #142 (this file's last entry before this change), under the temp slug `data-feed-status-indicator`, not a real number.
-- `docs/decisions/INDEX.md` — one new row appended after #142's row, matching this delivery's temp-slug entry.
+- `frontend/src/App.tsx` — two additive hunks (one import line, one `<BrokerPanel />` mount per `<main>`). No existing line removed or reordered; the parallel delivery's own `<header>` hunks untouched.
+- `frontend/src/services/api-client.ts` — one additive block appended after the parallel delivery's own `connectFinnhub()` (the file's last export before this change). No existing export changed.
+- `docs/architecture/system-design.md` — one new as-built paragraph + two ASCII diagrams inserted into §4.1, immediately before §4.2's existing header (which now itself contains the parallel delivery's own, separate note — untouched here). No existing content in this file changed or removed.
+- `docs/decisions/confirmed-decisions.md` — one new PENDING entry appended after the parallel delivery's own PENDING entry (this file's last entry before this change).
+- `docs/decisions/INDEX.md` — one new PENDING row appended after the parallel delivery's own PENDING row.
 
 **New:**
-- `frontend/src/components/header/DataFeedStatus.tsx`
-- `frontend/src/hooks/useDataFeedStatus.ts`
+- `frontend/src/components/broker/BrokerPanel.tsx`
+- `frontend/src/hooks/useBrokerStatus.ts`
 
 **Untouched (confirmed, not just assumed):**
 - Everything under `backend/`.
-- `backend/app/api/routes/broker.py`, `backend/app/broker_adapters/` — read-only reference during research, never edited.
-- `App.tsx`'s `<main>` panel list — only the `<header>` blocks were touched.
+- `App.tsx`'s `<header>` blocks and everything under `frontend/src/components/header/` — the parallel delivery's own territory.
 - `frontend/src/components/backtest/`, `frontend/src/components/backtest-results/`, and their hooks.
 - `docs/decisions/archive/*.md` — decision content there is immutable, correctly left alone.
+- `docs/architecture/system-design.md` §4.2 — the parallel delivery's own note there, untouched; my own note lives in §4.1.
 
-## Manual verification of the actual behavior (reasoned from the code, since this sandbox has no live Finnhub/Polygon keys or a running backend to click against)
+## Manual verification of the actual behavior
 
-- `useDataFeedStatus.ts`'s `Promise.allSettled` shape confirmed to keep each provider's last-good reading independently on a fetch failure, rather than either blanking both or fabricating a `false` — traced through the `.then(([finnhubResult, polygonResult]) => ...)` branch logic by hand against both the fulfilled and rejected cases.
-- `reconnectFinnhub()` confirmed to call `load()` in its `.finally()` block regardless of success or failure, so the badge always reflects a real post-attempt state rather than an optimistic one.
-- `DataFeedStatus.tsx`'s conditional rendering confirmed to only show the "Reconnect" button when `finnhubConnected === false` specifically (not `null`, i.e. not during the initial loading state, where nothing is known yet) — checked the exact boolean condition, not inferred from behavior.
+- `useBrokerStatus.ts`'s `refetchStatus()` transition logic (`prevConnectedRef`) traced by hand against both the true→false case (clears `subscribedSymbols`) and every other transition (leaves it alone) — confirmed against the actual code, not just the intent.
+- `connect()`'s `res.status === "connected"` vs. `"already_connected"` branch confirmed to only clear `subscribedSymbols` in the former case, matching `broker.py`'s own real branching (a genuine new `IBKRAdapter()` vs. the early-return no-op).
+- `BrokerPanel.tsx`'s Connect/Disconnect button `disabled` conditions confirmed to key off `connected === true` / `connected !== true` specifically (not a truthy/falsy check), so the initial `connected === null` loading state doesn't enable Disconnect prematurely.
+- `SubscribeForm`'s input/button `disabled` state confirmed to key off the `connected` prop, verified wired from `connected === true` (not `connected ?? false`, which would also disable it correctly, but the explicit form is what's actually in the code).

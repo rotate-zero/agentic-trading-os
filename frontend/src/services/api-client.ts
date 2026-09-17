@@ -1028,3 +1028,129 @@ export async function connectFinnhub(): Promise<FinnhubConnectResultWireShape> {
   }
   return (await res.json()) as FinnhubConnectResultWireShape;
 }
+
+// ---------------------------------------------------------------------------
+// IBKR Broker Connection (backend/app/api/routes/broker.py) — manual
+// connect/disconnect/subscribe/unsubscribe/status control for the one real
+// BrokerAdapter this app has (IBKRAdapter). Previously reachable only via
+// curl; zero frontend representation until this task. See
+// useBrokerStatus.ts for the polling + action hook that consumes these,
+// and components/broker/BrokerPanel.tsx for the new <main> sibling panel.
+//
+// IBKR requires Gateway/TWS already running and logged in externally
+// before POST /broker/connect can succeed (broker.py's own module
+// docstring) — there's no auto-connect for IBKR on backend startup the
+// way Finnhub/Polygon get one (app/main.py's lifespan), so "not
+// connected" is this adapter's normal, expected resting state here, not
+// a fault to alarm about.
+//
+// `symbol` on subscribe/unsubscribe is a real FastAPI QUERY parameter,
+// NOT a JSON body — confirmed directly against broker.py's actual route
+// signatures (`async def subscribe(symbol: str) -> dict`, no `Body(...)`
+// annotation anywhere, so FastAPI treats a bare `str` param as a query
+// param regardless of HTTP method) rather than assumed from this task's
+// own prompt text, which described it as a body field — same correction
+// discipline decision #127's own entry documents for a similarly stale
+// prompt claim elsewhere in this codebase. Same
+// POST-with-query-params-in-the-URL convention subscribeSymbol() and
+// triggerBacktest() above already use for the identical real reason.
+
+export interface BrokerStatusWireShape {
+  connected: boolean;
+}
+
+/**
+ * GET /broker/status — cheap, always-fresh read. IBKRAdapter.is_connected()
+ * is a local `self._ib.isConnected()` check (confirmed directly against
+ * ibkr_adapter.py) — no round trip to Gateway, so polling this often costs
+ * nothing server-side.
+ */
+export async function fetchBrokerStatus(): Promise<BrokerStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/broker/status`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BrokerStatusWireShape;
+}
+
+export interface BrokerConnectResultWireShape {
+  status: "connected" | "already_connected";
+}
+
+/**
+ * POST /broker/connect — takes over BOTH the streaming and historical
+ * broker_registry roles from whatever was previously connected there
+ * (Finnhub and/or Polygon, if either auto-connected on startup —
+ * broker.py's own module docstring explains why that takeover is safe
+ * here specifically: connecting IBKR is always a deliberate manual
+ * action, unlike backend startup's own provider ordering, which needs a
+ * tie-breaking rule instead). A real, expected failure mode: a 502 whose
+ * `detail` tells the caller Gateway/TWS isn't running or isn't logged in
+ * — thrown via the normal ApiError path like any other failed call, not
+ * a special case, so callers can show the backend's own actual message
+ * verbatim rather than collapsing it into a generic "connection failed."
+ */
+export async function connectBroker(): Promise<BrokerConnectResultWireShape> {
+  const res = await fetch(`${API_BASE_URL}/broker/connect`, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BrokerConnectResultWireShape;
+}
+
+/**
+ * POST /broker/disconnect — always 200, even if nothing was connected;
+ * broker_registry clears both the streaming and historical roles
+ * regardless, so this is safe to call unconditionally.
+ */
+export async function disconnectBroker(): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/broker/disconnect`, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+}
+
+export interface BrokerSubscribeResultWireShape {
+  status: "subscribed";
+  symbol: string;
+}
+
+/**
+ * POST /broker/subscribe?symbol=... — 400s with "Not connected — call
+ * POST /broker/connect first" if nothing's connected yet, or with the
+ * backend's own SymbolNotFoundError message (via qualifyContractsAsync's
+ * checked-not-ignored result — see ibkr_adapter.py's `_qualify()` for
+ * why that check exists) if IBKR can't resolve the symbol to a tradeable
+ * contract. Both surface as a normal ApiError with the backend's real
+ * detail text.
+ */
+export async function subscribeBrokerSymbol(symbol: string): Promise<BrokerSubscribeResultWireShape> {
+  const url = `${API_BASE_URL}/broker/subscribe?symbol=${encodeURIComponent(symbol)}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BrokerSubscribeResultWireShape;
+}
+
+export interface BrokerUnsubscribeResultWireShape {
+  status: "unsubscribed";
+  symbol: string;
+}
+
+/**
+ * POST /broker/unsubscribe?symbol=... — 400s only if nothing's connected
+ * at all (adapter is None). Unlike subscribe, unsubscribing a symbol
+ * that was never subscribed is NOT itself an error — confirmed directly
+ * against ibkr_adapter.py's `unsubscribe()`: it pops the symbol from its
+ * own private `_contracts` dict with a `None` default and silently skips
+ * the IBKR call entirely when nothing was there, rather than raising.
+ */
+export async function unsubscribeBrokerSymbol(symbol: string): Promise<BrokerUnsubscribeResultWireShape> {
+  const url = `${API_BASE_URL}/broker/unsubscribe?symbol=${encodeURIComponent(symbol)}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BrokerUnsubscribeResultWireShape;
+}
