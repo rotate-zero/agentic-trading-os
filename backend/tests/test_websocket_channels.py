@@ -1,7 +1,13 @@
 """
 Tests for the WebSocket Gateway's event -> channel routing/delivery
-(`app/api/websocket/channels.py`), specifically decision #126's new
-`EventType.CONTEXT_CHANGED -> "intelligence.context"` entry.
+(`app/api/websocket/channels.py`), covering decision #126's
+`EventType.CONTEXT_CHANGED -> "intelligence.context"` entry and this
+delivery's (temp id: `market-state-changed-websocket-channel`) analogous
+`EventType.MARKET_STATE_CHANGED -> "intelligence.market-state"` entry —
+same gap shape, one engine later, added to the same file rather than a
+new one since both exercise the identical unit under test
+(`EVENT_TO_CHANNEL` routing + real WS delivery), per this module's own
+"one file per module under test" convention below.
 
 Deliberately its own file, not folded into `test_event_bus.py`:
 `test_event_bus.py` tests the Bus's own dispatch mechanics and has no
@@ -47,8 +53,25 @@ WebSocket Gateway has zero persistence) — the real Postgres connection
 below is incidental, inherited from the app's own real lifespan
 (ContextEngine's bootstrap reads `scanner_universe_symbols`), not
 something this feature's own code path needs.
+
+`MarketStateChanged` has no equivalent startup noise, confirmed by direct
+read before writing its tests below: `MarketStateEngine.start()`
+(`app/market_state_engine/engine.py`) only calls
+`self._bus.subscribe(EventType.FEATURES_UPDATED, ...)` — no "fire once
+immediately" bootstrap loop the way `ContextEngine.start()` has. Real
+`FeaturesUpdated` traffic only exists once ticks are actually flowing
+(a live Finnhub/Polygon connection, or aggregation from recorded 1m
+candles), neither of which `TestClient(app)`'s own lifespan triggers on
+its own — so `test_market_state_changed_*` below don't need
+`_receive_until`'s noise-skipping for correctness, but reuse it anyway
+for the same reason `test_unrelated_event_does_not_reach_...` already
+does: a bounded read loop is strictly safer than a bare
+`ws.receive_json()` assuming the very next message is always the one
+just published, and costs nothing when the channel happens to be quiet.
 """
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -59,6 +82,7 @@ from app.main import app
 from app.schemas.events.context import ContextChanged
 from app.schemas.events.dev import DevPing
 from app.schemas.events.envelope import EventType
+from app.schemas.events.market_state import CrossSymbolState, MarketState
 
 # A ticker guaranteed absent from scanner_universe_symbols's real seed
 # data (AAPL/MSFT/NVDA/AMD/TSLA/SPY, migration 0004) — sidesteps any
@@ -70,6 +94,15 @@ _SYNTHETIC_TEST_SYMBOL = "ZZZZTEST"
 # alone (always None, real and synthetic alike) can't disambiguate —
 # no real CalendarProvider output could ever coincidentally match this.
 _GLOBAL_TEST_MARKER = "__decision126_test_marker__"
+
+# Distinctive `timeframe` marker for the MarketStateChanged tests below —
+# MarketState/CrossSymbolState carry no free-text field suited to
+# ContextChanged's provider-dict marker trick above (`_GLOBAL_TEST_MARKER`),
+# so `timeframe` (a plain `str`, no enum constraint — schemas/events/
+# market_state.py, confirmed by direct read) stands in instead. No real
+# MarketStateEngine compute could ever coincidentally emit this value; real
+# timeframes are 1m/5m/15m/1h only (engine.py/scoring.py).
+_MARKET_STATE_TEST_TIMEFRAME = "1m-market-state-changed-websocket-channel-test-marker"
 
 
 def _receive_until(ws, predicate, max_messages: int = 25) -> dict:
@@ -182,5 +215,140 @@ def test_unrelated_event_does_not_reach_intelligence_context_channel():
                     break
             else:
                 raise AssertionError("marked ContextChanged never arrived within 25 messages")
+
+            assert "DevPing" not in seen_event_types
+
+
+def test_market_state_changed_mapping_present():
+    """Regression guard for this delivery's own (temp id:
+    `market-state-changed-websocket-channel`) one-line addition — if this
+    entry is ever accidentally removed/renamed, this fails loudly rather
+    than silently reintroducing the exact gap this delivery closed, same
+    role `test_context_changed_mapping_present` plays for decision #126."""
+    assert EVENT_TO_CHANNEL[EventType.MARKET_STATE_CHANGED] == "intelligence.market-state"
+
+
+def test_per_symbol_market_state_changed_reaches_intelligence_market_state_with_real_symbol():
+    """Mirrors `MarketStateEngine._worker_loop`'s real per-symbol publish
+    shape (engine.py, confirmed by direct read before writing this test) —
+    `envelope.symbol` set to the real ticker. Uses a synthetic ticker (see
+    module docstring re: `_SYNTHETIC_TEST_SYMBOL`) even though no real
+    startup noise exists for this event today (see module docstring) —
+    matches this file's own defensive posture rather than assuming quiet."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "subscribe", "channel": "intelligence.market-state"})
+            ack = ws.receive_json()
+            assert ack == {"channel": "_meta", "subscribed": "intelligence.market-state"}
+
+            bus = get_event_bus()
+            envelope = make_envelope(
+                EventType.MARKET_STATE_CHANGED,
+                MarketState(
+                    timeframe=_MARKET_STATE_TEST_TIMEFRAME,
+                    candle_ts=datetime(2026, 1, 5, 14, 31, tzinfo=timezone.utc),
+                    trend_score=61.0,
+                    volatility_regime_score=40.0,
+                    volume_regime_score=55.0,
+                    vwap_relationship_score=70.0,
+                    acceleration_score=3.5,
+                ),
+                symbol=_SYNTHETIC_TEST_SYMBOL,
+            )
+            client.portal.call(bus.publish, envelope)
+
+            msg = _receive_until(
+                ws,
+                lambda m: m.get("payload", {}).get("timeframe") == _MARKET_STATE_TEST_TIMEFRAME
+                and m.get("symbol") == _SYNTHETIC_TEST_SYMBOL,
+            )
+            assert msg["channel"] == "intelligence.market-state"
+            assert msg["event_type"] == "MarketStateChanged"
+            assert msg["symbol"] == _SYNTHETIC_TEST_SYMBOL
+            assert msg["payload"]["trend_score"] == 61.0
+
+
+def test_cross_symbol_market_state_changed_reaches_intelligence_market_state_with_sentinel_symbol():
+    """Mirrors `MarketStateEngine._worker_loop`'s real cross-symbol publish
+    shape (engine.py, confirmed by direct read) — `envelope.symbol` set to
+    the real `_CROSS_SYMBOL_SENTINEL` value (`"__MARKET__"`), NOT null or
+    absent, unlike `ContextChanged`'s own market-wide shape. This is the
+    exact convention this delivery's own `EVENT_TO_CHANNEL` comment
+    documents: a subscriber distinguishes the two `MarketStateChanged`
+    shapes by comparing `envelope.symbol` to the literal sentinel string,
+    never by checking for None/absent — asserted explicitly below, not
+    merely relied upon."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "subscribe", "channel": "intelligence.market-state"})
+            ws.receive_json()  # ack
+
+            bus = get_event_bus()
+            envelope = make_envelope(
+                EventType.MARKET_STATE_CHANGED,
+                CrossSymbolState(
+                    timeframe=_MARKET_STATE_TEST_TIMEFRAME,
+                    candle_ts=datetime(2026, 1, 5, 14, 31, tzinfo=timezone.utc),
+                    spy_direction_score=58.0,
+                    qqq_direction_score=62.0,
+                    iwm_direction_score=49.0,
+                    trend_alignment_score=71.0,
+                    risk_on_score=66.0,
+                    qqq_leadership_score=52.0,
+                    iwm_confirmation_score=45.0,
+                ),
+                symbol="__MARKET__",
+            )
+            client.portal.call(bus.publish, envelope)
+
+            msg = _receive_until(
+                ws,
+                lambda m: m.get("payload", {}).get("timeframe") == _MARKET_STATE_TEST_TIMEFRAME
+                and m.get("symbol") == "__MARKET__",
+            )
+            assert msg["channel"] == "intelligence.market-state"
+            assert msg["event_type"] == "MarketStateChanged"
+            assert msg["symbol"] == "__MARKET__"
+            assert msg["symbol"] is not None  # explicit: unlike ContextChanged's market-wide shape
+            assert msg["payload"]["risk_on_score"] == 66.0
+
+
+def test_unrelated_event_does_not_reach_intelligence_market_state_channel():
+    """Channel isolation for the new channel — same structural proof
+    `test_unrelated_event_does_not_reach_intelligence_context_channel`
+    already gives for `intelligence.context`: a client subscribed only to
+    `intelligence.market-state` is never in `dev.ping`'s subscriber set."""
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as ws:
+            ws.send_json({"action": "subscribe", "channel": "intelligence.market-state"})
+            ws.receive_json()  # ack
+
+            bus = get_event_bus()
+            client.portal.call(bus.publish, make_envelope(EventType.DEV_PING, DevPing(message="unrelated", lane="normal")))
+            client.portal.call(
+                bus.publish,
+                make_envelope(
+                    EventType.MARKET_STATE_CHANGED,
+                    MarketState(
+                        timeframe=_MARKET_STATE_TEST_TIMEFRAME,
+                        candle_ts=datetime(2026, 1, 5, 14, 31, tzinfo=timezone.utc),
+                        trend_score=61.0,
+                        volatility_regime_score=40.0,
+                        volume_regime_score=55.0,
+                        vwap_relationship_score=70.0,
+                    ),
+                    symbol=_SYNTHETIC_TEST_SYMBOL,
+                ),
+            )
+
+            seen_event_types: set[str] = set()
+            for _ in range(25):
+                msg = ws.receive_json()
+                assert msg["channel"] == "intelligence.market-state"  # this socket only ever subscribed to this one
+                seen_event_types.add(msg["event_type"])
+                if msg.get("payload", {}).get("timeframe") == _MARKET_STATE_TEST_TIMEFRAME:
+                    break
+            else:
+                raise AssertionError("marked MarketStateChanged never arrived within 25 messages")
 
             assert "DevPing" not in seen_event_types

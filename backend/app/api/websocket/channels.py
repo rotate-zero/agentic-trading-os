@@ -39,6 +39,16 @@ EVENT_TO_CHANNEL: dict[EventType, str] = {
     # "one channel, distinguish by envelope.symbol" convention MarketStateChanged
     # already uses (decision #91): symbol unset = global/calendar (evaluate_all()),
     # symbol=<ticker> = per-symbol fundamentals/news (evaluate_for_symbol()).
+    EventType.MARKET_STATE_CHANGED: "intelligence.market-state",  # same gap-shape as
+    # #126, one engine later — MarketStateEngine already publishes this (decision
+    # #91's per-symbol shape, #93/#97's build), this is the missing routing entry.
+    # Two envelope shapes share this one channel (decision #91: "no new EventType
+    # needed — envelope.symbol distinguishes the two shapes"), but unlike
+    # ContextChanged the cross-symbol shape does NOT leave `symbol` unset — it's
+    # always populated: envelope.symbol == "__MARKET__" (the real ticker for the
+    # per-symbol shape, engine.py's own `_CROSS_SYMBOL_SENTINEL`). A subscriber
+    # tells the two apart by comparing envelope.symbol to that literal sentinel,
+    # never by checking for null/absent.
     EventType.OPPORTUNITY_CREATED: "opportunity.new",
     EventType.OPPORTUNITY_SELECTED: "opportunity.selected",
     EventType.ORDER_APPROVED: "orders.status",
