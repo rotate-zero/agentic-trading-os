@@ -119,6 +119,73 @@ Internal structure: `ConnectionManager` → `Normalizer` → `StateCache` → `P
 
 **5m/15m/1h are derived on read, not recorded separately.** `candle_aggregator.py` builds them hierarchically from the same recorded `1m` rows (`1m → 5m → 15m → 1h`, each level from the nearest coarser level already computed), bucketed session-locally via `MarketClock.session_bounds()` (§4.3) rather than a continuous 24h clock, so a bucket never straddles a session boundary. `GET /market/candles` tries this before falling through to an external provider, same priority as the raw `1m` self-recorded path. `1d` deliberately stays sourced from Polygon's real daily EOD bars rather than reconstructed from however much `1m` history happens to be recorded; `4h` is deliberately unsupported (a clean 400, not an attempt at a session-boundary definition nobody's confirmed — the regular session's 6.5h doesn't divide evenly by 4h). See decision #44.
 
+**Finnhub/Polygon connection status reaches the frontend for the first time (decision `data-feed-status-indicator`, number TBD — see that log entry).** `GET /finnhub/status` and `GET /market-data/status` (both existing, working routes — `finnhub_data.py`/`market_data.py`) had zero UI representation before this; only `curl` could ask "is either provider actually connected right now." A small always-visible indicator now sits in `App.tsx`'s `<header>` (both the full workspace and the popped-out window shell):
+
+```
+app/main.py lifespan (startup, soft-fail)     curl / DataFeedStatus.tsx's own
+   if FINNHUB_API_KEY configured:              "Reconnect" button (Finnhub only)
+   connect_finnhub() ────────────┐                        │
+   if POLYGON_API_KEY configured:│                        ▼
+   connect_polygon() ────────────┤             POST /finnhub/connect
+                                 ▼             (connect_finnhub(), same
+                    module-level _provider       shared function main.py's
+                    (finnhub_data.py /            own startup call uses)
+                     market_data.py, each
+                     own their own)
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                                ▼
+      GET /finnhub/status              GET /market-data/status
+      { connected }                    { connected, role }
+                 │                                │
+                 └───────────────┬────────────────┘
+                                  ▼
+                    useDataFeedStatus.ts (frontend/src/hooks)
+                    — pure poll, 120s; no push path exists,
+                      no EventType for a provider connect/
+                      disconnect (confirmed via channels.py's
+                      own EVENT_TO_CHANNEL)
+                                  ▼
+              DataFeedStatus.tsx — App.tsx <header>,
+              both FullWorkspaceShell and
+              PoppedOutWindowShell
+```
+
+Deliberately read-only for Polygon; Finnhub alone gets a manual "Reconnect" button, wrapping the same `POST /finnhub/connect` `app/main.py`'s own startup call already uses — a real, confirmed gap, not a preemptive control surface: `broker_adapters/finnhub_provider.py`'s own `_listen()` sets its connected flag to `False` on an unexpected WebSocket close with **no auto-reconnect**, by that file's own comment deferred to a future Phase 4 `ConnectionManager` (the same `ConnectionManager` this section's §4.2 responsibilities list above already names as not yet built). Until that Phase 4 work lands, calling this route again is genuinely the only way to restore a dropped Finnhub session — confirmed directly with Saqib before adding the button rather than assumed. Polygon has no equivalent gap (REST-polling based, no persistent socket to drop — `PolygonAdapter`'s own docstring), so it gets no matching button.
+
+Internal flow inside the new hook/component pair:
+
+```
+mount ──► load()
+            │
+            ▼
+  Promise.allSettled([fetchFinnhubStatus(), fetchMarketDataStatus()])
+            │
+   ┌────────┴─────────┐
+   ▼                   ▼
+fulfilled          rejected (either provider, independently)
+   │                   │
+   ▼                   ▼
+setXConnected(...)  console.error; PREVIOUS reading kept as-is
+                     (a failed fetch is "no fresh read," never
+                      fabricated into "disconnected")
+            │
+            ▼
+  setInterval(load, 120_000)  ──cleared on unmount──
+
+Finnhub badge, when disconnected:
+  [Reconnect] click ──► reconnectFinnhub()
+                              │
+                    POST /finnhub/connect
+                              │
+                  success ──► clear any old error, load()
+                  failure ──► reconnectError shown (badge "!",
+                               hover for detail), load() still
+                               runs either way — reflects the
+                               REAL post-attempt state, never
+                               an assumed one
+```
+
 ### 4.3 Market Clock
 The single source of truth for anything time/session-related. Every other module asks the Market Clock rather than computing this itself.
 

@@ -1,29 +1,49 @@
-# TESTING — decision #142 (architecture doc rollover: strategy-engine-design.md split into four files)
+# TESTING — pending decision (temp id: `data-feed-status-indicator`) — Finnhub/Polygon data feed status surfaced in the header
 
-No application tests apply — this is a documentation-only reorganization, no `backend/`/`frontend/` code changed. Per Saqib's own instruction, verification here is programmatic and structural rather than a test suite.
+Frontend-only delivery. No `backend/` files touched, so no backend test run applies here.
 
 ## Pre-work verification
 
-- Fresh `git clone --depth 1` at the start of this task, and a second fresh clone immediately before assigning the decision number, both landing on the same commit (`7311671`) — confirms no parallel session moved past decision #141 during this work.
-- Three-source decision-number check (`confirmed-decisions.md` tail, `INDEX.md` tail, `docs/decisions/archive/` file list) run twice — once at task start, once immediately before assignment — both times agreeing on `#141` as latest, `#142` as next available.
-- Repo-wide grep for every reference to `strategy-engine-design.md` (86 hits) before making any change, and specifically for markdown anchor links (`.md#...`) and line-number-style references — zero of either found anywhere in the repo, which is why no clickable link needed repair, only prose citations.
+- Fresh tarball pull (`codeload.github.com/.../refs/heads/main`) at task start.
+- Three-source decision-number check (`INDEX.md` tail, `confirmed-decisions.md` tail, `docs/decisions/archive/` file list) at task start: all three agreed the latest decision is #142, next available is #143.
+- `grep -rn "reconnect|retry|on_close|on_disconnect|auto"` across `backend/app/broker_adapters/finnhub_provider.py` / `polygon_provider.py`, and a direct read of both files' `connect()`/`disconnect()`/`is_connected()` methods, to confirm the real, current reconnect gap before proposing the Finnhub-only "Reconnect" button (see this delivery's decision-log entry for the finding and Saqib's confirmation).
+- Direct read of `backend/app/main.py`'s lifespan startup block — confirmed Finnhub/Polygon auto-connect on startup if their API keys are configured, each soft-failing independently (missing key or a real connect error never crashes the app).
+- `grep -n "EventType\." backend/app/event_bus/*.py backend/app/api/websocket/channels.py | grep -i "provider|connect|status"` — confirmed zero matches, i.e. no WebSocket event exists for a provider connecting/disconnecting, which is why `useDataFeedStatus.ts` is pure-poll rather than WebSocket-primary-with-poll-fallback like `useContextSnapshot.ts`.
 
-## Split correctness — proven programmatically, not by inspection
+## Immediately before writing/packaging
 
-A Python script located every `## N.` top-level header by regex (not hand-counted line numbers), computed exact `[start, end)` line ranges for §0–§18, and used those ranges for every extraction and every check below:
+- Re-pulled a fresh tarball and compared `md5sum` of every file this task could touch (`frontend/src/App.tsx`, `frontend/src/services/api-client.ts`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`) against the hashes captured at the very first pull, before making any edit: **byte-identical on all four** — confirms `main` did not move during this task, and specifically that the parallel IBKR-panel session (if it landed) touched neither shared file in a way that reached `main` yet.
+- Re-ran the three-source decision-number check immediately before writing the decision-log entry: unchanged, #142 still latest, #143 still next available. Per Saqib's standing rule, this delivery does **not** mint #143 as a real number — the entry is appended under the temp slug `data-feed-status-indicator`, flagged for whoever merges to finalize after their own re-check.
 
-1. **Coverage:** `sorted(core_sections + moved_sections) == list(range(19))` — every section 0–18 appears in exactly one of the four output files; none missing, none duplicated.
-2. **Byte-identical moved bodies:** for §7, §10, and §14–§18, `raw_original_section in new_file_content` and `new_file_content.endswith(raw_original_section)` — the moved content is a literal Python substring check, not a visual diff, confirming zero edits inside any moved body.
-3. **Full reconstruction:** concatenating `raw(0)` through `raw(18)` in original order reproduces the original file's body **exactly** (`==`, not diff) — proves the split didn't drop or duplicate so much as one byte anywhere across all four output files combined.
-4. **Kept-content integrity:** the 21 internal citation fixes applied to the retained core file were captured as an explicit (old_string, new_string) list; each target was asserted to match **exactly once** before being applied. Reversing all 21 fixes on the final core-file content and comparing to the raw, unedited concatenation of its kept sections (§0–§6, §8–§9, §11–§13) produces an **exact** match — proves no other edit landed anywhere in the 66KB of retained content beyond the 21 approved, reviewed fixes.
+## Type-check / build
 
-## Reference-update verification
+- `npx tsc -b`: clean except the four pre-existing `GridPresetPicker.tsx` errors (decision #35). Confirmed these are pre-existing and not introduced by this delivery by running the identical command against a separately, freshly pulled untouched clone — byte-identical error list, same four lines.
+- `npx vite build`: clean, no errors or warnings. `dist/` output produced successfully (93 modules transformed).
 
-- Repo-wide grep for `strategy-engine-design.md §(7|10|14|15|16|17|18)` across the five living docs plus the new core file itself, after all edits: zero matches — confirms no stale citation to a moved section remains anywhere it was in scope to fix.
-- Confirmed via `git diff --stat` that `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, `docs/decisions/archive/*.md`, `docs/decisions/future-ideas.md`, `docs/roadmap/phase-roadmap.md`, and `docs/README.md` show **zero** diff from this delivery (the first three deliberately, as immutable decision content; the latter three because their existing citations needed no change).
-- A repo-wide Python markdown-link resolver (walks every `.md` file under `docs/`, resolves every relative `](...)` link against the filesystem) found exactly one broken link in the whole tree: a pre-existing relative-path bug inside immutable `docs/decisions/archive/001-060.md`, confirmed via `git diff --stat` to be untouched by this delivery — zero broken links introduced.
+## Footprint verification
 
-## Final review
+`diff -rq` between this delivery and a freshly pulled, untouched clone (excluding `node_modules/`, `dist/`, and `tsconfig.tsbuildinfo` — the last is a local TypeScript build cache regenerated by running `tsc`, not a source change, and differs on any two independent `tsc` runs regardless of source content) shows exactly:
 
-- `git status --short`: 4 files modified (`strategy-engine-design.md`, `system-design.md`, `trading-intelligence-architecture.md`, `trading-intelligence-overview.md`), 3 files created (`backtest-runner-design.md`, `strategy-engine-open-decisions.md`, `strategy-engine-build-history.md`), plus this decision/`INDEX.md`/`CHANGES.md`/`TESTING.md` — nothing else.
-- `git diff --stat`: 40 insertions, 928 deletions across the 4 modified files (the deletions are §7/§10/§14–18 leaving the core file; the new files carry that content forward, not shown as "changed" since they're new).
+**Modified:**
+- `frontend/src/App.tsx` — two additive hunks (one import line, one `<DataFeedStatus />` mount per header). No existing line removed, reordered, or changed beyond wrapping the existing `<LayoutsMenu />`/`<GridPicker />` group in one new flex container for spacing.
+- `frontend/src/services/api-client.ts` — one additive block appended after the existing `triggerBacktest()` (the file's last export before this change). No existing export changed.
+- `docs/architecture/system-design.md` — one new as-built paragraph + two ASCII diagrams inserted into §4.2, immediately before §4.3's existing header. No existing content in this file changed or removed.
+- `docs/decisions/confirmed-decisions.md` — one new entry appended after #142 (this file's last entry before this change), under the temp slug `data-feed-status-indicator`, not a real number.
+- `docs/decisions/INDEX.md` — one new row appended after #142's row, matching this delivery's temp-slug entry.
+
+**New:**
+- `frontend/src/components/header/DataFeedStatus.tsx`
+- `frontend/src/hooks/useDataFeedStatus.ts`
+
+**Untouched (confirmed, not just assumed):**
+- Everything under `backend/`.
+- `backend/app/api/routes/broker.py`, `backend/app/broker_adapters/` — read-only reference during research, never edited.
+- `App.tsx`'s `<main>` panel list — only the `<header>` blocks were touched.
+- `frontend/src/components/backtest/`, `frontend/src/components/backtest-results/`, and their hooks.
+- `docs/decisions/archive/*.md` — decision content there is immutable, correctly left alone.
+
+## Manual verification of the actual behavior (reasoned from the code, since this sandbox has no live Finnhub/Polygon keys or a running backend to click against)
+
+- `useDataFeedStatus.ts`'s `Promise.allSettled` shape confirmed to keep each provider's last-good reading independently on a fetch failure, rather than either blanking both or fabricating a `false` — traced through the `.then(([finnhubResult, polygonResult]) => ...)` branch logic by hand against both the fulfilled and rejected cases.
+- `reconnectFinnhub()` confirmed to call `load()` in its `.finally()` block regardless of success or failure, so the badge always reflects a real post-attempt state rather than an optimistic one.
+- `DataFeedStatus.tsx`'s conditional rendering confirmed to only show the "Reconnect" button when `finnhubConnected === false` specifically (not `null`, i.e. not during the initial loading state, where nothing is known yet) — checked the exact boolean condition, not inferred from behavior.

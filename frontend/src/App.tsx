@@ -9,6 +9,7 @@ import { FeatureEnginePanel } from "./components/intelligence/FeatureEnginePanel
 import { ScannerPanel } from "./components/scanner/ScannerPanel";
 import { BacktestPanel } from "./components/backtest/BacktestPanel";
 import { BacktestResultsPanel } from "./components/backtest-results/BacktestResultsPanel";
+import { DataFeedStatus } from "./components/header/DataFeedStatus";
 
 // Minimal hand-rolled routing — the only two shapes this app needs: "/"
 // (the full multi-tab workspace) and "/window/:id" (one Main Window,
@@ -33,9 +34,12 @@ function FullWorkspaceShell() {
             Phase 1 — static mock data
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <LayoutsMenu />
-          <GridPicker />
+        <div className="flex items-center gap-3">
+          <DataFeedStatus />
+          <div className="flex items-center gap-2">
+            <LayoutsMenu />
+            <GridPicker />
+          </div>
         </div>
       </header>
 
@@ -96,9 +100,12 @@ function PoppedOutWindowShell({ windowId }: { windowId: string }) {
             Popped out — live-synced with the main workspace
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <LayoutsMenu />
-          <GridPicker />
+        <div className="flex items-center gap-3">
+          <DataFeedStatus />
+          <div className="flex items-center gap-2">
+            <LayoutsMenu />
+            <GridPicker />
+          </div>
         </div>
       </header>
 

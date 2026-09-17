@@ -942,3 +942,89 @@ export async function triggerBacktest(
   }
   return (await res.json()) as BacktestRunResultWireShape;
 }
+
+// ---------------------------------------------------------------------------
+// Data Feed Status (Finnhub / Polygon) — read-only visibility into the two
+// providers `app/main.py`'s lifespan auto-connects on startup if their API
+// keys are configured (soft-fail on a missing key or a real connect error —
+// an optional data source must never crash the whole app). Previously
+// reachable only via curl against GET /finnhub/status / GET
+// /market-data/status; zero frontend representation until this task. See
+// useDataFeedStatus.ts for the polling hook that consumes these, and
+// components/header/DataFeedStatus.tsx for the small header indicator.
+
+/**
+ * GET /finnhub/status (backend/app/api/routes/finnhub_data.py). Finnhub only
+ * ever registers as the STREAMING provider, never historical (that route's
+ * own module docstring — its free tier can't serve historical candles at
+ * all, decision #32/#33), so unlike Polygon below there's no `role` field
+ * here to show — connected genuinely just means "connected."
+ */
+export interface FinnhubStatusWireShape {
+  connected: boolean;
+}
+
+export async function fetchFinnhubStatus(): Promise<FinnhubStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/finnhub/status`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as FinnhubStatusWireShape;
+}
+
+/**
+ * GET /market-data/status (backend/app/api/routes/market_data.py). Polygon
+ * is always the historical provider once connected, and is ALSO promoted to
+ * the streaming role — a 15-minute-delayed fallback — whenever nothing else
+ * (i.e. Finnhub) has already claimed it (decision #33; confirmed directly
+ * against that route's own `broker_registry.get_streaming_provider()`
+ * check). `role` is a genuine three-way state, not a boolean, and is
+ * deliberately kept that way here rather than collapsed.
+ */
+export interface MarketDataStatusWireShape {
+  connected: boolean;
+  role: "historical+streaming" | "historical" | null;
+}
+
+export async function fetchMarketDataStatus(): Promise<MarketDataStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/market-data/status`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as MarketDataStatusWireShape;
+}
+
+/**
+ * POST /finnhub/connect (backend/app/api/routes/finnhub_data.py) — the one
+ * manual-recovery affordance this task adds, deliberately for Finnhub only.
+ * Real, current gap confirmed directly in
+ * broker_adapters/finnhub_provider.py: an unexpected WebSocket close sets
+ * the adapter's connected flag to false with NO auto-reconnect ("that's
+ * Phase 4's Market Data Engine (ConnectionManager)," per that file's own
+ * comment) — today, the only way to restore it is to call this route again,
+ * and before this task there was no UI path to do that at all, only curl.
+ * Confirmed directly with Saqib before adding this wrapper (see the
+ * data-feed-status-indicator decision log entry for the finding and
+ * outcome). Polygon has no equivalent gap — it's REST-polling based with no
+ * persistent socket to drop (PolygonAdapter's own docstring) — so it
+ * deliberately gets no matching wrapper here.
+ *
+ * Surfaces the real backend outcomes distinctly rather than collapsing them
+ * into a boolean: `"already_connected"` (idempotent — nothing changed),
+ * `"connected"` (a real new connection, with the backend's own `note`); a
+ * missing `FINNHUB_API_KEY` (400) or a real connect failure (502) both
+ * throw via the existing `ApiError`/`parseErrorDetail` convention above,
+ * same as every other wrapper in this file — no new error shape invented.
+ */
+export interface FinnhubConnectResultWireShape {
+  status: "connected" | "already_connected";
+  note?: string;
+}
+
+export async function connectFinnhub(): Promise<FinnhubConnectResultWireShape> {
+  const res = await fetch(`${API_BASE_URL}/finnhub/connect`, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as FinnhubConnectResultWireShape;
+}
