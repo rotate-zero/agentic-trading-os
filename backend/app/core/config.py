@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     ibkr_host: str = "127.0.0.1"
     ibkr_port: int = 4002
     ibkr_client_id: int = 1
+    # Intentionally a raw optional string, not ``int``: missing, blank,
+    # malformed, negative, or colliding values are validated only when
+    # POST /backtest/run/ibkr is called. A copied .env with the blank
+    # example value must not make general backend startup fail.
+    ibkr_backtest_client_id: str | None = None
 
     # --- Polygon.io (Phase 3 — free/Basic tier: 15-min delayed, 5 REST calls/min) ---
     # No WebSocket on this tier — PolygonAdapter polls instead. See

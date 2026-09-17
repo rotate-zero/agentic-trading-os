@@ -325,8 +325,9 @@ class BacktestRunner:
                 # historical_provider_guard.py's own module docstring for
                 # why this seam needs its own lock anyway rather than
                 # relying on being nested here to be correct. Installs
-                # THIS run's own market_data_provider (fixture-backed
-                # today; whatever it is generically) as broker_registry's
+                # THIS run's own market_data_provider (either the named-
+                # scenario fixture provider or the IBKR route's disconnected
+                # run-scoped real-candle provider) as broker_registry's
                 # historical role for exactly this block's duration, so
                 # FeatureEngine's Daily Levels/ATR/RVOL refresh has a real
                 # answer to `get_historical(symbol, "1d", ...)` instead of

@@ -13,9 +13,14 @@ Scope note: on_tick() gives raw per-tick price updates only. Building
 
 Verification note: every method here is built against real, introspected
 ib_async signatures (see the Phase 3 chat transcript / commit message),
-not memory. What's NOT verified is an actual live connection — this
-sandbox has no path to a running IB Gateway or an IBKR account. That has
-to happen on your machine.
+not memory. The historical-only primitives added for the IBKR Backtest
+Runner route deliberately expose qualification, error/disconnect events,
+and one bounded historical request without changing this adapter's live
+streaming defaults. Chunking, exact range filtering, deduplication, and
+application error mapping belong to the request-scoped acquisition layer
+in ``backtest_runner/ibkr_historical.py``. What's NOT verified is an
+actual live connection — this sandbox has no path to a running IB Gateway
+or an IBKR account. That has to happen on your machine.
 """
 from __future__ import annotations
 
@@ -119,6 +124,65 @@ class IBKRAdapter(BrokerAdapter):
         if result is None:
             raise SymbolNotFoundError(contract.symbol)
         return result
+
+    async def qualify_historical_contract(self, symbol: str) -> Stock:
+        """Resolve one US SMART-routed stock for isolated history use.
+
+        This is intentionally separate from ``subscribe()``: historical
+        acquisition must never request streaming market data or populate
+        the live subscription map merely to qualify a contract.
+        """
+        return await self._qualify(Stock(symbol, "SMART", "USD"))
+
+    def set_raise_request_errors(self, enabled: bool) -> None:
+        """Control ib_async's request-error behavior for an isolated client.
+
+        Live adapters keep ib_async's default. The backtest acquisition
+        connection enables this so request failures cannot silently become
+        empty or partial lists.
+        """
+        self._ib.RaiseRequestErrors = enabled
+
+    def add_error_listener(self, callback: Callable) -> None:
+        self._ib.errorEvent += callback
+
+    def remove_error_listener(self, callback: Callable) -> None:
+        self._ib.errorEvent -= callback
+
+    def add_disconnect_listener(self, callback: Callable) -> None:
+        self._ib.disconnectedEvent += callback
+
+    def remove_disconnect_listener(self, callback: Callable) -> None:
+        self._ib.disconnectedEvent -= callback
+
+    async def request_historical_chunk(
+        self,
+        contract: Stock,
+        *,
+        timeframe: str,
+        end: datetime,
+        duration_str: str,
+        use_rth: bool,
+    ):
+        """Issue exactly one bounded historical request.
+
+        ``timeout=0`` is deliberate. ``ib_async`` otherwise converts its
+        own timeout into an empty list, which is indistinguishable from a
+        legitimate no-data response. The acquisition layer wraps this call
+        in its own timeout and disconnects the isolated client on expiry.
+        ``formatDate=2`` makes intraday timestamps epoch/UTC; daily bars are
+        still date values and are normalized by the acquisition layer.
+        """
+        return await self._ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime=end,
+            durationStr=duration_str,
+            barSizeSetting=_bar_size_for(timeframe),
+            whatToShow="TRADES",
+            useRTH=use_rth,
+            formatDate=2,
+            timeout=0,
+        )
 
     async def subscribe(self, symbols: list[str]) -> None:
         for symbol in symbols:

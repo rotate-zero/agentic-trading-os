@@ -1,81 +1,250 @@
-# TESTING — pending decision (temp id: `broker-connection-panel`) — IBKR broker connection management surfaced as a new panel
+# TESTING — IBKR historical Backtest Runner provider
 
-Frontend-only delivery. No `backend/` files touched, so no backend `pytest` run applies — but all five routes this delivery surfaces were exercised live against a real, locally-run instance of this exact backend (see "Live route verification" below), not just read from source or reasoned about.
+## Base and environment
 
-## Pre-work verification
+- Fresh GitHub `main` base: `38cf0f68ff435b7cf5fca979d1977d0e5f8b8e84`.
+- Worktree: fresh codeload archive extracted into `/tmp/tmp.Pu0aohQ2X0`; implementation was not overlaid onto the existing repository checkout.
+- Python: repository virtual environment, Python 3.14, `ib_async==2.1.0`.
+- Database: real PostgreSQL 18.6, isolated unprivileged cluster under `/tmp`, listening on `127.0.0.1:55432`; real Alembic migrations `0001` through `0010` applied.
+- PostgreSQL timezone: UTC. The cluster initially inherited `Asia/Dhaka`; that first setup run produced two deterministic timestamp-rendering failures, so it was discarded, the server default was changed to UTC, and the untouched baseline was rerun before source edits.
+- No live IB Gateway/TWS/account connection was available or claimed.
 
-- Fresh tarball pull (`codeload.github.com/.../refs/heads/main`) at task start.
-- Read, in order: `docs/decisions/README.md`, `INDEX.md`'s tail; `backend/app/api/routes/broker.py` in full including its module docstring; `backend/app/broker_adapters/base.py`'s `BrokerAdapter`/`SymbolNotFoundError` docstrings; `backend/app/broker_adapters/ibkr_adapter.py`'s module docstring plus `connect()`/`disconnect()`/`subscribe()`/`unsubscribe()`/`is_connected()`/`_qualify()`/`_on_disconnected()`; `frontend/src/App.tsx` in full; `frontend/src/components/scanner/ScannerPanel.tsx` in full as structural template; `frontend/src/services/api-client.ts`'s existing wrapper conventions (all exports enumerated via grep); `frontend/src/hooks/useBacktestRun.ts` and `useContextSnapshot.ts` for the trigger/poll-reasoning references named in this task's own prompt.
-- Mid-task re-pull (the user's own "git is updated" signal) surfaced that the parallel Finnhub/Polygon `data-feed-status-indicator` delivery had already landed on `main`. Re-read the new/changed files it introduced (`App.tsx`'s diff, `api-client.ts`'s diff, its own `CHANGES.md`/`TESTING.md`/decision-log entry, `system-design.md` §4.2's new note) before writing any code of my own, to build on top of the current state rather than a stale one.
+Database setup used:
 
-## Immediately before writing/packaging
-
-- Three-source decision-number check (`INDEX.md` tail, `confirmed-decisions.md` tail, `docs/decisions/archive/` file list): all three agree the latest real number is #142; the `data-feed-status-indicator` entry immediately above mine already identified 143 as next-available at its own packaging time, and nothing has moved since — this delivery's own PENDING entry states the same number for the same reason, not assumed to be a re-derivation.
-- Re-checked `App.tsx` and `api-client.ts` for overlap with the already-landed parallel delivery: confirmed disjoint by inspection (that delivery edits `<header>` only in `App.tsx`; mine edits `<main>` only) and by diff (that delivery's `api-client.ts` block ends at line 1030; mine is appended after it, lines 1031+, no shared lines).
-
-## Live route verification
-
-The task's own material was explicit that a live IBKR connection can't be verified in this sandbox — but the five routes themselves (their status codes, error shapes, and parameter conventions) don't need a real Gateway to test, only a running instance of this backend. Installed `backend/requirements.txt` and ran `uvicorn app.main:app` locally with **no Postgres, no IBKR Gateway, and no API keys configured** — confirmed this boots cleanly (per `app/main.py`'s own documented soft-fail startup posture) — then hit all five routes directly:
-
-```
-$ curl -s http://127.0.0.1:8123/broker/status
-{"connected":false}
-
-$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://127.0.0.1:8123/broker/connect
-{"detail":"IBKR connect failed: [Errno 111] Connection refused. Is IB Gateway running
-and logged in? See backend/README.md's IBKR connection setup section."}
-HTTP_STATUS:502
-
-$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/subscribe?symbol=NVDA"
-{"detail":"Not connected — call POST /broker/connect first"}
-HTTP_STATUS:400
-
-$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/unsubscribe?symbol=NVDA"
-{"detail":"Not connected"}
-HTTP_STATUS:400
-
-$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST http://127.0.0.1:8123/broker/disconnect
-{"status":"disconnected"}
-HTTP_STATUS:200
-
-$ curl -s -w "\nHTTP_STATUS:%{http_code}\n" -X POST "http://127.0.0.1:8123/broker/subscribe" \
-    -H "Content-Type: application/json" -d '{"symbol":"NVDA"}'
-{"detail":[{"type":"missing","loc":["query","symbol"],"msg":"Field required","input":null}]}
-HTTP_STATUS:422
+```bash
+/usr/lib/postgresql/18/bin/initdb -D /tmp/atos-pg.r5q55D/data --auth=trust --username=trading
+/usr/lib/postgresql/18/bin/pg_ctl -D /tmp/atos-pg.r5q55D/data \
+  -l /tmp/atos-pg.r5q55D/postgres.log \
+  -o '-p 55432 -k /tmp/atos-pg.r5q55D' start
+/usr/lib/postgresql/18/bin/createdb -h 127.0.0.1 -p 55432 -U trading trading_workspace
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/alembic upgrade head
 ```
 
-This directly confirms every status code/error-shape assumption `api-client.ts`'s wrappers and `BrokerPanel.tsx`'s rendering make, and **decisively settles the query-param-vs-body question** this task's own prompt got wrong: the JSON-body attempt fails with a real `422` naming the missing `query` field, not a body field.
+## Untouched baseline
 
-## Type-check / build
+Command, before the first source edit:
 
-- `npx tsc -b`: clean except the four pre-existing `GridPresetPicker.tsx` errors (decision #35). Confirmed pre-existing (not introduced by this delivery, and not introduced by the already-merged parallel delivery either) by running the identical command against a separately, freshly pulled, completely untouched clone — byte-identical four-line error list.
-- `npx vite build`: clean, no errors or warnings. `dist/` output produced successfully (95 modules transformed — the parallel delivery's own reported 93, plus this delivery's 2 new files: `BrokerPanel.tsx`, `useBrokerStatus.ts`).
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest -q --tb=short
+```
 
-## Footprint verification
+Result: **741 collected; 740 passed; 1 failed; 0 skipped** in 788.94 seconds.
 
-`diff -rq` between this delivery and a freshly pulled clone (post-parallel-delivery `main`; excluding `node_modules/`, `dist/`, `tsconfig.tsbuildinfo`, and the backend's installed Python packages, none of which are source) shows exactly:
+The sole failure was the repository's timing-sensitive
+`test_feature_engine_backfills_from_persisted_history_on_cold_start`: it received two
+events before its fixed assertion instead of one. Immediate isolated rerun:
 
-**Modified:**
-- `frontend/src/App.tsx` — two additive hunks (one import line, one `<BrokerPanel />` mount per `<main>`). No existing line removed or reordered; the parallel delivery's own `<header>` hunks untouched.
-- `frontend/src/services/api-client.ts` — one additive block appended after the parallel delivery's own `connectFinnhub()` (the file's last export before this change). No existing export changed.
-- `docs/architecture/system-design.md` — one new as-built paragraph + two ASCII diagrams inserted into §4.1, immediately before §4.2's existing header (which now itself contains the parallel delivery's own, separate note — untouched here). No existing content in this file changed or removed.
-- `docs/decisions/confirmed-decisions.md` — one new PENDING entry appended after the parallel delivery's own PENDING entry (this file's last entry before this change).
-- `docs/decisions/INDEX.md` — one new PENDING row appended after the parallel delivery's own PENDING row.
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest \
+  tests/test_feature_engine.py::test_feature_engine_backfills_from_persisted_history_on_cold_start \
+  -q --tb=short
+```
 
-**New:**
-- `frontend/src/components/broker/BrokerPanel.tsx`
-- `frontend/src/hooks/useBrokerStatus.ts`
+Result: **1 passed** in 1.30 seconds. No source was changed to hide or weaken it.
 
-**Untouched (confirmed, not just assumed):**
-- Everything under `backend/`.
-- `App.tsx`'s `<header>` blocks and everything under `frontend/src/components/header/` — the parallel delivery's own territory.
-- `frontend/src/components/backtest/`, `frontend/src/components/backtest-results/`, and their hooks.
-- `docs/decisions/archive/*.md` — decision content there is immutable, correctly left alone.
-- `docs/architecture/system-design.md` §4.2 — the parallel delivery's own note there, untouched; my own note lives in §4.1.
+For transparency, the discarded non-UTC setup run collected the same 741 tests and
+reported 739 passed / 2 failed. Both failures compared UTC expectations to timestamps
+rendered with the PostgreSQL server's inherited `+06:00` zone; neither represented a
+repository defect.
 
-## Manual verification of the actual behavior
+## Focused validation
 
-- `useBrokerStatus.ts`'s `refetchStatus()` transition logic (`prevConnectedRef`) traced by hand against both the true→false case (clears `subscribedSymbols`) and every other transition (leaves it alone) — confirmed against the actual code, not just the intent.
-- `connect()`'s `res.status === "connected"` vs. `"already_connected"` branch confirmed to only clear `subscribedSymbols` in the former case, matching `broker.py`'s own real branching (a genuine new `IBKRAdapter()` vs. the early-return no-op).
-- `BrokerPanel.tsx`'s Connect/Disconnect button `disabled` conditions confirmed to key off `connected === true` / `connected !== true` specifically (not a truthy/falsy check), so the initial `connected === null` loading state doesn't enable Disconnect prematurely.
-- `SubscribeForm`'s input/button `disabled` state confirmed to key off the `connected` prop, verified wired from `connected === true` (not `connected ?? false`, which would also disable it correctly, but the explicit form is what's actually in the code).
+Pure adapter/acquisition tests:
+
+```bash
+.venv/bin/pytest tests/test_ibkr_adapter.py tests/test_ibkr_historical.py \
+  -q --tb=short --disable-warnings
+```
+
+Result: **19 passed**.
+
+New route tests against real PostgreSQL:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest tests/test_ibkr_backtest_route.py \
+  -q --tb=short --disable-warnings
+```
+
+Result: **12 passed**.
+
+Complete focused set after final adapter assertions:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest tests/test_ibkr_adapter.py tests/test_ibkr_historical.py \
+  tests/test_ibkr_backtest_route.py -q --tb=short --disable-warnings
+```
+
+Result: **33 passed**.
+
+Additional checks:
+
+```bash
+.venv/bin/python -m compileall -q app tests/test_ibkr_historical.py \
+  tests/test_ibkr_backtest_route.py
+
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest --collect-only -q
+```
+
+Collection result: **766 tests**, exactly 25 more than baseline.
+
+## Final complete suite
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 \
+POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest -q --tb=short
+```
+
+Result: **766 passed, 0 failed, 0 skipped** in 789.80 seconds.
+
+Comparison: 741 → 766 collected (**+25**); 740 → 766 passing; the baseline timing
+failure did not recur; zero new regressions.
+
+## Mocked IBKR behavior covered
+
+- A successful IBKR response becomes canonical `Candle` objects.
+- Intraday timestamps are timezone-aware UTC; IBKR daily dates are interpreted in the configured market timezone before conversion to UTC.
+- Multiple serial one-day one-minute chunks merge in ascending order.
+- Identical overlap-boundary bars deduplicate; conflicting duplicates fail as incomplete data.
+- Final provider reads honor exact `[start,end)` bounds and filter bars on both sides.
+- Acquisition includes the primary `1m` replay range, the configured prior-session `1m` premarket span, and the configured `1d` Daily Levels/ATR/RVOL span.
+- One-minute requests use `TRADES`, `useRTH=False`; daily requests use `TRADES`, `useRTH=True`.
+- Success, connect failure, unresolved contract, missing permission, pacing rejection, timeout, disconnect, zero primary bars, and malformed timestamp paths all disconnect the isolated adapter.
+- The application watches IBKR error/disconnect events in addition to exceptions; tests cover permission and pacing events that accompany or replace ordinary exceptions.
+- Route validation covers empty symbols, naïve timestamps, reversed ranges, over-24-hour ranges, exactly 24 hours, and missing/malformed/negative/colliding `IBKR_BACKTEST_CLIENT_ID` values.
+- Acquisition failure produces a stable HTTP error and leaves no `BacktestRunRecord` in real PostgreSQL.
+- Successful route integration replays through the real runner and persists honest IBKR `data_version` metadata.
+- A registered IBKR connection produces the same pre-replay `409` guard as Finnhub/Polygon, including on the unchanged fixture route.
+- No subscription, tick callback, order placement, or order cancellation method is invoked by acquisition.
+- Existing `POST /backtest/run` tests remain unchanged and passed in the complete suite.
+
+## Not live-verified
+
+The sandbox did not connect to a real Gateway/TWS instance or IBKR account. Therefore it
+did not empirically verify account-specific historical subscriptions, the exact error
+text returned by that account, farm availability, real pacing behavior, or real bar
+coverage. Those boundaries are handled from installed `ib_async` behavior and official
+IBKR error/documentation semantics, then exercised with mocks.
+
+## Saqib's live Gateway/TWS verification
+
+1. Start paper IB Gateway (`4002`) or paper TWS (`7497`), log in, and enable API socket clients plus trusted `127.0.0.1`.
+2. Confirm the account has the US-equity market-data subscriptions/permissions needed for historical `TRADES` bars.
+3. Set `IBKR_HOST`/`IBKR_PORT`, keep the normal live-path `IBKR_CLIENT_ID`, and set an explicit different value such as `IBKR_BACKTEST_CLIENT_ID=2`.
+4. Start the backend and confirm normal startup succeeds even when `IBKR_BACKTEST_CLIENT_ID` is temporarily blank; calling only the IBKR backtest route should then return the documented configuration `503`.
+5. Restore the distinct historical client ID. Confirm `GET /broker/status`, `GET /finnhub/status`, and `GET /market-data/status` report disconnected before replay.
+6. Use a liquid US stock and a short, completed historical interval first:
+
+   ```bash
+   curl -sS -X POST \
+     "http://localhost:8000/backtest/run/ibkr?strategy_name=ORB&symbol=AAPL&start=2026-09-15T13%3A30%3A00Z&end=2026-09-15T14%3A00%3A00Z"
+   ```
+
+7. While acquisition runs, confirm Gateway/TWS shows a separate client ID and read-only API session. Confirm no market-data subscription or order is created.
+8. After acquisition completes and replay begins, confirm that historical client disappears before the synchronous replay finishes.
+9. Query `GET /intelligence/backtest-runs?run_id=<returned-run_id>` and verify `data_version` is `ibkr:TRADES:1m-ext:1d-rth`; inspect `/intelligence/strategy-outcomes?is_backtest=true&backtest_run_id=<run_id>` separately.
+10. Repeat with a premarket-inclusive interval and inspect whether premarket-volume features populate when five prior sessions genuinely exist.
+11. Connect the normal broker with `POST /broker/connect`; confirm either backtest route now returns `409`. Disconnect it afterward.
+12. Test an account/symbol lacking historical permission and an invalid symbol; confirm neither request creates a `backtests` row.
+13. Do not interpret a successful run as live-account verification of profitability or historical Context fidelity. Only OHLCV is IBKR-backed; point-in-time fundamentals/news remain absent.
+
+## Expected HTTP examples
+
+Success shape:
+
+```http
+HTTP/1.1 200 OK
+{
+  "run_id": "<uuid>",
+  "sweep_id": "<uuid>",
+  "outcomes_recorded": 0,
+  "discarded_signals": []
+}
+```
+
+Missing configuration:
+
+```http
+HTTP/1.1 503 Service Unavailable
+{
+  "detail": {
+    "code": "ibkr_backtest_not_configured",
+    "message": "IBKR_BACKTEST_CLIENT_ID is required for POST /backtest/run/ibkr. Set an explicit client ID that differs from IBKR_CLIENT_ID."
+  }
+}
+```
+
+Range over 24 elapsed hours:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+{
+  "detail": {
+    "code": "invalid_backtest_request",
+    "message": "The requested replay window exceeds the v1 maximum of 24 elapsed hours; the range is rejected and will not be clamped."
+  }
+}
+```
+
+Missing historical permission:
+
+```http
+HTTP/1.1 503 Service Unavailable
+{
+  "detail": {
+    "code": "ibkr_historical_permission_denied",
+    "message": "IBKR error <code>: <account-specific permission message>"
+  }
+}
+```
+
+Timeout:
+
+```http
+HTTP/1.1 504 Gateway Timeout
+{
+  "detail": {
+    "code": "ibkr_historical_timeout",
+    "message": "IBKR historical request timed out after 60s (<request label>)."
+  }
+}
+```
+
+Live-provider guard:
+
+```http
+HTTP/1.1 409 Conflict
+{"detail":"Refusing to run a backtest: IBKR is currently connected in the live broker registry. ..."}
+```
+
+Zero usable primary bars:
+
+```http
+HTTP/1.1 400 Bad Request
+{
+  "detail": {
+    "code": "ibkr_no_data",
+    "message": "IBKR returned zero usable 1m TRADES bars for <symbol> in the exact interval [<start>, <end>)."
+  }
+}
+```
+
+## Clean-diff and archive validation
+
+The changed-file footprint is compared with a fresh untouched archive of the exact base
+commit, excluding only generated caches and the local virtual-environment symlink.
+`ibkr-historical-backtest-provider.zip` is built from that explicit file list, not from
+the whole worktree. Archive entries are rooted directly at the project root; `.git`,
+virtual environments, caches, test output, databases, and untouched files are excluded.

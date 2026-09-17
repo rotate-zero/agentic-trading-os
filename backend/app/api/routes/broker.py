@@ -86,6 +86,22 @@ async def status() -> dict:
     return {"connected": adapter is not None and adapter.is_connected()}
 
 
+def is_connected() -> bool:
+    """Whether a registry-owned IBKR adapter is currently connected.
+
+    The Backtest Runner live-safety guard needs the same plain-function
+    seam Finnhub and Polygon already expose. Check both registry roles:
+    IBKR normally owns both, but a later provider takeover can leave it
+    connected for historical use after its streaming role changes.
+    Request-scoped IBKR backtest acquisition is never registered and is
+    therefore deliberately invisible here.
+    """
+    return any(
+        isinstance(adapter, IBKRAdapter) and adapter.is_connected()
+        for adapter in broker_registry.get_all_active_providers()
+    )
+
+
 @router.post("/disconnect")
 async def disconnect() -> dict:
     adapter = broker_registry.get_streaming_provider()

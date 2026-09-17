@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from app.broker_adapters.base import BrokerAdapter, SymbolNotFoundError
 from app.broker_adapters.ibkr_adapter import IBKRAdapter, _bar_size_for, _duration_str
+from app.api.routes import broker
+from app.services import broker_registry
 
 
 def test_duration_str_under_a_day_uses_seconds():
@@ -85,3 +88,44 @@ def test_disconnected_event_handler_runs_without_raising():
     adapter = IBKRAdapter(host="127.0.0.1", port=4002, client_id=1)
     adapter._ib.disconnectedEvent.emit()  # should log a warning, not raise
 
+
+@pytest.mark.asyncio
+async def test_historical_chunk_uses_utc_format_and_external_timeout_control():
+    adapter = IBKRAdapter(host="127.0.0.1", port=4002, client_id=1)
+    seen = {}
+
+    async def fake_request(contract, **kwargs):
+        seen["contract"] = contract
+        seen.update(kwargs)
+        return ["bar"]
+
+    adapter._ib.reqHistoricalDataAsync = fake_request
+    contract = SimpleNamespace(symbol="AAPL")
+    end = datetime(2026, 7, 1, 15, 30, tzinfo=timezone.utc)
+    result = await adapter.request_historical_chunk(
+        contract,
+        timeframe="1m",
+        end=end,
+        duration_str="3600 S",
+        use_rth=False,
+    )
+
+    assert result == ["bar"]
+    assert seen == {
+        "contract": contract,
+        "endDateTime": end,
+        "durationStr": "3600 S",
+        "barSizeSetting": "1 min",
+        "whatToShow": "TRADES",
+        "useRTH": False,
+        "formatDate": 2,
+        "timeout": 0,
+    }
+
+
+def test_broker_connection_accessor_detects_registered_ibkr_in_either_role():
+    adapter = IBKRAdapter(host="127.0.0.1", port=4002, client_id=1)
+    adapter._ib.isConnected = lambda: True
+    broker_registry.set_historical_provider(adapter)
+
+    assert broker.is_connected() is True

@@ -4,19 +4,17 @@ FixtureCandleProvider — a synthetic, explicitly-labeled `MarketDataProvider`
 Runner's replay/persistence plumbing works end-to-end.
 
 **What this is, and is not (read before using this for anything else).**
-This is NOT a historical data source. `PolygonAdapter.get_historical()`
-raises `HistoricalDataUnavailableError` for 1m/5m/15m timeframes on the
-free tier (a real, confirmed `NOT_AUTHORIZED` response — see
-`polygon_provider.py`'s own handling) and no other real historical
-minute-level provider is wired into this codebase today. A run against
+This is NOT a historical data source. It remains the deterministic data
+source for named regression scenarios behind ``POST /backtest/run``.
+``POST /backtest/run/ibkr`` now provides a separate real-IBKR OHLCV path;
+it deliberately does not replace or relabel this class. A run against
 this provider proves the harness can replay candles through the real
 Feature/Level-Interaction/Market-State/Context/Strategy pipeline and
 persist a real `StrategyOutcomeRecord` — it proves NOTHING about whether
 any strategy is actually profitable, because the candles are hand-built
-or synthetically generated, not real market history. Sourcing real
-minute-level historical data (paid Polygon tier, Databento, or another
-vendor — `docs/decisions/future-ideas.md` #17) remains a separate, real
-prerequisite this module does not resolve.
+or synthetically generated, not real market history. The IBKR sibling
+route closes the historical OHLCV gap only; point-in-time historical
+fundamentals/news remain unavailable on both paths.
 
 **Why this implements `MarketDataProvider`, not something bespoke.**
 `docs/decisions/future-ideas.md` #5 already establishes that a Replay

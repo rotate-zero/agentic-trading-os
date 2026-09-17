@@ -53,29 +53,34 @@ is addressed here — see `replay_state_producer.py`/
 `engine_singleton_guard.py` for the existing, unmodified behavior this
 route simply inherits.
 
-**Scope boundary, restated from this task's own brief.** This route
-does not touch, and its own scenarios do not attempt to simulate,
-sourcing real minute-level historical data — that remains the same
-separate, larger, still-open prerequisite `fixture_provider.py`'s
-module docstring already describes. Nor does it add any Performance
-Analytics UI for inspecting results beyond the fields returned directly
-below: a caller wanting the raw persisted rows can already query the
-existing, unmodified `/intelligence/strategy-outcomes` route separately.
+**Two deliberately separate paths.** `POST /backtest/run` below remains
+the named, synthetic-fixture regression path and its frontend contract is
+unchanged. `POST /backtest/run/ibkr` acquires real IBKR historical OHLCV
+first, disconnects the isolated read-only acquisition adapter, then replays
+from a run-scoped in-memory provider. Neither path supplies historical
+point-in-time fundamentals or news; both keep the existing replay-safe
+FixtureBacktestContextProvider calendar behavior and honest absence for
+those fields.
 """
 from __future__ import annotations
 
 import dataclasses
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.api.routes import finnhub_data, market_data
+from app.api.routes import broker, finnhub_data, market_data
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.fixture_daily_history import build_daily_history_candles
 from app.backtest_runner.fixture_provider import FixtureCandleProvider
+from app.backtest_runner.ibkr_historical import (
+    IBKRHistoricalAcquisitionError,
+    acquire_ibkr_replay_data,
+)
 from app.backtest_runner.runner import BacktestRunner
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
+from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
 from app.strategy_engine.scheduler import default_registry
 
@@ -90,6 +95,7 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 # test_backtest_runner.py's own value, the only other place in the
 # codebase that has ever had to pick one.
 _FEATURE_VERSION = "feature_engine_v1"
+_MAX_IBKR_REPLAY_WINDOW = timedelta(hours=24)
 
 
 def _validate_strategy_name(strategy_name: str) -> None:
@@ -116,14 +122,12 @@ def _reject_if_live_data_connected() -> None:
     Interaction/MarketState/Context singletons is unsafe to run
     concurrently with live trading — but nothing enforced that until
     now. Since this deployment is a single always-on process (no
-    per-request worker isolation — see this route's own docstring), "is
-    this process live" is precisely "is a live streaming provider
-    currently connected," which `finnhub_data.py`/`market_data.py`
-    already track for their own `/status` routes. Reusing that existing
-    signal directly, rather than adding a separate settings flag someone
-    would have to remember to set, means this check is automatically
-    correct in both dev and production — it can only ever fire when live
-    data is genuinely flowing."""
+    per-request worker isolation — see this route's own docstring), the
+    provider modules' existing connection state is the safety signal.
+    Finnhub and Polygon expose their status directly; `broker.py` checks
+    registry-owned IBKR adapters in either role. The isolated historical
+    acquisition adapter is never registered and is therefore not mistaken
+    for a live provider."""
     if finnhub_data.is_connected():
         raise HTTPException(
             status_code=409,
@@ -146,6 +150,86 @@ def _reject_if_live_data_connected() -> None:
                 "a live-trading process."
             ),
         )
+    if broker.is_connected():
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to run a backtest: IBKR is currently connected in the live "
+                "broker registry. This route temporarily replaces process-wide replay "
+                "engines and the historical-provider role. Disconnect IBKR first."
+            ),
+        )
+
+
+def _configuration_error(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={"code": "ibkr_backtest_not_configured", "message": message},
+    )
+
+
+def _ibkr_backtest_client_id() -> int:
+    settings = get_settings()
+    raw = settings.ibkr_backtest_client_id
+    if raw is None or not str(raw).strip():
+        raise _configuration_error(
+            "IBKR_BACKTEST_CLIENT_ID is required for POST /backtest/run/ibkr. "
+            "Set an explicit client ID that differs from IBKR_CLIENT_ID."
+        )
+    try:
+        client_id = int(str(raw).strip())
+    except ValueError as exc:
+        raise _configuration_error(
+            "IBKR_BACKTEST_CLIENT_ID must be a non-negative integer distinct from IBKR_CLIENT_ID."
+        ) from exc
+    if client_id < 0:
+        raise _configuration_error("IBKR_BACKTEST_CLIENT_ID must be non-negative.")
+    if client_id == settings.ibkr_client_id:
+        raise _configuration_error(
+            "IBKR_BACKTEST_CLIENT_ID must differ from IBKR_CLIENT_ID; isolated and live "
+            "connections cannot share a client ID."
+        )
+    return client_id
+
+
+def _validate_ibkr_range(
+    symbol: str,
+    start: datetime,
+    end: datetime,
+) -> tuple[str, datetime, datetime]:
+    symbol = symbol.strip().upper()
+    if not symbol:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_backtest_request", "message": "symbol must not be empty"},
+        )
+    if start.tzinfo is None or start.utcoffset() is None or end.tzinfo is None or end.utcoffset() is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_backtest_request",
+                "message": "start and end must be timezone-aware ISO-8601 datetimes",
+            },
+        )
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    if start >= end:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_backtest_request", "message": "start must be before end"},
+        )
+    if end - start > _MAX_IBKR_REPLAY_WINDOW:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_backtest_request",
+                "message": (
+                    "The requested replay window exceeds the v1 maximum of 24 elapsed hours; "
+                    "the range is rejected and will not be clamped."
+                ),
+            },
+        )
+    return symbol, start, end
 
 
 @router.post("/run")
@@ -196,8 +280,9 @@ async def run_backtest(
     As of decision #132, this is enforced rather than merely documented:
     a Finnhub or Polygon connection currently live in this process
     causes a `409` before any engine is touched, not just a warning to
-    read here. As of decision #135, the same call also temporarily
-    replaces `broker_registry`'s historical-role provider
+    read here. The IBKR historical replay delivery extends that same
+    guard to registry-owned IBKR connections. As of decision #135, the
+    same call also temporarily replaces `broker_registry`'s historical-role provider
     (`historical_provider_guard.py`) — this check's existing Polygon gate
     already covers that specifically (`market_data.py`'s own `connect()`
     route is the one that calls `broker_registry.set_historical_provider()`;
@@ -205,9 +290,8 @@ async def run_backtest(
     `finnhub_data.py` directly — its own connection state genuinely has
     no bearing on the historical role, this check just also happens to
     gate on it for the pre-existing engine-singleton reason above). See
-    `historical_provider_guard.py`'s own module docstring for the one
-    provider this doesn't cover — IBKR, a pre-existing gap, not created
-    here.
+    `historical_provider_guard.py`'s own module docstring for the current
+    three-provider safety boundary.
 
     See this module's own docstring for what a response does and does
     not prove (several (strategy, scenario) pairs are expected to
@@ -245,6 +329,68 @@ async def run_backtest(
         end=candles[-1].candle_ts,
         context_provider=FixtureBacktestContextProvider(),
         data_version=f"fixture:{scenario}",
+        feature_version=_FEATURE_VERSION,
+    )
+    result = await runner.run()
+    return dataclasses.asdict(result)
+
+
+@router.post("/run/ibkr")
+async def run_ibkr_backtest(
+    strategy_name: str = Query(..., description="One of the 7 real v1 strategy names."),
+    symbol: str = Query(..., description="US stock symbol resolved through IBKR SMART/USD."),
+    start: datetime = Query(..., description="Timezone-aware ISO-8601 inclusive start."),
+    end: datetime = Query(..., description="Timezone-aware ISO-8601 exclusive end."),
+) -> dict[str, Any]:
+    """Acquire real IBKR candles, disconnect, then replay synchronously.
+
+    The user interval is exact ``[start, end)`` and is limited to 24
+    elapsed hours. Feature Engine's configured 1m premarket and 1d Daily
+    Levels/ATR/RVOL lookbacks are acquired in addition to that interval
+    and are not subject to the 24-hour cap. At roughly one second per
+    primary candle, a regular session takes about 6.5 minutes and a full
+    04:00-20:00 extended session can approach 16 minutes.
+    """
+    _validate_strategy_name(strategy_name)
+    symbol, start, end = _validate_ibkr_range(symbol, start, end)
+    client_id = _ibkr_backtest_client_id()
+    _reject_if_live_data_connected()
+
+    settings = get_settings()
+    try:
+        dataset = await acquire_ibkr_replay_data(
+            symbol=symbol,
+            start=start,
+            end=end,
+            host=settings.ibkr_host,
+            port=settings.ibkr_port,
+            client_id=client_id,
+            daily_lookback_days=settings.daily_levels_lookback_days,
+            premarket_lookback_days=settings.feature_engine_premarket_lookback_days,
+            market_timezone=settings.market_timezone,
+        )
+    except IBKRHistoricalAcquisitionError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+    # A live provider may have connected during the network acquisition.
+    # Re-check after the isolated adapter is gone and before any process-
+    # wide replay singleton or database row is touched.
+    _reject_if_live_data_connected()
+
+    strategy = next(
+        s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name
+    )
+    runner = BacktestRunner(
+        strategy=strategy,
+        symbol=symbol,
+        market_data_provider=dataset.provider,
+        start=start,
+        end=end,
+        context_provider=FixtureBacktestContextProvider(),
+        data_version=dataset.data_version,
         feature_version=_FEATURE_VERSION,
     )
     result = await runner.run()

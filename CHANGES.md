@@ -1,26 +1,73 @@
-# CHANGES — pending decision (temp id: `broker-connection-panel`) — IBKR broker connection management surfaced as a new panel
+# CHANGES — IBKR historical Backtest Runner provider
 
-**Decision number intentionally not assigned** — see this delivery's entry in `docs/decisions/confirmed-decisions.md` (appended after the `data-feed-status-indicator` entry) for why, and for the number to assign at merge time (143, per a three-source check at packaging time, unless another parallel session lands first).
+## Outcome
 
-Five real, working backend routes — `POST /broker/connect`, `POST /broker/subscribe`, `POST /broker/unsubscribe`, `GET /broker/status`, `POST /broker/disconnect` (`backend/app/api/routes/broker.py`) — had zero frontend representation; only `curl` could connect IBKR, check its status, or subscribe a symbol. This closes that gap with a new collapsible `<main>` sibling panel.
+Backtest Runner now has a sibling real-price-history path:
 
-## What changed
+```text
+POST /backtest/run/ibkr
+```
 
-- **New `frontend/src/components/broker/BrokerPanel.tsx`** — a connected/disconnected indicator (green dot when connected, muted neutral — not this app's `bear`/red token — when not, since "not connected" is IBKR's normal resting state outside a live session, not an error), a Connect button (shows the backend's real `502` detail close to verbatim when Gateway/TWS isn't running, rather than a generic "connection failed"), a Disconnect button, and a symbol subscribe form (text input + button, disabled until connected) with each subscribed symbol shown in a small removable row (× to unsubscribe), reusing `ScannerPanel.tsx`'s own `UniverseTab` row pattern verbatim. Mounted in `App.tsx`'s `<main>` in **both** shells (`FullWorkspaceShell` and `PoppedOutWindowShell`) — same placement every other sibling panel there already uses, since broker connection status is exactly the kind of live, backend-sourced state a popped-out second-monitor window needs equally.
-- **New `frontend/src/hooks/useBrokerStatus.ts`** — polls `GET /broker/status` every 10 seconds (the only source of truth; no WebSocket event exists for broker connection changes — confirmed via `channels.py`'s `EVENT_TO_CHANNEL`), and owns all four action routes (`connect`/`disconnect`/`subscribe`/`unsubscribe`) in the same hook, since a connection this stateful is one coherent concern. Keeps its own local `subscribedSymbols` list — explicitly flagged, in the hook's own comments and in the panel's UI, as **not** an authoritative read of what IBKR is actually streaming (no such `GET` route exists), just a record of what this panel instance has itself asked the backend to subscribe, cleared on disconnect (this panel's own, or a poll-detected external one) and on a genuinely new connection.
-- **`frontend/src/services/api-client.ts`** gained five additive exports: `fetchBrokerStatus()`, `connectBroker()`, `disconnectBroker()`, `subscribeBrokerSymbol()`, `unsubscribeBrokerSymbol()`, plus their wire-shape types. Nothing existing in this file was changed — appended after the parallel `data-feed-status-indicator` delivery's own additions (already merged), not before or in between.
-- **`frontend/src/App.tsx`** gained one new import and one `<BrokerPanel />` mount at the end of each `<main>`'s existing panel list (both shells), after `<BacktestResultsPanel />`. No existing lines removed or reordered; the parallel delivery's own `<header>` changes are untouched.
-- **`docs/architecture/system-design.md` §4.1** gained a new as-built note with two ASCII diagrams (cross-component data flow; the new hook/component's internal poll/connect/subscribe flow), matching this doc's existing plain-fenced-code-block diagram convention. Inserted into §4.1 (Broker Adapter Layer) specifically — the parallel delivery's own note lives in §4.2 (Market Data Engine) instead, since that one covers Finnhub/Polygon's auto-connected data feeds, not this manual `BrokerAdapter` connection flow.
+It downloads real IBKR OHLCV before replay, disconnects the isolated read-only IBKR
+client, and gives `BacktestRunner` a disconnected run-scoped provider containing those
+validated candles. The existing named-fixture `POST /backtest/run` route and frontend
+caller are unchanged.
 
-## A real inaccuracy in this task's own prompt, found and corrected — verified live, not just read from source
+This closes the synthetic candle/OHLCV gap only. `FixtureBacktestContextProvider` still
+provides replay-safe calendar context; point-in-time historical fundamentals and news
+remain unavailable and are not fabricated.
 
-The prompt described `symbol` on `/broker/subscribe`/`/broker/unsubscribe` as a JSON request body. Reading `broker.py` directly showed a bare `symbol: str` parameter with no `Body(...)` annotation, which FastAPI treats as a **query** parameter regardless of HTTP method. This was then verified live, not just reasoned from source: with the actual backend running locally (see Tests below), a JSON-body subscribe attempt returned a real `422` ("Field required", `loc: ["query", "symbol"]`), and the query-parameter form worked as the route's own error responses describe. `api-client.ts`'s wrappers use the query-parameter form throughout — same `POST`-with-query-params-in-the-URL convention `subscribeSymbol()`/`triggerBacktest()` already established in this file.
+## Components and lifecycle
 
-## What did not change
+- `IBKRAdapter` gained historical-only primitives for contract qualification, request/error listeners, and one bounded `TRADES` request. Live streaming defaults, read-only connection behavior, and execution stubs are unchanged.
+- `acquire_ibkr_replay_data()` creates one isolated adapter with the explicitly configured `IBKR_BACKTEST_CLIENT_ID`, enables request errors, observes error/disconnect events, qualifies once, issues serial chunks, normalizes/validates/merges them, and disconnects in `finally`.
+- `PreloadedHistoricalCandleProvider` holds real downloaded `1m` and `1d` candles. It permanently reports disconnected and cannot stream, subscribe, or publish ticks. BacktestRunner installs this—not the network adapter—during replay.
+- Acquisition includes the exact primary `1m` interval, Feature Engine's configured prior-session `1m` premarket span, and its configured `1d` Daily Levels/ATR/RVOL span.
+- Primary/auxiliary minute bars use `TRADES`, `useRTH=False`; daily bars use `TRADES`, `useRTH=True`.
+- The user interval is exact `[start,end)`, fixed at one-minute replay, and limited to 24 elapsed hours. Auxiliary lookbacks are not capped. The cap can be reconsidered when replay performance improves or background jobs exist.
+- One-minute history is acquired in serial one-day chunks with no blind retries. Timestamps become aware UTC; results are sorted, exact-filtered, overlap-deduplicated, and conflict-checked.
+- A failed acquisition happens before `BacktestRunner.run()` and therefore before any `BacktestRunRecord` write.
 
-- Nothing under `backend/` — this delivery is frontend-only, since all five routes it surfaces already existed and worked.
-- No order placement/cancellation UI — deliberately out of scope; `app/broker_adapters/base.py`'s `BrokerAdapter` docstring explains why no such backend routes exist at all.
-- No live IBKR connection was verified — `ibkr_adapter.py`'s own module docstring is explicit that this sandbox has no path to a running IB Gateway; that verification is Saqib's to do, separately, on his own machine.
-- `App.tsx`'s `<header>` — untouched, that's the parallel `data-feed-status-indicator` delivery's own territory.
-- `frontend/src/components/backtest/`, `backtest-results/`, and their hooks — out of scope, untouched.
-- No new backend route, no new WebSocket channel, no schema/migration change.
+## Safety and configuration
+
+- Added optional raw setting `IBKR_BACKTEST_CLIENT_ID` with no default. Blank or malformed values do not break general backend startup; the sibling route validates it on demand and rejects missing, negative, or live-ID-colliding values before connection.
+- The live-provider guard now includes registry-owned IBKR adapters, closing `future-ideas.md` #25 without registering the historical-only acquisition client.
+- The guard runs before acquisition and again after disconnect, before replay touches process-wide engines.
+- No order, execution route, streaming subscription, TickIngestBridge, or frontend behavior was added or changed.
+
+## Failure contract and provenance
+
+Stable application errors cover connection/Gateway failure, unresolved contract,
+permission/subscription denial, pacing rejection, timeout, disconnect, zero primary
+bars, malformed timestamps, and conflicting/incomplete responses. They map to explicit
+`400`, `409`, `422`, `502`, `503`, or `504` responses rather than successful empty
+runs.
+
+Persisted provenance is `ibkr:TRADES:1m-ext:1d-rth`. It identifies the vendor and
+request semantics without claiming an immutable IBKR dataset version.
+
+## Documentation
+
+Updated:
+
+- `backend/README.md`
+- `backend/.env.example`
+- `backend/app/api/routes/backtest.py`
+- `backend/app/backtest_runner/fixture_provider.py`
+- `backend/app/backtest_runner/historical_provider_guard.py`
+- `backend/app/backtest_runner/runner.py`
+- `docs/architecture/backtest-runner-design.md`
+- `docs/decisions/future-ideas.md` (#17 comparison note; #25 resolved)
+- `docs/decisions/INDEX.md` and `confirmed-decisions.md`
+- root `TESTING.md`, recreated from scratch
+
+The architecture document includes the request → live guard → isolated acquisition →
+normalization/preload → disconnect → replay → persistence lifecycle diagram.
+
+## Validation
+
+- Untouched UTC/PostgreSQL baseline: 741 collected; 740 passed; one timing-sensitive existing test failed and passed immediately in isolation.
+- Final collection: 766, exactly +25.
+- Focused adapter/acquisition/route set: 33 passed.
+- Complete final suite against real PostgreSQL: **766 passed, 0 failed, 0 skipped**.
+- No live IBKR connection was verified or claimed; `TESTING.md` contains Saqib's exact paper Gateway/TWS verification procedure and expected HTTP examples.

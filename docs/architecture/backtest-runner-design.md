@@ -78,7 +78,7 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 **As-built note (decision #128) — v1 is the vertical slice above the dashed line only, nothing below it.** Everything above described the eventual full system prospectively, before any of `backend/app/backtest_runner/` existed. What actually got built (Units 1-5) is the first vertical slice — proving the plumbing works end-to-end — not the outer grid-search/walk-forward/promotion loop described above, which remains real, deferred, future work exactly as originally scoped:
 
 ```
-                    IMPLEMENTED (v1, decision #127)
+             IMPLEMENTED FIXTURE PATH (v1, decision #128)
    ┌──────────────────────────────────────────────────────────┐
    │  Fixture Candle Data                                       │
    │  (FixtureCandleProvider — plumbing proof, NOT real          │
@@ -112,13 +112,15 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
                              │
    ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
                              ▼
-                    FUTURE (not built, real prerequisites remain)
-   Real minute-level historical data (paid Polygon tier or another
-   vendor — future-ideas.md #17) + point-in-time historical context
-   (HistoricalContextProvider, a documented but unbuilt extension
-   point) + multi-symbol replay + outer grid-search/walk-forward loop
+                    FUTURE (remaining prerequisites)
+   Point-in-time historical context (HistoricalContextProvider, a
+   documented but unbuilt extension point) + multi-symbol replay +
+   outer grid-search/walk-forward loop
    + robustness/parameter-sensitivity report + human review + promotion
-   — the full flow diagrammed earlier in this section, unchanged.
+   — the full flow diagrammed earlier in this section. Real historical
+   IBKR OHLCV later became a sibling input path; see the current as-built
+   note at the end of this section. It does not make fundamentals/news
+   historical.
 ```
 
 `HistoricalContextProvider` (`backend/app/backtest_runner/context_provider.py`) already exists as a named, documented extension point for the Context half of the future boundary above — deliberately unbuilt (`NotImplementedError`), not a stub pretending to work. `BacktestContextProvider` is the seam a real implementation plugs into without `BacktestRunner` itself changing. See decision #128 for the full as-built record, including why entry/exit snapshots are captured at `entry_filled_at`/`exit_filled_at` rather than the signal candle — a correction to this section's own original, less precise framing.
@@ -302,7 +304,7 @@ setLastBacktestRunId(result.run_id)                           │
    — no longer structurally 0.0 (decision #128's diagram above, corrected)
 ```
 
-**Two real, checked-not-assumed safety properties of the new seam — see `historical_provider_guard.py`'s own module docstring for the full reasoning.** (1) The installed provider is never `.connect()`ed, so `GET /market/candles` keeps returning its existing honest 400 throughout a backtest run — no silent fixture-data leak into that live-facing route. (2) Decision #132's Finnhub/Polygon 409 already means `broker_registry`'s historical role is unclaimed going into every valid run; one pre-existing, unrelated gap flagged rather than fixed here — decision #132's guard has no IBKR accessor, so an IBKR-connected session isn't blocked by it (`docs/decisions/future-ideas.md`, new entry).
+**Two real, checked-not-assumed safety properties of the seam — see `historical_provider_guard.py`'s own module docstring for the full reasoning.** (1) The installed provider is never `.connect()`ed, so `GET /market/candles` keeps returning its existing honest 400 throughout a backtest run — no silent replay-data leak into that live-facing route. (2) Decision #132 originally guarded Finnhub/Polygon only; the current implementation also checks registry-owned IBKR connections, closing the later-documented future-idea #25 gap. The IBKR historical acquisition connection is not registry-owned, disconnects before replay, and therefore does not weaken or bypass this guarantee.
 
 **A genuinely separate finding, not fixed by this decision, documented loudly rather than silently patched or silently accepted — see `backtest.py`'s own route docstring for the full disclosure given to callers.** Closing this gap means `FeatureEngine`'s real, unmodified Daily Levels reconciliation now actually runs during a backtest for the first time — and it writes into the SAME shared `symbols`/`daily_levels_state` tables live trading reads, under whatever `symbol` label the caller supplies, with no `is_backtest` flag on either table to distinguish origin. Confirmed by direct execution against a real Postgres: a second run against the identical `(symbol, scenario)` pair silently reverts `volume_regime_score`/`volatility_regime_score` to `0.0` for that run — `_maybe_refresh_daily_levels()`'s own pre-existing "restart-survival" short-circuit finds the `daily_levels_state` row the first run just persisted and skips the raw-candle-cache population before ever asking the provider again. Flagged as a new open item below (D18), not folded into this decision — a genuinely separate change from "wire a historical provider."
 
@@ -492,5 +494,46 @@ FK backtest_run_id ──► backtests.run_id ON DELETE CASCADE
 
 The cascade is deliberate and narrower than `strategy_outcomes.backtest_run_id`'s migration-`0008` FK, which has the default `NO ACTION`: outcomes are durable analytical records, while these Daily Levels rows are derived run checkpoints. Current `backend/app` has no code path that deletes a `backtests` row, and no table has an FK to `daily_levels_state.id`, both confirmed directly before choosing the cascade. Migration `0010` deletes only pre-migration `is_backtest=True` Daily Levels rows because no honest run UUID can be reconstructed for them; it does not touch Market State, Level Interaction, candles, scanner-universe, fundamentals, or symbols. `_load_confirmed_daily_levels_for_today()` remains unreachable for backtest engines under #140's gate, but its query includes `backtest_run_id` anyway so a future restart-survival re-enable cannot silently restore another run's checkpoint.
 
----
+**As-built note (pending decision `ibkr-historical-backtest-provider`) — real IBKR historical OHLCV is now a sibling replay path, not a replacement for fixtures.** `POST /backtest/run` and its frontend caller remain unchanged and continue to use named `FixtureCandleProvider` scenarios for deterministic regression. `POST /backtest/run/ibkr` accepts one symbol and timezone-aware `start`/`end`, fixes the replay timeframe at `1m`, enforces exact `[start,end)` semantics, and rejects a user interval over 24 elapsed hours rather than clamping it. The cap does not apply to Feature Engine's additional history and can be reconsidered when replay performance improves or a background-job model exists.
 
+The route reads the configured lookbacks rather than copying constants: the current five-session premarket baseline requests 15 calendar days of auxiliary `1m` bars, and Daily Levels/ATR/RVOL request 180 calendar days of `1d` bars. Minute acquisition uses `TRADES`, `useRTH=False`; daily acquisition uses `TRADES`, `useRTH=True`. One-minute requests are serial one-day chunks with no automatic retry, normalized to timezone-aware UTC, sorted, deduplicated at overlaps, conflict-checked, and finally filtered to the requested interval. A normal IBKR historical completion proves protocol completion, not that every wall-clock minute traded; closed periods and halts are not fabricated into a gap-free grid. Zero primary bars is an error.
+
+```
+POST /backtest/run/ibkr
+        │
+        ▼
+validate symbol / aware datetimes / exact [start,end) / 24h user cap
+        │
+        ▼
+live-provider safety check ── Finnhub / Polygon / registry-owned IBKR
+        │
+        ▼
+isolated IBKRAdapter(client_id=IBKR_BACKTEST_CLIENT_ID, readonly=True)
+  no broker_registry role · no TickIngestBridge · no subscriptions/orders
+        │
+        ├── serial 1m TRADES, useRTH=False
+        │     primary range + configured prior-session premarket span
+        └── 1d TRADES, useRTH=True
+              configured Daily Levels / ATR / RVOL span
+        │
+        ▼
+normalize UTC → exact-filter → sort → deduplicate/conflict-check
+        │
+        ▼
+disconnect IBKR in finally
+        │
+        ▼
+PreloadedHistoricalCandleProvider (real data, permanently disconnected)
+        │
+        ▼
+repeat live-provider safety check → BacktestRunner replay
+        │
+        ▼
+BacktestRunRecord / StrategyOutcomeRecord persistence
+```
+
+Acquisition errors are stable and explicit: unresolved contract and zero primary data are `400`; live-provider conflict is `409`; malformed request/range is `422`; configuration, permission, pacing, connection and disconnect failures are `503`; timeout is `504`; malformed/conflicting/incomplete upstream data is `502`. `ib_async` request errors and error/disconnect events are both observed because not every IBKR condition becomes a normal exception. All acquisition and validation precede `BacktestRunner.run()`, so a failed download cannot leave a `BacktestRunRecord`.
+
+`data_version="ibkr:TRADES:1m-ext:1d-rth"` records the meaningful vendor/request semantics without pretending IBKR publishes an immutable dataset version. `FixtureBacktestContextProvider` remains in use: market-calendar context is replay-safe, while historical point-in-time fundamentals and news remain honestly absent. At approximately one second per primary candle, one regular session is about 6.5 minutes and a full 04:00-20:00 extended session can approach 16 minutes, plus acquisition time.
+
+---

@@ -34,7 +34,7 @@ has exactly three real call sites in this codebase outside
 
   - `GET /market/candles` (`api/routes/market.py`) — the one real risk
     the fork this decision resolved was worried about: a concurrent
-    caller of this live-facing route getting fixture data back instead
+    caller of this live-facing route getting replay-scoped data back instead
     of an honest error during a backtest's ~1-3 minute run. Checked
     directly: that route gates on `adapter.is_connected()` BEFORE ever
     calling `get_historical()`. This module never calls `.connect()` on
@@ -45,27 +45,20 @@ has exactly three real call sites in this codebase outside
     /market/candles` keeps returning its existing honest 400
     ("no historical provider connected") for the entire duration of a
     backtest run, exactly as it would with nothing installed at all — no
-    silent fixture-data leak into a live-facing route, by construction,
+    silent replay-data leak into a live-facing route, by construction,
     not by luck.
   - `main.py`/`market_data.py` — two identity-comparison reads
     (`is X the same object as Y`), never a `get_historical()` call.
     Unaffected regardless of what's installed here.
 
-`POST /backtest/run` (decision #132) already refuses to run at all while
-Finnhub or Polygon is connected — so in the only precondition under
-which a backtest is allowed to run today, `broker_registry`'s historical
-role was already unclaimed by either of those two going into this
-module's swap. One real, PRE-EXISTING gap, not created by this module:
-decision #132's guard has no public `is_connected()` accessor for IBKR
-the way it does for Finnhub/Polygon (`broker.py` never got one), so an
-IBKR-connected live session isn't blocked by that 409 today. This module
-doesn't close that gap either — `engine_singleton_guard.py`'s own
-process-wide swap of all four engine singletons is already unsafe
-against a concurrent IBKR session for reasons that have nothing to do
-with the historical-provider role specifically, so this module's own
-swap doesn't change that exposure one way or the other. Flagged in
-decision #135's own text as a separate, pre-existing follow-up, not
-attempted here.
+Both Backtest Runner routes now refuse to run while Finnhub, Polygon, or
+a registry-owned IBKR adapter is connected. The IBKR historical route's
+own acquisition adapter is deliberately absent from `broker_registry`,
+disconnects before replay, and is replaced by a provider whose
+`is_connected()` is permanently false. The guard is rechecked after
+acquisition and before this process-wide swap begins. This closes the
+pre-existing IBKR gap documented by decision #135/future idea #25 without
+weakening decision #132 or making a historical-only request look live.
 """
 from __future__ import annotations
 

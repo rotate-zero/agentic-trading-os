@@ -31,6 +31,13 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   source — it never raises on a bad symbol itself). Unexpected disconnects are logged
   loudly; auto-reconnect is explicitly left to Phase 4's Market Data Engine, not built
   here — see the docstring on `_on_disconnected`.
+- **IBKR historical Backtest Runner path** (`POST /backtest/run/ibkr`) — opens an
+  isolated read-only IBKR connection, downloads the exact one-minute replay range plus
+  Feature Engine's configured one-minute premarket and one-day Daily Levels/ATR/RVOL
+  lookbacks, disconnects, then replays from a run-scoped in-memory provider containing
+  real IBKR OHLCV. The named-fixture `POST /backtest/run` path remains unchanged. This
+  makes price/volume history real; point-in-time historical fundamentals and news remain
+  unavailable and are not synthesized.
 - **`TickIngestBridge`** (`app/services/tick_ingest.py`, renamed from `IBKRIngestBridge` —
   see `../docs/decisions/confirmed-decisions.md` #31) — Phase-3-minimal bridge:
   publishes every tick as `PriceUpdated`, buckets ticks into 1-minute `CandleClosed`
@@ -104,6 +111,10 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   directly and through the `/broker/subscribe` and `/market/candles` routes
 - ✅ Disconnect handler — unit tested by firing the same `eventkit` event ib_async
   fires internally on a real drop
+- ✅ Historical acquisition normalization and failure mapping — mocked tests cover
+  serial chunks, overlap deduplication, exact `[start,end)` filtering, UTC ordering,
+  primary plus auxiliary lookbacks, unresolved contracts, permissions, pacing,
+  timeout/disconnect, zero bars, malformed timestamps, and cleanup on every path
 - ✅ The connect path genuinely attempts a real socket connection and fails cleanly
   (verified: got a real `ConnectionRefusedError` against `127.0.0.1:4002` with no
   Gateway running, surfaced as a clean HTTP 502, not a crash)
@@ -163,6 +174,56 @@ Then subscribe to `market.tick` and `market.candle` on the `/ws` endpoint (same 
 Phase 2 dev routes) — real IBKR ticks now flow through the exact same Event Bus →
 WebSocket Gateway pipeline the dummy events proved out in Phase 2. Nothing about that
 pipeline changed; only the source feeding it did.
+
+### IBKR historical backtest setup
+
+The historical route uses the same Gateway host/port but a separate API connection.
+Set an explicit client ID in `.env`; it has no default and must differ from the live
+connection's `IBKR_CLIENT_ID`:
+
+```dotenv
+IBKR_CLIENT_ID=1
+IBKR_BACKTEST_CLIENT_ID=2
+```
+
+Leaving `IBKR_BACKTEST_CLIENT_ID` blank does not prevent normal backend startup. The
+historical route validates it only when called and returns `503` before connecting if
+it is missing, malformed, negative, or equal to the live ID.
+
+The IBKR account must have permission/subscriptions for the requested US-equity
+historical data. Gateway/TWS must have API socket clients enabled and the configured
+port reachable. Do not connect the live broker, Finnhub, or Polygon streaming path in
+the same process while replaying: either Backtest Runner route returns `409` while a
+live provider is active.
+
+```bash
+curl -X POST "http://localhost:8000/backtest/run/ibkr?strategy_name=ORB&symbol=AAPL&start=2026-09-15T13%3A30%3A00Z&end=2026-09-15T20%3A00%3A00Z"
+```
+
+Contract and runtime semantics:
+
+- `start`/`end` must be timezone-aware ISO-8601 datetimes and define exact
+  `[start,end)` candle-start bounds.
+- v1 is fixed to one-minute replay and rejects user windows over 24 elapsed hours; it
+  never clamps. Feature Engine's auxiliary lookbacks are outside that cap. Reconsider
+  the cap after replay performance improves or background-job support exists.
+- Primary and premarket auxiliary bars use `TRADES`, `useRTH=False`; daily
+  Daily Levels/ATR/RVOL bars use `TRADES`, `useRTH=True`.
+- One-minute acquisition is serial one-day chunks with no blind retries. Permission,
+  pacing, timeout, disconnect, malformed/incomplete response, unresolved-contract,
+  and zero-primary-bar failures are explicit non-200 responses.
+- Replay is synchronous and costs approximately one second per primary candle: about
+  6.5 minutes for a regular session and up to about 16 minutes for 04:00-20:00,
+  excluding acquisition time.
+- `data_version` is `ibkr:TRADES:1m-ext:1d-rth`; it records request semantics, not an
+  immutable vendor dataset version.
+
+This environment did not verify a real Gateway/account connection. The live procedure
+is: log into paper Gateway/TWS, confirm API access and historical-data permissions, set
+the distinct client ID above, ensure `GET /broker/status`, `/finnhub/status`, and
+`/market-data/status` are disconnected, run a short liquid-symbol request first, then
+confirm the returned `run_id` through
+`GET /intelligence/backtest-runs?run_id=<uuid>` and inspect its persisted outcomes.
 
 ## Polygon.io connection setup
 
@@ -288,13 +349,18 @@ cd backend
 pytest
 ```
 
-No extra setup needed — every test file below runs with just `pip install -r requirements.txt`, no database and no live IBKR connection required. `pytest` alone picks up all of them.
+No live IBKR connection is required: provider behavior is mocked at the adapter boundary.
+The route/runner persistence tests do require the real PostgreSQL schema described in
+"Running locally"; they skip when it is unavailable. Run migrations and use real
+PostgreSQL for a complete suite rather than treating a skip-only run as final validation.
 
 | File | What it verifies |
 |---|---|
 | `test_event_bus.py` | Event Bus pub/sub, including a test that specifically proves a slow normal-lane subscriber can't delay a critical-lane event (confirmed decision #9) |
 | `test_debounce_scheduler.py` | The shared min/max-interval update-policy utility (confirmed decision #10) |
 | `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
+| `test_ibkr_historical.py` | DB-free mocked IBKR acquisition: canonical candles, serial chunks, exact filtering, UTC normalization/order, overlap dedup/conflict detection, auxiliary lookbacks, error/event mapping, zero bars, and cleanup without streaming or order calls |
+| `test_ibkr_backtest_route.py` | Real-PostgreSQL sibling-route validation, configuration/client-ID rules, 24-hour cap, stable failure responses, no run row on acquisition failure, successful preloaded-provider persistence, and the IBKR live-provider `409` guard |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
 | `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |
@@ -345,4 +411,3 @@ so it's dead code rather than something actively broken at runtime. Only `tsc -b
 full-project type-check catches it (`vite build` alone, and `npm run dev`, won't).
 Worth deciding whether to finish it or delete it — not touched here since it's out of
 scope for a data-source swap.
-
