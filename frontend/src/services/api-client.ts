@@ -1154,3 +1154,86 @@ export async function unsubscribeBrokerSymbol(symbol: string): Promise<BrokerUns
   }
   return (await res.json()) as BrokerUnsubscribeResultWireShape;
 }
+
+// ---------------------------------------------------------------------------
+// Market State Engine (market-state-frontend-surfacing — pending decision,
+// number TBD, see docs/decisions/confirmed-decisions.md) — GET
+// /intelligence/market-state, confirmed decision #98, M4 task 25. Built,
+// working, and reachable since then; zero frontend representation before
+// this task (confirmed by grep across frontend/src — the only prior
+// mentions of "market_state"/"MarketState" anywhere were unrelated
+// StrategyOutcome snapshot field names, not this route). Same
+// "backend capability nobody can see" gap decision #125 closed for
+// Context Engine — this wire shape/fetch wrapper mirrors
+// fetchContextSnapshot's own optional-symbol convention exactly.
+
+// MarketStateEngine.get_snapshot()'s own per-symbol row (schemas/events/
+// market_state.py::MarketState, model_dump(mode="json")) — verified
+// field-for-field against that Pydantic model directly, not assumed from
+// models/market_state.py's DB column names (which happen to match here,
+// but aren't the same schema). `acceleration_score` is `null` on a
+// symbol's first-ever recompute — no prior trend_score yet to derive a
+// rate of change from (decision #93) — a normal, expected absence, not
+// an error.
+export interface MarketStateSymbolWireShape {
+  timeframe: string;
+  candle_ts: string;
+  trend_score: number;
+  volatility_regime_score: number;
+  volume_regime_score: number;
+  vwap_relationship_score: number;
+  acceleration_score: number | null;
+}
+
+// CrossSymbolState (schemas/events/market_state.py) — SPY/QQQ/IWM's
+// synthesized composite (decision #91 §4, this build #97). All 7 score
+// fields are required on this type because the engine itself only ever
+// constructs one once every field is real (get_snapshot() returns
+// "market": null until then, never a partially-filled object — see the
+// envelope type below).
+export interface MarketStateCompositeWireShape {
+  timeframe: string;
+  candle_ts: string;
+  spy_direction_score: number;
+  qqq_direction_score: number;
+  iwm_direction_score: number;
+  trend_alignment_score: number;
+  risk_on_score: number;
+  qqq_leadership_score: number;
+  iwm_confirmation_score: number;
+}
+
+// MarketStateEngine.get_snapshot()'s own envelope — verified directly
+// against that method's docstring/implementation, not guessed:
+// "symbols" holds at most one entry when a `symbol` argument is passed
+// (zero if that symbol hasn't been computed yet — honest absence, never
+// a fabricated default), every computed symbol when omitted. "market" is
+// included whenever the composite has been synthesized at least once,
+// REGARDLESS of which `symbol` was requested or omitted — broad-market
+// state isn't scoped to the request, the same way a strategy reading one
+// symbol's own state would also want to know what SPY/QQQ/IWM are doing
+// without a second call.
+export interface MarketStateSnapshotWireShape {
+  symbols: Record<string, MarketStateSymbolWireShape>;
+  market: MarketStateCompositeWireShape | null;
+}
+
+/**
+ * GET /intelligence/market-state — confirmed decision #98 (built), thin
+ * passthrough of MarketStateEngine.get_snapshot(), unsurfaced anywhere in
+ * the UI until this task. `symbol` optional, same convention as
+ * fetchContextSnapshot/fetchOpportunities above: omit to get every
+ * symbol this process has computed plus the cross-symbol composite; pass
+ * a ticker to scope "symbols" to just that one (still alongside "market"
+ * whenever available — see MarketStateSnapshotWireShape's own comment).
+ */
+export async function fetchMarketStateSnapshot(symbol?: string): Promise<MarketStateSnapshotWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/market-state?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/market-state`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as MarketStateSnapshotWireShape;
+}

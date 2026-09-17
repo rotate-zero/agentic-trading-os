@@ -1,5 +1,6 @@
 import type { Opportunity } from "../../hooks/useOpportunities";
 import type { FundamentalsContext, NewsContext } from "../../hooks/useContextSnapshot";
+import type { MarketStateScores } from "../../hooks/useMarketState";
 import type { OpportunityAgreementWireShape, OpportunityConflictWireShape } from "../../services/api-client";
 
 function confidenceColor(confidence: number) {
@@ -218,6 +219,57 @@ function SymbolContextSummary({
   );
 }
 
+// Market State Engine's per-symbol scores (this task) — trend/
+// volatility-regime/volume-regime/vwap-relationship/acceleration are
+// genuinely per-symbol (unlike SPY/QQQ/IWM's cross-symbol composite,
+// which surfaces separately in InfoTab.tsx's GeneralContent — see that
+// file's own MarketStateSummary comment for the full split reasoning).
+// Lands here alongside SymbolContextSummary, in the same shared header
+// block rendered from all three of this component's return branches
+// (loading/empty/populated), not gated behind Opportunities being
+// non-empty — same reasoning SymbolContextSummary already established:
+// whether Strategy Engine has fired an opportunity for this symbol has
+// nothing to do with whether Market State Engine has computed state for
+// it. Never renders null: a `marketState` of null legitimately means
+// "this process hasn't computed a MarketState for this symbol yet"
+// (get_snapshot()'s own honest-absence contract), which is worth saying
+// explicitly, not hiding.
+function SymbolMarketStateSummary({ marketState }: { marketState: MarketStateScores | null }) {
+  return (
+    <div className="rounded-md border border-base-border bg-base-bg/60 p-2 text-[11px] text-text-muted">
+      <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">Market State</div>
+      {!marketState ? (
+        <span>Not yet computed for this symbol.</span>
+      ) : (
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono">
+          <span>
+            Trend <span className="text-text-primary">{marketState.trendScore.toFixed(0)}</span>
+          </span>
+          <span>
+            Volatility <span className="text-text-primary">{marketState.volatilityRegimeScore.toFixed(0)}</span>
+          </span>
+          <span>
+            Volume <span className="text-text-primary">{marketState.volumeRegimeScore.toFixed(0)}</span>
+          </span>
+          <span>
+            VWAP rel. <span className="text-text-primary">{marketState.vwapRelationshipScore.toFixed(0)}</span>
+          </span>
+          <span>
+            Accel.{" "}
+            <span className="text-text-primary">
+              {/* null: no prior trend_score yet to diff against (first-ever
+                  recompute, decision #93) — a normal, expected absence,
+                  never an error, so it renders as a plain dash rather than
+                  a warning or a fabricated 0. */}
+              {marketState.accelerationScore == null ? "—" : marketState.accelerationScore.toFixed(0)}
+            </span>
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AIAnalysisPanel({
   symbol,
   opportunities,
@@ -226,6 +278,7 @@ export function AIAnalysisPanel({
   conflict = null,
   fundamentals = null,
   news = null,
+  marketState = null,
 }: {
   symbol: string;
   opportunities: Opportunity[];
@@ -234,15 +287,17 @@ export function AIAnalysisPanel({
   conflict?: OpportunityConflictWireShape | null;
   fundamentals?: FundamentalsContext | null;
   news?: NewsContext | null;
+  marketState?: MarketStateScores | null;
 }) {
   const sorted = [...opportunities].sort((a, b) => b.confidence - a.confidence);
   const top = sorted.find((o) => o.status === "actionable") ?? sorted[0];
 
-  // Context Engine's Fundamentals/News (this task) live in the shared
-  // header block below, rendered in every branch — deliberately NOT
-  // gated behind the Opportunities loading/empty checks above/below:
-  // whether Strategy Engine has fired anything for this symbol is
-  // unrelated to whether Context Engine has Fundamentals/News for it.
+  // Context Engine's Fundamentals/News (decision #125) and Market
+  // State's per-symbol scores (this task) live in the shared header
+  // block below, rendered in every branch — deliberately NOT gated
+  // behind the Opportunities loading/empty checks above/below: whether
+  // Strategy Engine has fired anything for this symbol is unrelated to
+  // whether Context/Market State Engine have data for it.
   const header = (
     <div>
       <div className="text-[11px] uppercase tracking-wide text-text-muted">AI Opportunity Score</div>
@@ -255,6 +310,7 @@ export function AIAnalysisPanel({
       <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
         {header}
         <SymbolContextSummary fundamentals={fundamentals} news={news} />
+        <SymbolMarketStateSummary marketState={marketState} />
         <div className="p-3 text-center text-[11px] text-text-muted">Loading {symbol}…</div>
       </div>
     );
@@ -265,6 +321,7 @@ export function AIAnalysisPanel({
       <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
         {header}
         <SymbolContextSummary fundamentals={fundamentals} news={news} />
+        <SymbolMarketStateSummary marketState={marketState} />
         <div className="flex flex-col gap-2 p-1 text-center text-[11px] text-text-muted">
           <p>No opportunities reported yet for {symbol}.</p>
           <p>Strategy Engine evaluates on every candle/market-state update — nothing has fired here yet.</p>
@@ -277,6 +334,7 @@ export function AIAnalysisPanel({
     <div className="flex h-full flex-col gap-3 overflow-y-auto p-3">
       {header}
       <SymbolContextSummary fundamentals={fundamentals} news={news} />
+      <SymbolMarketStateSummary marketState={marketState} />
 
       {top && (
         <div className="rounded-md border border-signal/30 bg-signal/5 p-3">

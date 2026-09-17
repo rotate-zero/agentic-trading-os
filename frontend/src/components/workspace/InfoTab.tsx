@@ -7,6 +7,7 @@ import { useOpportunityConflicts } from "../../hooks/useOpportunityConflicts";
 import { useStrategyOutcomes } from "../../hooks/useStrategyOutcomes";
 import { usePerformanceAnalytics } from "../../hooks/usePerformanceAnalytics";
 import { useContextSnapshot } from "../../hooks/useContextSnapshot";
+import { useMarketState } from "../../hooks/useMarketState";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 
@@ -307,6 +308,71 @@ function MarketSessionSummary() {
   );
 }
 
+// Market State Engine's cross-symbol composite (this task) — the core
+// "interprets" stage of the pipeline (Feature Engine measures, Market
+// State interprets, Context Engine describes, Strategy decides), fully
+// built and reachable via GET /intelligence/market-state (decision #98)
+// but invisible anywhere in the frontend until now. Same market-wide-
+// vs-per-symbol split decision #125 already used for Context: SPY/QQQ/
+// IWM's synthesized composite (spy/qqq/iwm direction, trend alignment,
+// risk-on, qqq-leadership, iwm-confirmation) describes the whole market,
+// not any one connector's symbol, so it sits here in GeneralContent
+// alongside MarketSessionSummary rather than in AIAnalysisPanel.tsx (see
+// that file's own SymbolMarketStateSummary for the per-symbol half of
+// this same split — trend/volatility/volume/vwap-relationship/
+// acceleration). Always rendered, including the not-yet-synthesized
+// case (`market` stays null until SPY/QQQ/IWM have each reported a
+// trend_score at least once) — same "don't hide it, don't fabricate it"
+// posture MarketSessionSummary/RecentClosedTrades already establish in
+// this file.
+function MarketStateSummary() {
+  const { market, loading } = useMarketState();
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">Market State</div>
+      {loading && !market ? (
+        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
+      ) : !market ? (
+        <p className="p-1 text-[11px] text-text-muted">
+          Composite not yet available — waiting for SPY/QQQ/IWM to each report at least once.
+        </p>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1 rounded border border-base-border px-2 py-1.5 font-mono text-[11px]">
+          <div>
+            <div className="text-text-muted">SPY direction</div>
+            <div className="text-text-primary">{market.spyDirectionScore.toFixed(0)}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">QQQ direction</div>
+            <div className="text-text-primary">{market.qqqDirectionScore.toFixed(0)}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">IWM direction</div>
+            <div className="text-text-primary">{market.iwmDirectionScore.toFixed(0)}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">Trend alignment</div>
+            <div className="text-text-primary">{market.trendAlignmentScore.toFixed(0)}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">Risk-on</div>
+            <div className="text-text-primary">{market.riskOnScore.toFixed(0)}</div>
+          </div>
+          <div>
+            <div className="text-text-muted">QQQ leadership</div>
+            <div className="text-text-primary">{market.qqqLeadershipScore.toFixed(0)}</div>
+          </div>
+          <div className="col-span-2">
+            <div className="text-text-muted">IWM confirmation</div>
+            <div className="text-text-primary">{market.iwmConfirmationScore.toFixed(0)}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GeneralContent() {
   const symbols = useMemo(() => MOCK_TICKERS.map((t) => t.symbol), []);
   const prices = useLatestPrices(symbols);
@@ -341,6 +407,7 @@ function GeneralContent() {
         ))}
       </div>
       <MarketSessionSummary />
+      <MarketStateSummary />
       <RecentClosedTrades />
       <StrategyPerformanceSummary />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
@@ -370,6 +437,15 @@ function ConnectorContent({ symbol }: { symbol: string }) {
   // useOpportunities/useOpportunityConflicts and AIAnalysisPanel already
   // establish (AIAnalysisPanel itself fetches nothing).
   const { fundamentals, news } = useContextSnapshot(symbol);
+  // Per-symbol Market State (this task) — same symbol, same "parent owns
+  // fetching, child stays presentational" split useOpportunities/
+  // useOpportunityConflicts/useContextSnapshot above already establish
+  // for this component (AIAnalysisPanel itself fetches nothing). The
+  // cross-symbol composite this same hook can also return is out of
+  // scope here — that's market-wide, already surfaced separately in
+  // GeneralContent's own MarketStateSummary above, so only `symbolState`
+  // is passed down.
+  const { symbolState: marketState } = useMarketState(symbol);
   return (
     <AIAnalysisPanel
       symbol={symbol}
@@ -379,6 +455,7 @@ function ConnectorContent({ symbol }: { symbol: string }) {
       conflict={conflict}
       fundamentals={fundamentals}
       news={news}
+      marketState={marketState}
     />
   );
 }

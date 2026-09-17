@@ -1,73 +1,34 @@
-# CHANGES — IBKR historical Backtest Runner provider
+# CHANGES — pending decision (temp id: `market-state-frontend-surfacing`) — Market State Engine's live snapshot surfaced in the frontend
 
-## Outcome
+**Decision number intentionally not assigned** — see this delivery's entry in `docs/decisions/confirmed-decisions.md` (appended after the `market-state-changed-websocket-channel` entry) for why, and for the number to assign at merge time (143, per a three-source check at packaging time, unless another parallel session lands first).
 
-Backtest Runner now has a sibling real-price-history path:
+**Two other parallel deliveries landed on `main` during this task's own session** (prompted directly, twice: "Git is updated. Continue."):
+- `ibkr-historical-backtest-provider` — backend-only, new `POST /backtest/run/ibkr`. Zero overlap with this delivery.
+- `market-state-changed-websocket-channel` — backend-only, closed the exact `EVENT_TO_CHANNEL[MARKET_STATE_CHANGED]` routing gap this task's own prompt had anticipated might happen in parallel. It landed **after** this delivery's own hook was already built and tested on the honest basis that no channel existed yet. Rather than leave a now-false "no channel exists" claim in shipped docs/comments, every place this delivery said so was corrected (see "What changed" below) to say the channel exists but isn't yet consumed — a push-based upgrade is a natural, immediate follow-up, deliberately not folded into this same delivery (this task's own prompt says not to block on the channel landing first, and rebuilding around a moving upstream target mid-session is a worse outcome than shipping the already-tested version with an honest note).
 
-```text
-POST /backtest/run/ibkr
-```
+This delivery's own docs edits and decision-log append were rebased onto the updated `main` twice before packaging, so nothing from either parallel delivery is lost — including `system-design.md` §10.3, where this delivery's own new sentence is merged onto the same `MarketStateChanged` row `market-state-changed-websocket-channel` also edited, not overwriting it.
 
-It downloads real IBKR OHLCV before replay, disconnects the isolated read-only IBKR
-client, and gives `BacktestRunner` a disconnected run-scoped provider containing those
-validated candles. The existing named-fixture `POST /backtest/run` route and frontend
-caller are unchanged.
+**Flag for Saqib:** appending this delivery's own decision-log entry pushed `docs/decisions/confirmed-decisions.md` to 112,132 bytes, well past its ~100KB rollover threshold. Not rolled over as part of this delivery — doing so now would mean archiving five still-unnumbered PENDING entries into a file that's supposed to be frozen forever, which conflicts with their own "update at merge time" instructions. See the note at the end of this delivery's own decision-log entry for the recommended timing (once the first of the five PENDING entries actually merges).
 
-This closes the synthetic candle/OHLCV gap only. `FixtureBacktestContextProvider` still
-provides replay-safe calendar context; point-in-time historical fundamentals and news
-remain unavailable and are not fabricated.
+`GET /intelligence/market-state` (`backend/app/api/routes/intelligence.py`, confirmed decision #98) — a thin, already-correct passthrough of `MarketStateEngine.get_snapshot()` — had zero frontend representation; Market State Engine is the core "interprets" stage of the pipeline (Feature Engine measures, Market State interprets, Context Engine describes, Strategy Engine decides), and was the most central remaining instance of the "backend capability nobody can see" gap this log has repeatedly closed (Context at #125, Performance Analytics at #127, Backtest Runs at #139). This closes that gap.
 
-## Components and lifecycle
+## What changed
 
-- `IBKRAdapter` gained historical-only primitives for contract qualification, request/error listeners, and one bounded `TRADES` request. Live streaming defaults, read-only connection behavior, and execution stubs are unchanged.
-- `acquire_ibkr_replay_data()` creates one isolated adapter with the explicitly configured `IBKR_BACKTEST_CLIENT_ID`, enables request errors, observes error/disconnect events, qualifies once, issues serial chunks, normalizes/validates/merges them, and disconnects in `finally`.
-- `PreloadedHistoricalCandleProvider` holds real downloaded `1m` and `1d` candles. It permanently reports disconnected and cannot stream, subscribe, or publish ticks. BacktestRunner installs this—not the network adapter—during replay.
-- Acquisition includes the exact primary `1m` interval, Feature Engine's configured prior-session `1m` premarket span, and its configured `1d` Daily Levels/ATR/RVOL span.
-- Primary/auxiliary minute bars use `TRADES`, `useRTH=False`; daily bars use `TRADES`, `useRTH=True`.
-- The user interval is exact `[start,end)`, fixed at one-minute replay, and limited to 24 elapsed hours. Auxiliary lookbacks are not capped. The cap can be reconsidered when replay performance improves or background jobs exist.
-- One-minute history is acquired in serial one-day chunks with no blind retries. Timestamps become aware UTC; results are sorted, exact-filtered, overlap-deduplicated, and conflict-checked.
-- A failed acquisition happens before `BacktestRunner.run()` and therefore before any `BacktestRunRecord` write.
+- **New `frontend/src/hooks/useMarketState.ts`** — fetch + 5-second poll. No `MarketStateChanged` WebSocket channel existed when this hook was built (confirmed via `channels.py`'s `EVENT_TO_CHANNEL` at the time); a parallel session landed that exact channel mid-session (`market-state-changed-websocket-channel`, `intelligence.market-state`) after this hook was already built and tested — this hook does not yet consume it, and every doc/comment claim updated to say so honestly rather than left stale. A push-based upgrade is a natural, immediate follow-up, the same way decision #126 closed that gap for Context. The 5s interval is deliberately much tighter than `useContextSnapshot.ts`'s 60s: Market State Engine recomputes on a ~1s floor/~10s ceiling per symbol (~4s ceiling for the SPY/QQQ/IWM composite), a materially faster cadence than Context's session-boundary/15-minute-timer cadence — see the hook's own `POLL_INTERVAL_MS` comment for the full reasoning. Returns `{symbolState, market, loading, refetch}` from one combined fetch, mirroring `useContextSnapshot.ts`'s Calendar+Fundamentals/News split.
+- **`frontend/src/services/api-client.ts`** gained `fetchMarketStateSnapshot()` plus `MarketStateSymbolWireShape`/`MarketStateCompositeWireShape`/`MarketStateSnapshotWireShape`, verified field-for-field against the real `MarketState`/`CrossSymbolState` Pydantic schemas `get_snapshot()` actually serializes (`backend/app/schemas/events/market_state.py`), not assumed from the DB model's column names.
+- **`frontend/src/components/workspace/InfoTab.tsx`** — new `MarketStateSummary` section (the SPY/QQQ/IWM cross-symbol composite: direction scores, trend alignment, risk-on, leadership/confirmation) in `GeneralContent`, placed after `MarketSessionSummary` and before `RecentClosedTrades`; honest "not yet available" empty state until the composite has been synthesized at least once. `ConnectorContent` now also calls `useMarketState(symbol)` and passes the per-symbol result down to `AIAnalysisPanel`.
+- **`frontend/src/components/ai-panel/AIAnalysisPanel.tsx`** — new `SymbolMarketStateSummary` section (trend/volatility-regime/volume-regime/vwap-relationship/acceleration) hoisted into the shared header block rendered from all three of the component's return branches, alongside decision #125's own `SymbolContextSummary`; honest "not yet computed" state for an uncomputed symbol, and a plain dash (not an error) for a first-ever-recompute `null` `acceleration_score`.
+- **`docs/architecture/trading-intelligence-architecture.md` §4** (Market State's own dedicated section) gained an as-built note with two ASCII diagrams (cross-component data flow; the new hook's own internal fetch/poll flow), matching this doc's existing plain-fenced-code-block diagram convention.
+- **`docs/architecture/system-design.md` §10.3** gained one added sentence on the `MarketStateChanged` payload-schema row noting the new frontend consumer — merged onto the same row `market-state-changed-websocket-channel` also edited (its own sentence about the new WebSocket channel), not overwriting it. Same minimal-addition treatment decision #126 gave `ContextChanged`'s own row.
 
-## Safety and configuration
+## Placement reasoning (stated explicitly, per this task's own requirement)
 
-- Added optional raw setting `IBKR_BACKTEST_CLIENT_ID` with no default. Blank or malformed values do not break general backend startup; the sibling route validates it on demand and rejects missing, negative, or live-ID-colliding values before connection.
-- The live-provider guard now includes registry-owned IBKR adapters, closing `future-ideas.md` #25 without registering the historical-only acquisition client.
-- The guard runs before acquisition and again after disconnect, before replay touches process-wide engines.
-- No order, execution route, streaming subscription, TickIngestBridge, or frontend behavior was added or changed.
+Same market-wide-vs-per-symbol split decision #125 already used for Context Engine: the cross-symbol composite describes the whole market, not any one connector's symbol, so it belongs in `InfoTab.tsx`'s market-wide `GeneralContent`; the four per-symbol scores plus Acceleration are genuinely per-symbol, so they belong in `AIAnalysisPanel.tsx` alongside the per-symbol data already surfaced there. Neither section is gated behind Opportunities being non-empty — Market State Engine's own compute state has nothing to do with whether Strategy Engine has fired anything for that symbol yet.
 
-## Failure contract and provenance
+## What did not change
 
-Stable application errors cover connection/Gateway failure, unresolved contract,
-permission/subscription denial, pacing rejection, timeout, disconnect, zero primary
-bars, malformed timestamps, and conflicting/incomplete responses. They map to explicit
-`400`, `409`, `422`, `502`, `503`, or `504` responses rather than successful empty
-runs.
-
-Persisted provenance is `ibkr:TRADES:1m-ext:1d-rth`. It identifies the vendor and
-request semantics without claiming an immutable IBKR dataset version.
-
-## Documentation
-
-Updated:
-
-- `backend/README.md`
-- `backend/.env.example`
-- `backend/app/api/routes/backtest.py`
-- `backend/app/backtest_runner/fixture_provider.py`
-- `backend/app/backtest_runner/historical_provider_guard.py`
-- `backend/app/backtest_runner/runner.py`
-- `docs/architecture/backtest-runner-design.md`
-- `docs/decisions/future-ideas.md` (#17 comparison note; #25 resolved)
-- `docs/decisions/INDEX.md` and `confirmed-decisions.md`
-- root `TESTING.md`, recreated from scratch
-
-The architecture document includes the request → live guard → isolated acquisition →
-normalization/preload → disconnect → replay → persistence lifecycle diagram.
-
-## Validation
-
-- Untouched UTC/PostgreSQL baseline: 741 collected; 740 passed; one timing-sensitive existing test failed and passed immediately in isolation.
-- Final collection: 766, exactly +25.
-- Focused adapter/acquisition/route set: 33 passed.
-- Complete final suite against real PostgreSQL: **766 passed, 0 failed, 0 skipped**.
-- No live IBKR connection was verified or claimed; `TESTING.md` contains Saqib's exact paper Gateway/TWS verification procedure and expected HTTP examples.
+- Nothing under `backend/` — this delivery is frontend-only, since `GET /intelligence/market-state` already existed and worked.
+- `backend/app/api/websocket/channels.py` — read to confirm no `MarketStateChanged` channel exists yet, not edited (a parallel session may be adding one; zero overlap either way since this delivery doesn't depend on it).
+- `frontend/src/App.tsx` — untouched; placement inside `InfoTab.tsx`/`AIAnalysisPanel.tsx` made this unnecessary, as anticipated. Confirmed disjoint from the two other pending/landed frontend deliveries touching `App.tsx`'s `<main>`/`<header>`.
+- No new chart/visualization of Market State's history — live-snapshot surfacing only, same scope boundary decision #125 used for Context.
+- `useOpportunities.ts`, `useOpportunityConflicts.ts`, `useContextSnapshot.ts`, `useStrategyOutcomes.ts`, `usePerformanceAnalytics.ts`, and every backtest-panel/hook file — untouched.

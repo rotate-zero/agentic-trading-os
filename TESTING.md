@@ -1,115 +1,71 @@
-# TESTING — `MarketStateChanged` → WebSocket channel (temp id: `market-state-changed-websocket-channel`)
+# TESTING — pending decision (temp id: `market-state-frontend-surfacing`) — Market State Engine's live snapshot surfaced in the frontend
 
-## What changed
+Frontend-only delivery. No `backend/` files touched, so no backend `pytest` run applies.
 
-One missing routing entry closed, same shape as decision #126's `ContextChanged` fix:
+## Pre-work verification
 
-```python
-EventType.MARKET_STATE_CHANGED: "intelligence.market-state"
+- Fresh tarball pull (`codeload.github.com/.../refs/heads/main`) at task start, per this task's own explicit instruction not to assume prior state.
+- Read, in order: `docs/decisions/README.md`; `docs/decisions/INDEX.md`'s last several rows; decision #125 in full (`docs/decisions/archive/122-133.md`) as the direct pattern to mirror; `backend/app/market_state_engine/engine.py`'s `get_snapshot()` method and module docstring in full; `backend/app/models/market_state.py`; `backend/app/schemas/events/market_state.py` (the real `MarketState`/`CrossSymbolState` Pydantic schemas `get_snapshot()` actually serializes — cross-checked against, not assumed identical to, the DB column names in `models/market_state.py`); `backend/app/api/routes/intelligence.py`'s `GET /market-state` route in full; `frontend/src/hooks/useContextSnapshot.ts` in full as structural template; `frontend/src/components/workspace/InfoTab.tsx` and `frontend/src/components/ai-panel/AIAnalysisPanel.tsx` in full, current state; `backend/app/api/websocket/channels.py` in full (confirmed no `EventType.MARKET_STATE_CHANGED` entry in `EVENT_TO_CHANNEL` — not touched).
+- Grepped all of `frontend/src/` for `market-state`/`market_state`/`MarketState` before writing anything: confirmed the only existing mentions were unrelated `StrategyOutcome` snapshot field names (`market_state_at_entry`/`market_state_at_exit`), not this route — zero real prior usage.
+
+## Immediately before writing/packaging
+
+- Re-pulled a fresh tarball **twice** partway through this task's session, each prompted directly ("Git is updated. Continue."), and diffed each pull against the prior state.
+  - **First re-pull:** found `ibkr-historical-backtest-provider` (backend-only, new `POST /backtest/run/ibkr`) had landed. `diff -rq` confirmed it touches only backend files (`backtest.py`, `broker.py`, `fixture_provider.py`, `historical_provider_guard.py`, new `ibkr_historical.py`, `runner.py`, `ibkr_adapter.py`, `config.py`, three test files), `docs/architecture/backtest-runner-design.md`, and `docs/decisions/future-ideas.md` (closing future-idea #25) — zero overlap with this delivery.
+  - **Second re-pull:** found `market-state-changed-websocket-channel` had landed — the exact `EVENT_TO_CHANNEL[MARKET_STATE_CHANGED]` routing gap this task's own prompt anticipated. `diff -rq` confirmed it touches only `channels.py`, `backend/tests/test_websocket_channels.py`, and `docs/architecture/system-design.md` §10.3's `MarketStateChanged` row — the SAME row this delivery also edits. Resolved as a merge, not an overwrite: this delivery's own sentence was appended after that entry's own sentence in the same table cell, and every place this delivery had claimed "no channel exists" (the hook's own `POLL_INTERVAL_MS` comment, `trading-intelligence-architecture.md` §4's as-built note and diagram) was corrected to say the channel now exists but is not yet consumed by this hook, rather than left stale and misleading.
+  - Both times, this delivery's own six edited/new files were re-verified as byte-identical-base against the pull immediately before and after, confirming clean re-application with no other merge conflicts.
+- Three-source decision-number check (`INDEX.md` tail, `confirmed-decisions.md` tail, `docs/decisions/archive/` file list), re-run after both re-pulls: latest real number is still #142 both times; all five PENDING entries (`data-feed-status-indicator`, `broker-connection-panel`, `ibkr-historical-backtest-provider`, `market-state-changed-websocket-channel`, and this delivery's own) now anticipate the same next-available number, **143** — none has merged or been assigned yet as of final packaging.
+- Confirmed by inspection and by `diff -rq` against the final fresh clone that this delivery is file-disjoint from all four other pending/landed deliveries except for the one shared, merged line in `system-design.md` §10.3 noted above.
+- **Flag for Saqib, not resolved silently:** appending this delivery's own decision-log entry pushed `confirmed-decisions.md` to 112,132 bytes, well past the ~100KB rollover threshold `docs/decisions/README.md` documents (it was already past that threshold before this entry, from the two deliveries that landed mid-session). Not rolled over here — see the dedicated note at the end of this delivery's own entry in `confirmed-decisions.md` for why (archiving would strand five still-unnumbered PENDING entries' own "update at merge time" instructions) and the recommended timing.
+
+## Frontend build verification
+
+Baseline established on a freshly-pulled, untouched second clone (same `npm install`, same lockfile) before attributing any error to this delivery:
+
+```
+$ cd frontend && npx tsc -b
+src/components/workspace/GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.
+src/components/workspace/GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.
+
+$ npx vite build
+✓ 95 modules transformed.
+✓ built in 3.93s
 ```
 
-added to `EVENT_TO_CHANNEL` in `backend/app/api/websocket/channels.py`. `MarketStateEngine`
-already publishes both real shapes (per-symbol and cross-symbol/`"__MARKET__"`, decisions
-#93/#97) — no engine, publish-side, or payload change was made anywhere.
+Working tree, same commands, same result set:
 
-**Correction versus this task's own initial framing:** the cross-symbol shape's
-`envelope.symbol` is **never** null/absent — it's always the literal sentinel
-`"__MARKET__"` (`engine.py`'s own `_CROSS_SYMBOL_SENTINEL`). A subscriber must compare
-`envelope.symbol == "__MARKET__"`, not check for `None`. This differs from
-`ContextChanged`'s own market-wide shape, where `symbol` really is unset.
+```
+$ npx tsc -b --force
+src/components/workspace/GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.
+src/components/workspace/GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.
+src/components/workspace/GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.
 
-## How to verify
-
-Real PostgreSQL 16, no mocks.
-
-```bash
-cd backend
-python -m alembic upgrade head   # no new migration in this delivery
-python -m pytest -q tests/test_websocket_channels.py -v
+$ npx vite build
+✓ 96 modules transformed.
+✓ built in 4.04s
 ```
 
-Expect **8 passed** — decision #126's original 4 `ContextChanged` tests plus this
-delivery's 4 new `MarketStateChanged` tests:
+Identical four pre-existing decision-#35 `GridPresetPicker` errors, same lines, both sides — zero new `tsc` errors introduced. `vite build`: 95 modules on the untouched baseline, 96 on the working tree — exactly +1, the one new `useMarketState.ts` file (`api-client.ts`/`InfoTab.tsx`/`AIAnalysisPanel.tsx` are edits to already-counted modules, not new ones). Both trees built with `node_modules` installed fresh from the same `package-lock.json`; `frontend/tsconfig.tsbuildinfo` is a generated build cache (absolute paths, timestamps) that differs across any two separate checkouts regardless of source changes, so it's excluded from this delivery's zip rather than treated as part of the footprint.
 
-- `test_market_state_changed_mapping_present` — regression guard on the routing entry itself
-- `test_per_symbol_market_state_changed_reaches_intelligence_market_state_with_real_symbol`
-- `test_cross_symbol_market_state_changed_reaches_intelligence_market_state_with_sentinel_symbol`
-  — explicitly asserts `msg["symbol"] is not None`, not just the right value
-- `test_unrelated_event_does_not_reach_intelligence_market_state_channel`
+## No companion frontend test file
 
-All four use the same real `TestClient`/`.portal`-based delivery pattern #126 already
-established — nothing mocked, nothing patched.
+Re-confirmed by search immediately before writing this delivery that no hook in this codebase has its own test file today (same practice decisions #123/#125/#126 already document as still true) — `useMarketState.ts` doesn't introduce a new testing convention solely for itself.
 
-## Full-suite results (real Postgres, chunked — see note below)
+## Verification — footprint
 
-Against a fresh clone of `main` taken *after* the parallel `ibkr-historical-backtest-provider`
-delivery merged:
+`diff -rq` against a freshly-pulled untouched second clone confirms the only files touched are:
 
-| | Collected | Passed | Failed |
-|---|---|---|---|
-| Fresh `main` (before) | 766 | 766 | 0 |
-| This delivery's tree (after) | 770 | 770 | 0 |
+- `frontend/src/services/api-client.ts` (extended)
+- `frontend/src/hooks/useMarketState.ts` (new)
+- `frontend/src/components/workspace/InfoTab.tsx` (extended)
+- `frontend/src/components/ai-panel/AIAnalysisPanel.tsx` (extended)
+- `docs/architecture/trading-intelligence-architecture.md` (extended, §4)
+- `docs/architecture/system-design.md` (one sentence added to the `MarketStateChanged` §10.3 row, merged onto the same row `market-state-changed-websocket-channel` also edited)
+- `docs/decisions/confirmed-decisions.md` (this entry, appended)
+- `docs/decisions/INDEX.md` (matching row, appended)
+- `CHANGES.md`, `TESTING.md` (this file, delete-first rewrite)
 
-Exactly **+4**, zero regressions. No member of the long-documented decision #119 flaky
-cluster surfaced on either run (not claimed fixed — consistent with that cluster's own
-documented intermittency).
-
-**Why chunked, not one unbroken run:** this codebase's own documented ~1s/candle
-Backtest Runner replay cost (decision #131) — `test_backtest_runner_regression.py` alone
-takes ~8 minutes — makes one unbroken `pytest` invocation impractical in this sandbox. Ran
-in groups instead (all non-backtest/IBKR files together, ~50s; each backtest/IBKR file
-individually or in small groups) and summed. Every group matched its counterpart exactly
-except the group containing `test_websocket_channels.py` (204 vs. 200 baseline — the
-expected +4).
-
-## `diff -rq` footprint
-
-Against the same fresh post-merge clone, confirmed the only files this delivery touches are:
-
-- `backend/app/api/websocket/channels.py`
-- `backend/tests/test_websocket_channels.py`
-- `docs/architecture/system-design.md`
-- `docs/decisions/confirmed-decisions.md`
-- `docs/decisions/INDEX.md`
-- `TESTING.md` (this file)
-
-Nothing under `backend/app/backtest_runner/`, `routes/backtest.py`, `routes/broker.py`,
-`finnhub_data.py`, `market_data.py`, or any frontend file was touched.
-
-## Parallel-track re-check
-
-Re-pulled a fresh tarball mid-task (Saqib: "git is updated") and found the
-`ibkr-historical-backtest-provider` delivery had landed since this task's first pull.
-Confirmed file-disjoint both ways by `diff -rq` — that delivery's own stated footprint
-(`backend/app/backtest_runner/`, `routes/backtest.py`, `routes/broker.py`,
-`broker_adapters/ibkr_adapter.py`, `core/config.py`, plus its own docs/decisions files)
-has zero overlap with this delivery's footprint above. Rebased this delivery's two changed
-files cleanly onto that new `main` tip before running the full-suite comparison.
-
-A separate Claude session was also reported to be building a first-ever frontend surface
-for Market State Engine (new hook, `InfoTab.tsx`). No matching entry has landed on `main`
-as of this delivery's own packaging-time re-check, so there was nothing to reconcile
-against — that surface can subscribe to `intelligence.market-state` immediately once this
-delivery merges.
-
-## Decision number
-
-Left unassigned, per Saqib's standing rule against minting real decision numbers during
-parallel work. `INDEX.md`/`confirmed-decisions.md` carry this delivery under temp id
-`market-state-changed-websocket-channel`. Three-source re-check at packaging time shows a
-**four-way collision** on next-available-**143**, alongside `data-feed-status-indicator`,
-`broker-connection-panel`, and `ibkr-historical-backtest-provider`. Whoever merges first
-should re-run the three-source check, assign the real number, and update: this delivery's
-own decision-log entry header, its `INDEX.md` row, and the temp-id reference in the
-`EVENT_TO_CHANNEL` code comment in `channels.py`.
-
-## Not covered / manual merge notes
-
-- No frontend hook subscribes to `intelligence.market-state` yet — out of scope per this
-  task's explicit file boundaries (frontend is a parallel session's job). The channel is
-  live and ready the moment a consumer subscribes to it.
-- If the parallel Market State frontend session's delivery lands with its own
-  `EVENT_TO_CHANNEL`-adjacent doc edits to `system-design.md` §10.3, merge both prose
-  additions to the `MarketStateChanged` row by hand rather than letting one overwrite
-  the other — same category of manual-merge point decision #114/#115 already documents
-  for this repo's parallel-session history.
+Confirmed untouched: everything under `backend/`; `frontend/src/App.tsx`; `frontend/src/services/websocket-client.ts`; `backend/app/api/websocket/channels.py`; `frontend/src/hooks/useOpportunities.ts`, `useOpportunityConflicts.ts`, `useContextSnapshot.ts`, `useStrategyOutcomes.ts`, `usePerformanceAnalytics.ts`, `useBacktestOutcomes.ts`, `useBacktestRuns.ts`; any Finnhub/Polygon/broker-panel component or hook.
