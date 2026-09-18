@@ -465,7 +465,7 @@ Feeds back into two places: **Strategy Engine** (reweight or retire underperform
 
 There's a real idea worth keeping from the "everything should revolve around a persistent World Model" suggestion — but not in the form it was proposed. "Everything reads from it, everything writes to it" is the exact anti-pattern Feature Engine and Portfolio State Engine exist to prevent (§7 of `system-design.md`, principle 8: compute once, consume everywhere). A shared object with many writers is how state gets inconsistent, not how it stays coherent.
 
-What's actually valuable is a **read-only composite view**: a facade that assembles Market State + Portfolio State + Context + recent Performance Intelligence output into one coherent snapshot of "what does the system currently believe," for consumers that want the whole picture at once — a debug dashboard, or a future LLM-based reasoning layer that needs one prompt-sized summary instead of five separate queries.
+What's actually valuable is a **read-only composite view**: a facade that assembles Market State + Portfolio State + Context + Performance Intelligence output into one coherent snapshot of "what does the system currently believe," for consumers that want the whole picture at once — a debug dashboard, or a future LLM-based reasoning layer that needs one prompt-sized summary instead of five separate queries.
 
 ```python
 class WorldView:
@@ -473,21 +473,55 @@ class WorldView:
     # assembles from existing single-owner sources — owns nothing itself
 ```
 
-Single-writer-per-domain stays fully intact — `WorldView` has no state of its own and no write path. It's purely a read aggregator, the same relationship Context Engine has to its providers (§5). The full "everything writes to it" version is parked in [`../decisions/future-ideas.md`](../decisions/future-ideas.md) in case a genuine need for shared mutable world state emerges later — it hasn't yet.
+**World View v1 is built at `backend/app/world_view/composite.py`** (temp delivery id `world-view-v1`). `WorldViewSnapshot` contains `symbol`, the complete unmodified `market_state` and `context` public envelopes, a `performance` envelope, and the reserved `portfolio` slot. The optional symbol is passed unchanged to `MarketStateEngine.get_snapshot(symbol)` and `ContextEngine.get_snapshot(symbol)`; consequently their honest not-yet-computed behavior remains their own: an unknown symbol is absent from `symbols`, while valid broad-market/global portions remain present.
 
-**Not to be confused with `app/trading_intelligence/state_snapshot.py` (decision #98, M4).** That module is two functions, not a class, reading exactly two sources (Market State + Context, not Portfolio State or Performance Intelligence too), for exactly one purpose (shaping `StrategyOutcome`'s entry/exit snapshot fields) — a narrow, purpose-built read, not a general-purpose facade. `WorldView` above remains "hasn't yet":
+Portfolio State still has no application implementation. Saqib confirmed the widened-schema/implemented-narrowly option established by decision #6: v1 includes `portfolio: dict[str, Any] | None` and always returns `None`/JSON `null`. That means **the source is unavailable**, not an empty account, empty positions list, or zero buying power. No placeholder Portfolio engine or fabricated account data exists.
+
+Performance uses only `get_win_rate_by_hour()` and `get_expectancy_by_session_type()`. Each is called once with `is_backtest=False` and once with `is_backtest=True`, preserving the query layer's hard population boundary. These synchronous SQLAlchemy reads run via `asyncio.to_thread`, outside the async route's event loop. Their existing dataclass rows are converted without new metric definitions into this exact envelope:
+
+```text
+performance
+├── live
+│   ├── hourly_win_rates: [...]      # is_backtest=False
+│   └── session_expectancy: [...]    # is_backtest=False
+└── backtest
+    ├── hourly_win_rates: [...]      # is_backtest=True
+    └── session_expectancy: [...]    # is_backtest=True
+```
+
+These are the existing **system-wide, all-matching-history aggregates**. They are not recent and are not scoped by the World View `symbol`; the public query contracts have neither recency nor symbol filters. An empty population remains two empty lists, never `None` or fabricated zero rows.
+
+Single-writer-per-domain stays fully intact — `WorldView` has no state of its own and no write path. It adds no persistence, cache, event subscription, scheduler, background task, or WebSocket channel. `GET /intelligence/world-view` is a thin route: it passes the optional `symbol` to a stateless `WorldView().snapshot()` and lets FastAPI serialize the frozen `WorldViewSnapshot` dataclass normally. The full "everything writes to it" version is parked in [`../decisions/future-ideas.md`](../decisions/future-ideas.md) in case a genuine need for shared mutable world state emerges later — it hasn't yet.
+
+**Not to be confused with `app/trading_intelligence/state_snapshot.py` (decision #98, M4).** That module is two functions, not a class, reading exactly two sources (Market State + Context, not Portfolio State or Performance Intelligence too), for exactly one purpose (shaping `StrategyOutcome`'s entry/exit snapshot fields) — a narrow, purpose-built read, not a general-purpose facade. It remains separate and unchanged:
 
 ```
 MarketStateEngine.get_snapshot()  ──┐
                                      ├──▶  state_snapshot.py  ──▶  (future) Execution / Position
 ContextEngine.get_snapshot()      ──┘      (2 functions, 1 job)      Monitor → StrategyOutcome
 
-                                     WorldView (still not built)
-                                     would sit here instead, reading
-                                     Market State + Portfolio State +
-                                     Context + Performance Intelligence
-                                     for a different job: one summary
-                                     for a dashboard or LLM prompt.
+GET /intelligence/world-view?symbol=...                 external flow
+                  │
+                  ▼
+       WorldView.snapshot(symbol)                      composite facade
+          │          │             │             │
+          │          │             │             └──▶ portfolio = null
+          │          │             │                  (source unavailable)
+          │          │             │
+          │          │             └──▶ asyncio.to_thread(_read_performance)
+          │          │                       │
+          │          │                       ├──▶ live:      both queries(false)
+          │          │                       └──▶ backtest:  both queries(true)
+          │          │
+          │          └──▶ ContextEngine.get_snapshot(symbol)
+          └─────────────▶ MarketStateEngine.get_snapshot(symbol)
+                  │
+                  ▼
+       WorldViewSnapshot → normal JSON serialization
+
+Internal ownership boundary: every arrow above is a read. Market State,
+Context, and Performance Intelligence retain their own contracts and writers;
+World View stores and publishes nothing.
 ```
 
 ---
@@ -522,7 +556,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Market Clock | `core/market_clock.py` |
 | Event Bus + event contracts | `event_bus/bus.py`, `events.py` → see `system-design.md` §10; two dispatch lanes (critical vs. normal), see §4.4 |
 | Feature Engine | `feature_engine/engine.py`, `indicators.py` → `feature_snapshots` |
-| World View (read-only facade) | `world_view/composite.py` — reads only, owns nothing |
+| World View (read-only facade) | `backend/app/world_view/composite.py` — reads only, owns nothing |
 | Shared update-policy utility (DebounceScheduler) | `core/debounce_scheduler.py` — used by Market State Engine (§4) and Position Monitor (§13) |
 | Execution Mode (auto/manual) | `execution_engine/mode.py` (flag + `ExecutionModeChanged` event) → `portfolio_state` — see §18 |
 | Approval Queue | `execution_engine/approval_queue.py` → `trades` (`status=pending_confirmation`) — see §18 |

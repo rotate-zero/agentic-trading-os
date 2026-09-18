@@ -774,3 +774,16 @@ async def get_backtest_runs(
         for row in rows
     ]
     return {"backtest_runs": backtest_runs}
+
+
+@router.get("/world-view")
+async def get_world_view(symbol: str | None = Query(None)):
+    """Read-only composite over Market State, Context, and Performance.
+
+    World View owns the source assembly contract; this route only forwards
+    the optional symbol and returns its snapshot.  Portfolio State is not
+    implemented, so v1 serializes that reserved slot as JSON ``null``.
+    """
+    from app.world_view import WorldView
+
+    return await WorldView().snapshot(symbol)

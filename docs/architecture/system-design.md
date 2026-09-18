@@ -556,7 +556,7 @@ trading-workspace/
 │   │   │   ├── decision_engine.py        # arbitrates using Portfolio State
 │   │   │   └── trade_planning_engine.py  # entry/stop/target/size/R
 │   │   ├── world_view/
-│   │   │   └── composite.py              # read-only facade over Market/Portfolio/Context/Performance
+│   │   │   └── composite.py              # built v1 read-only facade over Market/Portfolio/Context/Performance
 │   │   ├── governor/
 │   │   │   ├── governor.py               # final risk/policy veto
 │   │   │   ├── position_sizing.py        # fractional Kelly
@@ -733,4 +733,3 @@ Internal flow inside the changed module (`channels.py` itself does no branching 
          does not inspect symbol at all — same as it already doesn't for
          ContextChanged's null-vs-set convention)
 ```
-
