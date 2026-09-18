@@ -1,48 +1,39 @@
-# TESTING — pending decision (temp id: `chart-migration-stage-4-flagging`) — Stage 4 of the chart migration executed, nothing to flag
+# TESTING — pending decision (temp id: `real-market-data-backtest-attempt`) — first attempted real-market-data BacktestRunner execution, blocked by environment
 
-Docs-only delivery. No `frontend/src/indicators/`, `frontend/src/utils/indicators.ts`, or `backend/` files touched — no code changed at all, so no backend `pytest` run applies and the frontend build is verified only to confirm this task's own code-boundary claim ("flagging must not change behavior"), not because any behavior actually changed.
+Docs-only delivery — no `backend/` or `frontend/` files touched, so no `pytest` run or `npx tsc -b`/`npx vite build` applies. What follows is the verification trail for the empirical claims this delivery's docs make, since the entire value of this delivery is that those claims are real, not asserted.
 
-## Pre-work verification
+## Pre-work
 
-- Fresh tarball pull (`codeload.github.com/.../refs/heads/main`) at task start, per this task's own explicit instruction not to assume prior state.
-- Read, in order: `docs/decisions/README.md`; `docs/decisions/INDEX.md`'s last several rows; `docs/architecture/feature-engine-chart-migration.md` in full (this task's own spec, per its prompt); `frontend/src/indicators/sma.ts`, `ema.ts`, `vwap.ts`, `previousDayLevels.ts`, `premarketLevels.ts`, `camarillaPivots.ts`, `vpoc.ts`, `sessions.ts`; `frontend/src/utils/indicators.ts` in full; the `GridPresetPicker.tsx`/`resample.ts` precedent, both the files themselves and every decision-log mention of each (`confirmed-decisions.md` #35, `archive/001-060.md`'s #43, `future-ideas.md`'s correction to #35).
-- Grepped `frontend/src/` for direct imports of each of the seven candidate filenames outside `utils/indicators.ts` — none found; `utils/indicators.ts` is the sole importer of all seven. Then read the actual call sites (not just the import lines) to confirm each imported function is genuinely invoked as a live local-fallback branch, not dead-imported — full reasoning in this delivery's `confirmed-decisions.md` entry.
-- Grepped for `sessions.ts` importers (`vwap.ts`/`previousDayLevels.ts`/`premarketLevels.ts`/`camarillaPivots.ts`/`vpoc.ts`; not `sma.ts`/`ema.ts`) and for `VolumeAvgIndicatorConfig` across `frontend/src/` to settle 4.3 directly rather than by inference.
+- Fresh `git clone --depth 1` at task start: `4f5f32b8444fbd5e384a604f8ea8add5740b60a9`.
+- Read, in order: this task's own prompt (hard boundary, decision-number rule); `docs/decisions/INDEX.md`'s tail and `docs/decisions/confirmed-decisions.md`'s tail in full (found a **six-way** collision on next-available-143, not the two-way the task's own framing described — corrected explicitly, not silently); D4's row in `docs/architecture/strategy-engine-open-decisions.md`; `docs/api/routes/backtest.py`, `backend/app/backtest_runner/runner.py`, `docs/architecture/backtest-runner-design.md` in full.
+- `backend/.env.example` read directly to confirm what real-data configuration exists and what's actually required (`IBKR_HOST`/`IBKR_PORT`/`IBKR_BACKTEST_CLIENT_ID`, `FINNHUB_API_KEY`, `POLYGON_API_KEY` — none set).
 
-## Immediately before writing/packaging
+## Environment build (real, not simulated)
 
-- Re-pulled a fresh tarball a second time immediately before writing, per this task's own standing three-source re-check instruction. `diff -rq` against the first pull: zero changes to `docs/decisions/`, `docs/architecture/feature-engine-chart-migration.md`, `frontend/src/indicators/`, or `frontend/src/utils/` — no parallel-session collision risk materialized. Consistent with this task's own prompt naming three parallel workstreams (IBKR historical provider, `MarketStateChanged` WebSocket channel, three frontend panels), none of which touches this task's scope.
-- Three-source decision-number check (`INDEX.md`'s last row, `confirmed-decisions.md`'s own tail, `docs/decisions/archive/` file list): latest real number is still #142; this delivery joins a now **six-way** collision on next-available-143, alongside the five already-PENDING entries (`data-feed-status-indicator`, `broker-connection-panel`, `ibkr-historical-backtest-provider`, `market-state-changed-websocket-channel`, `market-state-frontend-surfacing`) — none assigned or merged as of packaging. This delivery uses temp id `chart-migration-stage-4-flagging` throughout, per Saqib's standing rule.
+- `apt-get install postgresql postgresql-contrib` — PostgreSQL 16 installed natively; the repo's own `docker-compose.yml` Postgres image was not used since no container registry is reachable from this sandbox's network allowlist.
+- `pg_ctlcluster 16 main start`; `CREATE USER trading WITH PASSWORD 'trading' SUPERUSER`; `CREATE DATABASE trading_workspace OWNER trading` — exact convention from `ways-of-working.md`.
+- Python venv, `pip install -r backend/requirements.txt` — clean install, no errors, no version conflicts.
+- `backend/.env` copied from `.env.example`, `IBKR_BACKTEST_CLIENT_ID=2` set (required, no default per that file's own comment).
+- `alembic upgrade head` — clean run, `0001` through `0010`, zero errors. Confirms this session's schema matches decisions #140/#141's real current head, not an older or divergent one.
+- Direct query confirmed pre-attempt state: `strategy_outcomes` 0, `backtests` 0, `candles` 0 (`symbols` had 6 rows, from the scanner-universe seed migration only — unrelated to backtesting).
+- `uvicorn app.main:app` started as a real detached process (`setsid`, to survive across tool calls) against this real database. Startup log confirmed: `FINNHUB_API_KEY not set`, `POLYGON_API_KEY not set` — no live auto-connect attempted.
 
-## Frontend build
+## The attempt itself
 
-No application code changed, so before and after are the same tree — this run establishes (and re-confirms) the baseline this task's own prompt asked for, rather than proving a delta.
+- `GET /finnhub/status`, `GET /market-data/status`, `GET /broker/status` — all three confirmed `connected: false` immediately before the real call, so decision #132's live-data guard would not block it for the wrong reason.
+- `POST /backtest/run/ibkr?strategy_name=ORB&symbol=AAPL&start=2026-09-15T13:30:00+00:00&end=2026-09-15T15:30:00+00:00` — a real 2-hour window inside the 24-hour cap, a real recent trading day.
+- Response: `HTTP 503`, `{"detail":{"code":"ibkr_connection_unavailable","message":"Could not connect to IB Gateway/TWS at 127.0.0.1:4002: [Errno 111] Connection refused"}}` — captured verbatim, not paraphrased, in `backtest-runner-design.md`'s new as-built note.
+- Direct TCP check independent of the app: `/dev/tcp/127.0.0.1/4002` — `Connection refused`, confirming the failure is a genuinely unreachable Gateway, not an application-level misconfiguration.
 
-- `npm install` (`frontend/`, from the repo's own `package.json`/lockfile).
-- `npx tsc -b`: 4 errors, all in `src/components/workspace/GridPresetPicker.tsx` — the known, pre-existing decision #35 errors (`GRID_PRESETS` not exported, `preset`/`setPreset` not on `WorkspaceContextValue`, one implicit-`any` parameter). Zero errors anywhere else, including every file this task read (`frontend/src/indicators/*.ts`, `frontend/src/utils/indicators.ts`).
-- `npx vite build`: clean, 96 modules transformed, no warnings.
+## Ruling out alternatives, not assuming them unavailable
 
-## Backend
+- `curl -D - https://api.polygon.io/...` and `https://finnhub.io` — both `403`, `x-deny-reason: host_not_allowed`, confirming this sandbox's network egress allowlist has no market-data-provider domain in it (checked against the actual configured allowlist, not inferred from a prior belief).
+- `SELECT count(*) FROM candles WHERE ...` — confirmed 0 real live-recorded candles exist anywhere in this database to substitute as a "real data" source instead.
+- Grepped `backend/app/api/routes/` for any route other than `POST /backtest/run/ibkr` that constructs a `BacktestRunner` from a non-fixture provider — none exists.
 
-Not run. This delivery's own file-boundary claim (below) confirms nothing under `backend/` was touched, and this task's own explicit scope excludes `backend/` entirely.
+## Post-attempt verification
 
-## Frontend indicator/dispatcher-logic verification
-
-No frontend test framework exists in this codebase for hooks or dispatcher functions (confirmed by grep — no `vitest`/`jest` dependency, no `*.test.*` file under `frontend/src/`, consistent with every prior delivery's own note on this). The core factual claim of this delivery — that each of the seven files' imported function is still called live from a real, reachable branch — is verified by direct source trace:
-
-- `computePriceIndicator`'s `SMA`/`EMA` cases against `types/workspace.ts`'s actual `PriceIndicatorInstance.period` type (an unbounded `number`, with the chart's own period-picker UI allowing 2–500) and against `config.py`'s configured Feature Engine default periods (`[9, 20, 50]` SMA / `[9, 20]` EMA) for exactly `1m`/`5m`/`15m`/`1h` — any other period or timeframe combination provably takes the `sma()`/`ema()` branch.
-- `computePriceIndicator`'s `VWAP` case and `resolveHorizontalLevelPrice()`'s four cases against their own `backendSeries`/`backendLevels` optional-lookup guards — each is a plain `??`/truthiness check with no other gate, so an absent backend entry provably falls through to the local function every time, not just in theory.
-
-No live browser session available in this environment to click through and watch a fallback label (`"(local)"`) actually render — same standing gap every prior frontend-adjacent decision in this log has flagged, and immaterial here since no rendering code changed.
-
-## Verification — footprint
-
-`diff -rq` against a freshly-pulled untouched second clone confirms the only files touched are:
-
-- `docs/architecture/feature-engine-chart-migration.md` (Status line + §7 Stage 4 checklist, updated to state the finding)
-- `docs/decisions/future-ideas.md` (new #26 — the real trigger condition for revisiting)
-- `docs/decisions/confirmed-decisions.md` (this delivery's entry, appended)
-- `docs/decisions/INDEX.md` (matching row, appended)
-- `CHANGES.md`, `TESTING.md` (this file, delete-first rewrite)
-
-Confirmed untouched: everything under `backend/`; `frontend/src/indicators/sma.ts`, `ema.ts`, `vwap.ts`, `previousDayLevels.ts`, `premarketLevels.ts`, `camarillaPivots.ts`, `vpoc.ts`, `sessions.ts`, `types.ts`; `frontend/src/utils/indicators.ts`; `App.tsx`; `api-client.ts`; every file belonging to the three named pending frontend panels (broker, data-feed status, Market State).
+- Table counts re-checked after the failed attempt: `strategy_outcomes` 0, `backtests` 0 — unchanged, confirming the failed call left no partial or misleading row (matches `backtest.py`'s own documented behavior: acquisition failure precedes `BacktestRunRecord` creation).
+- `diff -rq` against a freshly re-pulled, untouched second clone (immediately before writing any doc) confirmed zero drift on `main` since task start — same commit both times, ruling out a parallel-session collision risk.
+- Backend process stopped (`pkill`) before packaging; the local Postgres instance and its data are local to this sandboxed session only and are not part of this delivery's footprint.
+- `diff -rq` against a third freshly re-pulled clone, immediately before packaging: confirms the only files touched anywhere in the repo are `docs/architecture/backtest-runner-design.md`, `docs/architecture/strategy-engine-open-decisions.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, plus this file and `CHANGES.md` — explicitly including zero changes under `backend/app/feature_engine/`, `backend/app/trading_intelligence/level_interaction_engine.py`, `backend/app/market_state_engine/`, and their five named test files (this task's own hard boundary), and zero changes anywhere else under `backend/` or `frontend/`.

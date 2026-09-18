@@ -536,4 +536,34 @@ Acquisition errors are stable and explicit: unresolved contract and zero primary
 
 `data_version="ibkr:TRADES:1m-ext:1d-rth"` records the meaningful vendor/request semantics without pretending IBKR publishes an immutable dataset version. `FixtureBacktestContextProvider` remains in use: market-calendar context is replay-safe, while historical point-in-time fundamentals and news remain honestly absent. At approximately one second per primary candle, one regular session is about 6.5 minutes and a full 04:00-20:00 extended session can approach 16 minutes, plus acquisition time.
 
+**As-built note — 2026-09-18, first attempted real-market-data execution (no code changed).** Saqib asked for a real, complete `BacktestRunner` run against real market data (not fixtures, not the test suite), specifically to give D4's readiness check (`strategy-engine-open-decisions.md`) something to find. This note is the honest record of that attempt, which did not succeed — no `strategy_outcomes`/`backtests` rows were produced, and D4 remains open.
+
+*Environment, provisioned fresh this session:* PostgreSQL 16 installed natively (`apt-get install postgresql`; the repo's own `docker-compose.yml` Postgres image was not reachable — no container registry in this sandbox's network allowlist), `trading` superuser + `trading_workspace` DB created per this doc's own convention, `alembic upgrade head` applied cleanly to `0010` (matching decision #141's current head) with **zero errors**, backend started via `uvicorn`. Confirmed empty before any attempt: `strategy_outcomes` 0 rows, `backtests` 0 rows, `candles` 0 rows (`is_backtest=false` — no live session has ever run here, so there is no self-recorded real history to fall back on either, see `candle_store.py`). `symbols` had 6 rows from the scanner-universe seed migration only.
+
+*Attempt:* with Finnhub/Polygon/IBKR all confirmed `connected: false` (so decision #132's live-data guard would not block the call), `POST /backtest/run/ibkr` was called directly — `strategy_name=ORB`, `symbol=AAPL`, a real 2-hour `[start,end)` window inside the 24-hour cap. Result:
+
+```
+POST /backtest/run/ibkr?strategy_name=ORB&symbol=AAPL&start=...&end=...
+        │
+        ▼
+_reject_if_live_data_connected()  ── passed (all three providers disconnected)
+        │
+        ▼
+acquire_ibkr_replay_data()
+        │
+        ▼
+IBKRAdapter.connect(127.0.0.1:4002)  ── Connection refused
+        │
+        ▼
+503 {"code": "ibkr_connection_unavailable",
+     "message": "Could not connect to IB Gateway/TWS at 127.0.0.1:4002:
+                  [Errno 111] Connection refused"}
+```
+
+This is exactly the gap `ibkr_adapter.py`'s own module docstring and decision #131's own verification notes already named ("this sandbox has no path to a running IB Gateway," "No live Gateway, TWS, account, entitlement, or IBKR response was verified in this sandbox") — not a new finding, but the first time it's been confirmed empirically through this specific route rather than stated as a standing caveat. A locally-run IB Gateway/TWS is a stateful desktop application requiring real IBKR account credentials; nothing in this sandbox's network egress configuration would change that, since the failure is a refused loopback TCP connection to a process that doesn't exist here, not a blocked outbound domain.
+
+*Checked and ruled out as alternatives, not just assumed unavailable:* direct `curl` to `https://api.polygon.io` and `https://finnhub.io` both returned `403` with `x-deny-reason: host_not_allowed` — this sandbox's network allowlist has no market-data-provider domains in it (confirmed against the actual configured allowlist, not inferred). Moot regardless: neither `FINNHUB_API_KEY` nor `POLYGON_API_KEY` is set, and — more fundamentally — no existing code path replays a `BacktestRunner` run through either provider; `POST /backtest/run/ibkr` is the only real-market-data replay route this codebase has. Building one would be new scope, not something this task's own "use what already exists" instruction covers.
+
+*Conclusion, stated plainly:* this environment cannot currently produce a real-market-data `BacktestRunner` execution. Nothing was worked around to manufacture rows — `strategy_outcomes`/`backtests` are exactly as empty now as before this attempt, and D4's readiness check still finds zero. Real resolution needs one of: (a) this sandbox given network access to a market-data provider's domain plus a real API key, which by itself still wouldn't produce IBKR data specifically and would need a new non-IBKR replay route built first; (b) `POST /backtest/run/ibkr` run from an environment with a real, reachable IB Gateway/TWS session (Saqib's own machine, per `ibkr_adapter.py`'s own standing caveat) — the fastest path to literally what was asked for, using code that already exists and already works, just never against a reachable Gateway; or (c) accepting a fixture-based real-`trading_workspace`-DB run instead, which is real persistence but not real market data, and wasn't what was asked for here. No code changed as part of this note — decision purely deferred to Saqib.
+
 ---
