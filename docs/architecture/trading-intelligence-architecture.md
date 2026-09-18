@@ -172,17 +172,21 @@ No correlation matrices, no full advancing/declining breadth, no sector rotation
 
 **Data source confirmation — closed by decision #95's M0 spike.** Polygon daily bars for SPY/QQQ/IWM confirmed clean (correct weekday bar counts, no gaps, healthy volume/price ranges, no ETF-specific quirks) — the empirical-before-architectural check this project applies elsewhere, not assumed correct just because they're liquid, well-known tickers. (Finnhub's free-tier WebSocket trade feed was also found to be IEX-only, ~10% of true ETF volume at best — a real constraint, but on tick-level Participation work, not on the Feature Engine's candle-derived `sma_20_slope_angle` that `trend_score` — and so `spy_direction_score`/`qqq_direction_score`/`iwm_direction_score` — is actually computed from. Not a blocker for the cross-symbol synthesis built here, decision #97.)
 
-**Reaches the frontend for the first time (decision `market-state-frontend-surfacing`, number TBD — see that log entry).** `GET /intelligence/market-state` (decision #98) — a thin passthrough of `get_snapshot()` above — had zero UI representation before this: the only prior mentions of "market state" anywhere in `frontend/src/` were unrelated `StrategyOutcome` snapshot field names, not this route. Same market-wide-vs-per-symbol split decision #125 already used for Context Engine: the cross-symbol composite (this section) is market-wide, so it surfaces in `InfoTab.tsx`'s `GeneralContent`; the four per-symbol scores plus Acceleration are per-symbol, so they surface in `AIAnalysisPanel.tsx` instead. Fetch + 5s poll (`useMarketState.ts`) — at the time this hook was built, no WebSocket channel existed for `MarketStateChanged` yet (`EVENT_TO_CHANNEL`, `backend/app/api/websocket/channels.py`, confirmed by reading it directly), the same fetch-plus-poll shape `useContextSnapshot.ts` itself originally shipped with under decision #125, before decision #126 wired `ContextChanged`'s own missing routing entry. **A parallel session (temp id `market-state-changed-websocket-channel`) landed that exact routing entry — channel `intelligence.market-state` — after this hook was already built and tested; this hook does not yet consume it.** A push-based upgrade is now unblocked and would be a natural, immediate follow-up, the same sequencing decision #125 → #126 already modeled for Context. The poll interval is deliberately much tighter than Context's 60s: this engine recomputes on a ~1s floor / ~10s ceiling per symbol (~4s ceiling for the cross-symbol composite, per `_CROSS_SYMBOL_MAX_INTERVAL_SECONDS` above), so 5s keeps the UI within roughly one recompute cycle without polling faster than the data can actually change. Honest absence throughout: a symbol this process hasn't computed yet is simply missing from the hook's own `symbolState`, rendered as "not yet computed," never a fabricated neutral score; the cross-symbol composite renders "not yet available" until it's `null` no longer; `acceleration_score` renders as a plain dash on a symbol's first-ever recompute, not as an error.
+**Reaches the frontend for the first time (decision `market-state-frontend-surfacing`, number TBD — see that log entry).** `GET /intelligence/market-state` (decision #98) — a thin passthrough of `get_snapshot()` above — had zero UI representation before this: the only prior mentions of "market state" anywhere in `frontend/src/` were unrelated `StrategyOutcome` snapshot field names, not this route. Same market-wide-vs-per-symbol split decision #125 already used for Context Engine: the cross-symbol composite (this section) is market-wide, so it surfaces in `InfoTab.tsx`'s `GeneralContent`; the four per-symbol scores plus Acceleration are per-symbol, so they surface in `AIAnalysisPanel.tsx` instead. Originally fetch + 5s poll (`useMarketState.ts`) — at the time this hook was built, no WebSocket channel existed for `MarketStateChanged` yet (`EVENT_TO_CHANNEL`, `backend/app/api/websocket/channels.py`, confirmed by reading it directly), the same fetch-plus-poll shape `useContextSnapshot.ts` itself originally shipped with under decision #125, before decision #126 wired `ContextChanged`'s own missing routing entry. A parallel session (temp id `market-state-changed-websocket-channel`) then landed that exact routing entry — channel `intelligence.market-state`. **As of this delivery (temp id `market-state-websocket-upgrade`), `useMarketState.ts` consumes that channel — WebSocket-primary, poll removed entirely rather than kept as a fallback the way decision #126 kept Context's:** this engine's own recompute cadence (~1s floor / ~10s ceiling per symbol, ~1s floor / ~4s ceiling for the cross-symbol composite, per `_CROSS_SYMBOL_MAX_INTERVAL_SECONDS` above) bounds a dropped/reconnecting WebSocket session's worst-case staleness to seconds, not the ~15 minutes that justified keeping Context's own poll — the same "fires often enough to self-heal quickly" reasoning `useOpportunities.ts`'s WS-only design already rests on for `OpportunityCreated`. Honest absence throughout: a symbol this process hasn't computed yet is simply missing from the hook's own `symbolState`, rendered as "not yet computed," never a fabricated neutral score; the cross-symbol composite renders "not yet available" until it's `null` no longer; `acceleration_score` renders as a plain dash on a symbol's first-ever recompute, not as an error.
 
 ```
-MarketStateEngine.get_snapshot()
-            │
-            ▼
-GET /intelligence/market-state  (decision #98, thin passthrough)
-            │
-            ▼
-   useMarketState(symbol?)  (fetch + 5s poll; does not yet consume
-                             the intelligence.market-state channel)
+MarketStateEngine.get_snapshot()          MarketStateEngine._worker_loop()
+            │                                          │
+            ▼                                          │  publish(MarketStateChanged)
+GET /intelligence/market-state                         ▼
+  (decision #98, thin passthrough)          EventBus → WebSocket Gateway
+            │                                → "intelligence.market-state"
+            │                                          │
+            └───────────────┬──────────────────────────┘
+                             ▼
+                useMarketState(symbol?)   (temp id market-state-websocket-
+                                            upgrade — WebSocket-primary,
+                                            no poll; see prose above)
             │
     ┌───────┴────────┐
     ▼                 ▼
@@ -196,7 +200,8 @@ SymbolMarketStateSummary   MarketStateSummary
 ```
 
 ```
-useMarketState.ts — internal fetch/poll flow
+useMarketState.ts — internal flow (temp id market-state-websocket-upgrade;
+supersedes this hook's original fetch/poll-only flow)
 
   mount, or `symbol` argument changes
             │
@@ -210,14 +215,20 @@ useMarketState.ts — internal fetch/poll flow
   fetchMarketStateSnapshot(sym)   │            convention useContextSnapshot
             │                     │            .ts's own `calendar` uses)
             ▼                     │
-  .then(wire) → normalize →       │      setInterval(load, 5_000)
-  setSymbolState / setMarket      │◄──────────────┘
-            │
-            ▼
-  .catch(err) → console.error, setLoading(false)
-  (mountedRef guards every setState — load() fires
-   repeatedly: once on mount/symbol-change, then
-   again every poll tick, within a single effect run)
+  .then(wire) → normalize →       │   workspaceSocket.subscribe(
+  setSymbolState / setMarket      │     "intelligence.market-state", onUpdate)
+            │                     │◄──────────────┘        │
+            ▼                          msg.symbol == "__MARKET__"?  ──yes─► load()
+  .catch(err) → console.error,               │no
+  setLoading(false)                          ▼
+  (mountedRef guards every setState —  msg.symbol == symbolRef.current? ─yes─► load()
+   load() fires repeatedly: once on          │no
+   mount/symbol-change, then again           ▼
+   on every relevant push, within      ignore (a different symbol's
+   a single effect run)                MarketState — not this concern)
+
+  effect cleanup: unsubscribe() only — no interval to clear, the poll
+  (POLL_INTERVAL_MS) was removed entirely rather than kept as a fallback
 ```
 
 ---

@@ -5,6 +5,17 @@ import {
   type MarketStateCompositeWireShape,
   type MarketStateSymbolWireShape,
 } from "../services/api-client";
+import { workspaceSocket, type WireMessage } from "../services/websocket-client";
+
+// Cross-symbol composite envelopes on this channel use this literal
+// sentinel as `envelope.symbol` — never null/absent, unlike
+// ContextChanged's own market-wide shape (decision #96). Confirmed
+// directly against `app/market_state_engine/engine.py`'s
+// `_CROSS_SYMBOL_SENTINEL` and `app/api/websocket/channels.py`'s own
+// `EVENT_TO_CHANNEL` comment for `MARKET_STATE_CHANGED` before writing
+// this hook's subscription below — not assumed from ContextChanged's
+// convention.
+const CROSS_SYMBOL_SENTINEL = "__MARKET__";
 
 // Normalized, display-ready shapes — same camelCase-flattening split
 // useContextSnapshot.ts's own Calendar/Fundamentals/News types
@@ -60,44 +71,41 @@ function normalizeMarket(wire: MarketStateCompositeWireShape): CrossSymbolMarket
   };
 }
 
-// Poll interval reasoning, stated explicitly (same discipline
-// useContextSnapshot.ts/useStrategyOutcomes.ts's own docstrings use for
-// their own choices, rather than defaulting to a number silently).
+// WebSocket-push reasoning, stated explicitly (same discipline
+// useContextSnapshot.ts's own POLL_INTERVAL_MS comment used for its
+// choice, rather than defaulting silently).
 //
-// Fetch + poll, NOT WebSocket-push: at the time this hook was written, no
-// `EventType.MARKET_STATE_CHANGED` entry existed in `EVENT_TO_CHANNEL`
-// (backend/app/api/websocket/channels.py, confirmed by reading that file
-// directly). A parallel session (temp id
-// `market-state-changed-websocket-channel`) landed the missing routing
-// entry — channel `intelligence.market-state` — after this hook was
-// already built and tested; this hook does NOT yet consume it. This was
-// the same shape useContextSnapshot.ts itself originally shipped with
-// under decision #125, before decision #126 wired CONTEXT_CHANGED's own
-// missing routing entry. A push-based upgrade is now unblocked and would
-// be a natural, immediate follow-up (this task's own decision-log entry
-// notes it), not something this delivery retroactively blocks on.
+// AS OF this task, `EVENT_TO_CHANNEL` (backend/app/api/websocket/
+// channels.py) routes `EventType.MARKET_STATE_CHANGED` to WebSocket
+// channel "intelligence.market-state" (temp id
+// `market-state-changed-websocket-channel`) — the gap this hook's own
+// comment used to describe. useContextSnapshot.ts is the direct
+// template for wiring push onto an existing fetch-based hook (decision
+// #126), but its own resolution of "does the poll stay as a fallback"
+// does NOT carry over here — a genuine difference in this engine's own
+// update cadence, not a default:
 //
-// The interval itself is deliberately NOT copied from
-// useContextSnapshot.ts's 60_000 — that number was chosen relative to
-// Context's own much slower cadence (session boundaries a handful of
-// times a day, plus a 15-minute Fundamentals/News timer per symbol).
-// Market State Engine recomputes on a materially faster cadence:
-// DebounceScheduler's own ~1s floor / ~10s ceiling per symbol, ~1s
-// floor / ~4s ceiling for the SPY/QQQ/IWM cross-symbol composite
-// (market_state_engine/engine.py's own module docstring, decision #91
-// §4 / #97 — `_MIN_INTERVAL_SECONDS`/`_MAX_INTERVAL_SECONDS`/
-// `_CROSS_SYMBOL_MAX_INTERVAL_SECONDS`). Copying Context's 60s here
-// would show state up to a full minute stale most of the time — far
-// looser than this engine's own update cadence, the opposite problem
-// 60s solves for Context (where it's tighter than that engine's 15-
-// minute cadence). `get_snapshot()` is the same synchronous, in-memory,
-// zero-I/O read `ContextEngine.get_snapshot()` is (confirmed directly
-// against market_state_engine/engine.py's own docstring), so a tight
-// poll still costs effectively nothing server-side. 5 seconds keeps
-// this comfortably within one full per-symbol recompute cycle (and just
-// over one cross-symbol cycle) without polling meaningfully faster than
-// the underlying data can actually change.
-const POLL_INTERVAL_MS = 5_000;
+// Context genuinely changes on a slow cadence (session boundaries a
+// handful of times a day, plus a 15-minute per-symbol timer), so a
+// dropped/reconnecting WebSocket session could otherwise go up to 15
+// real minutes with no self-correcting signal — decision #126 kept
+// Context's poll specifically to bound that worst case. Market State
+// Engine recomputes on a materially faster cadence: DebounceScheduler's
+// own ~1s floor / ~10s ceiling per symbol, ~1s floor / ~4s ceiling for
+// the SPY/QQQ/IWM cross-symbol composite (market_state_engine/engine.py's
+// own module docstring, decision #91 §4 / #97). That worst-case
+// reconnect gap is at most ~10 seconds here, not 15 minutes — the same
+// "fires often enough that a dropped/reconnecting WebSocket self-heals
+// quickly" situation useOpportunities.ts's own WS-only design (no
+// fallback poll at all) already rests on for `OpportunityCreated`, and
+// this engine's own cadence is at least as tight as that one. Retaining
+// the previous 5-second poll alongside push would mean routinely paying
+// for a request whose answer is already in hand from the more recent
+// push, and it re-introduces exactly the "unnecessary requests against
+// an engine that already tells you the instant it changes" cost this
+// upgrade exists to remove — so the poll is fully replaced, matching
+// useOpportunities.ts's resolution of this exact question rather than
+// useContextSnapshot.ts's.
 
 export interface UseMarketStateResult {
   // null: either no `symbol` was requested, or this process hasn't
@@ -126,15 +134,31 @@ export interface UseMarketStateResult {
  * that omit `symbol` ignore its returned `fundamentals`/`news`); pass a
  * ticker to also get that symbol's own per-symbol scores.
  *
- * Fetch + poll only, no WebSocket — see POLL_INTERVAL_MS's own comment
- * above for the full reasoning, including why the interval is much
- * tighter than useContextSnapshot.ts's.
+ * WebSocket-primary, no poll — see the comment above for the full
+ * reasoning on why this hook fully replaces its previous poll with push
+ * rather than keeping one as a fallback the way useContextSnapshot.ts
+ * does for its own (much slower) engine.
+ *
+ * Subscribes to the "intelligence.market-state" channel (mirroring
+ * useContextSnapshot.ts's subscribe/handle/unsubscribe pattern, itself
+ * modeled on useOpportunities.ts) as an INVALIDATION signal, not a
+ * second normalization path: a relevant push just calls this hook's own
+ * `load()`, the same REST fetch that's already the source of truth,
+ * rather than hand-parsing `WireMessage.payload` into
+ * `MarketStateScores`/`CrossSymbolMarketState` a second time.
+ * `MarketStateChanged`'s two envelope shapes (confirmed directly against
+ * `channels.py`, not assumed from ContextChanged's convention) route as:
+ * `symbol === CROSS_SYMBOL_SENTINEL` ("__MARKET__", never null/absent
+ * here) -> reload; `symbol === this hook's own symbol argument` -> that
+ * symbol's per-symbol scores changed -> reload; any other symbol ->
+ * ignored, via `symbolRef` so a push arriving after a symbol switch
+ * can't act on a stale closed-over symbol.
  *
  * Uses a `mountedRef` guard rather than a single per-effect `cancelled`
  * closure, for the same reason useContextSnapshot.ts does: `load()`
  * here fires repeatedly within one effect run (once on mount/symbol-
- * change, then again every poll tick), so one closed-over flag from the
- * first call wouldn't cover later ticks.
+ * change, then again on every relevant WebSocket push), so one
+ * closed-over flag from the first call wouldn't cover later pushes.
  */
 export function useMarketState(symbol?: string): UseMarketStateResult {
   const [symbolState, setSymbolState] = useState<MarketStateScores | null>(null);
@@ -179,10 +203,23 @@ export function useMarketState(symbol?: string): UseMarketStateResult {
     setSymbolState(null);
 
     load();
-    const interval = setInterval(load, POLL_INTERVAL_MS);
+
+    // WebSocket-primary trigger — invalidation signal only, see this
+    // hook's own docstring above for why `load()` (a real refetch)
+    // rather than merging `msg.payload` in piecemeal.
+    const onUpdate = (msg: WireMessage) => {
+      if (msg.symbol === CROSS_SYMBOL_SENTINEL) {
+        load(); // cross-symbol composite changed
+      } else if (msg.symbol === symbolRef.current) {
+        load(); // this hook's own symbol's per-symbol scores changed
+      }
+      // else: a different symbol's MarketState changed — not this hook
+      // instance's concern, ignore rather than merge it in.
+    };
+    const unsubscribe = workspaceSocket.subscribe("intelligence.market-state", onUpdate);
 
     return () => {
-      clearInterval(interval);
+      unsubscribe();
     };
   }, [symbol, load]);
 

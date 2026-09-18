@@ -1,133 +1,100 @@
-# TESTING — pending delivery `world-view-v1`
+# TESTING — pending delivery `market-state-websocket-upgrade`
 
-This is a replacement repo-root `TESTING.md`: **delete the old `TESTING.md` first, then apply this delivery**.
+This is a replacement repo-root `TESTING.md` (the version it replaces was
+`world-view-v1`'s own) — **this delivery is frontend-only**, so this file
+covers exactly this delivery; `world-view-v1`'s own backend verification
+detail is not reproduced here (it's fully recorded in its own decision-log
+entry, `docs/decisions/confirmed-decisions.md`, temp id `world-view-v1`).
 
-## Base and database setup
+## What changed
 
-- Exact untouched-main base: `0913746a1c2c5dae3ecb72844ea2ab1c5bab8d19`.
-- Fresh source tarball extracted with no enclosing directory at `/tmp/world-view-v1-main.QuishM`.
-- PostgreSQL 18.6 isolated cluster: `/tmp/world-view-v1-pg.amvOql/data`.
-- Connection: `127.0.0.1:55434`, database/user `trading_workspace`/`trading`, server timezone UTC.
-- Both full-suite runs began from a freshly created database migrated through Alembic `0010` with `alembic upgrade head`.
-- Python 3.14 project environment: `/home/rotate_zero/projects/agentic-trading-os/backend/.venv`.
+`frontend/src/hooks/useMarketState.ts` upgraded from fetch + 5-second poll
+to WebSocket-primary, subscribing to the `intelligence.market-state`
+channel (temp id `market-state-changed-websocket-channel`, already merged)
+via `workspaceSocket`, mirroring `useContextSnapshot.ts`'s decision #126
+pattern. The poll was removed entirely (not kept as a fallback) — see this
+delivery's own decision-log entry for the full reasoning. Public return
+shape (`symbolState`, `market`, `loading`, `refetch`) is unchanged; no
+consumer file needed edits.
 
-Environment prefix used for all pytest commands:
+Docs updated in the same change: `docs/architecture/system-design.md`
+§10.3 (corrected `MarketStateChanged` row + two new diagrams) and
+`docs/architecture/trading-intelligence-architecture.md` §4 (prose +
+both existing diagrams updated to reflect the current WS-primary design,
+superseding the now-stale fetch/poll-only versions).
 
-```bash
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading
-```
+## Base
 
-## Commands and exact results
+- Base tarball first pulled at task start; re-pulled a second time
+  immediately before packaging (three-source re-check protocol), since a
+  parallel World View session (temp id `world-view-v1`) landed on `main`
+  mid-task. This delivery's committed diff is against that second,
+  current pull.
+- Confirmed via `diff -rq` against a fresh untouched clone: `world-view-v1`
+  is entirely backend (`backend/app/world_view/`,
+  `backend/tests/test_world_view.py`, `backend/app/api/routes/
+  intelligence.py`) — zero overlap with this delivery's own footprint,
+  in either direction.
 
-### Untouched-main baseline
-
-```bash
-cd backend
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
-  /home/rotate_zero/projects/agentic-trading-os/backend/.venv/bin/pytest -q --tb=short
-```
-
-Result: **772 passed, 0 failed, 0 skipped; 75,497 warnings; 790.87s (13:10)**.
-
-### New World View tests
-
-```bash
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
-  /home/rotate_zero/projects/agentic-trading-os/backend/.venv/bin/pytest \
-  tests/test_world_view.py -q --tb=short
-```
-
-Result: **4 passed, 0 failed, 0 skipped; 221 warnings; 1.14s**.
-
-The four collected cases prove:
-
-- real Market State production through `FeaturesUpdated` and a bounded condition wait;
-- real Context production through `evaluate_all()` / `evaluate_for_symbol()`;
-- live and backtest outcomes written only through `record_strategy_outcome()` and never raw INSERT;
-- strict population separation and honest empty lists when either population is absent;
-- unmodified source envelopes for computed and never-computed symbols;
-- `portfolio` serialization as JSON `null`;
-- route behavior with and without `symbol`;
-- no World View persistence, using exact before/after counts for every public PostgreSQL table after source-owned work is drained.
-
-### New plus affected coverage
+## How to verify
 
 ```bash
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
-  /home/rotate_zero/projects/agentic-trading-os/backend/.venv/bin/pytest \
-  tests/test_world_view.py \
-  tests/test_intelligence_routes.py \
-  tests/test_market_state_engine.py \
-  tests/test_market_state_engine_timeframe_race.py \
-  tests/test_strategy_integration_contract.py \
-  tests/test_context_engine.py \
-  tests/test_performance_intelligence.py \
-  tests/test_performance_queries.py \
-  tests/test_performance_analytics_routes.py \
-  tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py \
-  -q --tb=short
+cd frontend
+npm install
+npx tsc -b
+npx vite build
 ```
 
-Result: **84 passed, 0 failed, 0 skipped; 4,412 warnings; 8.14s**.
+Both commands are clean. `npx tsc -b` reproduces only the four known,
+pre-existing decision #35 `GridPresetPicker` errors
+(`GRID_PRESETS`/`preset`/`setPreset` missing, one implicit-`any`) —
+confirmed identical, line for line, against a `tsc -b` run captured on a
+fresh untouched clone before this change. `npx vite build` produces the
+same module count (96 transformed) and completes with no errors.
 
-### Changed-tree full suite
+No frontend hook in this codebase has its own automated test file
+(confirmed by search before starting — matches this project's existing
+test-free hook practice, decision #123's own precedent), so none was
+added for this change either.
 
-The isolated database was dropped, recreated, and migrated through `0010` before this run, matching baseline setup.
+Manual/runtime verification of the actual WebSocket round-trip
+(subscribe → real `MarketStateChanged` push → `load()` re-fetch →
+re-render) was not performed in this sandbox — no live Finnhub/Polygon
+feed or running frontend dev server against a live backend was available
+here. The channel itself (`intelligence.market-state`) and its two real
+envelope shapes were already proven end-to-end by
+`market-state-changed-websocket-channel`'s own `test_websocket_channels.py`
+(backend, real `TestClient`/WebSocket delivery, not mocked) — this
+delivery's own correctness rests on: (a) that channel test coverage,
+(b) `useContextSnapshot.ts`'s own decision #126 subscribe/handle/
+unsubscribe pattern already proven live in production use for the
+identical mechanics, and (c) direct code review confirming the sentinel
+branch (`"__MARKET__"` vs. a real ticker vs. any other symbol) matches
+`channels.py`'s own documented convention exactly.
 
-```bash
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
-  /home/rotate_zero/projects/agentic-trading-os/backend/.venv/bin/pytest -q --tb=short
-```
+## What wasn't covered
 
-Result: **775 passed, 1 failed, 0 skipped; 76,449 warnings; 790.60s (13:10)**.
+- No live WebSocket round-trip test (see above) — recommend Saqib smoke-test
+  this against a running backend with a live/replay feed before relying on
+  it in the live workspace.
+- No new automated test file, per this codebase's existing hook-testing
+  convention (not a gap specific to this delivery).
 
-Failure:
+## Manual merge notes
 
-```text
-tests/test_feature_engine.py::test_stop_waits_for_an_in_flight_compute_before_returning
-AssertionError: assert 3 == 1
-```
-
-The test passed immediately when rerun alone:
-
-```bash
-env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55434 \
-  POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
-  /home/rotate_zero/projects/agentic-trading-os/backend/.venv/bin/pytest \
-  tests/test_feature_engine.py::test_stop_waits_for_an_in_flight_compute_before_returning \
-  -q --tb=short
-```
-
-Isolation result: **1 passed, 0 failed, 0 skipped; 2,934 warnings; 1.16s**.
-
-This is unrelated to World View: the failing test runs before `test_world_view.py`, and this delivery changes neither Feature Engine nor its tests. Its wall-clock `candle_ts` can land on an aggregated-timeframe boundary, producing more valid `FeaturesUpdated` events than its `len(received) == 1` assertion permits. It is reported as a related follow-up and was not changed.
-
-## Warning profile
-
-Warnings are existing Python 3.14 deprecations from FastAPI and pytest-asyncio (`asyncio.iscoroutinefunction`, event-loop policy APIs). No warning was hidden or filtered by this delivery.
-
-## Environment limitations
-
-- No frontend command was run because the delivery changes no frontend file.
-- Portfolio State cannot be integration-tested because direct code search confirms it has no application implementation; the approved v1 contract tests the reserved `null` slot instead.
-
-## Delivery footprint
-
-- `backend/app/world_view/__init__.py`
-- `backend/app/world_view/composite.py`
-- `backend/app/api/routes/intelligence.py`
-- `backend/tests/test_world_view.py`
-- `docs/architecture/trading-intelligence-architecture.md`
-- `docs/architecture/system-design.md`
-- `docs/decisions/confirmed-decisions.md`
-- `CHANGES.md`
-- `TESTING.md` (replacement)
-
-No `INDEX.md` row or real decision number is included. Frozen archives are untouched.
-
-The open decision file is over 136KB after appending `world-view-v1`, above the documented rollover threshold. It still contains eight unnumbered pending entries, so rollover remains a merge-time integration follow-up rather than part of this delivery.
+- `docs/decisions/confirmed-decisions.md`: this delivery's own PENDING
+  entry (temp id `market-state-websocket-upgrade`) was appended after
+  `world-view-v1`'s entry, which was already on `main` at re-pull time.
+  If another parallel PENDING entry lands between this delivery's
+  packaging and its merge, append after that entry instead — do not
+  reorder or renumber anything already on `main`.
+- `docs/decisions/INDEX.md`: unchanged by this delivery (correct — no
+  real number assigned yet, per standing rule). Do NOT add a row for
+  `market-state-websocket-upgrade` until a real number is assigned at
+  merge time via a fresh three-source re-check.
+- No file-level conflict expected with `world-view-v1`, the IBKR
+  real-data backtest track (`BacktestPanel.tsx`/`useBacktestRun.ts`,
+  untouched here), or any other currently-PENDING entry — this
+  delivery's footprint (`useMarketState.ts`, `system-design.md`,
+  `trading-intelligence-architecture.md`, `confirmed-decisions.md`,
+  this file) shares no file with any of them.

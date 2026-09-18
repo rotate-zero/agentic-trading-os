@@ -1,49 +1,59 @@
-# CHANGES — pending delivery `world-view-v1`
+# CHANGES — pending delivery `market-state-websocket-upgrade`
 
-Base commit: `0913746a1c2c5dae3ecb72844ea2ab1c5bab8d19` (GitHub `main` at inspection time).
+Base commit: fresh `main` re-pulled immediately before packaging (after
+`world-view-v1` landed mid-task; confirmed file-disjoint by `diff -rq`
+both ways).
 
 ## What changed
 
-- Added `backend/app/world_view/composite.py` with:
-  - stateless `WorldView.snapshot(symbol: str | None = None)`;
-  - frozen `WorldViewSnapshot` carrying `symbol`, unmodified Market State and Context envelopes, separated Performance Intelligence, and `portfolio`;
-  - four existing aggregate reads executed off-loop with `asyncio.to_thread` and separated by explicit live/backtest selectors.
-- Added `backend/app/world_view/__init__.py` as the package's public import surface.
-- Added thin `GET /intelligence/world-view` with optional `symbol` to the existing intelligence router.
-- Added `backend/tests/test_world_view.py` covering real public source evaluation, `record_strategy_outcome()` writes, live/backtest separation, empty populations, honest missing-symbol envelopes, option-A Portfolio serialization, route calls with/without `symbol`, and exact all-table before/after counts proving World View writes nothing.
-- Updated `docs/architecture/trading-intelligence-architecture.md` §15 from unbuilt intent to the as-built contract and expanded its existing ASCII diagram with external and internal data flow.
-- Updated the World View tree entry in `docs/architecture/system-design.md`.
-- Appended the unnumbered `world-view-v1` implementation entry to `docs/decisions/confirmed-decisions.md`. No real number or `INDEX.md` row was assigned.
-- Replaced repo-root `TESTING.md` with this delivery's exact setup, commands, and results.
+- Upgraded `frontend/src/hooks/useMarketState.ts` from fetch + 5-second
+  poll to WebSocket-primary: subscribes to the `intelligence.market-state`
+  channel via `workspaceSocket`, mirroring `useContextSnapshot.ts`'s
+  decision #126 pattern. Poll (`POLL_INTERVAL_MS`/`setInterval`) removed
+  entirely rather than kept as a fallback — reasoning in the decision-log
+  entry below.
+- Branches on the envelope's `symbol`: the real sentinel `"__MARKET__"`
+  reloads the cross-symbol composite, a matching ticker reloads that
+  symbol's per-symbol scores, anything else is ignored — confirmed
+  directly against `channels.py`/`market_state_engine/engine.py` rather
+  than assumed from `ContextChanged`'s null-based convention.
+- Public return shape (`UseMarketStateResult`) unchanged; zero consumer
+  files (`AIAnalysisPanel.tsx`, `InfoTab.tsx`) edited.
+- Updated `docs/architecture/system-design.md` §10.3's `MarketStateChanged`
+  row (no longer says the hook doesn't consume the channel) and added a
+  new as-built note with two diagrams (cross-component flow; the hook's
+  internal subscribe/branch/unsubscribe flow).
+- Updated `docs/architecture/trading-intelligence-architecture.md` §4's
+  prose and both of its existing diagrams to reflect the current
+  WS-primary design, superseding the now-stale fetch/poll-only versions.
+- Appended the unnumbered `market-state-websocket-upgrade` entry to
+  `docs/decisions/confirmed-decisions.md`. No real number or `INDEX.md`
+  row assigned (nine-way collision on next-available-143 — see that
+  entry for the full list).
+- Replaced repo-root `TESTING.md` and this file with this delivery's own
+  content.
 
-## Confirmed Portfolio choice
+## No backend changes
 
-Saqib selected option A: `portfolio: dict[str, Any] | None` is present now and serializes as `null` until Portfolio State exists. It means unavailable source, not empty portfolio. No Portfolio engine, fake positions, zero buying power, or placeholder data was created.
-
-## Behavior and boundaries
-
-- Market State and Context retain their complete public `get_snapshot(symbol)` envelopes.
-- `symbol` scopes only Market State and Context in v1.
-- Performance is system-wide and all-matching-history, not recent or symbol-scoped.
-- Performance shape is exactly:
-
-  ```text
-  live     → hourly_win_rates + session_expectancy
-  backtest → hourly_win_rates + session_expectancy
-  ```
-
-- `state_snapshot.py` remains the separate two-source capture mechanism for `StrategyOutcome` entry/exit fields.
-- No persistence, migration, write path, cache, scheduler, background task, event subscription, WebSocket channel, startup work, frontend change, or performance SQL was added.
+The `intelligence.market-state` WebSocket channel and its
+`EVENT_TO_CHANNEL` routing entry already existed (temp id
+`market-state-changed-websocket-channel`, already merged) — confirmed by
+direct read of `channels.py` before writing any code. Nothing under
+`backend/` was touched by this delivery.
 
 ## Validation summary
 
-- Untouched-main full baseline: 772 passed, 0 failed, 0 skipped; 75,497 warnings; 790.87s.
-- New World View tests: 4 passed, 0 failed, 0 skipped; 221 warnings; 1.14s.
-- New plus affected tests: 84 passed, 0 failed, 0 skipped; 4,412 warnings; 8.14s.
-- Changed-tree full suite: 775 passed, 1 failed, 0 skipped; 76,449 warnings; 790.60s. The one pre-existing Feature Engine test failed because it received three valid events where it asserts exactly one; it passed immediately in isolation (1 passed, 2,934 warnings, 1.16s). This delivery does not touch that engine/test, and World View tests execute later alphabetically.
+- `npx tsc -b`: clean — only the four known, pre-existing decision #35
+  `GridPresetPicker` errors, confirmed identical against a fresh
+  untouched clone's own baseline run.
+- `npx vite build`: clean, 96 modules transformed, no errors.
+- No frontend hook test file exists in this codebase (confirmed by
+  search) — none added, matching existing practice.
 
-## Related follow-up, not changed
+## Related, not changed
 
-`test_stop_waits_for_an_in_flight_compute_before_returning` uses a wall-clock candle timestamp and asserts exactly one published timeframe. On aggregation boundaries it can receive additional valid timeframe events. Its exact-count assertion should be made deterministic in a separately approved task; this delivery leaves it untouched.
-
-The open decision file is over 136KB and still contains eight unnumbered pending deliveries. Per the task boundary, rollover is deferred until merge-time numbering makes the archive boundary safe.
+`world-view-v1` (landed on `main` mid-task) already flagged
+`confirmed-decisions.md` as well past its ~100KB rollover trigger with
+multiple unnumbered PENDING entries blocking a safe rollover. This
+delivery adds one more such entry and does not attempt the rollover,
+for the same reason already on record.
