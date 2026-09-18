@@ -330,3 +330,21 @@ Downstream, this becomes **Hypothesis Health**: Position Monitor compares realiz
 **Trigger satisfied:** the real IBKR-backed historical replay route made connection ownership and the missing live guard part of one safety boundary; the accessor and `409` were implemented and tested together.
 
 **Where it would plug in:** `backend/app/api/routes/backtest.py`'s `_reject_if_live_data_connected()`, alongside its existing Finnhub/Polygon checks — same shape, one more provider.
+
+---
+
+## 26. Stage 4 of the Feature Engine chart migration — retiring `frontend/src/indicators/{sma,ema,vwap,previousDayLevels,premarketLevels,camarillaPivots,vpoc}.ts`
+
+**What it is:** flagging (per decisions #35/`resample.ts`'s precedent) or eventually deleting the seven frontend indicator files `feature-engine-chart-migration.md` §7 (Stage 4) scoped for retirement, now that Feature Engine computes all seven server-side (Stage 3, decisions #52/#53/#56/#57).
+
+**Why deferred:** investigated directly (temp id `chart-migration-stage-4-flagging`) rather than assumed — all seven still have a real, currently-exercised caller inside `utils/indicators.ts`'s own dispatcher, not a theoretical one. Two distinct, structural reasons, not one:
+1. **SMA/EMA/VWAP (3 files):** the chart lets a person configure any SMA/EMA period (2–500), but Feature Engine only computes the configured defaults (`[9, 20, 50]`/`[9, 20]`) for `1m`/`5m`/`15m`/`1h`. Anything else falls back to `sma.ts`/`ema.ts`/`vwap.ts`, labeled `"(local)"`.
+2. **PDH/PDL/PDC, pre-market H/L, Camarilla, VPOC (4 files):** fall back whenever there's no previous trading day within the configured lookback yet (`previousDayLevels.ts`/`premarketLevels.ts`/`camarillaPivots.ts`/`vpoc.ts`) — a cold-start gap that exists on principle (there is always a first day), not a coverage gap that more backend work closes.
+
+Decisions #54/#58 already said this explicitly when Stage 1 built the fallback ("NOT retired... still the fallback path, still real code something calls") — this entry exists so the next Stage 4 attempt has a concrete trigger to check instead of re-deriving the same finding from scratch, or worse, assuming the migration doc's "worth revisiting soon" framing means the fallback has become vestigial when it hasn't.
+
+**Trigger to revisit, per reason (they resolve independently):**
+- **Reason 1 (SMA/EMA/VWAP):** D4/Stage 5 (`feature-engine-chart-migration.md` §8) gets resolved as **5a** — the backend computes whatever period a chart pane actually requests, not just the fixed default list. Resolved as 5b (uncommon periods stay client-side permanently, by design) means this reason never goes away, and `sma.ts`/`ema.ts`/`vwap.ts` should stay flagged-but-present indefinitely rather than revisited again later.
+- **Reason 2 (the four horizontal-level files):** none. This is structural, not a coverage gap — it will never trigger. Any future attempt to flag these four on "backend coverage" grounds should re-check this entry first rather than re-litigate it.
+
+**Where it would plug in:** `feature-engine-chart-migration.md` §7 (Stage 4) — sub-items 4.1/4.2 unchanged in shape, just re-run against whichever of the two reasons has actually resolved. `sessions.ts` (checked directly as part of this same investigation) has no separate trigger of its own — it tracks reason 2's four files exactly, since `sma.ts`/`ema.ts` don't import it.
