@@ -2,10 +2,23 @@
 FeatureEngine tests, in three tiers:
 
 1. Pure math (indicators.sma) — no DB, no event loop, always runs.
-2. In-memory accumulation through a real EventBus — no DB required, since
-   FeatureEngine only needs a DB read on the very first candle it sees for
-   a never-before-seen symbol, and this tier deliberately stays inside
-   that first candle's warm-up window. Always runs.
+2. In-memory accumulation through a real EventBus — no PRE-EXISTING data
+   required (never depends on candles already sitting in Postgres from an
+   earlier run), since FeatureEngine only needs to backfill FROM persisted
+   history on the very first candle it sees for a never-before-seen
+   symbol, and this tier deliberately stays inside that first candle's
+   warm-up window. Not the same claim as "no DB connection at all",
+   though — found directly while root-causing this file's own flaky
+   cluster entry (temp id `flaky-test-cluster-rootcause`):
+   `_maybe_refresh_daily_levels`'s restart-survival check
+   (`_load_confirmed_daily_levels_for_today`) does one unconditional
+   `asyncio.to_thread` read against Postgres on literally every
+   never-before-seen (symbol, day), independent of whether the test
+   itself cares about Daily Levels at all — a real Postgres outage fails
+   every Tier 2 test too, not just Tier 3. Always runs (i.e. never
+   `@pytest.mark.skipif`'d), same as before this correction; only the
+   "no DB required" framing was ever inaccurate, not the tier boundary
+   itself.
 3. DB-backed cold-start backfill ("restart survival") — run against a REAL
    local Postgres, not mocked, same standard as test_candle_recorder.py
    (confirmed decisions #34, #37, #38). Skipped, not failed, if Postgres
@@ -17,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -57,6 +71,53 @@ def _clean_test_symbol(ticker: str) -> None:
 async def _publish_candle(bus: EventBus, symbol: str, candle_ts: datetime, close: float, timeframe: str = "1m") -> None:
     payload = CandleClosed(timeframe=timeframe, open=close, high=close, low=close, close=close, volume=10, candle_ts=candle_ts)
     await bus.publish(make_envelope(EventType.CANDLE_CLOSED, payload, symbol=symbol))
+
+
+async def _wait_until_candles_persisted(ticker: str, expected_count: int, timeout: float = 5.0) -> None:
+    """
+    Flaky-test-cluster root-cause pass: replaces a fixed `asyncio.sleep`
+    that was guessing how long CandleRecorder's write-behind writer takes
+    to land N rows — a guess that this codebase's own decision log already
+    named as the mechanism behind this file's cold-start test's flakiness.
+    Same shape as test_intelligence_routes.py's helper of the same name,
+    duplicated here (not imported) since that module carries its own
+    unrelated pytestmark/route-test fixtures this file deliberately
+    doesn't depend on (see this file's own module docstring: only Tier 3
+    needs a DB at all).
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    count = 0
+    while asyncio.get_event_loop().time() < deadline:
+        session = SessionLocal()
+        try:
+            count = session.execute(
+                text("SELECT count(*) FROM candles c JOIN symbols s ON s.id = c.symbol_id WHERE s.ticker = :t"),
+                {"t": ticker},
+            ).scalar_one()
+        finally:
+            session.close()
+        if count >= expected_count:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"only {count} of {expected_count} candles persisted for {ticker} within {timeout}s")
+
+
+async def _wait_until(condition, timeout: float = 5.0, interval: float = 0.02, description: str = "condition") -> None:
+    """
+    Generic bounded poll for an in-memory condition (e.g. an event
+    handler's `received` list growing) — same reasoning as
+    _wait_until_candles_persisted above, for the half of this file's
+    cold-start test that isn't a DB read: a fixed sleep guessing how long
+    a background worker's own asyncio.to_thread compute takes is exactly
+    the anti-pattern this pass is removing, not just the DB-facing half
+    of it.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if condition():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError(f"{description} was not met within {timeout}s")
 
 
 # --- Tier 1: pure math ------------------------------------------------------
@@ -675,7 +736,14 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
         try:
             await _publish_candle(bus, ticker, base_ts, 100.0)
             await _publish_candle(bus, ticker, base_ts + timedelta(minutes=1), 102.0)
-            await asyncio.sleep(0.3)  # let the write-behind writer actually land both rows
+            # Bounded, deterministic wait for the actual persisted count —
+            # was `await asyncio.sleep(0.3)` guessing how long the
+            # write-behind writer takes to land both rows. See
+            # _wait_until_candles_persisted's own docstring: this is the
+            # documented "async-timing race in Feature Engine cold-start
+            # backfill" this test exists to guard against, not just a
+            # cosmetic cleanup.
+            await _wait_until_candles_persisted(ticker, expected_count=2)
         finally:
             await recorder.stop()
         # Phase 2: a FRESH FeatureEngine — no in-memory window for this symbol —
@@ -687,7 +755,11 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
 
         try:
             await _publish_candle(bus, ticker, base_ts + timedelta(minutes=2), 104.0)
-            await asyncio.sleep(0.2)
+            # Bounded, deterministic wait for FeatureEngine's own
+            # cold-start backfill compute to finish — was
+            # `await asyncio.sleep(0.2)` guessing at that, the second half
+            # of the same anti-pattern the DB-read wait above replaces.
+            await _wait_until(lambda: len(received) >= 1, description=f"a FeaturesUpdated event for {ticker}")
 
             assert len(received) == 1  # correct on the FIRST event after cold start, no re-warm-up needed
             assert received[0].payload["features"]["sma_3"] == 102.0
@@ -695,6 +767,100 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
             await engine.stop()
     finally:
         await bus.stop()
+        _clean_test_symbol(ticker)
+
+
+@pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
+@pytest.mark.asyncio
+async def test_stop_waits_for_an_in_flight_compute_before_returning():
+    """
+    Flaky-test-cluster root-cause pass, following on from decision #84 —
+    same shape as test_level_interaction_engine.py's own
+    test_stop_waits_for_an_in_flight_persist_before_returning and
+    test_candle_recorder.py's test_stop_waits_for_an_in_flight_write_before_returning.
+    FeatureEngine.stop() shared the exact `task.cancel()` + `await task`
+    pattern decision #84 proved doesn't actually wait for an in-flight
+    asyncio.to_thread call to finish — flagged there as "very likely"
+    present here too, deliberately deferred at the time. This is the
+    concrete mechanism behind this file's own documented "async-timing
+    race in Feature Engine cold-start backfill": an orphaned to_thread
+    compute surviving past a supposedly-clean stop() contends for the same
+    process-wide default ThreadPoolExecutor and Postgres connection pool
+    as whatever runs immediately afterward (a fresh engine's own
+    cold-start backfill read, in the wild).
+
+    _compute_one is wrapped with an artificial delay so a compute is
+    GUARANTEED to still be running in the executor thread at the exact
+    moment stop() is called — no sleep between enqueue and stop.
+
+    Two things prove the fix:
+    - stop() itself must take at least as long as (most of) the
+      artificial delay.
+    - A FeaturesUpdated event for the queued item must still show up
+      (proving the compute genuinely ran to completion and published,
+      not that it was silently abandoned mid-flight).
+    """
+    ticker = "__TEST_FE_STOPRACE__"
+    _clean_test_symbol(ticker)
+    bus = EventBus()
+    await bus.start()
+    # sma_periods=[1] deliberately, unlike the cold-start test above: this
+    # test feeds exactly one candle with no persisted history to backfill
+    # from, so a period this loop can actually warm up on the first candle
+    # is what makes _compute_one produce a publishable result at all — the
+    # specific feature/value isn't what this test is proving.
+    engine = FeatureEngine(bus, sma_periods=[1], ema_periods=[])
+
+    delay_seconds = 0.3
+    original_compute_one = engine._compute_one
+
+    def _slow_compute_one(*args, **kwargs):
+        time.sleep(delay_seconds)  # runs inside the executor thread — a real blocking delay, not a mock
+        return original_compute_one(*args, **kwargs)
+
+    engine._compute_one = _slow_compute_one  # type: ignore[method-assign]
+    engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
+
+    try:
+        candle_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=1)
+        # Fed straight onto the engine's own queue — same shape
+        # _on_candle_closed itself would have produced — for the same
+        # reason the other two stop-race tests document: publishing
+        # through the Bus and immediately calling stop() risks the
+        # sentinel reaching this engine's queue ahead of the real item.
+        engine._queue.put_nowait(
+            {
+                "symbol": ticker, "timeframe": "1m", "open": 100.0, "high": 100.0,
+                "low": 100.0, "close": 100.0, "volume": 10, "candle_ts": candle_ts,
+            }
+        )
+        # Give the worker task a real chance to dequeue the item and get
+        # asyncio.to_thread's executor submission actually running (into
+        # the artificial 0.3s sleep) before stop() is called.
+        await asyncio.sleep(0.05)
+
+        t0 = time.monotonic()
+        await engine.stop()  # nothing queued after this — the one item is still mid-compute
+        elapsed = time.monotonic() - t0
+
+        assert elapsed >= 0.15, (
+            f"stop() returned after {elapsed:.3f}s — expected it to block for close to the "
+            f"remaining {delay_seconds}s artificial compute delay; it isn't actually waiting "
+            "for in-flight work anymore"
+        )
+        # engine.stop() only guarantees the WORKER finished (computed and
+        # called bus.publish()) — the Bus's own separate _consume() task
+        # still needs its own turn on the event loop to actually dispatch
+        # to our subscriber, same bus/engine decoupling documented in
+        # test_intelligence_routes.py's _wait_until_published(). A short
+        # bounded wait here, not a claim that stop() itself is insufficient.
+        await _wait_until(lambda: len(received) >= 1, timeout=1.0, description="the queued item's FeaturesUpdated event")
+        assert len(received) == 1  # the compute genuinely ran to completion and published, not abandoned mid-flight
+    finally:
+        await bus.stop()
+        _clean_test_symbol(ticker)
         _clean_test_symbol(ticker)
 
 
@@ -987,7 +1153,20 @@ async def test_vwap_publishes_even_while_sma_is_still_warming_up():
 
     try:
         await _publish_candle(bus, "__TEST_FE_VWAP_WARMUP__", _et(2026, 8, 11, 9, 30), 100.0)
-        await asyncio.sleep(0.1)
+        # Bounded, deterministic wait — was `await asyncio.sleep(0.1)`.
+        # This test's module-docstring tier ("no DB required") undersells
+        # what actually happens on the wire: _maybe_refresh_daily_levels
+        # does an UNCONDITIONAL asyncio.to_thread DB round trip
+        # (_load_confirmed_daily_levels_for_today) on the first candle for
+        # any never-before-seen (symbol, day) — this test's symbol
+        # included — before _compute_one ever runs. A fixed 0.1s sleep is
+        # the tightest margin of any test in this file against a real,
+        # variable-latency DB call plus the executor-thread contention the
+        # flaky-test-cluster root-cause pass's stop() fix (see
+        # CandleRecorder.stop()/FeatureEngine.stop()) addresses — almost
+        # certainly why this was "the most consistently-failing of the
+        # four" named in the flaky cluster.
+        await _wait_until(lambda: len(received) >= 1, description="a FeaturesUpdated event for the VWAP warm-up candle")
 
         assert len(received) == 1  # published on VWAP alone
         features = received[0].payload["features"]

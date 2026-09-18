@@ -1,39 +1,58 @@
-# TESTING — pending decision (temp id: `real-market-data-backtest-attempt`) — first attempted real-market-data BacktestRunner execution, blocked by environment
+# TESTING — pending decision (temp id: `flaky-test-cluster-rootcause`) — Root-caused the #119 flaky test cluster
 
-Docs-only delivery — no `backend/` or `frontend/` files touched, so no `pytest` run or `npx tsc -b`/`npx vite build` applies. What follows is the verification trail for the empirical claims this delivery's docs make, since the entire value of this delivery is that those claims are real, not asserted.
+Backend-only delivery. `docs/` and this file/`CHANGES.md` are the only other changes. No frontend files touched, so no `npx tsc -b`/`npx vite build` run applies.
 
-## Pre-work
+## Required reading done, in order
 
-- Fresh `git clone --depth 1` at task start: `4f5f32b8444fbd5e384a604f8ea8add5740b60a9`.
-- Read, in order: this task's own prompt (hard boundary, decision-number rule); `docs/decisions/INDEX.md`'s tail and `docs/decisions/confirmed-decisions.md`'s tail in full (found a **six-way** collision on next-available-143, not the two-way the task's own framing described — corrected explicitly, not silently); D4's row in `docs/architecture/strategy-engine-open-decisions.md`; `docs/api/routes/backtest.py`, `backend/app/backtest_runner/runner.py`, `docs/architecture/backtest-runner-design.md` in full.
-- `backend/.env.example` read directly to confirm what real-data configuration exists and what's actually required (`IBKR_HOST`/`IBKR_PORT`/`IBKR_BACKTEST_CLIENT_ID`, `FINNHUB_API_KEY`, `POLYGON_API_KEY` — none set).
+`docs/decisions/README.md`; `docs/decisions/INDEX.md`'s last several rows; decision #119 in full (`docs/decisions/archive/107-121.md`) as the rigorous prior run-down of this exact cluster; decision #84 in full (`docs/decisions/archive/080-090.md`) — turned out to be the single most important piece of required reading, since it's where this delivery's actual root cause was already half-diagnosed; `backend/app/feature_engine/engine.py` and `backend/app/services/candle_recorder.py` in full; `backend/app/trading_intelligence/level_interaction_engine.py` in full, as the sibling engine decision #84 already fixed; `backend/tests/conftest.py`; all four named tests' own source in full; `test_intelligence_routes.py`'s `_wait_until_published`/`_wait_until_candles_persisted` helpers as the bounded-wait precedent this task's own prompt pointed to.
 
-## Environment build (real, not simulated)
+## Per-test summary (as the task asked)
 
-- `apt-get install postgresql postgresql-contrib` — PostgreSQL 16 installed natively; the repo's own `docker-compose.yml` Postgres image was not used since no container registry is reachable from this sandbox's network allowlist.
-- `pg_ctlcluster 16 main start`; `CREATE USER trading WITH PASSWORD 'trading' SUPERUSER`; `CREATE DATABASE trading_workspace OWNER trading` — exact convention from `ways-of-working.md`.
-- Python venv, `pip install -r backend/requirements.txt` — clean install, no errors, no version conflicts.
-- `backend/.env` copied from `.env.example`, `IBKR_BACKTEST_CLIENT_ID=2` set (required, no default per that file's own comment).
-- `alembic upgrade head` — clean run, `0001` through `0010`, zero errors. Confirms this session's schema matches decisions #140/#141's real current head, not an older or divergent one.
-- Direct query confirmed pre-attempt state: `strategy_outcomes` 0, `backtests` 0, `candles` 0 (`symbols` had 6 rows, from the scanner-universe seed migration only — unrelated to backtesting).
-- `uvicorn app.main:app` started as a real detached process (`setsid`, to survive across tool calls) against this real database. Startup log confirmed: `FINNHUB_API_KEY not set`, `POLYGON_API_KEY not set` — no live auto-connect attempted.
+| Test | Root cause found | Fixed? | How |
+|---|---|---|---|
+| `test_feature_engine_backfills_from_persisted_history_on_cold_start` | Two fixed `asyncio.sleep()` calls guessing at (a) CandleRecorder's write-behind writer landing 2 rows, (b) FeatureEngine's cold-start backfill compute finishing — both genuinely variable-latency, worsened by the shutdown-race bug below leaking cross-test contention into the shared thread pool. | **Yes** | Both sleeps replaced with bounded, deterministic polls (DB row count; `received`-list length). Root engine-level bug (below) also fixed. |
+| `test_vwap_publishes_even_while_sma_is_still_warming_up` ("most consistently-failing") | Its own `asyncio.sleep(0.1)` — the tightest margin of any test in the cluster — raced an *undocumented*, unconditional `asyncio.to_thread` DB round trip in `_maybe_refresh_daily_levels`'s restart-survival check, which fires on every never-before-seen symbol regardless of whether Daily Levels is relevant to the test at all. | **Yes** | Sleep replaced with the same bounded `received`-list poll. Module docstring's stale "no DB required" claim for this test's tier corrected in place. |
+| `test_daily_levels_carry_level_interaction_once_touched` | Traced (via decision #84's own corroborating analysis, confirmed still applicable) to a real shutdown-race bug: `CandleRecorder.stop()`/`FeatureEngine.stop()` used a `task.cancel()` + `await task` pattern that returns before in-flight `asyncio.to_thread` work actually finishes, letting orphaned background work from one test's engines contend for the shared default `ThreadPoolExecutor`/Postgres pool with a later test's own. Decision #84 already fixed the identical bug in the third engine (`LevelInteractionEngine.stop()`) and explicitly flagged these two as "very likely" carrying it too — deferred at the time, never done. | **Yes, at the engine level** | `CandleRecorder.stop()`/`FeatureEngine.stop()` fixed with the same poison-pill drain #84 already proved. **No change to this test's own body** — it already used bounded polling, not a fixed sleep; there was no test-code anti-pattern to fix. |
+| `test_intelligence_routes.py::test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction` | Same shared root cause as the row above — same file, same real app lifespan, same engines. | **Yes, at the engine level** | Same engine-level fix. **No change to this test's own body**, same reasoning as above. |
 
-## The attempt itself
+## Root cause, in one paragraph
 
-- `GET /finnhub/status`, `GET /market-data/status`, `GET /broker/status` — all three confirmed `connected: false` immediately before the real call, so decision #132's live-data guard would not block it for the wrong reason.
-- `POST /backtest/run/ibkr?strategy_name=ORB&symbol=AAPL&start=2026-09-15T13:30:00+00:00&end=2026-09-15T15:30:00+00:00` — a real 2-hour window inside the 24-hour cap, a real recent trading day.
-- Response: `HTTP 503`, `{"detail":{"code":"ibkr_connection_unavailable","message":"Could not connect to IB Gateway/TWS at 127.0.0.1:4002: [Errno 111] Connection refused"}}` — captured verbatim, not paraphrased, in `backtest-runner-design.md`'s new as-built note.
-- Direct TCP check independent of the app: `/dev/tcp/127.0.0.1/4002` — `Connection refused`, confirming the failure is a genuinely unreachable Gateway, not an application-level misconfiguration.
+Decision #84 diagnosed and fixed a genuine bug: `task.cancel()` on an asyncio Task that's suspended awaiting `asyncio.to_thread(...)` returns almost immediately, regardless of whether the real OS thread underneath (actually running inside the executor) has finished — so `await task` after cancelling doesn't actually wait for the real work. That entry fixed it for `LevelInteractionEngine.stop()` via a poison-pill drain (enqueue a sentinel instead of cancelling, let the FIFO queue guarantee everything ahead of it finishes first) and explicitly flagged `CandleRecorder.stop()`/`FeatureEngine.stop()` as "very likely" carrying the identical bug — deliberately deferred at the time as follow-up work. Direct inspection confirmed that follow-up was never done, ~60 decisions later. This delivery applies the same, already-proven fix to both.
 
-## Ruling out alternatives, not assuming them unavailable
+## Verification performed
 
-- `curl -D - https://api.polygon.io/...` and `https://finnhub.io` — both `403`, `x-deny-reason: host_not_allowed`, confirming this sandbox's network egress allowlist has no market-data-provider domain in it (checked against the actual configured allowlist, not inferred from a prior belief).
-- `SELECT count(*) FROM candles WHERE ...` — confirmed 0 real live-recorded candles exist anywhere in this database to substitute as a "real data" source instead.
-- Grepped `backend/app/api/routes/` for any route other than `POST /backtest/run/ibkr` that constructs a `BacktestRunner` from a non-fixture provider — none exists.
+1. **Standalone reproduction**, before touching any app code, mirroring decision #84's own verification method: a worker loop wrapping a real blocking call in `asyncio.to_thread`, cancelled mid-flight, returns in ~0ms while the real work keeps running detached from the caller — versus a poison-pill drain, which genuinely blocks until the real work finishes. Confirmed the mechanism in isolation first.
+2. **Two new deterministic regression tests**, mirroring decision #84's own `test_stop_waits_for_an_in_flight_persist_before_returning`:
+   - `test_candle_recorder.py::test_stop_waits_for_an_in_flight_write_before_returning`
+   - `test_feature_engine.py::test_stop_waits_for_an_in_flight_compute_before_returning`
 
-## Post-attempt verification
+   Each wraps the real thread-offloaded method with an artificial 0.3s delay, feeds one item directly onto the engine's own queue, then asserts `stop()` blocks for close to that delay AND that the work genuinely completed (no `ForeignKeyViolation` on an immediate `DELETE`; a real published event). **Verified in both directions**, not just that they pass: each `stop()` was temporarily reverted to the old cancel-based pattern and its new test re-run 3x — deterministic failure every time (~0.00004s elapsed vs. an expected ~0.15s+ floor). Restored the fix and re-confirmed 3/3 passes. This is the strongest evidence in this delivery: not "the fix looks right" but "the exact bug this fix targets is provably present in the old code and provably gone in the new code."
+3. **All four originally-named tests** run individually and together — pass.
+4. **10 repeated fresh-DB runs** of `test_feature_engine.py` + `test_intelligence_routes.py` + `test_candle_recorder.py` + `test_level_interaction_engine.py` together (133 tests): 0 failures across all 10.
+5. **3 full-suite runs before the fix** (untouched tree): 770/770/770 passed, 0 failed each, ~13 min each.
+6. **3 full-suite runs after the fix**: 772/772/772 passed (770 + 2 new tests), 0 failed each, ~13 min each.
+7. Real Postgres 16 throughout, DB schema dropped and recreated (`alembic upgrade head` from scratch) between every run in steps 4–6, per this project's own established practice.
 
-- Table counts re-checked after the failed attempt: `strategy_outcomes` 0, `backtests` 0 — unchanged, confirming the failed call left no partial or misleading row (matches `backtest.py`'s own documented behavior: acquisition failure precedes `BacktestRunRecord` creation).
-- `diff -rq` against a freshly re-pulled, untouched second clone (immediately before writing any doc) confirmed zero drift on `main` since task start — same commit both times, ruling out a parallel-session collision risk.
-- Backend process stopped (`pkill`) before packaging; the local Postgres instance and its data are local to this sandboxed session only and are not part of this delivery's footprint.
-- `diff -rq` against a third freshly re-pulled clone, immediately before packaging: confirms the only files touched anywhere in the repo are `docs/architecture/backtest-runner-design.md`, `docs/architecture/strategy-engine-open-decisions.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, plus this file and `CHANGES.md` — explicitly including zero changes under `backend/app/feature_engine/`, `backend/app/trading_intelligence/level_interaction_engine.py`, `backend/app/market_state_engine/`, and their five named test files (this task's own hard boundary), and zero changes anywhere else under `backend/` or `frontend/`.
+## What this delivery could NOT show — stated honestly
+
+**Never caught the cluster actually failing in this sandbox, before or after the fix.** Both pre-change baseline runs and all 10 targeted repeated runs came back clean. This matches the cluster's own long-documented "0–3 failures depending on run" intermittency (decisions #131, #132, #135, #136 all report the same test suite passing clean on some runs and failing on others) — it is not evidence the root cause is wrong, but it does mean this delivery cannot claim "N failures before, 0 after" from a live catch. The evidence this fix rests on instead: the standalone mechanism reproduction, the two new regression tests' deterministic (not probabilistic) fail-then-pass verification, and decision #84's own prior corroborating analysis of the identical bug in a sibling engine. If a future session's own full-suite run does catch one of these four failing again after this fix, that would be a genuine surprise worth investigating fresh — not dismissed as "the known cluster."
+
+## Unrelated sandbox observation — not this delivery's bug
+
+Postgres stopped unexpectedly once mid-session (its own log shows an explicit "received fast shutdown request", not a crash — cause not identified). Matches decision #131's own already-documented finding of Postgres instability in a memory-constrained sandbox container. Restarted cleanly; no data implications; not investigated further as genuinely out of this task's scope. Mentioned here only so a future session doesn't waste time re-diagnosing it as new.
+
+## Footprint
+
+Confirmed by `diff -rq` against a freshly re-pulled untouched clone, taken immediately before packaging (after this delivery's own four files were rebased onto the six parallel deliveries that landed on `main` mid-session — confirmed zero overlap, all frontend/docs/`backend/app/backtest_runner`-scoped):
+
+- `backend/app/services/candle_recorder.py`
+- `backend/app/feature_engine/engine.py`
+- `backend/tests/test_candle_recorder.py`
+- `backend/tests/test_feature_engine.py`
+- `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, this file, `CHANGES.md`
+
+Nothing under `backend/app/backtest_runner/`, `backend/app/api/routes/backtest.py`, `backend/app/api/websocket/channels.py`, `backend/app/api/routes/broker.py`, `finnhub_data.py`, `market_data.py`, or any frontend file touched — per this task's own explicit boundary list.
+
+## Manual merge notes for parallel-session file conflicts
+
+None expected. This delivery's four backend files (`candle_recorder.py`, `feature_engine/engine.py`, `test_candle_recorder.py`, `test_feature_engine.py`) were not touched by any of the six parallel deliveries that landed during this task's session — confirmed by `diff -rq` and by each of those deliveries' own footprint statements. `docs/decisions/confirmed-decisions.md`/`INDEX.md` are append-only from this delivery's side (one new entry, one new row) — if another session's own entry lands between this delivery's packaging and merge, append after theirs, not in place of anything here, same as this delivery's own `INDEX.md` row already had to do relative to the six PENDING entries ahead of it. `CHANGES.md`/`TESTING.md` are, per this project's own established pattern, wholesale-replaced by whichever delivery merges next — nothing to hand-merge there by design.

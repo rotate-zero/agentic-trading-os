@@ -218,6 +218,14 @@ _ONE_MINUTE = timedelta(minutes=1)
 # than help it — easy to widen later if that default turns out wrong).
 _EXTENDED_HOURS_LABELS = {Session.PRE_MARKET, Session.OPEN, Session.LUNCH, Session.POWER_HOUR}
 
+# Poison-pill used by stop() to drive a graceful worker-loop exit instead of
+# cancelling the task outright — see stop()'s own docstring (flaky-test-
+# cluster root-cause pass, following on from confirmed decision #84) for the
+# real shutdown race this replaces. A private object identity, never a plain
+# value, so it can never collide with a real CandleClosed-derived queue item
+# (always a dict).
+_STOP_SENTINEL = object()
+
 
 class FeatureEngine:
     def __init__(
@@ -337,7 +345,7 @@ class FeatureEngine:
         self._rvol_lookback_days = get_settings().feature_engine_rvol_lookback_days
         self._premarket_lookback_days = get_settings().feature_engine_premarket_lookback_days
 
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()  # object half is _STOP_SENTINEL only
         self._worker_task: asyncio.Task | None = None
 
         # Per-(symbol, timeframe) rolling state — see module docstring.
@@ -456,11 +464,49 @@ class FeatureEngine:
         )
 
     async def stop(self) -> None:
-        """Awaits actual task completion, not just schedules cancellation
-        — see CandleRecorder.stop()'s docstring for the real bug this
-        fixes (confirmed decision #47)."""
+        """
+        Confirmed decision #47 gave this a `task.cancel()` + `await task`
+        pattern — an improvement over a bare `.cancel()`, but decision #84
+        later proved, for the sibling `LevelInteractionEngine`, that this
+        still isn't a genuine wait: the Task here is suspended awaiting the
+        plain `asyncio.Future` that `asyncio.to_thread` hands back (used
+        below for `_compute_one`, and inside `_maybe_refresh_daily_levels`/
+        `_maybe_refresh_premarket_baseline`'s own DB calls). `Future.cancel()`
+        on that object transitions it to CANCELLED synchronously regardless
+        of whether the real OS thread underneath has finished — `await
+        task` then returns almost immediately while the DB read/compute
+        keeps running to completion on its own, fully detached from
+        anything this method's caller can see or wait on. Decision #84
+        flagged this exact file (alongside CandleRecorder) as "very likely"
+        carrying the identical latent bug, deliberately deferred at the
+        time; re-confirmed present by direct inspection and a standalone
+        repro (mirroring #84's own verification method) during the flaky-
+        test-cluster root-cause pass this fixes it in.
+
+        This is the specific mechanism behind this engine's own documented
+        "async-timing race in cold-start backfill": a fresh process (or a
+        fresh test's own fresh `FeatureEngine`) reads persisted history via
+        `candle_store.get_recent_closes` expecting an EARLIER engine
+        instance's writes (via CandleRecorder) or its own prior candle's
+        `_maybe_refresh_daily_levels` DB round trip to have genuinely
+        finished — an orphaned `to_thread` call surviving past a supposedly
+        completed `stop()` is exactly what can still be running, and
+        contending for the same process-wide default `ThreadPoolExecutor`
+        and Postgres connection pool, when that read happens.
+
+        Fixed the same way #84 fixed it for `LevelInteractionEngine` and
+        this same pass fixed it for `CandleRecorder`: a poison-pill drain,
+        not cancellation. `stop()` no longer calls `.cancel()` — it enqueues
+        `_STOP_SENTINEL` onto the SAME queue `_worker_loop` already reads,
+        then awaits the worker task with nothing cancelled. Because the
+        queue is FIFO, the sentinel is only dequeued after every item
+        genuinely ahead of it — including one already mid-`to_thread` —
+        has fully finished. No timeout-then-cancel fallback, on purpose,
+        same trade-off #84 already made explicit: correctness over
+        shutdown latency for a background DB-reading/writing worker.
+        """
         if self._worker_task is not None and not self._worker_task.done():
-            self._worker_task.cancel()
+            await self._queue.put(_STOP_SENTINEL)
             try:
                 await self._worker_task
             except asyncio.CancelledError:
@@ -516,6 +562,14 @@ class FeatureEngine:
         try:
             while True:
                 item = await self._queue.get()
+                if item is _STOP_SENTINEL:
+                    # Graceful stop() request — not a real CandleClosed-
+                    # derived payload, nothing to process. Everything
+                    # queued AHEAD of this has already been fully
+                    # processed by the time we see it, since this is a
+                    # plain FIFO queue.
+                    self._queue.task_done()
+                    break
                 try:
                     await self._maybe_refresh_daily_levels(item)
                     await self._maybe_refresh_premarket_baseline(item)

@@ -68,12 +68,20 @@ from app.schemas.events.envelope import EventEnvelope, EventType
 
 logger = logging.getLogger(__name__)
 
+# Poison-pill used by stop() to drive a graceful writer-loop exit instead of
+# cancelling the task outright — see stop()'s own docstring (flaky-test-
+# cluster root-cause pass, following on from confirmed decision #84) for the
+# real shutdown race this replaces. A private object identity, never a plain
+# value, so it can never collide with a real CandleClosed-derived queue item
+# (always a dict).
+_STOP_SENTINEL = object()
+
 
 class CandleRecorder:
     def __init__(self, bus: EventBus, session_factory: type[Session] | None = None) -> None:
         self._bus = bus
         self._session_factory = session_factory or SessionLocal
-        self._queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()  # object half is _STOP_SENTINEL only
         self._writer_task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -83,20 +91,47 @@ class CandleRecorder:
 
     async def stop(self) -> None:
         """
-        Confirmed decision #47 — this used to be `task.cancel()` with
-        nothing awaiting it, which only SCHEDULES cancellation; it doesn't
-        block until the task has actually unwound. Found via a real,
-        reproducible bug, not by inspection: a cancelled task blocked
-        inside `asyncio.to_thread(...)` (this writer's DB call) can't be
-        interrupted until that thread finishes — so `stop()` could return,
-        and a caller could reasonably believe shutdown was complete, while
-        a write was still in flight and landed afterward. That's exactly
-        what corrupted a test's cleanup (a stray write racing a DELETE,
-        producing a foreign-key violation) — a real symptom of the same
-        risk existing in production shutdown, not a test-only artifact.
+        Confirmed decision #47 first replaced a bare `task.cancel()` (which
+        only SCHEDULES cancellation) with `task.cancel()` + `await task` —
+        an improvement, but decision #84 later proved, for the sibling
+        `LevelInteractionEngine`, that this still ISN'T a genuine wait: the
+        Task here is suspended awaiting the plain `asyncio.Future` that
+        `asyncio.to_thread` (`loop.run_in_executor` internally) hands back.
+        `Future.cancel()` on THAT object transitions it to CANCELLED
+        synchronously, regardless of whether the real OS thread underneath
+        it — the one actually running `_write_one`, including its own
+        blocking DB commit — has finished. `await task` then returns
+        almost immediately, while the write keeps running to completion on
+        its own, fully detached from anything this method's caller can see
+        or wait on. Decision #84 flagged this exact file as "very likely"
+        carrying the identical latent bug, deliberately deferred at the
+        time; re-confirmed present by direct inspection and a standalone
+        repro (mirroring #84's own verification method) during the flaky-
+        test-cluster root-cause pass this fixes it in.
+
+        For an engine whose thread-pool work WRITES rows keyed on
+        `symbol_id`, an orphaned write surviving past `stop()`'s return is
+        exactly what can race a caller's own post-`stop()` cleanup (e.g. a
+        test's `DELETE FROM symbols`) into a real, intermittent
+        ForeignKeyViolation — and, more importantly for the flaky cluster,
+        can leave a write for a symbol's history still landing on Postgres
+        AFTER a supposedly-clean shutdown, exactly the shape of race a
+        cold-start backfill immediately afterward (in a fresh process, or a
+        fresh test) can lose to.
+
+        Fixed the same way #84 fixed it for `LevelInteractionEngine`: a
+        poison-pill drain, not cancellation. `stop()` no longer calls
+        `.cancel()` at all — it enqueues `_STOP_SENTINEL` onto the SAME
+        queue `_writer_loop` already reads, then awaits the writer task
+        with nothing cancelled. Because the queue is FIFO, the sentinel is
+        only ever dequeued after every item genuinely ahead of it —
+        including one already running inside `to_thread` — has fully
+        finished. No timeout-then-cancel fallback, on purpose, same
+        trade-off #84 already made explicit: correctness over shutdown
+        latency for a background DB writer.
         """
         if self._writer_task is not None and not self._writer_task.done():
-            self._writer_task.cancel()
+            await self._queue.put(_STOP_SENTINEL)
             try:
                 await self._writer_task
             except asyncio.CancelledError:
@@ -116,6 +151,13 @@ class CandleRecorder:
         try:
             while True:
                 item = await self._queue.get()
+                if item is _STOP_SENTINEL:
+                    # Graceful stop() request — not a real CandleClosed
+                    # payload, nothing to persist. Everything queued AHEAD
+                    # of this has already been fully written by the time
+                    # we see it, since this is a plain FIFO queue.
+                    self._queue.task_done()
+                    break
                 try:
                     await asyncio.to_thread(self._write_one, item)
                 except Exception:  # noqa: BLE001 — one bad/unreachable-DB write must not kill the recorder or the app
