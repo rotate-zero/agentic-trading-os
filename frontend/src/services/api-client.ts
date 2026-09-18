@@ -944,6 +944,109 @@ export async function triggerBacktest(
 }
 
 // ---------------------------------------------------------------------------
+// POST /backtest/run/ibkr (temp id: backtest-panel-ibkr-real-data-option) —
+// the real-historical-data sibling to POST /backtest/run above. Confirmed
+// directly against backend/app/api/routes/backtest.py's run_ibkr_backtest():
+// same POST-with-query-params convention (strategy_name/symbol/start/end,
+// no JSON body), and dataclasses.asdict(await runner.run()) on the exact
+// same BacktestRunner/BacktestRunResult as the fixture route — so
+// BacktestRunResultWireShape above is reused verbatim, not redeclared.
+//
+// The one real difference this file has to account for: every error this
+// route can raise beyond the plain-string 409 (decision #132's live-data
+// guard, unchanged) comes back as `detail: {code, message}` — the first
+// object-shaped `detail` anywhere in this codebase (confirmed by reading
+// backtest.py's _validate_ibkr_range/_ibkr_backtest_client_id and
+// ibkr_historical.py's full IBKRHistoricalAcquisitionError hierarchy
+// directly, not assumed). The shared parseErrorDetail()/ApiError above stay
+// completely untouched — every existing caller's contract (`detail` is
+// always a plain string today) keeps holding. This block is purely
+// additive: a dedicated error class that preserves `code` alongside the
+// message, and a dedicated parser only this wrapper calls.
+
+/**
+ * IbkrBacktestError extends ApiError so every existing `instanceof
+ * ApiError` check anywhere in this codebase still catches it, while adding
+ * the one extra field this route's errors carry that no other route's do:
+ * the backend's own stable machine-readable `code` (e.g.
+ * "ibkr_historical_timeout"), or `null` when the response was the plain-
+ * string 409 shape (live-data guard) or an unrecognized/unparseable body —
+ * BacktestPanel.tsx's classifier falls back safely on `null` rather than
+ * assuming a code is always present.
+ */
+export class IbkrBacktestError extends ApiError {
+  constructor(
+    message: string,
+    status: number,
+    public readonly code: string | null,
+  ) {
+    super(message, status);
+    this.name = "IbkrBacktestError";
+  }
+}
+
+/**
+ * Reads `detail` once and returns both fields it might carry. Handles all
+ * three real shapes this route can return: a plain string (409, decision
+ * #132's unchanged live-data guard), `{code, message}` (422/503/400/502/504
+ * — every case in backtest.py's _validate_ibkr_range/
+ * _ibkr_backtest_client_id and ibkr_historical.py's IBKRHistoricalAcquisitionError
+ * subclasses), and — defensively — anything else (network failure before a
+ * body exists, a future backend change), which falls back to
+ * `res.statusText` with `code: null` rather than surfacing a raw object.
+ * Never returns anything but a plain string message; BacktestPanel.tsx
+ * never has a stack trace or a raw response object to accidentally render.
+ */
+async function parseIbkrErrorDetail(res: Response): Promise<{ message: string; code: string | null }> {
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    const detail = body.detail;
+    if (typeof detail === "string") {
+      return { message: detail, code: null };
+    }
+    if (detail && typeof detail === "object" && typeof (detail as { message?: unknown }).message === "string") {
+      const code = (detail as { code?: unknown }).code;
+      return { message: (detail as { message: string }).message, code: typeof code === "string" ? code : null };
+    }
+    return { message: res.statusText, code: null };
+  } catch {
+    return { message: res.statusText, code: null };
+  }
+}
+
+/**
+ * POST /backtest/run/ibkr — acquires real IBKR historical OHLCV first,
+ * disconnects the isolated acquisition adapter, then replays synchronously.
+ * `start`/`end` must already be timezone-aware UTC ISO-8601 strings (see
+ * BacktestPanel.tsx's Eastern-time conversion — this wrapper does no time
+ * interpretation of its own, matching `symbol`/`strategyName` above passing
+ * through as-is with no client-side reshaping).
+ *
+ * **Genuinely long-running, not a fast request.** Per this route's own
+ * docstring: roughly one real second per primary candle — about 6.5 minutes
+ * for a regular session, up to about 16 minutes for a full 04:00-20:00
+ * extended session. This is 4-6x triggerBacktest()'s own ~120-140s, which
+ * is exactly why useIbkrBacktestRun.ts is a separate hook rather than a
+ * mode branch inside useBacktestRun.ts — see that hook's own docstring.
+ */
+export async function triggerIbkrBacktest(
+  strategyName: string,
+  symbol: string,
+  start: string,
+  end: string,
+): Promise<BacktestRunResultWireShape> {
+  const url =
+    `${API_BASE_URL}/backtest/run/ibkr?strategy_name=${encodeURIComponent(strategyName)}` +
+    `&symbol=${encodeURIComponent(symbol)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    const { message, code } = await parseIbkrErrorDetail(res);
+    throw new IbkrBacktestError(message, res.status, code);
+  }
+  return (await res.json()) as BacktestRunResultWireShape;
+}
+
+// ---------------------------------------------------------------------------
 // Data Feed Status (Finnhub / Polygon) — read-only visibility into the two
 // providers `app/main.py`'s lifespan auto-connects on startup if their API
 // keys are configured (soft-fail on a missing key or a real connect error —

@@ -149,7 +149,7 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 
 `performance_queries.py`'s `_common_filters()` (decision #122) already enforced this exact discipline for the two `GROUP BY` queries next to this route; decision #130 brings `/strategy-outcomes` in line with it via the equivalent single predicate, since this route's raw-row shape doesn't share `_common_filters()`'s `GROUP BY`-oriented signature. `backtest_run_id` is additive-only — it always requires `is_backtest=true` alongside it (a live row never carries one), enforced as a 400, not a silently-empty result.
 
-**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #130) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response.
+**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #130) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response. *(Correction, temp id `backtest-panel-ibkr-real-data-option` — this panel is no longer fixture-scenario-only; see this section's own as-built note at the end for the added "Real IBKR data" mode.)*
 
 ```
 BacktestPanel.tsx (form: strategy_name / scenario / symbol)
@@ -565,5 +565,96 @@ This is exactly the gap `ibkr_adapter.py`'s own module docstring and decision #1
 *Checked and ruled out as alternatives, not just assumed unavailable:* direct `curl` to `https://api.polygon.io` and `https://finnhub.io` both returned `403` with `x-deny-reason: host_not_allowed` — this sandbox's network allowlist has no market-data-provider domains in it (confirmed against the actual configured allowlist, not inferred). Moot regardless: neither `FINNHUB_API_KEY` nor `POLYGON_API_KEY` is set, and — more fundamentally — no existing code path replays a `BacktestRunner` run through either provider; `POST /backtest/run/ibkr` is the only real-market-data replay route this codebase has. Building one would be new scope, not something this task's own "use what already exists" instruction covers.
 
 *Conclusion, stated plainly:* this environment cannot currently produce a real-market-data `BacktestRunner` execution. Nothing was worked around to manufacture rows — `strategy_outcomes`/`backtests` are exactly as empty now as before this attempt, and D4's readiness check still finds zero. Real resolution needs one of: (a) this sandbox given network access to a market-data provider's domain plus a real API key, which by itself still wouldn't produce IBKR data specifically and would need a new non-IBKR replay route built first; (b) `POST /backtest/run/ibkr` run from an environment with a real, reachable IB Gateway/TWS session (Saqib's own machine, per `ibkr_adapter.py`'s own standing caveat) — the fastest path to literally what was asked for, using code that already exists and already works, just never against a reachable Gateway; or (c) accepting a fixture-based real-`trading_workspace`-DB run instead, which is real persistence but not real market data, and wasn't what was asked for here. No code changed as part of this note — decision purely deferred to Saqib.
+
+**As-built note (temp id `backtest-panel-ibkr-real-data-option`) — `BacktestPanel.tsx` stops being fixture-scenario-only.** The as-built note above this section's earlier `POST /backtest/run` diagram (frontend delivery, decision #130) described the only trigger UI that existed at the time — see the correction inline at that note. `POST /backtest/run/ibkr` (previous as-built note, this section) has been reachable from the backend since its own delivery but, until now, only by hand-constructing an HTTP request, the same gap decision #130's own delivery closed for the fixture route. This delivery adds a second mode to the same panel rather than a second panel, confirming directly against `runner.py` (not assumed) that both routes return `dataclasses.asdict()` of the identical `BacktestRunResult` — so the existing `ResultsView` renders either mode's result unchanged.
+
+```
+BacktestPanel.tsx (BacktestForm) — mode: "Fixture scenario" | "Real IBKR data"
+strategy_name / symbol shared across both modes; scenario picker shown
+only in fixture mode, Eastern-time date-range shown only in ibkr mode
+            │
+            ├── Fixture scenario ──► useBacktestRun.ts (unchanged) ──►
+            │                        POST /backtest/run — plain-string
+            │                        error message only, ~120-140s
+            │
+            └── Real IBKR data ───► two ET datetime-local inputs (+
+                                     "Regular session"/"Extended session"
+                                     presets, anchored to the date already
+                                     entered or today's ET calendar date —
+                                     never asserted as a real trading day)
+                                             │
+                                             ▼
+                                     easternTime.ts: DST-aware
+                                     America/New_York → UTC conversion
+                                     (Intl.DateTimeFormat, no new
+                                     dependency), round-trip verified —
+                                     see its own header comment for a
+                                     real false-negative bug this
+                                     round-trip check caught and fixed
+                                     during implementation, not just a
+                                     defensive check that never fires
+                                             │
+                                             ▼
+                                     client-side start<end / 24h-cap
+                                     check — a doomed request is never
+                                     sent, but backend's own
+                                     _validate_ibkr_range stays the real
+                                     authority (no market-calendar/
+                                     holiday logic added here)
+                                             │
+                                             ▼
+                                     useIbkrBacktestRun.ts — new sibling
+                                     hook, not a mode branch inside
+                                     useBacktestRun.ts (materially
+                                     different request shape, error
+                                     taxonomy, and 6.5-16min vs ~120-140s
+                                     timing profile; small duplicated
+                                     timer/status-machine mechanics kept
+                                     deliberately obvious rather than
+                                     factored into a shared abstraction)
+                                             │
+                                             ▼
+                                     triggerIbkrBacktest() — new,
+                                     purely additive wrapper +
+                                     IbkrBacktestError in api-client.ts;
+                                     parseErrorDetail()/ApiError and
+                                     every existing caller untouched
+            │
+            ▼ (either path)
+   BacktestRunResult, rendered verbatim by the same ResultsView:
+   run_id / sweep_id / outcomes_recorded / discarded_signals[]
+```
+
+`IbkrBacktestError` is the first place in this codebase where a route's `detail` is an object (`{code, message}`) rather than a plain string — confirmed directly against `backtest.py`'s `_validate_ibkr_range`/`_ibkr_backtest_client_id` and `ibkr_historical.py`'s full `IBKRHistoricalAcquisitionError` hierarchy, not assumed from the route's docstring alone. Rather than widen the shared `parseErrorDetail()` (which would touch every existing caller's contract for a shape only this one route produces), a dedicated parser and error class carry `code` alongside `message`, so the panel can classify every real failure this route returns with a specific heading instead of a blended or generic one:
+
+```
+Start/End (ET) inputs, presets                 submit
+        │                                          │
+        ▼                                          ▼
+etWallClockToUtc() each side          triggerIbkrBacktest() →
+        │                              (success | IbkrBacktestError)
+        ├── parse/round-trip fail                   │
+        │   → inline message,                       ▼
+        │     Run disabled                classifyIbkrBacktestError(status, code)
+        │                                  409                        → live-data guard
+        ▼ both sides convert              invalid_backtest_request    → invalid date/symbol/range
+start < end AND window ≤ 24h ?            ibkr_backtest_not_configured→ not configured
+        │                                 ibkr_contract_unresolved    → symbol unresolved
+        ├── no → inline message,          ibkr_no_data                → no historical data
+        │        Run disabled             ibkr_historical_permission_denied → permission denied
+        │                                 ibkr_historical_pacing_rejected   → pacing/rate-limit
+        ▼ yes                             ibkr_historical_timeout     → timed out
+   Run enabled                            ibkr_malformed_response /
+                                           ibkr_incomplete_response    → malformed/incomplete data
+                                           anything else (incl. no code) → generic fallback heading
+                                                          │
+                                                          ▼
+                                           backend's own message shown verbatim underneath
+                                           every heading — never a stack trace or raw object
+```
+
+While a run is in flight, the panel shows live elapsed time and wording that the request can legitimately take up to ~16 minutes with no progress percentage available (the backend gives this synchronous route no progress signal to show one). Mode switching and the Run button are disabled whenever either mode's own hook reports `"running"` — both routes share the backend's single `_RUN_LOCK`, so this only prevents a wasted duplicate long-running request from this tab, not a real backend race. Every render block below `BacktestForm`'s own submit button is gated on `mode === "fixture" | "ibkr"` together with that mode's own hook state specifically (never a merged "whichever finished last" view), so a result or error from one mode can never render while the other mode is selected. Fixture mode's own copy, timing framing, and `useBacktestRun.ts` itself are byte-for-byte unchanged.
+
+Frontend-only: `BacktestPanel.tsx`, new `easternTime.ts` and `useIbkrBacktestRun.ts`, and an additive-only block appended to `api-client.ts`. `useBacktestRun.ts`, `useMarketState.ts` (the parallel `market-state-changed-websocket-channel` delivery's own boundary, confirmed untouched by both sides), `BacktestResultsPanel.tsx`, `useBacktestOutcomes.ts`, and everything under `backend/` are unchanged.
 
 ---

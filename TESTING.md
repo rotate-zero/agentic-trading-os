@@ -1,40 +1,37 @@
-# TESTING — pending delivery `market-state-websocket-upgrade`
+# TESTING — pending delivery `backtest-panel-ibkr-real-data-option`
 
 This is a replacement repo-root `TESTING.md` (the version it replaces was
-`world-view-v1`'s own) — **this delivery is frontend-only**, so this file
-covers exactly this delivery; `world-view-v1`'s own backend verification
-detail is not reproduced here (it's fully recorded in its own decision-log
-entry, `docs/decisions/confirmed-decisions.md`, temp id `world-view-v1`).
+`market-state-websocket-upgrade`'s own) — **this delivery is frontend-only**,
+covering exactly this delivery; earlier deliveries' own verification detail
+is not reproduced here (each is fully recorded in its own decision-log
+entry, `docs/decisions/confirmed-decisions.md`).
 
 ## What changed
 
-`frontend/src/hooks/useMarketState.ts` upgraded from fetch + 5-second poll
-to WebSocket-primary, subscribing to the `intelligence.market-state`
-channel (temp id `market-state-changed-websocket-channel`, already merged)
-via `workspaceSocket`, mirroring `useContextSnapshot.ts`'s decision #126
-pattern. The poll was removed entirely (not kept as a fallback) — see this
-delivery's own decision-log entry for the full reasoning. Public return
-shape (`symbolState`, `market`, `loading`, `refetch`) is unchanged; no
-consumer file needed edits.
-
-Docs updated in the same change: `docs/architecture/system-design.md`
-§10.3 (corrected `MarketStateChanged` row + two new diagrams) and
-`docs/architecture/trading-intelligence-architecture.md` §4 (prose +
-both existing diagrams updated to reflect the current WS-primary design,
-superseding the now-stale fetch/poll-only versions).
+`BacktestPanel.tsx` gains a "Real IBKR data" trigger mode alongside the
+existing fixture-scenario mode, wiring the previously-unreachable-except-
+by-hand `POST /backtest/run/ibkr` (temp id `ibkr-historical-backtest-provider`,
+already merged) into the same panel. New `easternTime.ts` (DST-aware
+America/New_York wall-clock conversion, no library), new sibling hook
+`useIbkrBacktestRun.ts`, and an additive-only block appended to
+`api-client.ts` (`triggerIbkrBacktest()`, `IbkrBacktestError`). Full
+reasoning, design forks, and the DST-conversion bug found and fixed during
+implementation are recorded in this delivery's own decision-log entry —
+not duplicated here.
 
 ## Base
 
-- Base tarball first pulled at task start; re-pulled a second time
-  immediately before packaging (three-source re-check protocol), since a
-  parallel World View session (temp id `world-view-v1`) landed on `main`
-  mid-task. This delivery's committed diff is against that second,
-  current pull.
-- Confirmed via `diff -rq` against a fresh untouched clone: `world-view-v1`
-  is entirely backend (`backend/app/world_view/`,
-  `backend/tests/test_world_view.py`, `backend/app/api/routes/
-  intelligence.py`) — zero overlap with this delivery's own footprint,
-  in either direction.
+- Base tarball first pulled at task start; re-pulled twice more during the
+  task (three-source re-check protocol) as two parallel sessions landed on
+  `main` mid-task: `world-view-v1` (backend-only: `backend/app/world_view/`,
+  `backend/tests/test_world_view.py`, `backend/app/api/routes/intelligence.py`)
+  and `market-state-websocket-upgrade` (`frontend/src/hooks/useMarketState.ts`
+  plus two architecture docs). Both confirmed zero file overlap with this
+  delivery in either direction — `market-state-websocket-upgrade`'s own
+  entry explicitly names `BacktestPanel.tsx`/`useBacktestRun.ts` as "the
+  parallel IBKR real-data backtest track's own boundary" and confirms it
+  left them untouched. This delivery's committed diff is against the third,
+  final pull, taken immediately before packaging.
 
 ## How to verify
 
@@ -50,51 +47,82 @@ pre-existing decision #35 `GridPresetPicker` errors
 (`GRID_PRESETS`/`preset`/`setPreset` missing, one implicit-`any`) —
 confirmed identical, line for line, against a `tsc -b` run captured on a
 fresh untouched clone before this change. `npx vite build` produces the
-same module count (96 transformed) and completes with no errors.
+baseline's 96 transformed modules plus exactly 2 (the two new files:
+`easternTime.ts`, `useIbkrBacktestRun.ts`), no errors or warnings.
 
-No frontend hook in this codebase has its own automated test file
-(confirmed by search before starting — matches this project's existing
-test-free hook practice, decision #123's own precedent), so none was
-added for this change either.
+## Manual verification of `easternTime.ts`'s DST conversion
 
-Manual/runtime verification of the actual WebSocket round-trip
-(subscribe → real `MarketStateChanged` push → `load()` re-fetch →
-re-render) was not performed in this sandbox — no live Finnhub/Polygon
-feed or running frontend dev server against a live backend was available
-here. The channel itself (`intelligence.market-state`) and its two real
-envelope shapes were already proven end-to-end by
-`market-state-changed-websocket-channel`'s own `test_websocket_channels.py`
-(backend, real `TestClient`/WebSocket delivery, not mocked) — this
-delivery's own correctness rests on: (a) that channel test coverage,
-(b) `useContextSnapshot.ts`'s own decision #126 subscribe/handle/
-unsubscribe pattern already proven live in production use for the
-identical mechanics, and (c) direct code review confirming the sentinel
-branch (`"__MARKET__"` vs. a real ticker vs. any other symbol) matches
-`channels.py`'s own documented convention exactly.
+No frontend test file exists for any hook, component, or API-client
+wrapper in this codebase (confirmed by search before starting — matches
+this project's existing test-free frontend practice, decision #123's own
+precedent), so none was added here either, per Saqib's own explicit
+instruction not to introduce a new frontend test framework for this
+change. The one genuinely non-trivial piece of new logic — the DST-aware
+Eastern-time conversion — was instead hand-verified: transpiled standalone
+with `esbuild` and run under plain Node, with the process `TZ` deliberately
+set to `Asia/Dhaka` (not America/New_York) to prove the result comes from
+the named IANA zone argument rather than the process's own local time.
+
+Cases exercised, all passing on the final version:
+
+- Regular-session open in EST (Jan) and EDT (Jul) — correct UTC instants.
+- Extended-session open (04:00 ET) and close (20:00 ET) in EDT.
+- The spring-forward gap itself (`2027-03-14T02:30`, which never occurs) —
+  correctly rejected.
+- The minute immediately before the gap (`01:59`) and immediately after it
+  (`03:00`) — both correctly accepted. **`03:00` was the case that caught a
+  real bug**: a naive one-shot "guess the offset, apply once" version of
+  the DST-conversion trick incorrectly rejected this genuinely valid
+  wall-clock time as nonexistent, because the offset applicable to the
+  *naive guess* differed from the offset applicable to the *resolved*
+  instant, right at the transition boundary. Fixed with a second
+  refinement pass before the round-trip check; re-verified after the fix.
+- The fall-back ambiguous hour (`2027-11-07T01:30`, which occurs twice) —
+  accepted, resolving to one real occurrence. Documented, accepted
+  limitation (see `easternTime.ts`'s own header comment): genuinely
+  indistinguishable from a bare wall-clock string without a timezone
+  library, and out of scope for backtest ranges targeting market hours.
+- Malformed input (`"not-a-date"`) and an invalid calendar date
+  (`2027-02-30`) — both correctly rejected.
+- Regular-session (9:30–16:00 ET) and extended-session (4:00–20:00 ET)
+  window math — 390 and 960 minutes respectively, matching the backend
+  route's own docstring figures ("about 6.5 minutes" / "up to about 16
+  minutes") exactly.
+
+Not committed as an automated test file, since no pattern for one exists
+in this codebase yet, matching Saqib's own explicit instruction.
 
 ## What wasn't covered
 
-- No live WebSocket round-trip test (see above) — recommend Saqib smoke-test
-  this against a running backend with a live/replay feed before relying on
-  it in the live workspace.
-- No new automated test file, per this codebase's existing hook-testing
-  convention (not a gap specific to this delivery).
+- No live `POST /backtest/run/ibkr` call was made against a real IB
+  Gateway/TWS session from this delivery (no such session is reachable in
+  this sandbox — see the `ibkr-historical-backtest-provider` entry's own
+  prior notes on that same constraint). This delivery's own correctness
+  rests on: (a) the route's own already-merged backend implementation and
+  tests, (b) direct code review confirming the request/response contract
+  and full error taxonomy against `backtest.py`/`ibkr_historical.py`
+  rather than assumed from either route's docstring, and (c) the
+  hand-verification above for the one piece of new client-side logic with
+  real correctness risk. Recommend Saqib smoke-test the "Real IBKR data"
+  mode end to end against a running backend with a real, reachable
+  Gateway before relying on it.
+- No automated frontend test file, per this codebase's existing
+  test-free frontend convention (not a gap specific to this delivery).
 
 ## Manual merge notes
 
 - `docs/decisions/confirmed-decisions.md`: this delivery's own PENDING
-  entry (temp id `market-state-websocket-upgrade`) was appended after
-  `world-view-v1`'s entry, which was already on `main` at re-pull time.
-  If another parallel PENDING entry lands between this delivery's
-  packaging and its merge, append after that entry instead — do not
-  reorder or renumber anything already on `main`.
+  entry (temp id `backtest-panel-ibkr-real-data-option`) was appended
+  after `market-state-websocket-upgrade`'s entry, which was already on
+  `main` at the final re-pull. If another parallel PENDING entry lands
+  between this delivery's packaging and its merge, append after that
+  entry instead — do not reorder or renumber anything already on `main`.
 - `docs/decisions/INDEX.md`: unchanged by this delivery (correct — no
   real number assigned yet, per standing rule). Do NOT add a row for
-  `market-state-websocket-upgrade` until a real number is assigned at
-  merge time via a fresh three-source re-check.
-- No file-level conflict expected with `world-view-v1`, the IBKR
-  real-data backtest track (`BacktestPanel.tsx`/`useBacktestRun.ts`,
-  untouched here), or any other currently-PENDING entry — this
-  delivery's footprint (`useMarketState.ts`, `system-design.md`,
-  `trading-intelligence-architecture.md`, `confirmed-decisions.md`,
-  this file) shares no file with any of them.
+  `backtest-panel-ibkr-real-data-option` until a real number is assigned
+  at merge time via a fresh three-source re-check.
+- No file-level conflict expected with any currently-PENDING entry — this
+  delivery's footprint (`BacktestPanel.tsx`, `easternTime.ts`,
+  `useIbkrBacktestRun.ts`, the additive block in `api-client.ts`,
+  `backtest-runner-design.md`, `confirmed-decisions.md`, this file,
+  `CHANGES.md`) shares no file with any of them.
