@@ -1339,3 +1339,63 @@ export async function fetchMarketStateSnapshot(symbol?: string): Promise<MarketS
   }
   return (await res.json()) as MarketStateSnapshotWireShape;
 }
+
+// Matches GET /intelligence/world-view's response shape (decision #150)
+// exactly — verified directly against `WorldViewSnapshot`
+// (backend/app/world_view/composite.py), not guessed from the route's
+// own docstring. `market_state`/`context` are `MarketStateEngine`'s and
+// `ContextEngine`'s own complete, unmodified `get_snapshot(symbol)`
+// envelopes — WorldView neither flattens nor changes their honest
+// absent-symbol/global/cross-symbol behavior, so they reuse
+// `MarketStateSnapshotWireShape`/`ContextSnapshotWireShape` exactly
+// rather than re-declaring the same shapes under new names.
+// `performance`'s per-population shape reuses `HourlyWinRateWireShape`/
+// `SessionTypeExpectancyWireShape` for the same reason: World View's own
+// `_read_performance()` converts the exact same
+// `get_win_rate_by_hour()`/`get_expectancy_by_session_type()` dataclass
+// rows fetchWinRateByHour/fetchExpectancyBySessionType already expose,
+// just called once per population (`is_backtest=False`/`True`) and
+// nested under "live"/"backtest" instead of returned as two separate
+// route responses. `portfolio` is `dict[str, Any] | None` on the
+// backend and always `None`/JSON `null` in v1 — Portfolio State has no
+// application implementation yet (composite.py's own module docstring);
+// this is "source unavailable," never a fabricated empty portfolio.
+export interface WorldViewPerformancePopulationWireShape {
+  hourly_win_rates: HourlyWinRateWireShape[];
+  session_expectancy: SessionTypeExpectancyWireShape[];
+}
+
+export interface WorldViewPerformanceWireShape {
+  live: WorldViewPerformancePopulationWireShape;
+  backtest: WorldViewPerformancePopulationWireShape;
+}
+
+export interface WorldViewSnapshotWireShape {
+  symbol: string | null;
+  market_state: MarketStateSnapshotWireShape;
+  context: ContextSnapshotWireShape;
+  performance: WorldViewPerformanceWireShape;
+  portfolio: Record<string, unknown> | null;
+}
+
+/**
+ * GET /intelligence/world-view — decision #150, thin passthrough of
+ * `WorldView().snapshot(symbol)`, zero frontend representation until
+ * this task (confirmed by grep across frontend/src/ before starting).
+ * `symbol` optional, same convention as fetchContextSnapshot/
+ * fetchMarketStateSnapshot above — it scopes `market_state`/`context`
+ * only (both passed through unchanged to their own engines); it has no
+ * effect on `performance`/`portfolio`, which are system-wide/unscoped
+ * regardless of `symbol` (see WorldViewSnapshotWireShape's own comment
+ * and `composite.py`'s module docstring).
+ */
+export async function fetchWorldView(symbol?: string): Promise<WorldViewSnapshotWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/world-view?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/world-view`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as WorldViewSnapshotWireShape;
+}

@@ -8,8 +8,10 @@ import { useStrategyOutcomes } from "../../hooks/useStrategyOutcomes";
 import { usePerformanceAnalytics } from "../../hooks/usePerformanceAnalytics";
 import { useContextSnapshot } from "../../hooks/useContextSnapshot";
 import { useMarketState } from "../../hooks/useMarketState";
+import { useWorldView } from "../../hooks/useWorldView";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
+import type { HourlyWinRateWireShape, SessionTypeExpectancyWireShape } from "../../services/api-client";
 
 const CONNECTOR_COLORS: Record<number, string> = {
   0: "#F85149",
@@ -373,6 +375,151 @@ function MarketStateSummary() {
   );
 }
 
+// World View surfaced in the UI for the first time (this task) — GET
+// /intelligence/world-view (decision #150) had zero frontend
+// representation until now, confirmed by grep before starting.
+//
+// Scope decision, stated explicitly per this task's own instruction:
+// World View's own architectural purpose (trading-intelligence-
+// architecture.md §15) is "one summary instead of several separate
+// queries" for a debug view or a future automated-reasoning layer — not
+// a replacement for the detailed, filterable panels already built for
+// each domain individually. A full re-rendering of every field
+// GET /intelligence/world-view returns would mostly duplicate
+// MarketSessionSummary/MarketStateSummary (Calendar/Market State, both
+// already live-updating via WebSocket, decisions #125/#126/#147/#151)
+// and StrategyPerformanceSummary (decisions #127/#137/#138) — busywork,
+// not new value. So `market_state`/`context` are deliberately NOT
+// re-rendered here at all (useWorldView.ts doesn't even normalize them —
+// see that hook's own docstring); the two genuinely new things World
+// View adds, and the only two this section renders, are:
+// (a) `performance`'s all-time, both-populations-side-by-side shape —
+//     StrategyPerformanceSummary's own toggle immediately above shows
+//     exactly ONE of live/backtest at a time, filtered by hour/session;
+//     nothing else in this codebase shows both at once, unfiltered; and
+// (b) being the one place that honestly demonstrates Portfolio State's
+//     current absence as part of a complete four-domain picture.
+//
+// Placement: directly below StrategyPerformanceSummary, same section
+// (GeneralContent) — same "global, not tied to any one connector's
+// symbol" placement rule #123/#125/#127 already established for this
+// file, and adjacent to the toggle it's most at risk of being confused
+// with, which is exactly why its own subtitle below states the
+// distinction plainly rather than relying on proximity alone.
+// StrategyPerformanceSummary's own internals are completely untouched —
+// this is a new, separate function, added alongside it, not a
+// restructuring of it.
+//
+// aggregateWinRate/aggregateExpectancy below sum/weight-average fields
+// that are already real per-row numbers from the backend
+// (total_trades/win_count per hour, trade_count/expectancy_r per
+// session) — the same fields StrategyPerformanceSummary's own toggle
+// already renders unaggregated. This is NOT the kind of invented
+// composite/aggregate score decisions #125/#127 explicitly avoided
+// adding (no new interpretation, weighting scheme, or ranking is
+// introduced) — it's the minimal arithmetic needed to show "how many
+// trades, what fraction won, what expectancy" as a single side-by-side
+// glance rather than duplicating the full hour-by-hour/session-by-
+// session breakdown a second time in a different section.
+function aggregateWinRate(rows: HourlyWinRateWireShape[]): { trades: number; winRate: number | null } {
+  const trades = rows.reduce((sum, row) => sum + row.total_trades, 0);
+  const wins = rows.reduce((sum, row) => sum + row.win_count, 0);
+  return { trades, winRate: trades > 0 ? wins / trades : null };
+}
+
+function aggregateExpectancy(rows: SessionTypeExpectancyWireShape[]): {
+  trades: number;
+  expectancyR: number | null;
+} {
+  const trades = rows.reduce((sum, row) => sum + row.trade_count, 0);
+  const weighted = rows.reduce((sum, row) => sum + row.expectancy_r * row.trade_count, 0);
+  return { trades, expectancyR: trades > 0 ? weighted / trades : null };
+}
+
+function WorldViewSummary() {
+  const { performance, portfolio, loading, error } = useWorldView();
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="text-[11px] uppercase tracking-wide text-text-muted">
+        World View <span className="text-text-primary">— All-Time</span>
+      </div>
+      <div className="text-[10px] text-text-muted">
+        Live and backtest together, all matching history — distinct from the hour/session toggle above.
+      </div>
+      {loading ? (
+        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
+      ) : error ? (
+        <p className="p-1 text-[11px] text-bear">Couldn't load World View — {error}</p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 gap-2">
+            {(["live", "backtest"] as const).map((population) => {
+              const pop = performance?.[population];
+              const winRate = aggregateWinRate(pop?.hourly_win_rates ?? []);
+              const expectancy = aggregateExpectancy(pop?.session_expectancy ?? []);
+              const isEmpty = winRate.trades === 0 && expectancy.trades === 0;
+              return (
+                <div
+                  key={population}
+                  className="rounded border border-base-border px-2 py-1.5 font-mono text-[11px]"
+                >
+                  <div className="mb-1 text-text-muted">{population === "live" ? "Live" : "Backtest"}</div>
+                  {isEmpty ? (
+                    <div className="text-text-muted">
+                      {population === "live"
+                        ? "No live trades yet — no Execution Engine exists to write them."
+                        : "No backtest trades yet."}
+                    </div>
+                  ) : (
+                    <div className="flex flex-col gap-0.5">
+                      <div className="flex items-center justify-between">
+                        <span className="text-text-muted">Win rate</span>
+                        <span className={winRate.winRate !== null && winRate.winRate >= 0.5 ? "text-bull" : "text-bear"}>
+                          {winRate.winRate !== null ? `${(winRate.winRate * 100).toFixed(0)}%` : "—"}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-text-muted">{winRate.trades} trades</div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-text-muted">Expectancy</span>
+                        <span
+                          className={
+                            expectancy.expectancyR !== null && expectancy.expectancyR >= 0 ? "text-bull" : "text-bear"
+                          }
+                        >
+                          {expectancy.expectancyR !== null
+                            ? `${expectancy.expectancyR >= 0 ? "+" : ""}${expectancy.expectancyR.toFixed(2)}R`
+                            : "—"}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-text-muted">{expectancy.trades} trades</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {/* Portfolio State has no application implementation (decision
+              #150) — rendered honestly as "not available," never hidden
+              and never implied to be an empty-but-valid portfolio. v1
+              only ever returns null; the non-null branch is stated
+              plainly rather than left silently unhandled, without
+              building any actual Portfolio UI ahead of that engine
+              existing. */}
+          <div className="mt-1 flex items-center justify-between rounded border border-base-border px-2 py-1 font-mono text-[11px]">
+            <span className="text-text-muted">Portfolio</span>
+            <span className="text-text-muted">
+              {portfolio === null
+                ? "Not available (Portfolio State not yet built)"
+                : "Available — no Portfolio State UI exists yet to render it"}
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function GeneralContent() {
   const symbols = useMemo(() => MOCK_TICKERS.map((t) => t.symbol), []);
   const prices = useLatestPrices(symbols);
@@ -410,6 +557,7 @@ function GeneralContent() {
       <MarketStateSummary />
       <RecentClosedTrades />
       <StrategyPerformanceSummary />
+      <WorldViewSummary />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
       <p className="text-xs leading-relaxed text-text-muted">
         General mode isn't tied to any single connector — it's the scrollable, market-wide view. Select a

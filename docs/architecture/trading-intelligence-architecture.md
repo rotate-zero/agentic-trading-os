@@ -535,6 +535,48 @@ Context, and Performance Intelligence retain their own contracts and writers;
 World View stores and publishes nothing.
 ```
 
+**As-built: frontend surfacing (decision #154).** `GET /intelligence/world-view` had zero frontend representation until this delivery, confirmed by grep across `frontend/src/` before starting. Scoped deliberately narrow rather than as a full re-rendering of the payload: `market_state`/`context` are NOT re-rendered here at all — both already have their own complete, live-updating UI (`MarketSessionSummary`/`MarketStateSummary`, decisions #125/#126/#147/#151) that a mechanical re-display would only duplicate. The two things actually new about World View — `performance`'s all-time, both-populations-at-once shape (distinct in kind from `StrategyPerformanceSummary`'s own live/backtest *toggle*, decisions #127/#137/#138, which shows exactly one population at a time, filtered by hour/session) and Portfolio State's honest, explicit absence — are the only two fields this surfacing renders.
+
+New fetch-based `frontend/src/hooks/useWorldView.ts` (one-shot on mount, `refetch()` exposed, no poll and no WebSocket subscription) — World View has no event subscription, cache, or WebSocket channel of its own by design (`composite.py`'s own module docstring), and `performance` is composed from `strategy_outcomes` via the same two query functions `usePerformanceAnalytics.ts` already established have no live writer/event to react to; that hook's exact "one-shot + caller-visible `error`" reasoning carries over directly. New `fetchWorldView()` + wire types in `api-client.ts` (additive only), reusing `MarketStateSnapshotWireShape`/`ContextSnapshotWireShape`/`HourlyWinRateWireShape`/`SessionTypeExpectancyWireShape` rather than re-declaring the same shapes under new names — `WorldView.snapshot()` returns those engines'/queries' own envelopes unmodified. New `WorldViewSummary` section in `InfoTab.tsx`'s `GeneralContent`, directly below `StrategyPerformanceSummary` (added alongside, that component's own internals untouched) — a compact, honest side-by-side Live/Backtest summary (trades, win rate, expectancy — arithmetic aggregation of already-real per-row backend numbers, not an invented composite score, same discipline decisions #125/#127 already established) plus an explicit Portfolio row.
+
+```text
+GET /intelligence/world-view                          frontend data flow
+        │
+        ▼
+  fetchWorldView()  ─────────────────────────────▶  useWorldView.ts
+  (api-client.ts)                                    │        │
+                                                       │        └──▶ market_state, context
+                                                       │             (received, NOT normalized/exposed —
+                                                       │              MarketSessionSummary/MarketStateSummary
+                                                       │              already own this data, live-updating)
+                                                       ▼
+                                         { performance, portfolio, loading, error, refetch }
+                                                       │
+                                                       ▼
+                                    WorldViewSummary (InfoTab.tsx, GeneralContent)
+                                      directly below StrategyPerformanceSummary
+
+Internal flow inside WorldViewSummary:
+
+  performance.live / performance.backtest
+        │                    │
+        ▼                    ▼
+  hourly_win_rates[]   session_expectancy[]
+        │                    │
+        ▼                    ▼
+  aggregateWinRate()   aggregateExpectancy()      pure sum / weighted-average,
+        │                    │                    no new metric definition
+        ▼                    ▼
+  { trades, winRate }  { trades, expectancyR }
+        │                    │
+        └────────┬───────────┘
+                  ▼
+     one compact column per population, Live | Backtest side by side
+
+  portfolio === null  ──▶  "Not available (Portfolio State not yet built)"
+                           (v1 always null — composite.py never returns otherwise)
+```
+
 ---
 
 ## 16. Explicitly Deferred (Not Forgotten)
