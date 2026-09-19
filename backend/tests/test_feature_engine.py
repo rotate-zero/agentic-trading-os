@@ -727,7 +727,16 @@ async def test_feature_engine_backfills_from_persisted_history_on_cold_start():
     _clean_test_symbol(ticker)
     bus = EventBus()
     await bus.start()
-    base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=10)
+    # Fixed Saturday anchor — unconditionally Session.CLOSED, so the engine
+    # publishes exactly one FeaturesUpdated for the one candle this test
+    # feeds it and never a 5m/15m/1h aggregated one. Was
+    # `datetime.now(utc) - 10min`: during a real pre-market or regular
+    # session, vwap/pre-market extras make a completed 5m/15m/1h bucket
+    # publishable even though SMA(3) isn't warm there, so `len(received)
+    # == 1` silently depended on which minute of the day the suite ran
+    # (same defect, and same fix, as the stop-race test below and
+    # test_feature_engine_publishes_once_warmed_up_and_not_before above).
+    base_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
 
     try:
         # Phase 1: an earlier "process" persists 2 prior closes via a real CandleRecorder.
@@ -824,7 +833,16 @@ async def test_stop_waits_for_an_in_flight_compute_before_returning():
     bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
 
     try:
-        candle_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=1)
+        # Fixed Saturday anchor — unconditionally Session.CLOSED (MarketClock
+        # treats weekends as CLOSED regardless of hour), so this one 1m candle
+        # yields exactly one FeaturesUpdated. Was `datetime.now(utc) - 1min`:
+        # in a real pre-market/regular/after-hours session, a candle that
+        # completes a 5m/15m/1h bucket makes _compute_one publish one extra
+        # event per completed bucket (2, 3, or 4 in total), so the `== 1`
+        # below passed or failed depending on the minute of the day the
+        # suite happened to run — not on any state left by an earlier test
+        # (this test's EventBus and engine are its own, per-instance).
+        candle_ts = _et(2026, 8, 15, 12, 0).astimezone(timezone.utc).replace(second=0, microsecond=0)
         # Fed straight onto the engine's own queue — same shape
         # _on_candle_closed itself would have produced — for the same
         # reason the other two stop-race tests document: publishing

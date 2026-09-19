@@ -1,91 +1,67 @@
-# CHANGES — decision-number reconciliation (#143–#152)
+# CHANGES — feature-engine-test-isolation-fix (decision #153)
 
-Base: `main` @ `dc0393d` ("zip it"), re-pulled immediately before packaging
-(three-source re-check: `INDEX.md` tail, `confirmed-decisions.md` tail,
-`docs/decisions/archive/` file list — all unchanged since the prior
-session's own last check: last real number #142, archive unchanged
-through `122-133.md`).
+Base: `main` as pulled at the start of the task, re-pulled immediately before
+packaging (three-source re-check: `INDEX.md` tail, `confirmed-decisions.md`
+tail, `docs/decisions/archive/` file list — last real number #152, archive
+unchanged through `122-133.md`; no concurrent change touched any file below).
 
 ## What changed
 
-Not a code delivery — this is the merge-time reconciliation of ten
-same-day parallel deliveries that had each packaged under a temp id and
-independently observed "next available is 143," per Saqib's own standing
-rule against minting real numbers during parallel work. Assigned
-**#143–#152**, in the order each entry's own text already recorded via
-its self-reported N-way collision count (the order each was packaged):
+**Test-only delivery. No production code changed.**
 
-| # | Temp id |
-|---|---|
-| 143 | `data-feed-status-indicator` |
-| 144 | `broker-connection-panel` |
-| 145 | `ibkr-historical-backtest-provider` |
-| 146 | `market-state-changed-websocket-channel` |
-| 147 | `market-state-frontend-surfacing` |
-| 148 | `chart-migration-stage-4-flagging` |
-| 149 | `flaky-test-cluster-rootcause` |
-| 150 | `world-view-v1` |
-| 151 | `market-state-websocket-upgrade` |
-| 152 | `backtest-panel-ibkr-real-data-option` |
+Decision #150 reported a full-suite-only failure of
+`test_feature_engine.py::test_stop_waits_for_an_in_flight_compute_before_returning`
+(received 3 `FeaturesUpdated`, expected 1; passes in isolation). The task
+framed it as cross-test contamination. **It isn't.** It is a wall-clock-
+dependent test, and it fails in isolation too — at the right minute of the day.
 
-No design decisions were re-opened or re-litigated — every entry's own
-substance (rationale, footprint, test results) is untouched verbatim;
-only the number-assignment paragraph at the top of each was replaced
-with a short "assigned at merge-time reconciliation" note, and the
-header changed from `[PENDING — temp id: ...]` to `N. <title>`.
+- `backend/tests/test_feature_engine.py` — two timestamp sites moved from
+  `datetime.now(utc) - N minutes` to the file's existing fixed Saturday anchor
+  (`_et(2026, 8, 15, 12, 0)`, unconditionally `Session.CLOSED`), each with a short
+  comment saying why the non-session timestamp is intentional:
+  - `test_stop_waits_for_an_in_flight_compute_before_returning` (the named test)
+  - `test_feature_engine_backfills_from_persisted_history_on_cold_start` (identical
+    defect, same file/root cause/assertion pattern; inclusion approved by Saqib)
+- `docs/decisions/confirmed-decisions.md` — new entry #153.
+- `docs/decisions/INDEX.md` — one new row (#153).
+- `CHANGES.md`, `TESTING.md` — replaced (delete-first).
 
-- `docs/decisions/confirmed-decisions.md` — all ten headers renumbered,
-  all ten number-assignment paragraphs replaced.
-- `docs/decisions/INDEX.md` — the seven rows that already existed as
-  `**PENDING**` placeholders were renumbered and had their now-resolved
-  "number intentionally unassigned" tail sentences removed. **Three rows
-  were added for the first time** — `world-view-v1` (#150),
-  `market-state-websocket-upgrade` (#151), and
-  `backtest-panel-ibkr-real-data-option` (#152) had no `INDEX.md` row at
-  all until now, a real gap in this log's own practice (the first
-  instance, `world-view-v1`, was already flagged by
-  `market-state-websocket-upgrade`'s own entry; the third,
-  `backtest-panel-ibkr-real-data-option`, had gone unflagged until this
-  reconciliation's own repo-wide check found it too).
-- Every forward-reference call site any of the ten entries' own text
-  named — plus a repo-wide grep for `temp id`/`temp-id`/`number TBD` to
-  catch any it didn't — updated to cite the real number directly:
-  `frontend/src/services/api-client.ts`,
-  `frontend/src/hooks/useMarketState.ts`,
-  `frontend/src/components/backtest/BacktestPanel.tsx`,
-  `frontend/src/components/backtest/easternTime.ts`,
-  `backend/app/world_view/composite.py`,
-  `backend/tests/test_world_view.py`,
-  `backend/tests/test_feature_engine.py`,
-  `backend/tests/test_websocket_channels.py`,
-  `docs/architecture/system-design.md` (§4.1, §4.2, §10.3 ×2 plus an
-  ASCII-diagram label),
-  `docs/architecture/trading-intelligence-architecture.md` (§4, plus two
-  ASCII-diagram labels),
-  `docs/architecture/feature-engine-chart-migration.md` (§0, §7),
-  `docs/architecture/backtest-runner-design.md` (§7 ×2, plus one
-  reference belonging to #145 and one belonging to #146 in the same
-  section), `docs/decisions/future-ideas.md` (#25's resolution note, #26's
-  own investigation note).
+No new components, modules, routes or fixtures were added, so there is no new
+functionality to describe. Assertions, event filters, timeouts, `FeatureEngine`
+(including decision #149's `stop()` fix), `CandleRecorder`, `EventBus`,
+`conftest.py`, `backend/app/world_view/` and every frontend file are untouched.
 
-**Verification, not just pattern-matched replace:** every substitution
-was applied as an exact whole-string match asserted to occur exactly
-once, aborting loudly on a mismatch rather than guessing — so nothing
-was silently skipped or double-applied. A repo-wide sweep after every
-edit confirms zero remaining `temp id`/`temp-id`/`number TBD` markers
-outside this file's own history notes and `future-ideas.md` #27 (a
-genuinely separate, still-deferred item, correctly left alone).
+## Why (mechanism)
+
+```
+CandleClosed(1m, candle_ts)  ->  FeatureEngine._compute_one
+   |
+   |-- always: publish FeaturesUpdated(1m)                              (1 event)
+   |
+   `-- if MarketClock.session_bounds(candle_ts) is not None            (trading weekday,
+         |                                                               04:00-20:00 ET)
+         `-- for width in (5m, 15m, 60m):
+               if candle_aggregator.completes_bucket(candle_ts, session_start, width):
+                   publish FeaturesUpdated(width)                       (+1 event each)
+
+test (before):  candle_ts = now(UTC) - 1 min   -> event count = f(minute of day)
+test (after):   candle_ts = Sat 2026-08-15 12:00 ET -> session_bounds is None -> always 1 event
+```
+
+Events per candle minute on a trading weekday (Fri 2026-09-18, computed through
+the real `MarketClock` + `candle_aggregator`): 1 event on 1248 minutes, 2 on 128,
+3 on 49, 4 on 15. Never anything but 1 on weekends/holidays. The EventBus in the
+test is its own per-instance object, so no earlier test can add events.
 
 ## Deliberately NOT done
 
-- **Archive rollover.** `confirmed-decisions.md` is ~154KB, well past the
-  ~100KB rollover trigger `docs/decisions/README.md` documents, and has
-  been repeatedly flagged as ready "once the first PENDING entry gets a
-  real number" — true as of this reconciliation. Not bundled in here:
-  it's a distinct, separate operation (move to
-  `archive/134-152.md`, update `INDEX.md`'s file-location column for
-  every one of those 19 entries, start a fresh open file) that wasn't
-  explicitly confirmed. Trivial to do as an immediate follow-up now that
-  every number in range is final — say the word.
-- No code was touched. No test was re-run (nothing here changes runtime
-  behavior).
+- No change to `FeatureEngine`, `CandleRecorder`, `EventBus` or fixtures — there was
+  no isolation defect to fix.
+- The unrelated slow test #46
+  (`test_backtest_runner_regression.py::test_backtest_runner_namespace_preserves_live_levels_and_repeat_runs_keep_nonzero_regime_scores`,
+  several minutes in this sandbox; the suite does complete, ~13 min per full run), Backtest Runner, DB
+  performance and production config were not debugged or modified.
+- Other tests elsewhere in the suite that use `datetime.now()` were not audited
+  beyond `test_feature_engine.py`.
+- A duplicated `_clean_test_symbol(ticker)` call at the end of the stop-race test's
+  `finally` block was noticed and left alone (harmless, out of scope).
