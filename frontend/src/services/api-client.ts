@@ -944,7 +944,7 @@ export async function triggerBacktest(
 }
 
 // ---------------------------------------------------------------------------
-// POST /backtest/run/ibkr (temp id: backtest-panel-ibkr-real-data-option) —
+// POST /backtest/run/ibkr (decision #152) —
 // the real-historical-data sibling to POST /backtest/run above. Confirmed
 // directly against backend/app/api/routes/backtest.py's run_ibkr_backtest():
 // same POST-with-query-params convention (strategy_name/symbol/start/end,
@@ -1107,7 +1107,7 @@ export async function fetchMarketDataStatus(): Promise<MarketDataStatusWireShape
  * comment) — today, the only way to restore it is to call this route again,
  * and before this task there was no UI path to do that at all, only curl.
  * Confirmed directly with Saqib before adding this wrapper (see the
- * data-feed-status-indicator decision log entry for the finding and
+ * decision #143 log entry for the finding and
  * outcome). Polygon has no equivalent gap — it's REST-polling based with no
  * persistent socket to drop (PolygonAdapter's own docstring) — so it
  * deliberately gets no matching wrapper here.
@@ -1259,8 +1259,7 @@ export async function unsubscribeBrokerSymbol(symbol: string): Promise<BrokerUns
 }
 
 // ---------------------------------------------------------------------------
-// Market State Engine (market-state-frontend-surfacing — pending decision,
-// number TBD, see docs/decisions/confirmed-decisions.md) — GET
+// Market State Engine (decision #147) — GET
 // /intelligence/market-state, confirmed decision #98, M4 task 25. Built,
 // working, and reachable since then; zero frontend representation before
 // this task (confirmed by grep across frontend/src — the only prior

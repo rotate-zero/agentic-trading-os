@@ -2,7 +2,7 @@
 Tests for the WebSocket Gateway's event -> channel routing/delivery
 (`app/api/websocket/channels.py`), covering decision #126's
 `EventType.CONTEXT_CHANGED -> "intelligence.context"` entry and this
-delivery's (temp id: `market-state-changed-websocket-channel`) analogous
+delivery's (decision #146) analogous
 `EventType.MARKET_STATE_CHANGED -> "intelligence.market-state"` entry —
 same gap shape, one engine later, added to the same file rather than a
 new one since both exercise the identical unit under test
@@ -220,8 +220,8 @@ def test_unrelated_event_does_not_reach_intelligence_context_channel():
 
 
 def test_market_state_changed_mapping_present():
-    """Regression guard for this delivery's own (temp id:
-    `market-state-changed-websocket-channel`) one-line addition — if this
+    """Regression guard for this delivery's own (decision #146) one-line
+    addition — if this
     entry is ever accidentally removed/renamed, this fails loudly rather
     than silently reintroducing the exact gap this delivery closed, same
     role `test_context_changed_mapping_present` plays for decision #126."""

@@ -321,7 +321,7 @@ Downstream, this becomes **Hypothesis Health**: Position Monitor compares realiz
 
 ## 25. IBKR connection not checked by `POST /backtest/run`'s live-data guard (decision #132) — RESOLVED
 
-**Status: resolved by the IBKR historical Backtest Runner delivery.** `broker.py` now exposes an IBKR-specific `is_connected()` accessor over registered providers, and `_reject_if_live_data_connected()` applies the same pre-replay `409` to IBKR that it already applied to Finnhub and Polygon. The request-scoped historical acquisition adapter is never registered and disconnects before replay, so it is not mislabeled as a live stream.
+**Status: resolved by the IBKR historical Backtest Runner delivery (decision #145).** `broker.py` now exposes an IBKR-specific `is_connected()` accessor over registered providers, and `_reject_if_live_data_connected()` applies the same pre-replay `409` to IBKR that it already applied to Finnhub and Polygon. The request-scoped historical acquisition adapter is never registered and disconnects before replay, so it is not mislabeled as a live stream.
 
 **Original gap:** decision #132's `_reject_if_live_data_connected()` (`backend/app/api/routes/backtest.py`) refused to run a backtest with a `409` while Finnhub or Polygon was connected, because `engine_singleton_guard.py`'s process-wide engine-singleton swap is unsafe against live trading in the same process. It did not check IBKR (`backend/app/api/routes/broker.py`), so an IBKR-connected live session was not blocked.
 
@@ -337,7 +337,7 @@ Downstream, this becomes **Hypothesis Health**: Position Monitor compares realiz
 
 **What it is:** flagging (per decisions #35/`resample.ts`'s precedent) or eventually deleting the seven frontend indicator files `feature-engine-chart-migration.md` §7 (Stage 4) scoped for retirement, now that Feature Engine computes all seven server-side (Stage 3, decisions #52/#53/#56/#57).
 
-**Why deferred:** investigated directly (temp id `chart-migration-stage-4-flagging`) rather than assumed — all seven still have a real, currently-exercised caller inside `utils/indicators.ts`'s own dispatcher, not a theoretical one. Two distinct, structural reasons, not one:
+**Why deferred:** investigated directly (decision #148) rather than assumed — all seven still have a real, currently-exercised caller inside `utils/indicators.ts`'s own dispatcher, not a theoretical one. Two distinct, structural reasons, not one:
 1. **SMA/EMA/VWAP (3 files):** the chart lets a person configure any SMA/EMA period (2–500), but Feature Engine only computes the configured defaults (`[9, 20, 50]`/`[9, 20]`) for `1m`/`5m`/`15m`/`1h`. Anything else falls back to `sma.ts`/`ema.ts`/`vwap.ts`, labeled `"(local)"`.
 2. **PDH/PDL/PDC, pre-market H/L, Camarilla, VPOC (4 files):** fall back whenever there's no previous trading day within the configured lookback yet (`previousDayLevels.ts`/`premarketLevels.ts`/`camarillaPivots.ts`/`vpoc.ts`) — a cold-start gap that exists on principle (there is always a first day), not a coverage gap that more backend work closes.
 

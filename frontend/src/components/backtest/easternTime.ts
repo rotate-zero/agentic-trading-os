@@ -1,6 +1,6 @@
 /**
  * DST-aware America/New_York wall-clock <-> UTC conversion for the IBKR
- * backtest date-range inputs (temp id: backtest-panel-ibkr-real-data-option).
+ * backtest date-range inputs (decision #152).
  *
  * No date/timezone library is a dependency anywhere in this codebase
  * (confirmed directly against frontend/package.json before writing this) —

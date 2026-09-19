@@ -1,4 +1,4 @@
-"""World View v1 integration and route tests (temp id ``world-view-v1``).
+"""World View v1 integration and route tests (decision #150).
 
 The source-backed tests use Market State's real ``FeaturesUpdated`` event
 path, Context's public evaluation methods, and Performance Intelligence's

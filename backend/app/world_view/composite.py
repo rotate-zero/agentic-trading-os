@@ -1,4 +1,4 @@
-"""Read-only World View facade (confirmed decision #7; ``world-view-v1``).
+"""Read-only World View facade (confirmed decision #7; #150).
 
 ``WorldView`` assembles the public snapshots owned by Market State and
 Context with the two existing Performance Intelligence aggregates.  It

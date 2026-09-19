@@ -9,7 +9,7 @@ FeatureEngine tests, in three tiers:
    symbol, and this tier deliberately stays inside that first candle's
    warm-up window. Not the same claim as "no DB connection at all",
    though — found directly while root-causing this file's own flaky
-   cluster entry (temp id `flaky-test-cluster-rootcause`):
+   cluster entry (decision #149):
    `_maybe_refresh_daily_levels`'s restart-survival check
    (`_load_confirmed_daily_levels_for_today`) does one unconditional
    `asyncio.to_thread` read against Postgres on literally every

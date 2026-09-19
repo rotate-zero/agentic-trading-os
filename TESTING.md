@@ -1,34 +1,78 @@
-# TESTING — pending delivery `ibkr-broker-panel-validation-deferred`
+# TESTING — decision-number reconciliation (#143–#152)
 
-**Docs-only deferral record plus the unchanged validation script.** Nothing in this delivery was run against IBKR, and nothing may be read as an IBKR result.
+**Docs/comments-only delivery.** No application code changed, no runtime
+behavior changed — nothing here needs `pytest` or `npx tsc -b`/`vite
+build`. Verification is about correctness of the renumbering itself.
 
-## What changed
+## How this was verified
 
-See `CHANGES.md`: `docs/decisions/future-ideas.md` (#27), `docs/architecture/ibkr-broker-panel-validation.md` (status, deferral record, resume checklist), `backend/README.md` (pointer on the ❌ line), plus the unchanged `backend/scripts/check_ibkr_broker_panel.py`.
+1. **Exact-match substitution, not regex/fuzzy replace.** Every one of
+   the ~35 edits (10 headers, 10 number-paragraphs, 7 `INDEX.md` row
+   renumbers + 3 new rows, ~19 forward-reference sites) was applied via
+   a Python script asserting the target string occurs in the file
+   **exactly once** before replacing it — a zero-match or multi-match
+   result aborts the whole run rather than editing the wrong spot. All
+   ~35 assertions passed cleanly on every run. One wording defect (the
+   first entry's note read "...packaged): . Assigned..." — an empty
+   predecessor list, not a match failure) was caught by reading the
+   actual output before packaging, not by the assertion; `git checkout`
+   reverted the one affected file and the template was fixed before
+   re-running.
 
-## How to verify
+2. **Sequential-numbering check.** `grep -oE '^### [0-9]+\.'
+   docs/decisions/confirmed-decisions.md` produces exactly
+   `134, 135, ..., 152` with no gaps or repeats.
+   `grep -oE '^\| [0-9]+ \|' docs/decisions/INDEX.md | sort -n | uniq -d`
+   is empty (no duplicate numbers across the whole index, not just the
+   new range).
+
+3. **Zero-PENDING check.** `grep -c '\[PENDING' confirmed-decisions.md`
+   and `grep -c PENDING INDEX.md` are both `0` after the change (were
+   10 and 7 respectively before).
+
+4. **Repo-wide sweep for stragglers.** `grep -rln -E "temp id|temp-id|
+   temp delivery id|number TBD"` across every `.md`/`.ts`/`.tsx`/`.py`
+   file, before and after. Before: 20 files. After: only
+   `confirmed-decisions.md` (this reconciliation's own "packaged under
+   temp id X" history notes — intentional, same as #136's own "drafted
+   and cited throughout as #135" precedent), `future-ideas.md` (future
+   idea #27's own still-genuinely-unassigned `ibkr-broker-panel-
+   validation-deferred`/`-results` temp ids — correctly untouched, not
+   part of this ten-way collision), and
+   `docs/architecture/ibkr-broker-panel-validation.md` (same #27 track).
+
+5. **Python syntax check.** `python3 -m py_compile` on the four touched
+   `.py` files (`composite.py`, `test_world_view.py`,
+   `test_feature_engine.py`, `test_websocket_channels.py`) — all clean.
+   The four touched `.ts`/`.tsx` files got comment-only edits (verified
+   by reading each diff directly, not assumed) — no import, type, or
+   runtime-code lines touched, so a `tsc -b`/`vite build` pass wasn't
+   expected to catch anything a direct read didn't already confirm; not
+   run, since this sandbox's frontend toolchain cost is better spent
+   when actual code changes.
+
+6. **`git diff --stat`** confirms exactly the 15 files this delivery's
+   own footprint claims and nothing else: `backend/app/world_view/
+   composite.py`, `backend/tests/test_feature_engine.py`,
+   `backend/tests/test_websocket_channels.py`,
+   `backend/tests/test_world_view.py`,
+   `docs/architecture/backtest-runner-design.md`,
+   `docs/architecture/feature-engine-chart-migration.md`,
+   `docs/architecture/system-design.md`,
+   `docs/architecture/trading-intelligence-architecture.md`,
+   `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`,
+   `docs/decisions/future-ideas.md`,
+   `frontend/src/components/backtest/BacktestPanel.tsx`,
+   `frontend/src/components/backtest/easternTime.ts`,
+   `frontend/src/hooks/useMarketState.ts`,
+   `frontend/src/services/api-client.ts`.
+
+## How to re-verify after unzipping
 
 ```bash
-# the script is byte-identical to the previously stub-tested one
-sha256sum backend/scripts/check_ibkr_broker_panel.py
-git diff --stat -- backend/app        # expect: empty (no application code changed)
-git diff -- backend/app/api/routes/broker.py   # expect: empty
-grep -n "^## 27\." docs/decisions/future-ideas.md
+grep -c '\[PENDING' docs/decisions/confirmed-decisions.md   # expect 0
+grep -c PENDING docs/decisions/INDEX.md                      # expect 0
+grep -oE '^### [0-9]+\.' docs/decisions/confirmed-decisions.md
+grep -rln -E "temp id|temp-id|number TBD" \
+  --include="*.md" --include="*.ts" --include="*.tsx" --include="*.py" .
 ```
-
-## What was verified, and how
-
-- The deferral facts come from two checks: a TCP probe from the authoring sandbox (`127.0.0.1:4002` refused) and a local session on Saqib's machine (no listener on 4002, no TWS/Gateway process, endpoint `127.0.0.1:4002`, client ID `1`, worktree clean), as he relayed it. Nothing was re-checked on his machine from here.
-- Script logic was previously exercised against a stub backend (real FastAPI routers, Event Bus and `/ws`; fake `IB`): happy path, connect failure, provider-takeover guard, pre-existing session, missing listener, every static guard, zero-ticks FAIL branch, backend/confirmed client-ID mismatch. That validates the script only.
-
-## What isn't covered
-
-- Everything about real IBKR: adapter behaviour through the routes, tick flow, Broker panel rendering, predictions P1–P7.
-- Backend pytest and `tsc -b` were not run: no application or frontend code changed.
-
-## Manual merge notes
-
-- `docs/decisions/future-ideas.md` and `backend/README.md` are **full-file copies from `main` @ `3c80afd`** with one addition/edit each. If a parallel session touched either file since, diff before copying rather than overwriting.
-- Section number **27** in `future-ideas.md` is the next free one at `3c80afd`; if another session also added a section, renumber this one (nothing else references the number except this delivery's own docs: `README.md`, the runbook, `CHANGES.md`).
-- Repo-root `CHANGES.md` and `TESTING.md` are per-delivery replacements and collide with any other pending delivery's; keep whichever lands last or merge the sections.
-- If the earlier `ibkr-broker-panel-validation-harness` zip was already applied, this one overwrites the same script/doc paths harmlessly.

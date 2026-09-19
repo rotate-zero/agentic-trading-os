@@ -77,8 +77,8 @@ function normalizeMarket(wire: MarketStateCompositeWireShape): CrossSymbolMarket
 //
 // AS OF this task, `EVENT_TO_CHANNEL` (backend/app/api/websocket/
 // channels.py) routes `EventType.MARKET_STATE_CHANGED` to WebSocket
-// channel "intelligence.market-state" (temp id
-// `market-state-changed-websocket-channel`) — the gap this hook's own
+// channel "intelligence.market-state" (decision #146) — the gap this
+// hook's own
 // comment used to describe. useContextSnapshot.ts is the direct
 // template for wiring push onto an existing fetch-based hook (decision
 // #126), but its own resolution of "does the poll stay as a fallback"

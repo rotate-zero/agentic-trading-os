@@ -51,7 +51,7 @@ function formatHoursMinutes(totalMs: number): string {
 
 type BacktestMode = "fixture" | "ibkr";
 
-// temp id: backtest-panel-ibkr-real-data-option. Maps every real failure
+// Decision #152. Maps every real failure
 // shape POST /backtest/run/ibkr can return (confirmed directly against
 // backend/app/api/routes/backtest.py + backend/app/backtest_runner/
 // ibkr_historical.py's full IBKRHistoricalAcquisitionError hierarchy) to a
