@@ -119,7 +119,11 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   (verified: got a real `ConnectionRefusedError` against `127.0.0.1:4002` with no
   Gateway running, surfaced as a clean HTTP 502, not a crash)
 - ❌ An actual live connection to a running Gateway with a real IBKR account — this
-  sandbox has no path to that. Has to happen on your machine.
+  sandbox has no path to that. Has to happen on your machine. **Validation tooling
+  exists but the run is deferred** (no paper Gateway was running on the dev machine on
+  2026-09-19, and the run was set aside): `scripts/check_ibkr_broker_panel.py`, runbook
+  `../docs/architecture/ibkr-broker-panel-validation.md`, `../docs/decisions/future-ideas.md`
+  #27. Until it has run, the `/broker/*` routes and the Broker panel remain unverified live.
 - ❌ Auto-reconnect after a disconnect — not built. Deliberately deferred to Phase 4's
   Market Data Engine (`ConnectionManager`), not pulled forward into this adapter.
 
