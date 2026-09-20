@@ -44,9 +44,10 @@ untouched, unrenamed, and not imported here — this module doesn't
 depend on it, and nothing about this schema's shape was changed to
 accommodate it (see the discrepancy note below).
 
-**A real, deliberately UNRESOLVED discrepancy between this schema and
-`state_snapshot.py`'s current capture behavior — recorded here, not
-silently patched.** §5 (decision #89) locks `market_state_at_entry`,
+**A real discrepancy between this schema and `state_snapshot.py`'s
+current capture behavior — recorded here, not silently patched. As of
+decision #128, resolved for the Backtest Runner path; the live path
+remains unresolved (see below).** §5 (decision #89) locks `market_state_at_entry`,
 `market_state_at_exit`, `context_at_entry`, and `context_at_exit` as
 REQUIRED `dict` fields (no `| None`) on `StrategyOutcome`. But
 `state_snapshot.py`'s own `capture_market_state_snapshot()`/
@@ -59,12 +60,18 @@ exactly the moment it needs to construct a `StrategyOutcome`, and would
 have no honest non-`None` value to put in a field this schema requires.
 This task is a persistence-layer build, not an architecture revision —
 per Saqib's explicit instruction, the fix is NOT to weaken §5's locked
-contract to paper over what `state_snapshot.py` can produce. The gap is
-real, genuinely unresolved, and tracked as new open item **D17**
-(strategy-engine-design.md §10): whichever future module wires a real
-caller to `record_strategy_outcome()` will need to either (a) only call
-it once both snapshots are confirmed non-`None`, or (b) trigger a real
-revisit of §5's nullability — not decided here, and no code in this
+contract to paper over what `state_snapshot.py` can produce. The gap was
+real and tracked as open item **D17** (strategy-engine-design.md §10):
+whichever future module wires a caller to `record_strategy_outcome()`
+would need to either (a) only call it once both snapshots are confirmed
+non-`None`, or (b) trigger a real revisit of §5's nullability. Decision
+#128's Backtest Runner chose (a) — it only calls
+`record_strategy_outcome()` once both snapshots are confirmed
+non-`None`, discarding the signal (as a `DiscardedSignal`, not a
+persisted `StrategyOutcome`) otherwise. That resolves D17 for the
+Backtest Runner path; the live-path caller (Execution Engine/Position
+Monitor) still doesn't exist, so D17 remains open for that path — not
+decided here, and no code in this
 module resolves it either way. This module implements §5 exactly as
 locked: all four fields stay required.
 """

@@ -5,14 +5,20 @@ app/schemas/performance.py (the `StrategyOutcome`/`BacktestRun`
 Pydantic contracts) and app/models/trading_intelligence.py (the
 `StrategyOutcomeRecord`/`BacktestRunRecord` ORM tables).
 
-This module has no real caller wired into it — Execution Engine and
-Position Monitor don't exist yet. Its only caller today is this task's
-own test suite (test_performance_intelligence.py), which constructs a
-synthetic `StrategyOutcome` directly — same "prove the contract, don't
-fabricate the caller" precedent app/trading_intelligence/state_snapshot.py
-(decision #98) already established for the read side. Do NOT wire this
-into any live pipeline as part of this or a future task without a real
-Execution Engine/Position Monitor to drive it.
+This module has no LIVE caller wired into it — Execution Engine and
+Position Monitor don't exist yet. As of decision #128, it has a real,
+non-live caller: Backtest Runner's `BacktestRunner.run()`
+(`app/backtest_runner/runner.py`) calls this directly, once both
+`capture_strategy_outcome_snapshots()` snapshots are confirmed
+non-`None`, to persist a real `StrategyOutcome` for every completed
+backtest fill. This task's own test suite
+(test_performance_intelligence.py) remains a second, separate caller,
+constructing a synthetic `StrategyOutcome` directly — same "prove the
+contract, don't fabricate the caller" precedent
+app/trading_intelligence/state_snapshot.py (decision #98) already
+established for the read side. Do NOT wire this into any LIVE pipeline
+as part of this or a future task without a real Execution Engine/Position
+Monitor to drive it.
 """
 from __future__ import annotations
 

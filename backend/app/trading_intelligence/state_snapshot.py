@@ -9,8 +9,10 @@ strategy-engine-design.md §5). Confirmed decision #98, M4.
 a pure read of whatever MarketStateEngine/ContextEngine currently know
 for a symbol, shaped to drop straight into those four `StrategyOutcome`
 fields. It does not:
-  - create the `strategy_outcomes` table (no migration exists yet —
-    system-design.md §4.13 lists the shape, not a built table),
+  - create the `strategy_outcomes` table (migration 0008 built this at
+    decision #120 — the "no migration exists yet" framing this
+    docstring originally carried is stale as of #120 and corrected
+    here),
   - write anything, ever (no session, no persistence),
   - know what "entry" or "exit" means (no Execution Engine, no Position
     Monitor, no fill event exists yet to call this from).
@@ -19,10 +21,15 @@ now just to exercise this function would be exactly the scope this
 build (M4) was deliberately kept narrow to avoid; see
 strategy-engine-design.md §10's own staged plan. What matters today is
 that the CONTRACT is real and tested against real MarketState/Context
-data, not a stub — so whichever module calls this later (Execution
-Engine, Position Monitor, a Backtest Runner) has a stable, already-
-proven function to call rather than reinventing this read against two
-engines' internals itself.
+data, not a stub — so whichever module calls this has a stable,
+already-proven function to call rather than reinventing this read
+against two engines' internals itself. As of decision #128, Backtest
+Runner is exactly that real caller: `BacktestRunner.run()`
+(`app/backtest_runner/runner.py`) calls `capture_strategy_outcome_snapshots()`
+directly at its own entry/exit-fill equivalents — the "a Backtest
+Runner" framing above originally listed this as a hypothetical future
+caller; it's a real one now. Execution Engine and Position Monitor
+remain the genuinely hypothetical, still-nonexistent LIVE-path callers.
 
 **Why this lives here, not inside context_engine/ or
 market_state_engine/.** This module reads BOTH engines' public

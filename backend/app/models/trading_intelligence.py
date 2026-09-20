@@ -44,10 +44,14 @@ not because they share a lifecycle with `level_interaction_state`/
 - `strategy_outcomes` — one row per CLOSED trade, append-only, the
   paired Pydantic contract is `app.schemas.performance.StrategyOutcome`.
   Written by `app.trading_intelligence.performance.record_strategy_outcome()`
-  — no real caller wired yet (Execution Engine/Position Monitor don't
-  exist), same "build the stable contract now, real callers plug in
-  later" precedent decision #98 already used for the read side
-  (`state_snapshot.py`).
+  — no LIVE caller wired yet (Execution Engine/Position Monitor don't
+  exist), but a real non-live caller does: Backtest Runner v1's
+  `BacktestRunner.run()` (`app/backtest_runner/runner.py`, decision
+  #128) calls it for every completed backtest fill — the "no real
+  caller wired yet" framing this docstring originally carried is stale
+  as of #128 and corrected here, same "build the stable contract now,
+  real callers plug in later" precedent decision #98 already used for
+  the read side (`state_snapshot.py`).
 - `backtests` — one row per (strategy_version, config_hash) per
   walk-forward fold, the paired Pydantic contract is
   `app.schemas.performance.BacktestRun`. Written by Backtest Runner v1's
