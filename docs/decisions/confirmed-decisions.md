@@ -483,3 +483,115 @@ The exact Performance Intelligence envelope is `{"live": {"hourly_win_rates": [.
 **Verified delivery footprint**, confirmed by `diff -rq` against a fresh clone pulled immediately before packaging (the same clone that surfaced the #153 collision above): exactly `frontend/src/components/workspace/InfoTab.tsx`, new `frontend/src/hooks/useWorldView.ts`, an additive-only block appended to `frontend/src/services/api-client.ts`, `docs/architecture/trading-intelligence-architecture.md`, this entry (`confirmed-decisions.md`), the matching `INDEX.md` row, repo-root `TESTING.md`, and repo-root `CHANGES.md`. `INDEX.md`'s other rows, every frozen archive, `system-design.md`, `useMarketState.ts`, `useContextSnapshot.ts`, `usePerformanceAnalytics.ts`, `useStrategyOutcomes.ts`, `StrategyPerformanceSummary`/`MarketSessionSummary`/`MarketStateSummary`/`RecentClosedTrades`'s own internals, every other hook and component, decision #153's own entry/row/files, and everything under `backend/` remain untouched.
 
 **Related, deliberately not bundled here:** `confirmed-decisions.md` is now past ~155KB (past the ~100KB rollover trigger decision #150 flagged and deliberately deferred until merge-time numbering made the archive boundary knowable — which it now has, `#143`–`#153` all carrying real, confirmed numbers). This delivery still does not perform that rollover: it's unrelated to World View frontend surfacing, and a ~150KB+ file restructuring folded into an unrelated task's delivery is exactly the kind of scope creep this project's own discipline avoids. Flagged to Saqib as a standing, ready-to-do follow-up rather than done silently.
+
+### 155. Backtest replay timing investigation — the ~13-minute suite is ~92% four replay tests, each paying `MarketStateEngine`'s real 1.0 s debounce floor once per replayed candle; options laid out, nothing decided or changed
+
+**Status: awaiting Saqib's direction — nothing decided or changed.** Investigation only (slug `backtest-replay-timing-investigation`; number assigned at merge after the three-source re-check — `INDEX.md` last row #154, `confirmed-decisions.md` tail #154, archive `001-060` … `122-133`, all agreeing). **Zero code and zero test changes**; `backend/` and `frontend/` read-only; #153 and every existing decision untouched. Only this entry, its `INDEX.md` row, `CHANGES.md` and `TESTING.md` changed. The parallel `test-wall-clock-audit` instance appends to the same four files — whoever lands second renumbers inline.
+
+**Environment (it changes timings).** 1 vCPU / 4 GB sandbox, Ubuntu 24.04, Python 3.12.3, PostgreSQL 16.15 (apt), **`fsync = off` is the only Postgres tuning** (as #153 documented; `synchronous_commit` on, `shared_buffers` 128 MB), DB freshly migrated to `0010`. Baseline command: `cd backend && python3 -m pytest -p no:cacheprovider --durations=0 -v tests`, run detached and followed with bounded polls. Result: **776 passed, 787.29 s** (787.95 s wall) — inside the 787–789 s last session reported.
+
+**Measured — where the 787 s goes** (summed per-test time 784.25 s; setup/teardown < 5 ms each).
+
+| Slice | Seconds | Share |
+|---|---|---|
+| 4 tests: `test_backtest_runs_keep_independent_daily_level_rows` 236.33 and `…namespace_preserves_live_levels…` 236.30 (two runs each), `test_run_backtest_first_pullback_scenario_fires_and_persists` 128.23, `test_run_backtest_volume_gated_strategy_returns_honest_zero` 118.16 (run positions #1, #2, #46, #47) | 719.02 | **91.7%** |
+| 8 smaller replay-driving tests (1.0–3.1 s each) | 21.39 | 2.7% |
+| **All 12 replay-driving tests ≥ 1 s** (six replay-related files, 60 tests, total 741.28 s / 94.5%) | **740.41** | **94.4%** |
+| Everything else (716 tests) | 42.97 | 5.5% |
+
+All 12 fit **wall ≈ (replayed candles − 1) × 1.0 s + ~0.2 s** (118.16 s for 119 candles, 128.23 s for 129, 3.05 s for 4, 2.04 s for 3). The hypothesis holds: the time is the design cost the producer docstring describes, concentrated in four tests. Slow tests outside replay are fixed sleeps inside test bodies (0.1–1.1 s; 26 tests ≥ 0.5 s sum to 20.81 s). The full 30-slowest list is in `TESTING.md`.
+
+**Mechanism, confirmed by a throwaway instrumented probe** (sandbox only, not delivered): `BacktestRunner` on `volume_gated_baseline` with Reversal, built like the regression test, wrapping `advance_to`, `_settle_market_state`, `_drain_bus`, the Context Engine calls, worker-thread computes/persist, and `asyncio.sleep` (attributed to its caller).
+
+| Real 1.0 s floor (run R1) | Value |
+|---|---|
+| Fixture candles → replayed → `market_state_history` rows | 120 → **119** → 119 |
+| `run()` wall / process CPU | 118.159 s / 0.767 s (**0.65% CPU**) |
+| `advance_to` first candle (a symbol's first trigger skips the debounce) / candles 2–119 mean (min–max) | 0.068 s / **1.0004 s** (0.955–1.040) |
+| Share of `advance_to` inside `_settle_market_state` | 99.7% |
+| Debounce sleeps: count / mean requested delay; settle polls | 118 / 0.970 s; 2,345 (19.7 per candle at 0.05 s) |
+| Everything else, whole run (bus drains, Context Engine, feature compute, state compute + persist at 2.5 ms/candle, level interaction) | ≈ 0.64 s |
+
+The sleep is anchored to the previous callback's start, so it does not stack on compute; the poll adds ≤ 50 ms of rounding. **Nothing else in replay adds a real wait** — a grep of `asyncio.sleep`/`time.sleep`/`wait_for`/`to_thread` across the replay path finds only the settle poll (0.05 s interval, 5 s timeout, both already constructor arguments) and the debounce sleep; the 10 s ceiling loop never fires in replay.
+
+**Counterfactual paces** (same scenario; `market_state_engine.engine._MIN_INTERVAL_SECONDS`, and in R3 the producer's poll, monkeypatched inside the probe only):
+
+| Run | Floor / poll | `run()` wall | Rows |
+|---|---|---|---|
+| R1, R6 (repeat) | 1.0 s / 0.05 s (production) | 118.16 s, 118.14 s | 119 |
+| R2 | 0.05 s / 0.05 s | 6.10 s (19× faster) | 119 |
+| R3 | 0.001 s / 0.005 s | 0.995 s (7.6 ms/candle; 119× faster) | 119 |
+
+**Finding 1 — the floor is not only a delay; `acceleration_score` reads it (measured + read).** `MarketStateEngine._compute` divides the change in trend score by the real `time.monotonic()` gap since the previous compute (`_prev_trend`), not by `candle_ts`. Trend, volatility, volume and VWAP scores were identical in all 119 rows at every pace; `acceleration_score` differed in **80 of 119 rows** (max |Δ| 3.59 at 0.05 s, 35.18 at 0.001 s); two real-pace runs matched exactly. Momentum on the same scenario records the same single BUY (102.34 → 103.70, `target`, same entry instant) at all three paces, but its persisted `market_state_at_entry.acceleration_score` is **49.93 / 48.75 / 40.08** (1.0 / 0.05 / 0.001 s). So any option that shortens the gap changes replayed and persisted values, not just runtime. This is also a live-vs-replay divergence today — **by reading, unmeasured**: live measures over the gap since the previous compute, which the 10 s ceiling loop keeps bounded, so replay's ~1 s window is more sensitive than live's (an earlier interim "~60×" was wrong; it assumed the full candle spacing). Momentum reads this field.
+
+**Finding 2 — two tests are coupled to the floor (measured by throwaway suite emulation).** `test_backtest_routes.py::…first_pullback…` asserts `elapsed > 60` as its "did the replay really run" proof, deliberately (its docstring says so); any real speed-up fails it. `test_replay_state_producer.py::…settle_timeout_raised_honestly…` uses a 0.001 s timeout and relies on the real floor being longer. Emulating a scoped test-side patch over the six replay files (throwaway pytest plugin): floor 0.05 s → **84.78 s, 775 passed, 1 failed** (the `elapsed > 60` test); floor 0.001 s + poll 0.005 s → **52.70 s, 774 passed, 2 failed** (both). A scoped patch does not reach `test_debounce_scheduler.py` (own schedulers) or `test_market_state_engine.py` (own default-constructed engines; line 134 sleeps 1.1 s to clear the real floor); a global patch would. `test_backtest_routes.py` is not excluded from the parallel audit — possible overlap.
+
+**Finding 3 — the last fixture candle is never replayed (observation, not acted on).** `FixtureCandleProvider.get_historical` filters `start <= candle_ts < end`, and `backtest.py:329` and the regression tests pass `end=candles[-1].candle_ts`: 120 fixture candles → 119 `advance_to` calls → 119 rows in R1. The comment near `test_backtest_runner_regression.py:595–610` attributes a one-row shortfall to the final state update never landing; in this measurement every replayed candle persisted a row. Left as found.
+
+**Finding 4 — D17's tracker status (verified, not edited).** `strategy-engine-open-decisions.md` still reads D17 as "Open … no code anywhere resolves it either way yet", while #128 records runner-level as-built handling (snapshots at the real `entry_filled_at`/`exit_filled_at`; `None` at either ⇒ `DiscardedSignal`). Reconcile separately. **Constraint honoured:** no option below changes *when* a snapshot is `None` or `advance_to`'s guarantee that `market_state.candle_ts == candle_ts` before capture; option (c) changes snapshot *values*, not availability.
+
+**Diagram (i) — data flow for one replayed candle.** The single real wait is marked.
+
+```
+BacktestRunner.run() — for each replayed candle                        (runner.py)
+        │
+        ▼
+EngineBackedReplayStateProducer.advance_to(candle)           (replay_state_producer.py)
+        │ publish CandleClosed on the run-scoped EventBus
+        ▼
+FeatureEngine handler: queue.put_nowait ──► worker: compute (thread, ~0.4 ms) ──► FeaturesUpdated
+        │ exact waits: bus Queue.join(), then FeatureEngine._queue.join()
+        ▼
+_drain_bus()  (~0.2 ms)
+        ├──► LevelInteractionEngine ── exact wait: its _queue.join() (~1 ms)
+        ├──► producer subscriber cache (FeatureSet)
+        └──► MarketStateEngine._on_features_updated   (1m only)
+                    ▼
+             DebounceScheduler.trigger()      min_interval = _MIN_INTERVAL_SECONDS = 1.0 s
+                    ├── symbol's first trigger ──► callback runs now
+                    └── otherwise: asyncio.sleep(1.0 − elapsed)   ◄════ REAL WAIT ≈ 0.97 s / candle
+                    ▼
+             callback → queue.put_nowait(symbol) → worker: _compute (~0 ms;
+                    acceleration = Δtrend ÷ real monotonic gap) → to_thread(_persist) (~2.5 ms)
+                    → cache → publish MarketStateChanged
+                    ▼
+_settle_market_state(): poll producer cache every 0.05 s ◄══ rounds the wait up by ≤ 50 ms
+        ▼
+ContextEngine.evaluate_all / evaluate_for_symbol   (direct call, ~0.1 ms)
+        ▼
+ReplayState ──► strategy.evaluate ──► fill simulation ──► snapshot capture (D17: None ⇒ discard)
+```
+
+**Diagram (ii) — internal flow of `_settle_market_state` and `DebounceScheduler`.**
+
+```
+_settle_market_state(symbol, candle_ts)              DebounceScheduler (one per symbol)
+deadline = monotonic() + settle_timeout (5 s)        trigger():
+loop:                                                  elapsed = monotonic() − _last_run
+  cache.candle_ts == candle_ts ? ─yes─► return         elapsed ≥ 1.0 s ? ─yes─► _run() now
+  monotonic() ≥ deadline ? ─yes─► raise                  └─ no ─► _pending = True; one task:
+                          ReplaySettleTimeout                     _run_after_delay(1.0 − elapsed)
+  asyncio.sleep(0.05) ◄══ ~20× per candle                         └─ asyncio.sleep ◄═══ REAL WAIT
+        └── repeat                                       _run(): _last_run = monotonic(); callback()
+                                                     ceiling loop: sleep(10 s); if idle ≥ 10 s ─► _run()
+                                                     (never fires during replay)
+```
+
+**Options (design only — nothing implemented; savings measured where a probe or emulation exists, otherwise labelled estimates).**
+
+| | What would change | What tests PROVE now that it might weaken or hide | Live path | Saving |
+|---|---|---|---|---|
+| **(a) Test-side** — patch the floor inside replay tests | Test-side fixture/`conftest`, no production file; value must stay above the producer test's 0.001 s timeout | Real-pace end-to-end replay stops being exercised unless canaries stay (eight 3–4-candle tests cost ~21 s). Replayed `acceleration_score` no longer real-pace — no replay test asserts it (grep: none in the six files). `elapsed > 60` fails by design, needs a candle-count proof (regression test already asserts rows per candle). Settle-timeout test fails at 0.001 s | none | **Measured emulation: 787 → 84.8 s (0.05 s); 52.7 s (0.001 s, 2 failures).** Four heavy tests only: ≈ 105 s (estimate) |
+| **(b1) Production, injectable interval** | `min_interval_seconds` argument (default = today) on `MarketStateEngine` in `market_state_engine/engine.py`; `replay_state_producer.py` passes a replay value | As (a), plus changes replay results for real users (Finding 1); revisits the Unit 2 brief ("don't redesign existing engines merely to make v1 replay easier") — Saqib's call | additive, default unchanged (intent; unbuilt) | Suite as (a); 120-candle run 118 s → 6.1 s / 1.0 s (measured via monkeypatch). Real-IBKR 24 h window (≤ ~960 extended-hours bars — my assumption): ~16 min → ~49 s / ~7 s (estimate; acquisition unmeasured) |
+| **(b2) Production, flush path** | `DebounceScheduler.flush()` (shared — its docstring names Position Monitor) + `MarketStateEngine` hook; producer swaps the poll for an exact `_queue.join()` | Debounce logic stays intact for its own tests; replay stops exercising it; acceleration semantics as (b1) | additive, replay-only (unbuilt) | Estimate ≈ R3 or better; suite floor ≈ 50 s (43 s is non-replay) |
+| **(c) Replay clock** | Inject clock/sleep into `DebounceScheduler` and `MarketStateEngine` (`time.monotonic()` sites in `debounce_scheduler.py`, `_compute`); replay drives a virtual clock from `candle_ts` | Debounce runs unmodified; **replayed/persisted acceleration changes** and Momentum firings on existing scenarios need re-verification (#135 notes); matches neither today's replay nor live (Finding 1) | additive, default real clock; largest surface | Estimate ≈ (b2) |
+| **(d) Slow tier** | `pytest.ini` marker or `conftest` hook keyed on the four tests | Nothing proven changes; the D18/D19 isolation guards leave the default run and must run before merge | none | **Measured: default tier 67.45 s** (772 passed, 4 `--deselect`ed, zero repo change); slow tier still 719 s when run |
+| **(e) Nothing** | — | Unchanged; #153 called the slowness "not debugged" — now it is | none | 787 s per full verification |
+
+**Recommendation — for Saqib's decision, not a decision.** (1) Now, no repo change: the four-test `--deselect` (measured 67.5 s) while iterating on code that does not touch replay; full suite before merging anything that does. (2) For a durable suite-time fix, (a) scoped narrowly: patch only the four heavy tests, at ~0.05 s (0.001 s collides with the settle-timeout test), keep the eight small replay tests and `test_replay_state_producer.py` on the real floor as canaries, replace `elapsed > 60` with a candle-count proof. No production file, no live effect, D17-neutral; its cost is replay acceleration off real pace in four tests, which nothing asserts today. (3) Treat production-side speed-up ((b)/(c)) as a separate decision gated on the forks below.
+
+**Forks for Saqib — nothing here pre-decides them.** (1) *What should replay's `acceleration_score` mean?* Today it is a function of replay pace; production-side speed-ups silently change it, and a candle-time clock would make it neither today's number nor live's. (2) *Is faster replay for users in scope* (the 24 h IBKR cap "can be reconsidered when replay performance improves", #145), *or only faster tests?* That decides whether (a)/(d) suffice.
+
+**Not measured.** Full-suite runs at each candidate configuration (only the two emulations and the `--deselect` run exist); the four-tests-only (a) variant; (b2)/(c) savings; real-IBKR replay length and acquisition time; live-path acceleration; scenarios beyond `volume_gated_baseline` and strategies beyond Reversal/Momentum; other hardware; durable-`fsync` Postgres. Every timing shares `fsync = off`.
+
+**Docs updated in the same change:** this entry, its `INDEX.md` row, `CHANGES.md`, `TESTING.md` (docs only). `backtest-runner-design.md`'s existing "~1s/candle" statements are now measured-confirmed and left as written (a fifth file this delivery deliberately did not touch). Reproduction commands, the 30 slowest tests and manual-merge notes are in `TESTING.md`.

@@ -1,84 +1,19 @@
-# CHANGES — World View frontend surfacing (decision #154)
+# CHANGES — Backtest replay timing investigation (decision #155)
 
-Base: `main`, re-pulled immediately before packaging — and re-pulled a
-second time when that re-check turned up a real change: the parallel
-backend `test_feature_engine.py` cross-test-contamination fix mentioned
-in this task's own prompt landed on `main` as **decision #153** between
-an earlier recheck (which still showed #152 as latest) and packaging.
-Confirmed zero file overlap by `diff -rq` isolating their delivery's
-exact footprint (`backend/tests/test_feature_engine.py`, `CHANGES.md`,
-`TESTING.md`, the two decision-log files) before reassigning this
-delivery from a tentatively-held #153 to the actual next-available
-**#154**, rebasing this working tree onto the corrected pull, and
-re-verifying the number once more immediately before writing decision
-#154's own entry. Frontend-only.
+Base: `main`, re-pulled immediately before packaging; the decision number was assigned by the three-source re-check (`INDEX.md` last row, `confirmed-decisions.md` tail, archive file list) run immediately before writing the entry. Slug during parallel work: `backtest-replay-timing-investigation`. **Docs only — no `backend/` or `frontend/` file is touched, no test is touched.**
 
 ## What changed
 
-`GET /intelligence/world-view` (decision #150) had zero frontend
-representation until this delivery. Scoped deliberately narrow rather
-than as a full re-rendering of the payload — see decision #154's own
-entry in `docs/decisions/confirmed-decisions.md` for the full reasoning.
-`market_state`/`context` are **not** re-rendered anywhere in this
-delivery (both already have their own complete, live-updating UI
-elsewhere); only `performance` (all-time, live+backtest side by side —
-a shape nothing else in this codebase shows) and `portfolio` (rendered
-honestly as "not available") are surfaced.
+- `docs/decisions/confirmed-decisions.md` — new entry #155 appended: measured findings, two diagrams, options table (a)–(e), a recommendation flagged for Saqib's decision, two design forks, and what was not measured. Status in the entry: **awaiting Saqib's direction — nothing decided or changed.**
+- `docs/decisions/INDEX.md` — one new row (#155), appended.
+- `CHANGES.md` / `TESTING.md` — replaced (this file and its sibling).
 
-### New files
+## What the investigation found (details in the entry and `TESTING.md`)
 
-- `frontend/src/hooks/useWorldView.ts` — fetch-based, one-shot on mount,
-  `refetch()` exposed, no poll/WebSocket (World View has no event source
-  of its own by design). Distinguishes a caller-visible `error` from
-  genuinely empty data, same as `usePerformanceAnalytics.ts`. Deliberately
-  does not normalize/expose `market_state`/`context`.
+- The 787 s full suite is dominated by four replay tests (719 s, 91.7%); every replayed candle after the first waits on `MarketStateEngine`'s real 1.0 s debounce floor — confirmed by a per-candle instrumented run, not just by reading the docstring.
+- The floor also feeds `acceleration_score` (it divides by real elapsed time), so making replay faster would change persisted replay values — this is why the options table separates "faster tests" from "faster replay for users".
+- Nothing was implemented, patched or renumbered. Existing decisions (including #153) are untouched.
 
-### Modified files (additive only)
+## Parallel-work note
 
-- `frontend/src/services/api-client.ts` — new `fetchWorldView()` +
-  `WorldViewSnapshotWireShape`/`WorldViewPerformanceWireShape`/
-  `WorldViewPerformancePopulationWireShape`, appended at file end.
-  Reuses `MarketStateSnapshotWireShape`/`ContextSnapshotWireShape`/
-  `HourlyWinRateWireShape`/`SessionTypeExpectancyWireShape` rather than
-  re-declaring the same shapes.
-- `frontend/src/components/workspace/InfoTab.tsx` — new
-  `WorldViewSummary` component, added directly below
-  `StrategyPerformanceSummary` in `GeneralContent`.
-  `StrategyPerformanceSummary`'s own internals are untouched. Two new
-  small pure helpers, `aggregateWinRate()`/`aggregateExpectancy()` —
-  sum/weighted-average of already-real per-row backend numbers, not an
-  invented composite score.
-- `docs/architecture/trading-intelligence-architecture.md` §15 — one new
-  as-built note with two diagrams (cross-component data flow; internal
-  aggregation flow inside `WorldViewSummary`).
-- `docs/decisions/confirmed-decisions.md` — new entry #154.
-- `docs/decisions/INDEX.md` — new row for #154.
-
-## What did NOT change
-
-- Nothing under `backend/`.
-- `frontend/src/hooks/useMarketState.ts`,
-  `frontend/src/hooks/useContextSnapshot.ts`,
-  `frontend/src/hooks/usePerformanceAnalytics.ts`,
-  `frontend/src/hooks/useStrategyOutcomes.ts` — all byte-for-byte
-  unchanged.
-- `StrategyPerformanceSummary`/`MarketSessionSummary`/
-  `MarketStateSummary`/`RecentClosedTrades` in `InfoTab.tsx` — internals
-  untouched; only a new sibling section was added.
-- `docs/architecture/system-design.md` — references `world_view/` only in
-  a file-tree listing; no frontend-coverage claim existed there to
-  correct or extend.
-- `confirmed-decisions.md`'s archive rollover — past its ~100KB trigger
-  and now unblocked (decision #150's own deferral), but deliberately not
-  bundled into this unrelated delivery. Flagged as a standing follow-up.
-- Decision #153's own entry, row, and files (`test_feature_engine.py`) —
-  that delivery landed first; this one only appends after it.
-
-## Verification
-
-`npx tsc -b` output byte-identical to a fresh-clone baseline (only the
-four known decision #35 `GridPresetPicker` errors). `npx vite build`
-clean: baseline's 98 modules plus exactly 1 (`useWorldView.ts`), no
-errors or warnings. Full footprint confirmed by `diff -rq` against a
-freshly pulled, untouched clone immediately before packaging. See
-`TESTING.md` for the complete verification account.
+`test-wall-clock-audit` appends to the same four files. If it lands first, renumber this entry to the next free number, update the entry header, the `INDEX.md` row and the "decision #N" mentions in these two root files, and note the collision inline. See `TESTING.md` for the manual-merge notes.
