@@ -261,3 +261,86 @@ async def test_empty_candle_range_raises_rather_than_silently_no_ops():
     )
     with pytest.raises(ValueError, match="zero candles"):
         await runner.run()
+
+
+# --- sweep_id threading (batch/sweep endpoint) ------------------------------
+#
+# Uses the same deterministic _OneShotStubStrategy as the tests above,
+# deliberately: its evaluate() fires purely off an internal call counter,
+# never off market_state/features/context, so it reproduces identically
+# across repeated runs of the same symbol regardless of any real engine
+# state — decoupling these two tests from a genuine, separately-confirmed
+# finding (see this delivery's decision-log entry): level_interaction_state
+# carries no backtest_run_id (unlike daily_levels_state, decision #141/D19),
+# so a real strategy's own MATCH condition can legitimately see different
+# results on a second run of the same symbol. That's a pre-existing
+# BacktestRunner characteristic, not something to route around here — this
+# stub simply isn't sensitive to it, so it isn't in the way of what these
+# two tests actually check.
+
+
+def _stub_runner(*, sweep_id=None) -> BacktestRunner:
+    candles = _fixture_candles()
+    opportunity = Opportunity(
+        strategy="STUB_ONE_SHOT", version="stub_v1", direction="BUY", confidence=0.9,
+        structural_invalidation=98.0, structural_target=101.0,
+        evidence={"conditions": {}, "reason": "stub", "basis": "closed"},
+        setup_detected_at=candles[1].candle_ts,
+    )
+    strategy = _OneShotStubStrategy(_make_config(), fire_on_call_index=1, opportunity=opportunity)
+    provider = FixtureCandleProvider.single(SYMBOL, "1m", candles)
+    kwargs = dict(
+        strategy=strategy,
+        symbol=SYMBOL,
+        market_data_provider=provider,
+        start=candles[0].candle_ts,
+        end=candles[-1].candle_ts + timedelta(minutes=1),
+        context_provider=FixtureBacktestContextProvider(),
+        data_version="fixture-v1",
+        feature_version="feature_engine_v1",
+    )
+    if sweep_id is not None:
+        kwargs["sweep_id"] = sweep_id
+    return BacktestRunner(**kwargs)
+
+
+async def test_default_sweep_id_is_still_fresh_per_run_when_unspecified():
+    """Existing callers (`/backtest/run`, `/backtest/run/ibkr`, every
+    direct-construction test above) pass no `sweep_id` — confirms that
+    path is completely unchanged: each run still mints its own fresh
+    UUID, "a sweep of one," same as before this delivery."""
+    result_a = await _stub_runner().run()
+    result_b = await _stub_runner().run()  # no cleanup between runs — see module note above
+
+    assert result_a.outcomes_recorded == 1
+    assert result_b.outcomes_recorded == 1
+    assert result_a.sweep_id != result_b.sweep_id
+    assert result_a.run_id != result_b.run_id
+
+
+async def test_explicit_sweep_id_is_honored_and_shared_across_runs():
+    """The real threading a batch/sweep caller needs: two separate runs,
+    passing the SAME caller-supplied sweep_id, land that identical value
+    on both real `backtests` rows — not two independently-minted ones."""
+    shared_sweep_id = uuid4()
+
+    result_a = await _stub_runner(sweep_id=shared_sweep_id).run()
+    result_b = await _stub_runner(sweep_id=shared_sweep_id).run()  # no cleanup between runs — see module note above
+
+    assert result_a.outcomes_recorded == 1
+    assert result_b.outcomes_recorded == 1
+    assert result_a.sweep_id == shared_sweep_id
+    assert result_b.sweep_id == shared_sweep_id
+    assert result_a.run_id != result_b.run_id  # still two distinct real runs
+
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            text("SELECT run_id, sweep_id FROM backtests WHERE sweep_id = :sid"),
+            {"sid": str(shared_sweep_id)},
+        ).mappings().all()
+    finally:
+        session.close()
+    assert len(rows) == 2
+    assert {str(r["run_id"]) for r in rows} == {str(result_a.run_id), str(result_b.run_id)}
+    assert all(str(r["sweep_id"]) == str(shared_sweep_id) for r in rows)

@@ -1,6 +1,22 @@
-# CHANGES — decision #157: deterministic fast backtest replay
+# CHANGES — decision #159: POST /backtest/sweep (batch/sweep endpoint v1)
 
 ## Current delivery
+
+- New, additive `POST /backtest/sweep` route: one strategy across an explicit `symbols` × `scenarios` cross-product, run sequentially through the exact existing `BacktestRunner`/`_RUN_LOCK` path (no new locking mechanism), sharing one real `sweep_id` across every resulting `backtests` row. Existing `/backtest/run`, `/backtest/run/ibkr` unmodified.
+- `BacktestRunner.__init__` gains one new, optional, additive parameter: `sweep_id: UUID | None = None`. Every existing caller is unaffected — omitting it still mints a fresh `uuid4()` per run, exactly as before.
+- Confirmed with Saqib before implementation: both `symbols`/`scenarios` lists explicit and required (no implicit "all known symbols"/"all scenarios" expansion); batch bound `len(symbols) * len(scenarios) <= 20`, sized off a measured ~2.01s/run in this environment. Fixture scenarios only — `/backtest/run/ibkr`'s real-data path is explicitly out of scope.
+- A fresh `Strategy` instance is built per `(symbol, scenario)` pair rather than reused across the loop — confirmed necessary by reading all 7 strategy implementations directly (each holds per-symbol-keyed internal state).
+- Partial-failure handling: pre-execution validation rejects the whole request before any run starts; a genuine per-pair error afterward is caught, logged, and reported per-pair without aborting the remaining pairs or losing already-completed results — matching an existing codebase convention for independent-item batches (`FeatureEngine`'s worker loop, `websocket/manager.py`'s broadcast).
+- The live-trading guard (decision #132) is checked once before the sweep starts, matching `/backtest/run`'s own existing precedent.
+- Response ordering (`symbols` outer, `scenarios` inner) is deterministic by construction, never database order.
+- Real finding surfaced during verification, documented but not fixed in this delivery: repeat real runs of the same symbol (within a sweep, or via two separate `/backtest/run` calls) can legitimately produce different `outcomes_recorded`, because `LevelInteractionState`/`LevelInteractionEvent` never received the per-run `backtest_run_id` isolation `daily_levels_state` got at decision #141/D19. Flagged to Saqib directly; `strategy-engine-open-decisions.md` was not touched (this delivery's own explicit boundary — owned by a parallel session).
+- New `backend/tests/test_backtest_sweep_route.py` (13 real-Postgres tests, including a non-mocked proof of strict sequential execution via a spy on the real lock context manager) and two new unit tests in `test_backtest_runner.py` for `sweep_id` threading. Full backend suite: 798 passed (783 baseline + 15 new), 77.68s.
+- `docs/architecture/backtest-runner-design.md` gained a new as-built note (decision #159) with a cross-component data-flow diagram and an internal-loop diagram.
+- Route-only — no frontend change, matching this project's established backend-first sequencing.
+
+## Prior delivery record — decision #157: deterministic fast backtest replay
+
+### Current delivery (as landed)
 
 - `MarketStateEngine` now derives Acceleration elapsed seconds from consecutive source 1m `candle_ts` values. First and non-positive deltas remain honestly `None`; the existing points/second cap is unchanged.
 - `DebounceScheduler.flush()` atomically consumes a pending callback and neutralizes its delayed task. `stop()` now awaits canceled scheduler tasks.

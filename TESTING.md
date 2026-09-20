@@ -1,4 +1,6 @@
-# TESTING — open-decisions-d-item-audit (decision #158)
+# TESTING
+
+## Part A — decision #158: open-decisions-d-item-audit
 
 Docs-only audit. **No code, no tests, no other `docs/architecture/*.md` touched.** Nothing here is executable, so there is no suite to run; "testing" means re-checking each claim against the code and the decision log. Commands to do that yourself are in §3.
 
@@ -115,3 +117,134 @@ A separate session may be building the fixture-scenario batch/sweep endpoint. Fi
 - **`TESTING.md`:** delete-first replaces the whole file. If the other delivery also replaced it, combine as separate sections rather than picking one.
 - **`CHANGES.md`:** untouched here, so no conflict from this side.
 - `confirmed-decisions.md` is now ~215,000 bytes, far past the ~100KB rollover trigger — already flagged and deliberately deferred since #150. Not performed here; do it in a dedicated task when no parallel session is appending.
+
+---
+
+## Part B — decision #159: backtest-sweep-endpoint-v1
+
+**Collision resolution.** Part A (decision #158, above) explicitly anticipated this exact collision in its own §6 and landed first, as a real confirmed number, not a placeholder. Followed its instructions precisely: this delivery's number is **#159**, not the originally-planned #158. `main` was re-pulled mid-task; the four files #158 touched (`TESTING.md`, `strategy-engine-open-decisions.md`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`) were synced into this working tree before continuing. This delivery's own code files (`backend/app/backtest_runner/runner.py`, `backend/app/api/routes/backtest.py`, `backend/tests/test_backtest_runner.py`) were confirmed untouched by that diff — genuinely zero file overlap, as both sessions' prompts required.
+
+Base: `main`, pulled fresh at task start (`INDEX.md`/`confirmed-decisions.md` tail #157 at that point), re-pulled again mid-task after #158 landed, reconciled, and re-checked immediately before writing this entry (`INDEX.md`/`confirmed-decisions.md` tail #158, archives `001-060` … `122-133` unchanged). Slug during parallel work: `backtest-sweep-endpoint-v1`.
+
+---
+
+### 1. What changed
+
+| File | Change |
+|---|---|
+| `backend/app/backtest_runner/runner.py` | Small, additive: `BacktestRunner.__init__` gains `sweep_id: UUID \| None = None`, resolving to a fresh `uuid4()` when omitted (unchanged behavior for every existing caller) or the caller's value otherwise. `run()` reads `self._sweep_id` instead of minting its own. |
+| `backend/app/api/routes/backtest.py` | New, additive `POST /backtest/sweep` route + two new frozen dataclasses (`SweepPairResult`, `BacktestSweepResult`) + two small validation helpers. Existing `/backtest/run`, `/backtest/run/ibkr` handlers untouched — read for convention, not modified. |
+| `backend/tests/test_backtest_runner.py` | Two new unit tests appended: default `sweep_id` still fresh per run when unspecified; explicit `sweep_id` honored and shared across two real runs. Nothing existing edited. |
+| `backend/tests/test_backtest_sweep_route.py` | New file, 13 real HTTP-level tests against the new route. |
+| `docs/architecture/backtest-runner-design.md` | New as-built note (decision #159) appended at the end — cross-component data-flow diagram, internal-loop diagram, the `sweep_id`-threading rationale, and the `level_interaction_state` finding (§4 below). Nothing existing edited. |
+| `docs/decisions/confirmed-decisions.md` | New entry `### 159.` appended. |
+| `docs/decisions/INDEX.md` | New `\| 159 \|` row appended. |
+| `TESTING.md` | This file — Part A (decision #158) kept intact; this Part B appended. |
+| `CHANGES.md` | Not touched by #158, so this delivery adds a new top section above #157's existing content, following the established Part-under-"Current delivery" pattern from #155/#156. |
+
+Nothing under `frontend/` changed. `docs/architecture/strategy-engine-open-decisions.md` — this delivery's own parallel-session boundary — was **not** touched.
+
+---
+
+### 2. Real environment used
+
+- Python 3.12.3, PostgreSQL 16 (`apt`-installed in this sandbox), 1 vCPU.
+- `CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;` / `CREATE DATABASE trading_workspace OWNER trading;` / `alembic upgrade head` — clean migration, no errors.
+- `pip install -r backend/requirements.txt` (`--break-system-packages`).
+- All commands below run with `PYTHONPATH=.` and `POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading` from `backend/`.
+
+---
+
+### 3. Timing — measured directly, not estimated
+
+```
+$ python -m pytest tests/test_backtest_routes.py::test_run_backtest_first_pullback_scenario_fires_and_persists -x -q
+1 passed in 2.01s
+```
+Confirms decision #157's ~2s/run figure independently, in this environment — the basis for the 20-pair batch bound (see decision-log entry §"Confirmed v1 scope").
+
+```
+Real 3 symbols × 2 scenarios sweep (6 real runs, real Postgres):
+WALL CLOCK: 4.364s   pairs_requested=6  pairs_succeeded=6
+```
+The exact "modest batch size" benchmark this task asked for, run for real via `TestClient` against the live route (not the pytest harness, to isolate pure request wall-clock).
+
+---
+
+### 4. New test suite — `test_backtest_sweep_route.py` (13 tests)
+
+```
+$ python -m pytest tests/test_backtest_sweep_route.py -v
+test_sweep_valid_cross_product_shares_sweep_id_and_preserves_order PASSED
+test_sweep_runs_strictly_sequentially_through_the_real_lock PASSED
+test_sweep_rejects_when_live_data_connected_before_any_run PASSED
+test_sweep_rejects_unknown_strategy_name PASSED
+test_sweep_rejects_unknown_scenario_before_any_run PASSED
+test_sweep_requires_symbols_param PASSED
+test_sweep_requires_scenarios_param PASSED
+test_sweep_rejects_empty_symbol_value PASSED
+test_sweep_accepts_exactly_the_max_batch_size PASSED
+test_sweep_rejects_21_pairs_before_any_run PASSED
+test_sweep_partial_failure_continues_and_preserves_earlier_successes PASSED
+test_sweep_processes_duplicate_requested_pairs_as_independent_real_runs PASSED
+test_run_route_unaffected_by_sweep_route_presence PASSED
+13 passed in 24.18s
+```
+
+Notable, not mocked: `test_sweep_runs_strictly_sequentially_through_the_real_lock` wraps the *real* `engine_singleton_guard.install_replay_engines` context manager with a timing spy that still delegates to the real implementation (real `_RUN_LOCK`, real engines) and asserts the recorded `[enter, exit]` intervals across a multi-pair sweep never overlap — a deterministic, non-flaky proof of sequential execution, not a timing-floor guess. `test_sweep_accepts_exactly_the_max_batch_size` actually runs all 20 real fixture backtests (5 symbols × 4 real scenarios) rather than only checking the validation branch. `test_sweep_partial_failure_continues_and_preserves_earlier_successes` forces one real, deterministic failure via a narrow monkeypatch on `load_scenario_candles` for one specific scenario name — every other pair in that test still runs through the real `BacktestRunner`/lock path.
+
+One real bug caught and fixed during this task's own test-writing, not shipped: the first draft of this file's `_clean_test_symbol` helper guessed a `symbol`/`ticker` text column on several tables that actually key off `symbol_id` (FK to `symbols`) — the deletes silently no-opped inside a broad `except: rollback()`, leaving stale state across tests. Fixed by copying `test_backtest_routes.py`'s own proven helper verbatim (`symbol_id IN (SELECT id FROM symbols WHERE ticker = :t)`).
+
+---
+
+### 5. New unit tests — `test_backtest_runner.py` (2 tests, part of the full run below)
+
+`test_default_sweep_id_is_still_fresh_per_run_when_unspecified`, `test_explicit_sweep_id_is_honored_and_shared_across_runs` — both use the file's own existing `_OneShotStubStrategy` (fires off an internal call counter, not off engine state), deliberately: this decouples the `sweep_id`-threading proof from the real, separately-confirmed `level_interaction_state` finding (§6 below), which affects real strategies' MATCH conditions on a symbol's second real run but not this stub's.
+
+---
+
+### 6. Real finding surfaced during verification, not fixed in this delivery
+
+Calling the *existing, unmodified* `POST /backtest/run` twice in a row against one fresh symbol:
+
+```
+run1: 200  outcomes_recorded=1
+run2: 200  outcomes_recorded=0
+```
+
+Root cause confirmed by reading `backend/app/models/trading_intelligence.py` directly: `LevelInteractionState`'s unique constraint is `(symbol_id, timeframe, level_key)` — no `backtest_run_id` column, unlike `daily_levels_state` (which got exactly this isolation at decision #141/D19). A second real run of the same symbol inherits real leftover touch/resolution state from the first. Confirmed to be genuinely pre-existing and unrelated to this delivery's own code — reproduced through the unmodified single-run route, no sweep code involved. Documented in the decision-log entry and the architecture doc's new as-built note; **not fixed here** (out of this task's scope, and `strategy-engine-open-decisions.md` is this delivery's own explicit do-not-touch boundary) — flagged to Saqib directly to route as he judges best.
+
+This shaped the new test suite directly: `test_sweep_processes_duplicate_requested_pairs_as_independent_real_runs` deliberately does not assert that two real runs of the same symbol produce identical `outcomes_recorded`.
+
+---
+
+### 7. Full backend suite
+
+```
+$ python -m pytest tests/ -q
+798 passed, 1 warning in 77.68s (0:01:17)
+```
+
+798 = 783 (decision #157's own reported baseline, unchanged since — #158 was docs-only) + 13 new sweep-route tests + 2 new `sweep_id` unit tests. Zero regressions, zero unexpected count.
+
+---
+
+### 8. Footprint verification
+
+```
+$ diff -rq <fresh main, re-pulled post-#158> <this working tree>
+Files .../backend/app/api/routes/backtest.py differ
+Files .../backend/app/backtest_runner/runner.py differ
+Files .../backend/tests/test_backtest_runner.py differ
+Only in <working tree>/backend/tests: test_backtest_sweep_route.py
+```
+(plus the docs files listed in §1 — `TESTING.md`, `CHANGES.md`, `confirmed-decisions.md`, `INDEX.md`, `backtest-runner-design.md` — expected and accounted for.) Nothing else differs. `docs/architecture/strategy-engine-open-decisions.md` byte-identical to the post-#158 `main`.
+
+---
+
+### 9. What this delivery did not cover
+
+- No frontend surfacing — deliberate, matches this project's established backend-first sequencing (see decision-log entry).
+- The `level_interaction_state` cross-run isolation gap (§6) is documented, not fixed.
+- A failed pair's `run_id` is not retrievable from the sweep response even when a `backtests` row may exist for that attempt — stated limitation, see the route's own docstring and the decision-log entry.
+- No background-job/async/progress/cancellation infrastructure — explicit non-goal per the task brief, confirmed still unnecessary given the measured timings in §3.

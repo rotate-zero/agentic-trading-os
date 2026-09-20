@@ -58,11 +58,25 @@ from a run-scoped in-memory provider. Neither path supplies historical
 point-in-time fundamentals or news; both keep the existing replay-safe
 FixtureBacktestContextProvider calendar behavior and honest absence for
 those fields.
+
+**A third path, additive: `POST /backtest/sweep`.** One strategy across
+an explicit cross-product of symbols × fixture scenarios, run
+sequentially through this exact same `BacktestRunner`/`_RUN_LOCK` path,
+sharing one real `sweep_id` instead of each run minting its own ("a
+sweep of one," per decision #155's note on the schema). Fixture-only —
+deliberately excludes `/run/ibkr`'s real-data path, since a single IBKR
+acquisition already costs real minutes and looping that synchronously
+inside one request would be impractical. See the route's own docstring
+for scope, batch-size bound, and partial-failure handling.
 """
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import logging
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from uuid import UUID, uuid4
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -75,13 +89,14 @@ from app.backtest_runner.ibkr_historical import (
     IBKRHistoricalAcquisitionError,
     acquire_ibkr_replay_data,
 )
-from app.backtest_runner.runner import BacktestRunner
+from app.backtest_runner.runner import BacktestRunner, DiscardedSignal
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
 from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
 from app.strategy_engine.scheduler import default_registry
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
+logger = logging.getLogger(__name__)
 
 # Not versioned anywhere else in this codebase yet (runner.py's own
 # module docstring: "Feature Engine has no versioning scheme of its own
@@ -93,6 +108,14 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 # codebase that has ever had to pick one.
 _FEATURE_VERSION = "feature_engine_v1"
 _MAX_IBKR_REPLAY_WINDOW = timedelta(hours=24)
+
+# Saqib-approved bound (see this delivery's decision-log entry for the
+# reasoning): len(symbols) * len(scenarios) must not exceed this before
+# any run starts. Measured ~2.01s per fixture run (130-candle scenario,
+# real local Postgres) makes 20 sequential runs ≈ 40s of wall clock for
+# the whole synchronous call — a measured fact about THIS environment,
+# not a guarantee for any deployment or proxy timeout.
+_MAX_SWEEP_PAIRS = 20
 
 
 def _validate_strategy_name(strategy_name: str) -> None:
@@ -380,3 +403,227 @@ async def run_ibkr_backtest(
     )
     result = await runner.run()
     return dataclasses.asdict(result)
+
+
+# --- POST /backtest/sweep --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SweepPairResult:
+    """One (symbol, scenario) pair's outcome within a sweep. `run_id` is
+    `None` only on a genuine per-pair failure — `BacktestRunner.run()`
+    only returns its internally-minted `run_id` on a successful return,
+    and this route does not thread `run_id` in (only `sweep_id` — see
+    `runner.py`'s own docstring for why that's the one small, additive
+    change this task asked for). A `BacktestRunRecord` row may still
+    exist in the database for a failed attempt (it's written before
+    replay starts, per `runner.py`'s own ordering comment) — its
+    `run_id` just isn't retrievable from this response without a larger
+    change to the runner's return contract than this task's scope."""
+
+    symbol: str
+    scenario: str
+    run_id: UUID | None
+    outcomes_recorded: int | None
+    discarded_signals: list[DiscardedSignal]
+    error: str | None
+
+
+@dataclass(frozen=True)
+class BacktestSweepResult:
+    sweep_id: UUID
+    strategy_name: str
+    pairs_requested: int
+    pairs_succeeded: int
+    pairs_failed: int
+    runs: list[SweepPairResult] = field(default_factory=list)
+
+
+def _validate_sweep_symbols(symbols: list[str]) -> list[str]:
+    """No real symbol registry exists to validate against — confirmed
+    directly: `/backtest/run`'s own `symbol` param is documented as "an
+    arbitrary label for this run's outcome rows, not a real ticker
+    lookup," and that stays true here. Normalizing (`strip().upper()`,
+    matching `/run`'s own convention) and rejecting empty labels after
+    normalization is the full extent of what's reasonable to validate."""
+    if not symbols:
+        raise HTTPException(status_code=422, detail="symbols must contain at least one value")
+    normalized = [s.strip().upper() for s in symbols]
+    if any(not s for s in normalized):
+        raise HTTPException(status_code=422, detail="symbols must not contain empty values")
+    return normalized
+
+
+def _validate_sweep_scenarios(scenarios: list[str]) -> list[str]:
+    if not scenarios:
+        raise HTTPException(status_code=422, detail="scenarios must contain at least one value")
+    for scenario in set(scenarios):
+        _validate_scenario(scenario)
+    return scenarios
+
+
+@router.post("/sweep")
+async def run_backtest_sweep(
+    strategy_name: str = Query(..., description="One of the 7 real v1 strategy names (see default_registry())."),
+    symbols: list[str] = Query(
+        ...,
+        description=(
+            "Explicit list of symbol labels to sweep, e.g. ?symbols=AAPL&symbols=MSFT. "
+            "No implicit 'all known symbols' expansion — say exactly what to sweep."
+        ),
+    ),
+    scenarios: list[str] = Query(
+        ...,
+        description=(
+            "Explicit list of scenarios.py names to sweep, e.g. ?scenarios=vwap_neutral_conquest. "
+            "No implicit 'all scenarios' expansion."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Run one strategy across the explicit cross-product of `symbols` ×
+    `scenarios`, sequentially, sharing one real `sweep_id` across every
+    resulting `backtests` row — the real batch caller `sweep_id` has been
+    waiting for since Backtest Runner v1 (decision #128's schema; #155's
+    own "a sweep of one" note).
+
+    **Fixture-only, deliberately.** Excludes `/run/ibkr`'s real-data
+    path — a single IBKR acquisition already costs real minutes (up to
+    ~16 per decision #145); looping that synchronously inside one HTTP
+    request would be impractical. Use `/run/ibkr` directly per symbol
+    for real-data backtests.
+
+    **Scope, confirmed with Saqib before building.** The cross-product of
+    both lists, both explicit and required — no implicit "all known
+    symbols" or "all scenarios" expansion, since that could silently
+    balloon into a very large sequential run. Requested-pair ordering is
+    `symbols` outer / `scenarios` inner (`itertools.product(symbols,
+    scenarios)`), preserved exactly in the response's `runs` list — never
+    reordered by database or collection behavior — so each result lines
+    up with the request that produced it without relying on `run_id`
+    lookups.
+
+    **Batch bound.** `len(symbols) * len(scenarios)` must not exceed
+    `_MAX_SWEEP_PAIRS` (20); the request is rejected before any run
+    starts if it does. Measured ~2.01s per fixture run in this
+    environment (real local Postgres, 130-candle scenario) made 20 a
+    reasonable synchronous v1 bound — stated as a measured fact about
+    this environment, not a guarantee for any deployment or proxy
+    timeout. The limit is on requested pairs, not successful runs.
+
+    **Execution model — reuses `/backtest/run`'s own path exactly, one
+    pair at a time.** No new locking mechanism: each pair goes through
+    the identical `BacktestRunner.run()` → `install_replay_engines()` →
+    `engine_singleton_guard._RUN_LOCK` path `/backtest/run` already uses,
+    acquiring and releasing that same process-wide lock once per run —
+    true parallelism was never on the table, per that lock's own
+    docstring on why concurrent runs in one process are unsafe by
+    design. A fresh `Strategy` instance is built for every pair (fresh
+    `default_registry()` call, same as `/backtest/run` does per request)
+    rather than reused across the loop: confirmed directly that all 7
+    real strategies hold `self._state: dict[str, ...]` keyed per symbol
+    — reusing one instance across pairs would let one pair's state (e.g.
+    ORB's opening-range candle count) leak into another pair that
+    happens to reuse the same symbol against a different scenario.
+
+    **Live-trading guard, checked once before the sweep starts, not
+    per-pair.** Same reasoning `/backtest/run` itself already rests on:
+    a single run's own several-second replay never re-checks mid-run
+    either, so treating a sequence of those same runs identically is
+    consistent, not a new weaker standard invented for sweeps.
+
+    **Partial-failure handling.** Pre-execution validation (strategy
+    name, every requested scenario name, batch size, non-empty lists)
+    rejects the whole request before any run starts. Once execution
+    begins, a genuine per-pair error (as opposed to an honest
+    `outcomes_recorded=0`, which is expected and not an error) is
+    caught, logged, and recorded against that pair — remaining pairs
+    still run, and every already-completed pair's result is still
+    returned. This mirrors an existing, real convention in this
+    codebase for independent-item batches: `FeatureEngine._worker_loop`
+    ("one bad symbol/candle must not stall the other ~100") and
+    `websocket/manager.py`'s broadcast ("a dead socket must not break
+    the broadcast") both already establish "one item's failure doesn't
+    sink the batch" as this project's own precedent — applied here
+    rather than invented fresh.
+    """
+    _validate_strategy_name(strategy_name)
+    symbols = _validate_sweep_symbols(symbols)
+    scenarios = _validate_sweep_scenarios(scenarios)
+
+    pairs = list(itertools.product(symbols, scenarios))
+    if len(pairs) > _MAX_SWEEP_PAIRS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Requested {len(pairs)} (symbol, scenario) pairs "
+                f"({len(symbols)} symbols × {len(scenarios)} scenarios), exceeding the "
+                f"maximum of {_MAX_SWEEP_PAIRS} per sweep. Split this into multiple "
+                f"requests, or request fewer symbols/scenarios."
+            ),
+        )
+
+    _reject_if_live_data_connected()
+
+    sweep_id = uuid4()
+    runs: list[SweepPairResult] = []
+
+    for symbol, scenario in pairs:
+        try:
+            strategy = next(
+                s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name
+            )
+            candles = load_scenario_candles(scenario)
+            first_day = get_market_clock().trading_day(candles[0].candle_ts)
+            daily_candles = build_daily_history_candles(before=first_day)
+            provider = FixtureCandleProvider({(symbol, "1m"): candles, (symbol, "1d"): daily_candles})
+            pair_runner = BacktestRunner(
+                strategy=strategy,
+                symbol=symbol,
+                market_data_provider=provider,
+                start=candles[0].candle_ts,
+                end=candles[-1].candle_ts,
+                context_provider=FixtureBacktestContextProvider(),
+                data_version=f"fixture:{scenario}",
+                feature_version=_FEATURE_VERSION,
+                sweep_id=sweep_id,
+            )
+            result = await pair_runner.run()
+        except Exception as exc:  # noqa: BLE001 — one bad pair must not sink the rest of the sweep
+            logger.exception(
+                "backtest sweep: pair (symbol=%r, scenario=%r) failed under sweep_id=%s",
+                symbol,
+                scenario,
+                sweep_id,
+            )
+            runs.append(
+                SweepPairResult(
+                    symbol=symbol,
+                    scenario=scenario,
+                    run_id=None,
+                    outcomes_recorded=None,
+                    discarded_signals=[],
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+        else:
+            runs.append(
+                SweepPairResult(
+                    symbol=symbol,
+                    scenario=scenario,
+                    run_id=result.run_id,
+                    outcomes_recorded=result.outcomes_recorded,
+                    discarded_signals=result.discarded_signals,
+                    error=None,
+                )
+            )
+
+    pairs_failed = sum(1 for r in runs if r.error is not None)
+    sweep_result = BacktestSweepResult(
+        sweep_id=sweep_id,
+        strategy_name=strategy_name,
+        pairs_requested=len(pairs),
+        pairs_succeeded=len(pairs) - pairs_failed,
+        pairs_failed=pairs_failed,
+        runs=runs,
+    )
+    return dataclasses.asdict(sweep_result)

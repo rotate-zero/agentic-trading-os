@@ -738,3 +738,100 @@ This delivery enables later batch/sweep work but does not implement an orchestra
 Decision #155's final-candle observation is confirmed and deliberately not changed: fixture providers implement `[start,end)`, while the route and the named regression runs pass `end=candles[-1].candle_ts`; therefore a 120-candle fixture replays exactly 119 candles. Exact settlement now proves every candle *included by the provider* persists once. Changing the caller boundary would add a separate candle and can change signals/fills, so it remains a separate behavioral task.
 
 ---
+
+**As-built note (decision #159) — `POST /backtest/sweep`: the real batch caller `sweep_id` was minted for since v1 (decision #128; #155's own "a sweep of one" note).** Decision #157 (directly above) closed the one thing that made batch runs impractical (each run taking one to several minutes) without touching the one thing that makes concurrent runs unsafe (`engine_singleton_guard._RUN_LOCK`, process-wide by design) — so the right v1 shape is a synchronous, sequential loop, confirmed practical here: 3 symbols × 2 scenarios (6 real runs, real Postgres) completed in **4.36s wall clock**, matching the ~2s/run single-run figure decision #157 reported.
+
+**Scope, confirmed with Saqib before implementation.** Fixture scenarios only — deliberately excludes `POST /backtest/run/ibkr`'s real-data path (a single IBKR acquisition already costs real minutes, per decision #145; looping that synchronously would be impractical). Explicit cross-product of an explicit `symbols` list × explicit `scenarios` list, both required — no implicit "all known symbols"/"all scenarios" expansion. Batch bound: `len(symbols) * len(scenarios) <= 20`, checked before any run starts. 20 was sized off the measured ~2s/run figure (20 runs ≈ 40s, comfortably under common default gateway timeouts) — a bound on *requested* pairs, not successful ones, and a measured fact about this environment, not a guaranteed production runtime.
+
+Cross-component data flow:
+
+```
+POST /backtest/sweep(strategy_name, symbols[], scenarios[])
+              │
+              ▼
+   pre-execution validation (all before any run starts)
+   ├─ _validate_strategy_name()        ◄── reused from /backtest/run, unchanged
+   ├─ _validate_scenario() per unique scenario  ◄── reused, unchanged
+   ├─ symbols normalized (.strip().upper()), reject empty
+   │    (no real symbol registry exists to validate against — confirmed
+   │     directly: /backtest/run's own `symbol` is documented as "an
+   │     arbitrary label ... not a real ticker lookup," same here)
+   ├─ len(symbols) * len(scenarios) <= 20 (_MAX_SWEEP_PAIRS)
+   └─ _reject_if_live_data_connected()  ◄── decision #132's guard, reused,
+                                             checked once — see reasoning below
+              │
+              ▼
+   sweep_id = uuid4()          ◄── minted once, shared by every run below
+              │
+              ▼
+   for (symbol, scenario) in itertools.product(symbols, scenarios):
+   ordering: symbols outer / scenarios inner — preserved exactly in the
+   response, never database/collection order
+              │
+              ├─► fresh Strategy instance (fresh default_registry() call,
+              │    same as /backtest/run does per-request — see internal
+              │    flow below for why "fresh" matters)
+              ├─► fresh FixtureCandleProvider (load_scenario_candles(scenario)
+              │    reads its fixture CSV fresh each call — no shared
+              │    mutable state across pairs)
+              ├─► BacktestRunner(..., sweep_id=sweep_id)  ◄── the one new
+              │    constructor param; every other kwarg matches /run exactly
+              └─► await runner.run()   ◄── same call, same _RUN_LOCK,
+                   try/except per pair — see partial-failure note below
+              │
+              ▼
+   BacktestSweepResult: sweep_id, strategy_name, pairs_requested,
+   pairs_succeeded, pairs_failed, runs[] (one SweepPairResult per pair,
+   in request order — symbol, scenario, run_id | None, outcomes_recorded
+   | None, discarded_signals, error | None)
+```
+
+**Execution model — reuses `/backtest/run`'s own path exactly, one pair at a time.** No second locking mechanism: each pair acquires and releases the identical process-wide `_RUN_LOCK` `/backtest/run` already uses, via the identical `install_replay_engines()` call inside `BacktestRunner.run()`. True parallelism was never on the table — that lock's own docstring explains why concurrent runs in one process are unsafe by design (singleton engine installation would let one run's in-flight capture calls see another run's state). Proved empirically, not just asserted: a test wraps the real `install_replay_engines` context manager with a timing spy (still delegating to the real implementation — the real lock, the real engines) and confirms the recorded `[enter, exit]` intervals across a multi-pair sweep never overlap.
+
+Internal loop flow, and the one correctness finding that shaped it:
+
+```
+for (symbol, scenario) in pairs:
+        │
+        ▼
+  default_registry(now) ──► pick strategy_name match ──► FRESH instance
+        │                                                     │
+        │            all 7 real strategies confirmed to hold
+        │            self._state: dict[str, ...] KEYED PER SYMBOL
+        │            (ORB, Gap, Volume Spike, FirstPullback, Reversal,
+        │             Momentum, VWAP — checked directly, not assumed)
+        │                                                     │
+        │      reusing ONE Strategy instance across pairs would let
+        │      one pair's state (e.g. ORB's opening-range candle
+        │      count) leak into a later pair reusing the same symbol
+        │      against a different scenario — a fresh instance per
+        │      pair closes that off entirely
+        ▼
+  BacktestRunner(..., sweep_id=shared) ──► await run()
+        │
+        ├─ success ──► SweepPairResult(run_id, outcomes_recorded,
+        │               discarded_signals, error=None)
+        │
+        └─ Exception ──► logged, SweepPairResult(run_id=None,
+                          outcomes_recorded=None, error=str) — loop
+                          CONTINUES to the next pair; already-collected
+                          results are preserved. Matches an existing,
+                          real convention in this codebase for
+                          independent-item batches (FeatureEngine's
+                          worker loop: "one bad symbol/candle must not
+                          stall the other ~100"; websocket/manager.py's
+                          broadcast: "a dead socket must not break the
+                          broadcast") — applied here, not invented fresh.
+```
+
+**A second, deeper finding surfaced during verification — not a sweep defect, but real and worth recording here.** Running the *same symbol* through two separate real runs — whether two pairs in one sweep, or two separate calls to the existing, unmodified `POST /backtest/run` — can legitimately produce different `outcomes_recorded` between them. Confirmed directly: calling `/backtest/run` twice in a row against one fresh symbol, no sweep code involved at all, reproduced the identical discrepancy (1, then 0). Root cause, confirmed by reading the models rather than assumed: `daily_levels_state` got per-run isolation via `backtest_run_id` (decision #141/D19), but `LevelInteractionState`/`LevelInteractionEvent` (`app/models/trading_intelligence.py`) never did — `LevelInteractionState`'s own unique constraint is `(symbol_id, timeframe, level_key)`, with no `backtest_run_id` column at all, so a second run of the same symbol inherits real leftover touch/resolution state from the first. This is a pre-existing `BacktestRunner` characteristic that predates this delivery and applies equally to single runs; the sweep endpoint is simply the first caller likely to request the same symbol twice in quick succession. **Not fixed here** — out of this task's scope, and a fix would mean giving `level_interaction_state` the same per-run-isolation treatment D19 gave `daily_levels_state`, a change of that same shape and size. `docs/architecture/strategy-engine-open-decisions.md` is owned by a parallel session for this delivery and wasn't touched; flagged to Saqib directly to route as he judges best (a new D-item, most likely).
+
+**`sweep_id` threading — confirmed a small, additive constructor change, not a larger one.** `BacktestRunner.run()` already minted its own `sweep_id = uuid4()` as a local — "a sweep of one," per decision #155's own note on the schema. The only change: `__init__` now accepts `sweep_id: UUID | None = None`, resolving to a fresh `uuid4()` when omitted (`self._sweep_id = sweep_id if sweep_id is not None else uuid4()`) and to the caller's value otherwise; `run()` reads `self._sweep_id` instead of minting its own. Every existing caller (`/backtest/run`, `/backtest/run/ibkr`, every direct-construction test) passes nothing and gets byte-for-byte the same behavior as before — confirmed via the full existing backtest test suite, unchanged pass count.
+
+**Live-trading guard (decision #132), checked once before the sweep starts, not per-pair.** Same reasoning `/backtest/run` itself already rests on: a single run's own several-second replay never re-checks mid-run either, so treating a sequence of those same runs identically is consistent with existing precedent, not a new weaker standard invented for sweeps specifically.
+
+**Response ordering is deterministic by construction**, not by database query: `runs[]` is built by appending to a plain list inside the `itertools.product(symbols, scenarios)` loop, in that exact order — never re-sorted, never read back from `backtests` in query order.
+
+Route-only, matching this project's established "build the backend capability first, surface it later" sequencing (Context Engine #98→#125, Performance Analytics #122→#127, World View #150→#154) — no frontend change.
+
+---

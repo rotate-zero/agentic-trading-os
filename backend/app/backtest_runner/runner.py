@@ -261,7 +261,20 @@ class BacktestRunner:
     is a single-element list, not a bare string, so a future multi-symbol
     runner extends this row shape rather than needing a new one — this
     class itself still only drives one symbol (Unit 4 brief: don't build
-    multi-symbol now, don't foreclose it either)."""
+    multi-symbol now, don't foreclose it either).
+
+    **`sweep_id` threading (decision: batch/sweep endpoint).** Confirmed
+    a small, additive constructor change, not a larger one: `run()`
+    already minted its own `sweep_id = uuid4()` as a local — "a sweep of
+    one," per decision #155's own note on the schema. The only change is
+    *where* that UUID comes from. A caller that wants several runs to
+    share one real sweep now passes `sweep_id=` explicitly; every
+    existing caller (`POST /backtest/run`, `POST /backtest/run/ibkr`,
+    every direct-construction test) passes nothing and gets byte-for-byte
+    the same "mint one fresh UUID, one run, one sweep" behavior as
+    before — resolved once here in `__init__`, not duplicated at each
+    call site.
+    """
 
     def __init__(
         self,
@@ -278,7 +291,9 @@ class BacktestRunner:
         walk_forward_fold: int | None = None,
         is_holdout: bool = False,
         clock: MarketClock | None = None,
+        sweep_id: UUID | None = None,
     ) -> None:
+        self._sweep_id = sweep_id if sweep_id is not None else uuid4()
         self._strategy = strategy
         self._symbol = symbol
         self._market_data_provider = market_data_provider
@@ -301,7 +316,7 @@ class BacktestRunner:
             )
 
         run_id = uuid4()
-        sweep_id = uuid4()  # "a sweep of one" — see this task's earlier design note, confirmed
+        sweep_id = self._sweep_id  # caller-supplied for a real sweep, else the fresh UUID __init__ minted — "a sweep of one" either way
         config_hash = _compute_config_hash(self._strategy.config.gate_conditions, self._strategy.config.params)
 
         producer = EngineBackedReplayStateProducer(
