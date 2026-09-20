@@ -1,4 +1,8 @@
-# TESTING — Backtest replay timing investigation (decision #155)
+# TESTING — combined: decision #155 (backtest replay timing investigation) and decision #156 (wall-clock test audit)
+
+Both deliveries append to `docs/decisions/confirmed-decisions.md`/`INDEX.md` (no conflict there — both entries present) and replace this file plus `CHANGES.md`. #156 landed second and combined both deliveries' content here as sections, per #155's own manual-merge notes (§6 of its part, below), rather than overwriting #155's content.
+
+## Part A — Backtest replay timing investigation (decision #155)
 
 **Docs-only delivery. Nothing was implemented or changed; nothing was decided.** Status: awaiting Saqib's direction. No `backend/`, `frontend/` or test file is touched, so no test suite needs re-running for this change. "Verification" here means reproducibility: every number below has the command and environment that produced it. Sections are separated on purpose: **1 Measured facts → 2 Options → 3 Recommendation → 4 Not measured → 5 Verification of this delivery → 6 Manual-merge notes.**
 
@@ -160,3 +164,101 @@ Decision-number check, run immediately before the entry was written: `INDEX.md` 
 - `docs/decisions/INDEX.md` — append-only, one row. Keep the other row(s); renumber this row to match the entry header.
 - `CHANGES.md` and `TESTING.md` — both deliveries replace the whole root file. If the other one landed first, do not overwrite it: keep both as sections in each file, or rename this pair to `CHANGES-backtest-replay-timing-investigation.md` / `TESTING-backtest-replay-timing-investigation.md`. After renumbering, update the "decision #155" mentions in both.
 - Content overlap to watch: `test_backtest_routes.py::…first_pullback…` carries a wall-clock assertion (`elapsed > 60`) that the audit instance may also flag; this delivery changes no test.
+
+## Part B — Wall-clock-dependent test audit (decision #156)
+
+**Docs-only delivery. No test or production file changed; nothing was fixed because nothing proven-broken was found.** Sections: **1 Methodology → 2 Full inventory table → 3 Controlled-clock proof (the two genuine candidates) → 4 Read-only review of `test_backtest_runner_*.py` → 5 What was not covered → 6 Verification of this delivery.**
+
+## 1. Methodology
+
+Per the task's own instruction, occurrence is not defect: `datetime.now()`/`utcnow()`/`date.today()`/`time.time()` appearing in a test only matters if the test's **outcome** — not just the literal value computed — can change depending on which real moment it runs at. Two ways that can happen:
+
+- **Direct**: the test itself calls one of the four functions and the result influences something asserted.
+- **Indirect**: test or production code under test calls a `MarketClock` method with no explicit `ts` argument, so it defaults to real `datetime.now()` internally (every method's signature is `ts: datetime | None = None`, confirmed in `app/core/market_clock.py`).
+
+First confirmed, by reading `feature_engine/engine.py`'s `_compute_one`/`_compute_aggregated` in full, that **the engine itself never touches the wall clock** — every session/timing decision (`MarketClock.session_bounds`, `.trading_day`, etc.) is driven off the caller-supplied `candle_ts`, never real `now()`. This means the defect class decision #153 found is structurally confined to test code, not production code — a test is only at risk if *it* supplies a `now()`-derived timestamp into the system under test.
+
+Direct-risk inventory: `grep -rn "datetime\.now(\|utcnow(\|date\.today(\|time\.time()" backend/tests/` (excluding `test_feature_engine.py`), then every hit read in its surrounding test to classify as comment vs. real, and every real hit traced through the actual code path it feeds — not guessed from the pattern alone.
+
+Indirect-risk inventory: `grep -rn` for zero-argument calls to each `MarketClock` method (`.is_market_open()`, `.current_session()`, `.session_bounds()`, `.trading_day()`, `.minutes_since_open()`, `.next_session_boundary()`, `.is_regular_session()`) across both `backend/tests/` and `backend/app/`. Zero hits in tests. Two in production: `GET /health` (`market_session`, `market_open`) and `GET /market/feed-status` (`market_session`). Neither is a defect: no test file references `/health` at all (`grep -rln "/health\b" backend/tests/` — empty), and the one test hitting `/market/feed-status` (`test_market_feed_status_reports_staleness_for_a_recorded_candle`, `test_market_routes.py`) asserts only `"market_session" in body`, never its value. `ContextEngine._loop`'s implicit-now `next_session_boundary()` call was also checked (it sizes a background sleep, cancelled by every test's `.stop()` well before it could elapse) — read the method's full fallback branch (walks forward to the next non-holiday weekday if nothing is left "today") and confirmed it cannot raise for any input, so even an unbounded real-clock value passed through this path is inert.
+
+## 2. Full inventory table — every real (non-comment) direct call site
+
+36 real sites across 16 files (`test_daily_levels.py` has 10 raw hits, all inside comments describing 5 anchors already fixed to literal `datetime(2026, 8, 12, 15, 0, ...)` timestamps — 0 real sites, no action needed).
+
+| File | Real sites | Outcome | Why (code path actually traced) |
+|---|---|---|---|
+| `test_tick_ingest.py` | 1 | No | `exchange_ts` is an opaque per-tick value; `TickIngestBridge` forwards `PRICE_UPDATED` per tick regardless of session (grepped for `MarketClock` in `tick_ingest.py` — zero hits) |
+| `test_backtest_runner_fixtures.py` (read-only) | 2 | No | L52: unknown-symbol lookup raises before any date filtering; L167: asserts `NotImplementedError` on a documented stub, argument value irrelevant |
+| `test_candle_recorder.py` | 4 | No | `CandleRecorder`/`candle_store` have zero `MarketClock` import; DB writes/reads are plain range queries by `candle_ts`. One real lead chased and ruled out: the `candles` table is monthly range-partitioned and migration `0001` only seeds July/August 2026 — today (2026-09-19/20) is outside that range, which looked like a live bug. `app/db/partitions.py` auto-creates the *write's own* month keyed off that row's `candle_ts` before every insert (confirmed by reading `candle_recorder.py:179`), not off wall-clock `now` — so this never fails regardless of the real date. File run live: 4/4 passed |
+| `test_backtest_runner_regression.py` (read-only) | 3 | No | L330: `get_aggs` unconditionally raises `BadResponse`, start/end never inspected; L548/L650: `default_registry(datetime.now(...))` only sets `StrategyConfig.active_from`, which decision #116/D14 confirms is stored but never enforced anywhere in the scheduler — the value is inert |
+| `test_live_tick_relay.py` | 3 | No | `LiveTickRelay` has zero `MarketClock` import (grepped); `exchange_ts` only builds OHLC bars, no session dependency |
+| `test_strategy_integration_contract.py` | 2 (+2 comment) | No | Both are a "not coincidentally close to real now" sanity check on a timestamp fixed years in the past (`_TS`) — can only ever be true |
+| `test_ibkr_backtest_route.py` | 1 | No | `acquired_at=datetime.now(...)` is passed into `IBKRReplayDataset` and never asserted anywhere in the test |
+| `test_news_flag_provider.py` | 1 | No | `time.time()` used for a *relative* delta (`minutes_ago * 60`) consumed synchronously by `_summarize()`'s own `time.time()` call milliseconds later — not the session/calendar defect class; all `minutes_ago` values used are far from the 15m importance-threshold edge |
+| `test_candle_aggregator.py` | 3 | No | All three `datetime.now(_ET)` values are `start`/`end` filter bounds passed to a `monkeypatch`ed `candle_store.get_recorded_candles` (a `lambda` that ignores its args and returns fixed data), or feed a path that raises `ValueError` before any date logic runs |
+| `test_intelligence_routes.py` | 3 (+6 comment) | 2× No (proven, §3) / 1× No (by design) | L261, L318: see §3. L476 (`test_intelligence_series_reflects_real_persisted_candles`): already defensive by construction — its own comment explains it asserts only that the `vwap` key exists, never its value, precisely because `base_ts` might not land in a regular session |
+| `test_polygon_provider.py` | 5 | No | All five are `start`/`end` args passed to a `get_aggs` `lambda` that ignores kwargs entirely and returns fixed fake data (confirmed `get_historical`'s body: `start`/`end` flow straight into `get_aggs` and nowhere else) |
+| `test_fundamentals_provider.py` | 1 | No | `now` populates DB columns (`profile_updated_at` etc.) that the test never asserts on — only `sector`/`industry`/`market_cap`/`revenue_ttm`/`financials_period`/`next_earnings_date` are checked |
+| `test_finnhub_provider.py` | 1 | No | `get_historical` unconditionally raises `HistoricalDataUnavailableError` (free-tier contract) regardless of the start/end passed |
+| `test_ibkr_adapter.py` | 1 | No | Qualification is mocked to always fail, raising `SymbolNotFoundError` before `now`/start/end are ever used |
+| `test_fundamentals_refresh.py` | 2 | No | Self-referential: both the input data (`soon`/`later`) and the expected result derive from the *same* `date.today()` call in the same test — always `soon < later`, robust to any real date |
+| `test_market_routes.py` | 3 | No | L235/L413 self-recorded-candle tests: candle_ts (`now − 1min`) always falls inside the route's own `[now − N·count, now]` window by a huge margin (route's own `now()` call is at most ~1s after the seed's) — not the session-dependent defect class. L333 (`staleness_seconds`): plain elapsed-time subtraction with a ±generous tolerance, asserted with `assert known_age_seconds - 5 <= ... <= known_age_seconds + 30`, no session/day dependency. All three routes: `market_session`/similar keys, when present, are never asserted on value |
+
+## 3. Controlled-clock proof — the two genuine candidates
+
+`test_intelligence_state_merges_feature_and_level_interaction_data` and `test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction` (both `test_intelligence_routes.py`) derive `base_ts = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes=20|30)`, then publish 9/17 consecutive 1m candles through the real EventBus into a real running app (`app.router.lifespan_context`), exercising the real Feature Engine and Level Interaction Engine. Reading alone couldn't rule this out (a straddled ET midnight could plausibly reset `LevelInteractionEngine`'s daily touch counter mid-run), so it was proven, not assumed.
+
+Command (repeated verbatim per instant/rep, only `FAKETIME` changes):
+
+```
+cd backend
+FAKETIME="@<instant>" LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 \
+  python3 -m pytest \
+    tests/test_intelligence_routes.py::test_intelligence_state_merges_feature_and_level_interaction_data \
+    tests/test_intelligence_routes.py::test_sma_ema_slope_family_groups_under_the_owning_period_and_is_excluded_from_level_interaction \
+    -q -p no:cacheprovider
+```
+
+| Instant (UTC) | What it is | Reps | Result |
+|---|---|---|---|
+| 2026-09-18 14:45:00 | Weekday regular session | 3 | 3/3 pass |
+| 2026-09-18 09:00:00 | Weekday pre-market | 3 | 3/3 pass |
+| 2026-09-18 21:00:00 | Weekday after-hours | 3 | 3/3 pass |
+| 2026-09-19 14:45:00 | Saturday (closed) | 3 | 3/3 pass |
+| 2026-09-07 14:45:00 | Labor Day (holiday, closed) | 3 | 3/3 pass |
+| 2026-09-18 04:15:00 | Just past ET midnight (00:15 ET) — `base_ts` straddles the ET trading-day boundary | 3 | 3/3 pass |
+| 2026-09-18 00:15:00 | Just past UTC midnight | 3 | 3/3 pass |
+| 2026-03-08 06:50:00 | 2026 US DST spring-forward edge | 3 | 3/3 pass |
+| 2026-11-01 06:20:00 | 2026 US DST fall-back edge | 3 | 3/3 pass |
+| 2026-09-30 23:59:00 | Month rollover | 3 | 3/3 pass |
+
+**30 pytest invocations, 60 individual test passes, 0 failures.** Why safe, confirmed by reading the assertions: both tests reach their result via `_wait_until_published`/HTTP polling of `GET /intelligence/state`, scoped to `body["timeframes"]["1m"]`, and assert specific SMA/VWAP/level-interaction *values*, never an event *count*. The extra 5m/15m/1h `FeaturesUpdated` publishes #153's bug produces during a real session land under the `"5m"`/`"15m"`/`"1h"` keys of the same response — a different, unasserted part of the payload — so they cannot perturb these two tests' outcome regardless of session or day.
+
+## 4. Read-only review of `test_backtest_runner_*.py`
+
+Per the file boundary, these two files (5 real sites — `test_backtest_runner_fixtures.py` L52/L167, `test_backtest_runner_regression.py` L330/L548/L650) were read and classified (table above) but not touched. **No suspected wall-clock defect found to report** to the parallel `backtest-replay-timing-investigation` (#155) session.
+
+That session's own `TESTING.md` flagged one overlap concern for this audit to check: `test_backtest_routes.py`'s `assert elapsed > 60` (line 131). Checked directly: `elapsed = time.monotonic() - t0` around an HTTP POST — a real-duration *stopwatch* measurement, not a calendar timestamp. `grep -n "datetime\.now(\|utcnow(\|date\.today(\|time\.time()" test_backtest_routes.py` returns zero hits; the file has no occurrence of this audit's defect class at all. Confirmed no actual overlap — that assertion's flakiness risk (if any) is about real execution speed, exactly #155's own subject, not which calendar day/session it runs in.
+
+## 5. What was not covered
+
+- The controlled-clock matrix (§3) was run only against the two genuine candidates, not against all 36 real sites — the rest were ruled out by tracing their actual code path (table in §2), per the task's own "occurrence is not defect, find out deterministically" framing, which does not require sweeping every harmless site under `libfaketime` (the task explicitly warns against sweeping the full suite under many clocks for exactly this reason — cost without signal).
+- Production wall-clock reads outside the test suite (e.g. `app/services/tick_ingest.py`'s own `datetime.now()` calls for stale-bucket flushing, noted in passing while tracing `test_tick_ingest.py`) were read but not independently audited — out of scope; this task covers test-suite defects, not a production wall-clock audit.
+- No new regression tests were added, because nothing was found to regress-test against.
+
+## 6. Verification of this delivery
+
+Full suite re-run once, at the real natural clock, after the audit (a no-regression *count* check — no controlled-clock re-run was needed since zero files changed):
+
+```
+cd backend
+setsid nohup python3 -m pytest -q -p no:cacheprovider tests > full_suite.log 2>&1 &
+# followed with bounded polls, never a blind sleep
+```
+
+Result: **776 passed, 0 failed, 786.25s** (the mid-run gap in this sandbox's own logs — Postgres briefly went down between tool turns and was restarted before this run — did not affect the result; the run reported here is a single, complete, successful invocation). Matches the 776-passed baseline #149–#155 have all reported; no regression.
+
+`diff -rq` against a fresh clone pulled immediately before packaging: only `docs/decisions/confirmed-decisions.md` (appended), `docs/decisions/INDEX.md` (appended), `CHANGES.md` (replaced), `TESTING.md` (replaced) differ. Nothing under `backend/` or `frontend/`, no test file, no existing decision entry edited.
+
+Decision-number check, run immediately before the entry was written: `INDEX.md` last row **#155**, `confirmed-decisions.md` tail **#155**, archive files `001-060 … 122-133` (unchanged) — all agree; next free number **#156**.
