@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 
 Callback = Callable[[], Awaitable[None] | None]
 
@@ -74,16 +75,36 @@ class DebounceScheduler:
 
     async def _run_after_delay(self, delay: float) -> None:
         await asyncio.sleep(delay)
-        if self._pending:
-            await self._run()
+        await self._run(only_if_pending=True)
 
-    async def _run(self) -> None:
+    async def _run(self, *, only_if_pending: bool = False) -> bool:
         async with self._lock:
+            if only_if_pending and not self._pending:
+                return False
             self._last_run = time.monotonic()
             self._pending = False
             result = self._callback()
             if asyncio.iscoroutine(result):
                 await result
+            return True
+
+    async def flush(self) -> bool:
+        """Run a pending callback now and neutralize its delayed task.
+
+        This is intentionally narrower than an unconditional run: when
+        the latest trigger already ran immediately, ``flush()`` is a
+        no-op. The pending check and callback share ``_lock`` with the
+        delayed path, so one trigger cannot become two invocations.
+        """
+        ran = await self._run(only_if_pending=True)
+        task = self._pending_run_task
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if self._pending_run_task is task:
+            self._pending_run_task = None
+        return ran
 
     async def start(self) -> None:
         """Start the background ceiling loop — guarantees max_interval freshness."""
@@ -92,9 +113,12 @@ class DebounceScheduler:
         self._ceiling_task = asyncio.create_task(self._ceiling_loop(), name=f"{self._name}-ceiling")
 
     async def stop(self) -> None:
-        for task in (self._ceiling_task, self._pending_run_task):
-            if task is not None and not task.done():
+        tasks = [task for task in (self._ceiling_task, self._pending_run_task) if task is not None]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._ceiling_task = None
         self._pending_run_task = None
 

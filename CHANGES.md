@@ -1,4 +1,18 @@
-# CHANGES — combined: decision #155 (backtest replay timing investigation) and decision #156 (wall-clock test audit)
+# CHANGES — decision #157: deterministic fast backtest replay
+
+## Current delivery
+
+- `MarketStateEngine` now derives Acceleration elapsed seconds from consecutive source 1m `candle_ts` values. First and non-positive deltas remain honestly `None`; the existing points/second cap is unchanged.
+- `DebounceScheduler.flush()` atomically consumes a pending callback and neutralizes its delayed task. `stop()` now awaits canceled scheduler tasks.
+- Backtest-only `MarketStateEngine.settle_replay()` flushes the latest payload and drains the authoritative worker queue. Replay does not start a periodic ceiling; live/default cadence remains 1s floor and 10s/4s ceiling.
+- `EngineBackedReplayStateProducer.advance_to()` now uses exact bus/worker queue completion; polling, `ReplaySettleTimeout`, and its constructor knobs were removed.
+- Tests cover pace-independent Acceleration, source-time gaps, first/non-positive deltas, live cadence, no delayed duplicate event/row, exact Feature/Market State/Context settlement, D18/D19 isolation, route behavior, and Momentum's intentional zero-outcome change.
+- Existing 119-candle timing check: 1.97s process wall (pytest 1.47s) in the documented local environment, versus decision #155's ~118s baseline in a different sandbox.
+- Backend/frontend route copy was corrected to remove obsolete one-second-per-candle and fixed-duration claims; no frontend controls or behavior were added.
+- Batch/sweep orchestration remains out of scope. Serialized runs and synchronous HTTP routes remain.
+- Confirmed without changing it: passing the last fixture timestamp as `end` to the `[start,end)` provider excludes that candle.
+
+## Prior delivery record — decisions #155 and #156
 
 ## Part A — Backtest replay timing investigation (decision #155)
 

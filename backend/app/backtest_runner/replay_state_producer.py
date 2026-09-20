@@ -17,9 +17,7 @@ candle)` and read the returned `ReplayState` — it has no visibility into,
 and must never depend on, whatever `advance_to()` does internally to get
 there. That's the whole point of this seam: `EngineBackedReplayStateProducer`
 below currently satisfies the contract by running the REAL async engines
-and waiting for them to settle (which, for `MarketStateEngine`
-specifically, really does mean a bounded real-world wait — see that
-class's own docstring) — but a future producer could satisfy the exact
+and waiting for their exact queue-completion signals — but a future producer could satisfy the exact
 same `ReplayStateProducer` ABC with a synchronous, non-async-engine
 implementation (e.g. a pure-function forward walk, the same pattern
 `feature_engine/historical.py` already established for SMA/EMA) without
@@ -32,16 +30,13 @@ this module produces or checks — `FeatureSet.candle_ts`,
 `MarketState.candle_ts`, the replay clock handed to
 `BacktestContextProvider.advance_to()` — is derived from the fixture
 candle being replayed, never `datetime.now()`/`time.time()`. The
-wall-clock waits inside `_settle()` below are about HOW LONG this process
-waits for a real background task to catch up, not WHAT INSTANT is being
-computed for; those are two different clocks and this module is careful
-never to let the first one leak into the second.
+queue waits inside `advance_to()` are synchronization only, not a source
+of domain time; processing speed cannot leak into persisted state.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,15 +58,7 @@ from app.trading_intelligence.level_interaction_engine import LevelInteractionEn
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ReplayState", "ReplayStateProducer", "EngineBackedReplayStateProducer", "ReplaySettleTimeout"]
-
-
-class ReplaySettleTimeout(RuntimeError):
-    """Raised when the downstream pipeline hasn't produced state for a
-    replayed candle within the bounded wait `_settle()` allows. A
-    timeout here is a real signal something is wrong (a subscriber
-    silently failing, a debounce that never fires) — never suppressed
-    into a fabricated/partial ReplayState."""
+__all__ = ["ReplayState", "ReplayStateProducer", "EngineBackedReplayStateProducer"]
 
 
 @dataclass(frozen=True)
@@ -79,7 +66,7 @@ class ReplayState:
     """Exactly what `Strategy.evaluate(symbol, market_state, features,
     context)` needs, for one symbol at one replayed candle_ts. All three
     `.candle_ts`-bearing fields are asserted equal to the input candle's
-    `candle_ts` before this is ever constructed — see `_settle()`."""
+    `candle_ts` before this is ever constructed — see `advance_to()`."""
 
     symbol: str
     candle_ts: datetime
@@ -114,12 +101,12 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
     real `FeatureEngine` + real `LevelInteractionEngine` + real
     `MarketStateEngine` + a real `ContextEngine` (built from the supplied
     `BacktestContextProvider`) — the SAME engine classes production uses,
-    zero modification, zero subclassing. Nothing here reimplements
+    with only Market State's explicit replay settlement control invoked.
+    Nothing here reimplements
     feature/state/context computation; this class only orchestrates
     candle delivery and waits for the real pipeline to reflect it.
 
-    **Where the wall-clock waiting actually lives (read this before
-    changing anything about candle pacing).** Three different settling
+    **Where exact synchronization lives.** Three different settling
     mechanisms are needed, for three different reasons — tracing exactly
     why required reading each engine's own internals, not assuming:
 
@@ -144,35 +131,13 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
        `DebounceScheduler` in either), so once their own queue is joined,
        their state is genuinely current — no sleep needed for either.
 
-    3. `MarketStateEngine`: DOES debounce (`DebounceScheduler`,
-       `_MIN_INTERVAL_SECONDS = 1.0` — confirmed by reading
-       `market_state_engine/engine.py`/`core/debounce_scheduler.py`
-       directly). A symbol's first-ever trigger in a process runs its
-       callback immediately (an uninitialized `_last_run = 0.0` makes the
-       very first `elapsed` reading enormous), but every trigger after
-       that, arriving within 1 real second of the previous one — which a
-       fast, non-real-time replay loop will do for every candle after the
-       first — gets deferred onto a REAL `asyncio.sleep(delay)` inside
-       `DebounceScheduler._run_after_delay()`. There is no flush/force
-       path on `DebounceScheduler` and this class deliberately does not
-       add one (Unit 2 brief: "Do not redesign the existing engines
-       merely to make v1 replay easier"). So `_settle()` polls
-       `MarketState` at a short interval, bounded by a generous timeout,
-       until its own subscriber cache shows `candle_ts` caught up — this
-       IS a real wall-clock wait, contained entirely in this method,
-       genuinely up to ~1 real second per candle after the first. This is
-       the ONLY step in `advance_to()` that imposes a real delay; the
-       other two are exact synchronization, not timed waits.
-
-    This means a v1 fixture run of N candles for one symbol costs
-    roughly N real seconds, dominated entirely by step 3 — acceptable for
-    the "smallest useful" validation run this task builds, explicitly NOT
-    acceptable for a future real multi-year historical backtest. That's a
-    real, separate scaling problem for whoever builds the outer sweep
-    later (see this class's own module docstring on the
-    `ReplayStateProducer` seam existing so that future work doesn't
-    require touching `BacktestRunner` at all) — not something this task
-    solves by redesigning `DebounceScheduler`.
+    3. `MarketStateEngine`: live still debounces at its 1s floor and
+       periodic ceiling. This run-scoped backtest engine instead receives
+       an explicit `settle_replay(symbol)` call. It atomically flushes a
+       pending floor-delayed callback (or no-ops if the first trigger
+       already ran), neutralizes the delayed task, and joins the worker
+       queue. The worker's compute, persistence, cache-before-publish and
+       `MarketStateChanged` event remain the only authoritative path.
 
     ``backtest_run_id`` is required at construction and passed only to
     Feature Engine, whose Daily Levels checkpoint is run-scoped. Market
@@ -186,12 +151,8 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
         *,
         context_provider: BacktestContextProvider,
         backtest_run_id: UUID,
-        settle_timeout_seconds: float = 5.0,
-        settle_poll_interval_seconds: float = 0.05,
     ) -> None:
         self._context_provider = context_provider
-        self._settle_timeout = settle_timeout_seconds
-        self._settle_poll_interval = settle_poll_interval_seconds
 
         self.bus = EventBus()
         self.feature_engine = FeatureEngine(
@@ -317,18 +278,18 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
         await self._drain_bus()  # the FeaturesUpdated publish just triggered needs its own dispatch round
         await self.level_interaction_engine._queue.join()
 
-        # Step 3 — the one real wait: MarketStateEngine's debounce floor.
-        # See class docstring's numbered breakdown above.
-        await self._settle_market_state(symbol, candle.candle_ts)
+        # Step 3 — exact replay-only Market State settlement: atomically
+        # flush any floor-delayed callback, then drain the worker queue.
+        await self.market_state_engine.settle_replay(symbol)
         await self._drain_bus()  # dispatch this producer's own MarketStateChanged subscriber
 
         features = self._latest_features.get((symbol, "1m"))
         market_state = self._latest_market_state.get(symbol)
         if features is None or market_state is None:
-            # Should be unreachable given _settle_market_state() already
+            # Should be unreachable given settle_replay() already
             # confirmed market_state — a real bug, not an expected
             # "waiting" condition, so this is a hard failure, not a
-            # ReplaySettleTimeout.
+            # waiting condition.
             raise RuntimeError(
                 f"advance_to({symbol!r}, candle_ts={candle.candle_ts!r}): pipeline settled but "
                 f"features={features!r} market_state={market_state!r} — this is a bug in this "
@@ -386,27 +347,6 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
         to make v1 replay easier' applied to the bus as well."""
         await self.bus._critical_queue.join()
         await self.bus._normal_queue.join()
-
-    async def _settle_market_state(self, symbol: str, candle_ts: datetime) -> None:
-        """The one real wait — see class docstring step 3. Polls this
-        producer's OWN subscriber cache (never engine internals) until it
-        reflects `candle_ts`, bounded by `_settle_timeout`. A timeout
-        raises `ReplaySettleTimeout` rather than returning stale state —
-        this producer never hands back a `ReplayState` whose
-        `market_state.candle_ts` doesn't match the candle being
-        replayed."""
-        deadline = time.monotonic() + self._settle_timeout
-        while True:
-            current = self._latest_market_state.get(symbol)
-            if current is not None and current.candle_ts == candle_ts:
-                return
-            if time.monotonic() >= deadline:
-                raise ReplaySettleTimeout(
-                    f"MarketStateEngine did not settle to candle_ts={candle_ts!r} for {symbol!r} "
-                    f"within {self._settle_timeout}s (last seen: "
-                    f"{current.candle_ts if current else None!r})"
-                )
-            await asyncio.sleep(self._settle_poll_interval)
 
     @staticmethod
     def _read_context(context_engine: ContextEngine, symbol: str) -> ContextChanged | None:

@@ -1,4 +1,38 @@
-# TESTING — combined: decision #155 (backtest replay timing investigation) and decision #156 (wall-clock test audit)
+# TESTING — decision #157: deterministic fast backtest replay
+
+## Current delivery verification
+
+Environment for the new timing measurement: WSL2 Linux 6.6.114.1, 12 logical CPUs, 7.7GiB RAM, Python 3.14.4, PostgreSQL 18.6 (`fsync=on`, `synchronous_commit=on`, `shared_buffers=128MB`). Command:
+
+```
+/usr/bin/time -f 'WALL_SECONDS=%e CPU_PERCENT=%P MAX_RSS_KB=%M' \
+  env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_DB=trading_workspace \
+  POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/pytest \
+  tests/test_backtest_routes.py::test_run_backtest_volume_gated_strategy_returns_honest_zero \
+  -q --tb=short
+```
+
+Result: 1 passed; pytest 1.47s; process wall 1.97s; 119 Market State rows for the 119 candles admitted by the fixture provider. Decision #155's previous 118.16s measurement used a different 1-vCPU/4GB/PostgreSQL-16.15 (`fsync=off`) environment, so no hardware-independent ratio is claimed.
+
+Focused results so far:
+
+- Debounce Scheduler + pure scoring + timeframe/Acceleration regressions: 41 passed.
+- Replay State Producer + Market State Engine against real PostgreSQL: 12 passed.
+- Required focused set (scheduler, Market State, replay, runner/routes, D18/D19, IBKR route, Momentum): 127 passed in 12.57s.
+- Manual existing-scenario check: `volume_gated_baseline` + Momentum now records zero outcomes; 119 rows, acceleration range 50.00–54.22, below threshold 65. This is the intended consequence of 60-second source-time intervals; decision #155's wall-clock path recorded one BUY.
+
+Complete backend suite before the final GitHub-main reconciliation: 783 passed in 55.67s, no failures, deselection, retries, marker exclusions, or timeout changes.
+
+Post-reconciliation/final-numbering rerun:
+
+- Required focused set: 127 passed in 12.78s.
+- Complete backend suite: 783 passed in 55.50s.
+- `npx vite build`: passed, 99 modules, 1.77s.
+
+Frontend verification after correcting stale timing copy: `npx vite build` passed (99 modules). `npm run build` remains blocked by the four pre-existing `GridPresetPicker.tsx` TypeScript errors documented by prior deliveries (`GRID_PRESETS`, `preset`, `setPreset`, implicit `any`); none is in a changed file.
+
+## Prior delivery record — decisions #155 and #156
 
 Both deliveries append to `docs/decisions/confirmed-decisions.md`/`INDEX.md` (no conflict there — both entries present) and replace this file plus `CHANGES.md`. #156 landed second and combined both deliveries' content here as sections, per #155's own manual-merge notes (§6 of its part, below), rather than overwriting #155's content.
 

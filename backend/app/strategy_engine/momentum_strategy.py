@@ -62,18 +62,12 @@ Two consequences this design leans on directly rather than guessing at:
    question, not the same threshold reused — see "Why trend's threshold
    here is NOT `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD`" below.
 
-**Known, accepted noise risk, explicitly not resolved by empirical
-testing before this build (Saqib's own call):** `market_state_engine/
-engine.py`'s per-symbol `DebounceScheduler` recomputes on roughly a ~1s
-floor / ~10s ceiling cadence. With `elapsed_seconds` that small,
-ordinary candle-to-candle `trend_score` jitter can saturate
-`acceleration_score` without a real regime shift underneath it. Saqib's
-explicit instruction: choose a sensible threshold from the formula's own
-semantics now, do not spend a session on empirical distribution
-analysis first — `acceleration_score_threshold` below is flagged
-unvalidated same as every other v1 calibration constant in this
-codebase, expected to be retuned once real live distributions exist
-(Stage 2, decision #112/D10, once unblocked by this build).
+**Calibration remains provisional.** `elapsed_seconds` is the positive
+delta between consecutive source 1m `candle_ts` values, not the engine's
+processing cadence. This removes CPU/event-loop/replay-speed noise while
+preserving the original points-per-second formula and cap; the threshold
+below remains unvalidated against real live distributions, like every
+other v1 calibration constant, and should be retuned only from evidence.
 
 --- Why trend's threshold here is NOT `scoring_utils.ESTABLISHED_TREND_SCORE_THRESHOLD` ---
 

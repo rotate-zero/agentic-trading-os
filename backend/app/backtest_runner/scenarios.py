@@ -80,14 +80,10 @@ report `outcomes_recorded=0`, same as running any of the four
 volume-gated strategies against anything. The per-strategy names below
 describe what each scenario was BUILT to demonstrate, not a restriction.
 
-**Timing, worth knowing before picking a scenario.** Each replayed
-candle costs a real, measured ~1 second of wall-clock time inside
-`EngineBackedReplayStateProducer` (genuine per-candle engine settle
-time, not a configurable poll interval) — so a 130-candle scenario is a
-~130 second HTTP round trip. Scenario lengths below are deliberately
-kept to the minimum each one was verified to need (with a modest
-buffer), not padded to a full trading session, specifically because of
-this cost.
+**Timing, worth knowing before picking a scenario.** Replay settlement
+uses exact engine/bus queue completion and does not pay Market State's
+live one-second debounce floor per candle. Scenario lengths below remain
+deliberately small and reviewable; the HTTP route is still synchronous.
 """
 from __future__ import annotations
 

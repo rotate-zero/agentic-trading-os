@@ -216,9 +216,9 @@ Contract and runtime semantics:
 - One-minute acquisition is serial one-day chunks with no blind retries. Permission,
   pacing, timeout, disconnect, malformed/incomplete response, unresolved-contract,
   and zero-primary-bar failures are explicit non-200 responses.
-- Replay is synchronous and costs approximately one second per primary candle: about
-  6.5 minutes for a regular session and up to about 16 minutes for 04:00-20:00,
-  excluding acquisition time.
+- Replay is synchronous but uses exact engine/bus queue settlement rather than the
+  live one-second Market State debounce floor (decision #157). IBKR acquisition time
+  varies independently and the route exposes no progress stream.
 - `data_version` is `ibkr:TRADES:1m-ext:1d-rth`; it records request semantics, not an
   immutable vendor dataset version.
 

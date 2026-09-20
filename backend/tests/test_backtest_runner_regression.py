@@ -590,25 +590,11 @@ async def test_backtest_runner_namespace_preserves_live_levels_and_repeat_runs_k
         live_level.archived_day,
     ) == (987.654321, 7, 9, "active", first_day, first_day, None)
 
-    # NOT `len(rows) == len(candles)` — checked directly against the
-    # UNMODIFIED baseline (no decision #135 seam at all, plain
-    # FixtureCandleProvider.single()): the real, pre-existing
-    # MarketStateEngine/ReplayStateProducer pipeline already persists one
-    # fewer `market_state_history` row than replayed candles for this
-    # exact scenario — the final candle's state update never lands
-    # before `producer.stop()`. Confirmed by direct execution against
-    # `main`, not this delivery's own code — a genuine pre-existing gap,
-    # unrelated to and not introduced by decision #135, out of scope to
-    # fix here (would mean touching `MarketStateEngine`/
-    # `ReplayStateProducer`, not the historical-provider seam). A
-    # non-trivial floor (rather than no count check at all) still
-    # catches a real regression where the seam breaks early and stops
-    # producing state altogether.
-    assert len(rows) >= 2 * (len(candles) - 1), (
-        f"expected close to one market_state_history row per replayed candle on each of two runs "
-        f"({len(candles)} candles each), got only {len(rows)} — more missing than the one-per-run "
-        f"pre-existing, unrelated final-candle gap accounts for"
-    )
+    # The provider is [start,end), and this test intentionally passes the
+    # final candle timestamp as end, so exactly len(candles)-1 candles are
+    # replayed per run. Decision #155 confirmed this input-boundary cause;
+    # it was never a final asynchronous state update being lost.
+    assert len(rows) == 2 * (len(candles) - 1)
     assert all(float(r.volume_regime_score) != 0.0 for r in rows), (
         "volume_regime_score was 0.0 for at least one replayed candle — the exact "
         "decision #135 regression this test exists to catch."

@@ -10,10 +10,10 @@ export type BacktestRunStatus = "idle" | "running" | "done" | "error";
  * Unlike every other hook in this codebase (useScannerState's 15s poll,
  * useContextSnapshot's WS-primary + safety-net poll, ...), this isn't a
  * "keep some server state fresh" hook — there's nothing to poll or
- * subscribe to. It's a one-shot action with a genuinely long real-time
- * wait (see triggerBacktest's own docstring: ~1s per replayed candle,
- * ~120-140s per scenario), so the thing this hook actually needs to get
- * right is exposing that wait honestly rather than hiding it. `run()`
+ * subscribe to. It's a one-shot synchronous action whose duration depends
+ * on workload and environment (replay no longer pays a one-second debounce
+ * floor per candle as of decision #157), so the hook exposes elapsed time
+ * honestly rather than hiding the request behind a generic spinner. `run()`
  * starts a plain 1s `setInterval` the instant the call is fired and
  * derives `elapsedSeconds` from a real `Date.now()` delta each tick
  * (not just an incrementing counter — a slow browser tab throttling
@@ -26,7 +26,7 @@ export type BacktestRunStatus = "idle" | "running" | "done" | "error";
  * `status === "running"`, since this route's own
  * `engine_singleton_guard.py` would serialize a genuine double-call on
  * the backend anyway (see that route's docstring); this guard just
- * avoids firing a second, wasted ~2-minute HTTP request from this tab
+ * avoids firing a second, wasted HTTP request from this tab
  * that would end up blocked behind the first regardless.
  */
 export function useBacktestRun() {

@@ -462,9 +462,8 @@ function BacktestForm() {
               <span className="font-mono text-[10px] leading-snug text-bear">{rangeValidation.message}</span>
             )}
             <span className="font-mono text-[9px] leading-snug text-text-muted">
-              Roughly 1 real second per primary candle: about 6.5 minutes for a regular session, up to about 16
-              minutes for a full extended session. This is genuinely slow, not a stall — see the running state below
-              once started.
+              Acquisition time depends on IBKR and the requested range. Replay then settles through exact engine
+              queues without the live one-second debounce wait; the request remains synchronous.
             </span>
           </div>
         )}
@@ -482,10 +481,9 @@ function BacktestForm() {
         </span>
       </div>
 
-      {/* Fixture mode's running/error/result states below are completely
-          unchanged from before this delivery — same copy, same
-          ~120-140s framing, gated on fixtureRun's own status only, never
-          on ibkrRun's. IBKR mode gets its own parallel, explicitly
+      {/* Fixture mode's running/error/result states are gated on
+          fixtureRun's own status only, never on ibkrRun's. IBKR mode gets
+          its own parallel, explicitly
           separate blocks further down — this pairing (mode check +
           that mode's own hook status only) is what guarantees a result
           or error from one mode is never rendered while the other mode
@@ -496,9 +494,8 @@ function BacktestForm() {
             Running… {formatElapsed(fixtureRun.elapsedSeconds)} elapsed
           </span>
           <span className="font-mono text-[9px] text-text-muted">
-            Fully synchronous — roughly 1 real second per replayed candle
-            {selectedScenario ? `, ~${selectedScenario.candleCount}s typical for this scenario` : ""}. This is
-            expected, not a stall.
+            Fully synchronous — replay is settling through exact engine queues. Elapsed time depends on workload and
+            this environment; it is not paced to one wall-clock second per candle.
           </span>
         </div>
       )}
@@ -528,9 +525,8 @@ function BacktestForm() {
               synchronous call), so implying one here would be fabricated
               precision this task's own honesty principle rules out. */}
           <span className="font-mono text-[9px] text-text-muted">
-            Still active — this is genuinely slow (roughly 1 second per primary candle) and can legitimately take up
-            to approximately 16 minutes for a full extended session. No progress percentage is available; this is
-            expected, not a stall.
+            Still active — IBKR acquisition and replay are one synchronous request. No progress percentage or reliable
+            completion estimate is available.
           </span>
         </div>
       )}

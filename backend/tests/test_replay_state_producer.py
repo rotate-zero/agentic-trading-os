@@ -5,10 +5,11 @@ Covers: EngineBackedReplayStateProducer settles real Feature/MarketState/
 Context state to the replayed candle_ts (never wall-clock), D17
 availability via the real capture functions once engines are installed
 via engine_singleton_guard, singleton install/restore correctness, and
-ReplaySettleTimeout firing honestly rather than returning stale state.
+exact immediate Market State settlement without duplicate writes/events.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -17,9 +18,11 @@ from sqlalchemy import text
 
 from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.engine_singleton_guard import install_replay_engines
-from app.backtest_runner.replay_state_producer import EngineBackedReplayStateProducer, ReplaySettleTimeout
+from app.backtest_runner.replay_state_producer import EngineBackedReplayStateProducer
 from app.broker_adapters.base import Candle
+from app.core.debounce_scheduler import DebounceScheduler
 from app.db.session import SessionLocal
+from app.schemas.events.envelope import EventType
 from app.trading_intelligence.state_snapshot import capture_context_snapshot, capture_market_state_snapshot
 
 SYMBOL = "ZZTEST"  # deliberately not a real ticker — never collides with real data
@@ -113,7 +116,7 @@ async def test_advance_to_settles_state_to_the_replayed_candle_ts_not_wall_clock
     )
     await producer.start()
     try:
-        for candle in candles:
+        for index, candle in enumerate(candles):
             state = await producer.advance_to(SYMBOL, candle)
             assert state.candle_ts == candle.candle_ts
             assert state.features.candle_ts == candle.candle_ts
@@ -122,6 +125,7 @@ async def test_advance_to_settles_state_to_the_replayed_candle_ts_not_wall_clock
             # Real calendar facts for the REPLAYED date, not test wall-clock time.
             assert state.context.providers["calendar"]["fed_day"] is True
             assert state.context.providers["calendar"]["trading_day"] == "2026-01-28"
+            assert state.context.providers["calendar"]["minutes_since_open"] == index
     finally:
         await producer.stop()
 
@@ -197,25 +201,46 @@ async def test_engine_singleton_guard_restores_prior_value_even_on_exception():
     assert market_state_engine_module._market_state_engine is sentinel_prev
 
 
-async def test_replay_settle_timeout_raised_honestly_not_stale_state_returned():
-    """A producer configured with an impossibly short settle timeout must
-    raise ReplaySettleTimeout, never silently hand back state from a
-    prior candle as if it were current."""
+async def test_consecutive_replay_candles_flush_without_floor_wait_or_delayed_duplicates(monkeypatch):
+    """A blocked delayed task cannot block replay settlement and cannot
+    later duplicate the event or persistence row that flush produced."""
     start = datetime(2026, 1, 28, 14, 30, tzinfo=timezone.utc)
-    candles = _fixture_candles(2, start)
+    candles = _fixture_candles(3, start)
+    never_release = asyncio.Event()
+
+    async def _blocked_delay(self, delay):  # noqa: ANN001, ARG001
+        await never_release.wait()
+
+    monkeypatch.setattr(DebounceScheduler, "_run_after_delay", _blocked_delay)
 
     producer = EngineBackedReplayStateProducer(
         context_provider=FixtureBacktestContextProvider(),
         backtest_run_id=uuid4(),
-        settle_timeout_seconds=0.001,  # shorter than MarketStateEngine's real 1.0s debounce floor
-        settle_poll_interval_seconds=0.0005,
     )
+    received: list = []
+    producer.bus.subscribe(EventType.MARKET_STATE_CHANGED, lambda envelope: received.append(envelope))
     await producer.start()
     try:
-        await producer.advance_to(SYMBOL, candles[0])  # first trigger runs synchronously — should succeed
-        with pytest.raises(ReplaySettleTimeout):
-            # second candle within the same process hits the real 1.0s
-            # debounce floor — 0.001s is nowhere near enough to clear it
-            await producer.advance_to(SYMBOL, candles[1])
+        states = [await producer.advance_to(SYMBOL, candle) for candle in candles]
+        assert [state.features.candle_ts for state in states] == [c.candle_ts for c in candles]
+        assert [state.market_state.candle_ts for state in states] == [c.candle_ts for c in candles]
+        assert [state.context.providers["calendar"]["trading_day"] for state in states] == ["2026-01-28"] * 3
+        assert [datetime.fromisoformat(event.payload["candle_ts"]) for event in received] == [
+            c.candle_ts for c in candles
+        ]
+        assert all(scheduler._pending_run_task is None for scheduler in producer.market_state_engine._schedulers.values())
     finally:
         await producer.stop()
+
+    session = SessionLocal()
+    try:
+        row_count = session.execute(
+            text(
+                "SELECT count(*) FROM market_state_history msh JOIN symbols s ON s.id = msh.symbol_id "
+                "WHERE s.ticker = :t AND s.is_backtest IS TRUE"
+            ),
+            {"t": SYMBOL},
+        ).scalar_one()
+    finally:
+        session.close()
+    assert row_count == len(candles)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -84,8 +84,15 @@ def _clean_cross_symbol_test_state() -> None:
     _clean_test_symbol("__MARKET__")
 
 
-async def _publish(bus: EventBus, symbol: str, close: float, features: dict[str, float]) -> None:
-    payload = FeatureSet(timeframe="1m", candle_ts=_TS, close=close, features=features)
+async def _publish(
+    bus: EventBus,
+    symbol: str,
+    close: float,
+    features: dict[str, float],
+    *,
+    candle_ts: datetime = _TS,
+) -> None:
+    payload = FeatureSet(timeframe="1m", candle_ts=candle_ts, close=close, features=features)
     await bus.publish(make_envelope(EventType.FEATURES_UPDATED, payload, symbol=symbol))
 
 
@@ -132,7 +139,13 @@ async def test_second_observation_populates_acceleration():
 
         await _publish(bus, ticker, close=100.0, features={"sma_20_slope_angle": 0.0})
         await asyncio.sleep(1.1)  # clear the ~1s debounce floor before the second trigger
-        await _publish(bus, ticker, close=100.0, features={"sma_20_slope_angle": 10.0})
+        await _publish(
+            bus,
+            ticker,
+            close=100.0,
+            features={"sma_20_slope_angle": 10.0},
+            candle_ts=_TS + timedelta(minutes=1),
+        )
         await asyncio.sleep(0.2)
 
         assert len(received) == 2

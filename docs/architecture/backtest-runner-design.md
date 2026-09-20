@@ -87,7 +87,8 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
    │            ▼                                                │
    │  ReplayStateProducer                                        │
    │  (real EventBus/FeatureEngine/LevelInteractionEngine/       │
-   │   MarketStateEngine — zero modification to any of them)     │
+   │   MarketStateEngine — real engines; narrow replay-only       │
+   │   immediate settlement control on Market State)             │
    │            │                                                │
    │            ▼                                                │
    │  Feature / Market State  ──────┐                            │
@@ -155,10 +156,10 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 BacktestPanel.tsx (form: strategy_name / scenario / symbol)
             │
             ▼
-   POST /backtest/run                 ◄── fully synchronous, ~1s/candle,
-   (useBacktestRun.ts)                     ~120-140s per scenario — the
-            │                              panel shows a live "Nm Ns
-            ▼                              elapsed" state, not a bare
+   POST /backtest/run                 ◄── fully synchronous; exact queue
+   (useBacktestRun.ts)                     settlement, no live debounce wait
+            │                              (elapsed state remains useful)
+            ▼
    BacktestRunResult, rendered              spinner, while this is in
    verbatim: run_id / sweep_id /            flight
    outcomes_recorded / discarded_signals[]
@@ -534,7 +535,7 @@ BacktestRunRecord / StrategyOutcomeRecord persistence
 
 Acquisition errors are stable and explicit: unresolved contract and zero primary data are `400`; live-provider conflict is `409`; malformed request/range is `422`; configuration, permission, pacing, connection and disconnect failures are `503`; timeout is `504`; malformed/conflicting/incomplete upstream data is `502`. `ib_async` request errors and error/disconnect events are both observed because not every IBKR condition becomes a normal exception. All acquisition and validation precede `BacktestRunner.run()`, so a failed download cannot leave a `BacktestRunRecord`.
 
-`data_version="ibkr:TRADES:1m-ext:1d-rth"` records the meaningful vendor/request semantics without pretending IBKR publishes an immutable dataset version. `FixtureBacktestContextProvider` remains in use: market-calendar context is replay-safe, while historical point-in-time fundamentals and news remain honestly absent. At approximately one second per primary candle, one regular session is about 6.5 minutes and a full 04:00-20:00 extended session can approach 16 minutes, plus acquisition time.
+`data_version="ibkr:TRADES:1m-ext:1d-rth"` records the meaningful vendor/request semantics without pretending IBKR publishes an immutable dataset version. `FixtureBacktestContextProvider` remains in use: market-calendar context is replay-safe, while historical point-in-time fundamentals and news remain honestly absent. As of decision #157, replay no longer waits approximately one second per primary candle; the route remains synchronous and IBKR acquisition time varies independently.
 
 **As-built note — 2026-09-18, first attempted real-market-data execution (no code changed).** Saqib asked for a real, complete `BacktestRunner` run against real market data (not fixtures, not the test suite), specifically to give D4's readiness check (`strategy-engine-open-decisions.md`) something to find. This note is the honest record of that attempt, which did not succeed — no `strategy_outcomes`/`backtests` rows were produced, and D4 remains open.
 
@@ -575,7 +576,7 @@ only in fixture mode, Eastern-time date-range shown only in ibkr mode
             │
             ├── Fixture scenario ──► useBacktestRun.ts (unchanged) ──►
             │                        POST /backtest/run — plain-string
-            │                        error message only, ~120-140s
+            │                        error message; synchronous fast replay
             │
             └── Real IBKR data ───► two ET datetime-local inputs (+
                                      "Regular session"/"Extended session"
@@ -607,7 +608,7 @@ only in fixture mode, Eastern-time date-range shown only in ibkr mode
                                      hook, not a mode branch inside
                                      useBacktestRun.ts (materially
                                      different request shape, error
-                                     taxonomy, and 6.5-16min vs ~120-140s
+                                     taxonomy, and acquisition behavior
                                      timing profile; small duplicated
                                      timer/status-machine mechanics kept
                                      deliberately obvious rather than
@@ -656,5 +657,84 @@ start < end AND window ≤ 24h ?            ibkr_backtest_not_configured→ not 
 While a run is in flight, the panel shows live elapsed time and wording that the request can legitimately take up to ~16 minutes with no progress percentage available (the backend gives this synchronous route no progress signal to show one). Mode switching and the Run button are disabled whenever either mode's own hook reports `"running"` — both routes share the backend's single `_RUN_LOCK`, so this only prevents a wasted duplicate long-running request from this tab, not a real backend race. Every render block below `BacktestForm`'s own submit button is gated on `mode === "fixture" | "ibkr"` together with that mode's own hook state specifically (never a merged "whichever finished last" view), so a result or error from one mode can never render while the other mode is selected. Fixture mode's own copy, timing framing, and `useBacktestRun.ts` itself are byte-for-byte unchanged.
 
 Frontend-only: `BacktestPanel.tsx`, new `easternTime.ts` and `useIbkrBacktestRun.ts`, and an additive-only block appended to `api-client.ts`. `useBacktestRun.ts`, `useMarketState.ts` (the parallel decision #146 delivery's own boundary, confirmed untouched by both sides), `BacktestResultsPanel.tsx`, `useBacktestOutcomes.ts`, and everything under `backend/` are unchanged.
+
+---
+
+**Deterministic fast replay foundation (decision #157).** Decision #155 measured two coupled defects in the original replay path: each candle after the first waited for Market State's live one-second debounce floor, and persisted Acceleration divided by the wall-clock processing gap. Faster replay therefore changed strategy input. The corrected path keeps the real engines and their authoritative worker/persistence/event flow while making market-data time authoritative and giving the run-scoped backtest engine an exact immediate-settlement control.
+
+Cross-component data flow:
+
+```
+BacktestRunner
+      │ each historical candle
+      ▼
+EngineBackedReplayStateProducer
+      │ CandleClosed + exact bus/worker drains
+      ▼
+FeatureEngine ── FeaturesUpdated(1m, source candle_ts)
+      │
+      ▼
+MarketStateEngine.settle_replay(symbol)
+      │ replay-only flush + worker queue drain
+      │ compute → persist → cache → MarketStateChanged
+      ▼
+exact Feature / Market State / Context timestamp verification
+      │
+      ▼
+Strategy.evaluate()  (unchanged live/replay implementation)
+```
+
+Internal synchronization flow:
+
+```
+NORMAL LIVE PATH                              REPLAY FORCE/FLUSH PATH
+FeaturesUpdated(1m)                          FeaturesUpdated(1m)
+       │                                            │
+       ▼                                            ▼
+DebounceScheduler.trigger()                  DebounceScheduler.trigger()
+       │                                            │
+       ├─ floor clear → callback now                ├─ first → callback already queued
+       └─ inside 1s → one delayed task              └─ rapid → pending delayed task
+       │                                            │
+       │                                      settle_replay(symbol)
+       │                                            │
+       │                                      scheduler.flush()
+       │                                      ├─ pending check under same lock
+       │                                      ├─ callback exactly once if pending
+       │                                      └─ cancel + await delayed task
+       │                                            │
+       └──────────────────────┬─────────────────────┘
+                              ▼
+                    MarketState worker queue
+                              │ queue.join(): compute complete
+                              ▼
+        score using Δ source candle_ts (positive only)
+                              │
+                              ▼
+                  persistence → cache → publication
+                              │
+                              ▼
+             bus queues drain / subscriber cache updated
+                              │
+                              ▼
+ Feature.candle_ts == MarketState.candle_ts == requested candle_ts
+ Context provider cursor == requested candle_ts; mismatch/missing = hard failure
+
+Live ceiling loop: unchanged (~10s ordinary, ~4s SPY/QQQ/IWM).
+Replay ceiling loop: not started; explicit candle advances are authoritative,
+so a periodic callback cannot duplicate the latest replayed candle.
+Shutdown/exception: scheduler.stop() cancels and awaits any delayed task before
+the Market State poison-pill worker drain returns.
+```
+
+The replay producer no longer polls every 50ms and no longer exposes settle-timeout/poll constructor arguments. A delayed debounce task cannot later duplicate the flushed candle because delayed and forced paths consume the same `_pending` flag under one scheduler lock. The real Market State worker remains authoritative: no scoring or persistence logic was copied into Backtest Runner, and cache-before-publish plus `MarketStateChanged` ordering is unchanged.
+
+**Measured replay duration, local evidence only.** Decision #155's prior `volume_gated_baseline` measurement replayed 119 of 120 fixture candles in 118.16s (1 vCPU/4GB sandbox, Python 3.12.3, PostgreSQL 16.15, `fsync=off`). The same existing route test after this change replayed the same 119 candles in 1.97s process wall time (pytest body 1.47s) on WSL2 with 12 logical CPUs, 7.7GiB RAM, Python 3.14.4, PostgreSQL 18.6, `fsync=on`, `synchronous_commit=on`, 128MB shared buffers. The environments differ, so this is evidence that the per-candle sleep disappeared, not a universal speedup claim.
+
+**Intentional strategy effect.** Momentum is the only strategy that consumes `acceleration_score`. On `volume_gated_baseline`, decision #155's wall-clock semantics produced one BUY; source candle time now yields acceleration 50.00–54.22, below Momentum's 65 threshold, so the same replay honestly produces zero outcomes. First Pullback and the existing route/regression scenarios retain their asserted outcomes. The cap was not retuned: it already has points-per-second units, and consecutive 1m candle timestamps make its documented full-swing-in-60-seconds calibration internally consistent.
+
+This delivery enables later batch/sweep work but does not implement an orchestrator, parameter generation, ranking, folds, promotion, background jobs, progress/cancellation, multi-symbol replay, or parallel execution. Remaining scaling constraints are explicit: process-wide replay locks still serialize runs, both HTTP routes remain synchronous, real IBKR acquisition remains external I/O, and historical fundamentals/news remain unavailable.
+
+Decision #155's final-candle observation is confirmed and deliberately not changed: fixture providers implement `[start,end)`, while the route and the named regression runs pass `end=candles[-1].candle_ts`; therefore a 120-candle fixture replays exactly 119 candles. Exact settlement now proves every candle *included by the provider* persists once. Changing the caller boundary would add a separate candle and can change signals/fills, so it remains a separate behavioral task.
 
 ---

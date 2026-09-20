@@ -7,35 +7,13 @@ already covered by `test_backtest_runner.py`. What's under test here is
 this route specifically: query-param validation, strategy/scenario
 lookup wiring, and the real HTTP response shape.
 
-**Why two of these tests are genuinely slow (~130-140s each), and why
-that's deliberate rather than something to work around.** `POST
-/backtest/run` is a fully synchronous call — `EngineBackedReplayStateProducer`
-costs a measured, real ~1 second of engine-settle time per replayed
-candle, and this route's own docstring is explicit that a caller should
-expect the HTTP response itself to take that long. A test using a short
-timeout, or one that only checks the fast validation-error paths, would
-quietly hide that reality rather than prove it — so
-`test_run_backtest_first_pullback_scenario_fires_and_persists` below
-deliberately measures its own wall-clock elapsed time and asserts a
-generous floor, specifically so a future change that accidentally
-short-circuits the replay (e.g. a bug that returns before really
-replaying every candle) would fail this test, not just silently ship a
-faster-but-wrong response. `TestClient`'s in-process ASGI transport does
-NOT enforce httpx's normal 5-second default client timeout (confirmed
-directly: a throwaway `asyncio.sleep(7)` endpoint returns successfully
-through `TestClient` well past 5 seconds) — so these tests would pass
-even if this route somehow took much longer than documented in a real
-deployment; they prove correctness and genuine non-trivial elapsed time,
-not an upper bound on latency. Whether a real deployment's own
-infrastructure (a reverse proxy or load balancer in front of this
-service, if one is ever added) would truncate a multi-minute request is
-outside anything a test against this app alone can determine — see this
-route's own docstring for what was checked about this codebase's actual
-deployment (no such component exists in it today).
+The route remains a synchronous HTTP call, but replay settlement is now
+queue-driven rather than paced by Market State's live debounce floor.
+The guaranteed-fire test proves full replay with exact persisted candle
+counts instead of a brittle minimum wall-clock duration.
 """
 from __future__ import annotations
 
-import time
 import uuid
 
 import pytest
@@ -45,9 +23,11 @@ from starlette.testclient import TestClient
 from app.api.routes import finnhub_data, market_data
 from app.db.session import SessionLocal
 from app.main import app
+from app.strategy_engine.momentum_strategy import DEFAULT_ACCELERATION_SCORE_THRESHOLD
 
 FIRST_PULLBACK_SYMBOL = "ZBTR1"
 VOLUME_GATED_SYMBOL = "ZBTR2"
+MOMENTUM_SYMBOL = "ZBTR3"
 
 
 def _db_available() -> bool:
@@ -93,9 +73,11 @@ def _clean_test_symbol(ticker: str) -> None:
 def _clean_before_and_after():
     _clean_test_symbol(FIRST_PULLBACK_SYMBOL)
     _clean_test_symbol(VOLUME_GATED_SYMBOL)
+    _clean_test_symbol(MOMENTUM_SYMBOL)
     yield
     _clean_test_symbol(FIRST_PULLBACK_SYMBOL)
     _clean_test_symbol(VOLUME_GATED_SYMBOL)
+    _clean_test_symbol(MOMENTUM_SYMBOL)
 
 
 def test_run_backtest_first_pullback_scenario_fires_and_persists():
@@ -103,7 +85,6 @@ def test_run_backtest_first_pullback_scenario_fires_and_persists():
     genuinely records a real StrategyOutcomeRecord through this route —
     not just through direct BacktestRunner construction."""
     with TestClient(app) as client:
-        t0 = time.monotonic()
         resp = client.post(
             "/backtest/run",
             params={
@@ -112,7 +93,6 @@ def test_run_backtest_first_pullback_scenario_fires_and_persists():
                 "scenario": "first_pullback_vwap_dip",
             },
         )
-        elapsed = time.monotonic() - t0
 
     assert resp.status_code == 200
     body = resp.json()
@@ -121,17 +101,6 @@ def test_run_backtest_first_pullback_scenario_fires_and_persists():
     # Real UUIDs, not placeholders.
     uuid.UUID(body["run_id"])
     uuid.UUID(body["sweep_id"])
-
-    # This scenario is 130 candles; ~1s/candle is a measured, real cost
-    # (see this module's own docstring), not an incidental slowdown —
-    # a response coming back near-instantly would mean the replay didn't
-    # actually happen. Floor is deliberately well under the ~130s this
-    # should really take, to avoid flaking on a slower CI machine, while
-    # still being far enough above zero to catch a short-circuit.
-    assert elapsed > 60, (
-        f"expected a ~130s synchronous replay (130 candles @ ~1s/candle), "
-        f"got {elapsed:.1f}s — did the replay actually run?"
-    )
 
     # Verify against the DB directly, same posture test_backtest_runner.py
     # already takes — don't just trust the response body.
@@ -144,12 +113,22 @@ def test_run_backtest_first_pullback_scenario_fires_and_persists():
             ),
             {"t": FIRST_PULLBACK_SYMBOL},
         ).fetchone()
+        market_state_count = session.execute(
+            text(
+                "SELECT count(*) FROM market_state_history msh JOIN symbols s ON s.id = msh.symbol_id "
+                "WHERE s.ticker = :t AND s.is_backtest IS TRUE"
+            ),
+            {"t": FIRST_PULLBACK_SYMBOL},
+        ).scalar_one()
     finally:
         session.close()
     assert row is not None
     assert row.strategy_name == "FirstPullback"
     assert row.direction == "BUY"
     assert row.exit_reason == "target"
+    # Scenario has 130 candles, while the route intentionally passes
+    # end=candles[-1].candle_ts to a [start,end) provider: 129 are replayed.
+    assert market_state_count == 129
 
 
 def test_run_backtest_volume_gated_strategy_returns_honest_zero():
@@ -171,6 +150,40 @@ def test_run_backtest_volume_gated_strategy_returns_honest_zero():
     body = resp.json()
     assert body["outcomes_recorded"] == 0
     assert body["discarded_signals"] == []
+
+
+def test_momentum_result_change_is_explained_by_candle_time_acceleration():
+    """Decision #155's wall-clock replay produced one Momentum BUY on
+    this scenario. With source-time deltas, every non-null acceleration
+    stays below Momentum's threshold, so zero outcomes is intentional."""
+    with TestClient(app) as client:
+        resp = client.post(
+            "/backtest/run",
+            params={
+                "strategy_name": "Momentum",
+                "symbol": MOMENTUM_SYMBOL,
+                "scenario": "volume_gated_baseline",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["outcomes_recorded"] == 0
+
+    session = SessionLocal()
+    try:
+        row_count, max_acceleration = session.execute(
+            text(
+                "SELECT count(*), max(msh.acceleration_score) "
+                "FROM market_state_history msh JOIN symbols s ON s.id = msh.symbol_id "
+                "WHERE s.ticker = :t AND s.is_backtest IS TRUE"
+            ),
+            {"t": MOMENTUM_SYMBOL},
+        ).one()
+    finally:
+        session.close()
+
+    assert row_count == 119
+    assert float(max_acceleration) < DEFAULT_ACCELERATION_SCORE_THRESHOLD
 
 
 def test_run_backtest_rejects_unknown_strategy_name():
@@ -219,7 +232,7 @@ def test_run_backtest_requires_all_three_query_params():
 # Both tests below monkeypatch is_connected() directly rather than
 # standing up a real Finnhub/Polygon connection (which would need a real
 # API key this test environment doesn't have, and would reintroduce this
-# route's own ~1s/candle real-time cost for no benefit — the guard fires
+# route's full replay work for no benefit — the guard fires
 # before any candle is replayed, so these are deliberately fast tests).
 
 

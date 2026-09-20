@@ -29,6 +29,32 @@ async def test_rapid_triggers_are_floored_to_min_interval():
 
 
 @pytest.mark.asyncio
+async def test_flush_runs_pending_callback_once_and_neutralizes_delayed_run():
+    calls: list[int] = []
+    sched = DebounceScheduler(lambda: calls.append(1), min_interval=0.05, max_interval=10.0)
+
+    await sched.trigger()
+    await sched.trigger()
+    assert await sched.flush() is True
+    assert calls == [1, 1]
+
+    await asyncio.sleep(0.1)
+    assert calls == [1, 1]
+    await sched.stop()
+
+
+@pytest.mark.asyncio
+async def test_flush_is_noop_when_latest_trigger_already_ran():
+    calls: list[int] = []
+    sched = DebounceScheduler(lambda: calls.append(1), min_interval=1.0, max_interval=10.0)
+
+    await sched.trigger()
+    assert await sched.flush() is False
+    assert calls == [1]
+    await sched.stop()
+
+
+@pytest.mark.asyncio
 async def test_ceiling_loop_runs_callback_even_with_no_triggers():
     calls: list[int] = []
     sched = DebounceScheduler(lambda: calls.append(1), min_interval=0.05, max_interval=0.15)

@@ -26,11 +26,10 @@ export interface IbkrBacktestRunError {
  *   with several distinct machine-readable codes — see api-client.ts's own
  *   comment block above triggerIbkrBacktest), not useBacktestRun.ts's plain
  *   ApiError.message.
- * - Timing: roughly 6.5 to ~16 real minutes (one second per primary candle
- *   over the requested window), 4-6x useBacktestRun.ts's own ~120-140s —
- *   baking that into the SAME hook would mean either overstating the
- *   fixture path's wait or understating this one; keeping useBacktestRun.ts
- *   completely unedited was this task's own explicit design call.
+ * - Execution: external IBKR acquisition plus synchronous replay, with no
+ *   progress event stream. Replay uses decision #157's exact settlement;
+ *   acquisition can still vary independently. Keeping this separate avoids
+ *   mixing that request/error lifecycle into the fixture hook.
  *
  * The interval-based live-elapsed-timer mechanics below are intentionally
  * near-identical to useBacktestRun.ts's own — a small, obvious duplication,

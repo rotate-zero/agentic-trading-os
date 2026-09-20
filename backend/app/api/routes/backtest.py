@@ -43,15 +43,12 @@ fetches its fixture daily history and fills the raw-candle cache, so an
 identical second run retains real `volume_regime_score` and
 `volatility_regime_score` values instead of reverting both to `0.0`.
 
-**Latency.** Each replayed candle costs a real, measured ~1 second of
-`EngineBackedReplayStateProducer` engine-settle time (genuine processing
-time, not a tunable poll interval) — a 130-candle scenario is roughly a
-130 second HTTP round trip. `engine_singleton_guard.py`'s `_RUN_LOCK`
-also means concurrent calls to this route serialize within one worker
-process, same as any two direct `BacktestRunner` callers would. Neither
-is addressed here — see `replay_state_producer.py`/
-`engine_singleton_guard.py` for the existing, unmodified behavior this
-route simply inherits.
+**Latency.** Replay settlement uses exact engine/bus queue completion,
+not Market State's live one-second debounce floor, so it no longer costs
+roughly one wall-clock second per candle. This remains a synchronous HTTP
+route, and `engine_singleton_guard.py`'s `_RUN_LOCK` still serializes
+concurrent calls within one worker process. Background jobs, progress,
+cancellation, and parallel replay remain separate future work.
 
 **Two deliberately separate paths.** `POST /backtest/run` below remains
 the named, synthetic-fixture regression path and its frontend contract is
@@ -240,33 +237,21 @@ async def run_backtest(
         ...,
         description=(
             "One of scenarios.py's named fixture scenarios — no default, must be explicit. "
-            "Each is ~120-140 1-minute candles; see this route's own docstring for why that "
-            "means a ~120-140 SECOND synchronous HTTP response, not milliseconds."
+            "Each is ~120-140 1-minute candles; replay is synchronous but uses exact queue "
+            "settlement rather than waiting for the live debounce floor."
         ),
     ),
 ) -> dict[str, Any]:
     """Trigger one real `BacktestRunner` run against a named fixture
     scenario.
 
-    **This call is fully synchronous and blocks for roughly real time,
-    not request-processing time.** `EngineBackedReplayStateProducer`
-    costs a measured, genuine ~1 second of engine-settle time per
-    replayed candle (confirmed by direct timing, not estimated) — so
-    this endpoint does not return until (scenario candle count) seconds
-    have actually elapsed. A 130-candle scenario is a ~130 second HTTP
-    round trip; all of this task's scenarios are 120-140 candles
-    (~2-2.5 minutes), deliberately kept to the minimum each needed
-    rather than padded to a full session, specifically because of this
-    cost. This is a deliberate v1 trade-off, not an oversight: v1 has no
-    background-job, polling, or webhook infrastructure, and none is
-    added here — verified against this deployment's own stack (a single
-    uvicorn worker, `Dockerfile`, no reverse proxy, no
-    `--timeout-keep-alive` override, `docker-compose.yml`) to confirm
-    nothing already in place here would truncate a multi-minute
-    synchronous request; a different deployment (a proxy or load
-    balancer with its own request timeout in front of this service)
-    could behave differently, which this route has no way to know or
-    control.
+    **This call is fully synchronous.** Replay settlement uses exact
+    EventBus and engine-worker queue completion, including Market State's
+    replay-only immediate settlement; it does not wait for the live
+    one-second debounce floor. v1 still has no background-job, progress,
+    cancellation, polling, or webhook infrastructure, and the process-wide
+    replay guards still serialize runs. A different deployment's request
+    timeout remains outside this route's control.
 
     **Refuses to run against a live-trading process (decision #132).**
     `engine_singleton_guard.py`'s `install_replay_engines()` (unchanged

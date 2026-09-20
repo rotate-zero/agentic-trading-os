@@ -12,7 +12,7 @@ tests. `make_envelope()` is pure too (no I/O), used here exactly as
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -106,3 +106,71 @@ async def test_non_1m_arrival_does_not_schedule_a_recompute():
 
     await engine._schedulers["TEST"].stop()  # avoid leaking a running scheduler task past this test
     await asyncio.sleep(0)  # let the event loop actually process the cancellation before teardown
+
+
+def _compute_sequence(engine: MarketStateEngine, observations: list[tuple[datetime, float]]) -> list[float | None]:
+    scores: list[float | None] = []
+    for candle_ts, slope in observations:
+        engine._latest_features[("TEST", "1m")] = {
+            "timeframe": "1m",
+            "candle_ts": candle_ts,
+            "close": 100.0,
+            "features": {"sma_20_slope_angle": slope},
+        }
+        state = engine._compute("TEST")
+        assert state is not None
+        scores.append(state.acceleration_score)
+    return scores
+
+
+@pytest.mark.asyncio
+async def test_acceleration_is_identical_despite_materially_different_processing_delays():
+    observations = [
+        (_TS, 0.0),
+        (_TS + timedelta(minutes=1), 4.0),
+        (_TS + timedelta(minutes=4), -2.0),
+    ]
+    fast = _compute_sequence(MarketStateEngine(EventBus()), observations)
+
+    slow_engine = MarketStateEngine(EventBus())
+    slow: list[float | None] = []
+    for observation in observations:
+        await asyncio.sleep(0.05)
+        slow.extend(_compute_sequence(slow_engine, [observation]))
+
+    assert slow == fast
+
+
+def test_acceleration_uses_source_candle_delta_including_multi_minute_gap():
+    scores = _compute_sequence(
+        MarketStateEngine(EventBus()),
+        [(_TS, 0.0), (_TS + timedelta(minutes=3), 10.0)],
+    )
+    # Trend moves 50 -> 75 over 180 source-time seconds:
+    # 50 + (25/180) * 30 = 54.1666...
+    assert scores == [None, pytest.approx(54.1666666667)]
+
+
+def test_acceleration_first_and_non_positive_deltas_are_explicitly_none():
+    scores = _compute_sequence(
+        MarketStateEngine(EventBus()),
+        [
+            (_TS, 0.0),
+            (_TS, 10.0),
+            (_TS - timedelta(minutes=1), -10.0),
+        ],
+    )
+    assert scores == [None, None, None]
+
+
+@pytest.mark.asyncio
+async def test_default_engine_keeps_live_debounce_floor_and_ceiling():
+    from app.market_state_engine.engine import _MAX_INTERVAL_SECONDS, _MIN_INTERVAL_SECONDS
+
+    engine = MarketStateEngine(EventBus())
+    await engine._on_features_updated(_feature_envelope("TEST", "1m", sma_20_slope_angle=0.0))
+    scheduler = engine._schedulers["TEST"]
+    assert scheduler._min_interval == _MIN_INTERVAL_SECONDS == 1.0
+    assert scheduler._max_interval == _MAX_INTERVAL_SECONDS == 10.0
+    assert scheduler._ceiling_task is not None
+    await scheduler.stop()

@@ -920,13 +920,9 @@ export interface BacktestRunResultWireShape {
  * addScannerUniverseSymbol's JSON-body convention; no other adjustment
  * to this file's fetch/API_BASE_URL usage was needed for a POST call.
  *
- * **This call is genuinely slow — expect ~1 real second per replayed
- * candle (~120-140s for every scenario in BACKTEST_SCENARIOS above),
- * not a fast request.** That's the route's own documented, deliberate
- * behavior (`EngineBackedReplayStateProducer`'s real engine-settle time),
- * not a client-side timeout to work around — see useBacktestRun.ts for
- * how BacktestPanel.tsx surfaces that wait honestly instead of hiding it
- * behind a generic spinner.
+ * This remains a synchronous request, but replay settlement uses exact
+ * engine/bus queue completion and no longer waits roughly one real second
+ * per candle for Market State's live debounce floor (decision #157).
  */
 export async function triggerBacktest(
   strategyName: string,
@@ -1022,12 +1018,9 @@ async function parseIbkrErrorDetail(res: Response): Promise<{ message: string; c
  * interpretation of its own, matching `symbol`/`strategyName` above passing
  * through as-is with no client-side reshaping).
  *
- * **Genuinely long-running, not a fast request.** Per this route's own
- * docstring: roughly one real second per primary candle — about 6.5 minutes
- * for a regular session, up to about 16 minutes for a full 04:00-20:00
- * extended session. This is 4-6x triggerBacktest()'s own ~120-140s, which
- * is exactly why useIbkrBacktestRun.ts is a separate hook rather than a
- * mode branch inside useBacktestRun.ts — see that hook's own docstring.
+ * The request is synchronous and includes external IBKR acquisition, whose
+ * duration can vary independently of replay. Replay itself uses decision
+ * #157's exact settlement and no longer waits one second per candle.
  */
 export async function triggerIbkrBacktest(
   strategyName: string,

@@ -57,7 +57,7 @@ before `stop()` returns.
 
 Rolling window (§4's "Implementation note"): the only history this v1
 needs is enough to compute Acceleration — one prior (trend_score,
-timestamp) pair per symbol, kept in `_prev_trend`. Nothing longer; §4 is
+source candle timestamp) pair per symbol, kept in `_prev_trend`. Nothing longer; §4 is
 explicit that a cold start on restart is an accepted v1 simplification,
 not a gap this table needs to help close. Mutated only from inside the
 single worker task, so no lock is needed the way LevelInteractionEngine's
@@ -108,7 +108,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -161,7 +160,9 @@ class MarketStateEngine:
 
         self._schedulers: dict[str, DebounceScheduler] = {}
         self._latest_features: dict[tuple[str, str], dict[str, Any]] = {}  # (symbol, timeframe) -> raw FeaturesUpdated payload — decision #99's reconciliation
-        self._prev_trend: dict[str, tuple[float, float]] = {}  # symbol -> (trend_score, time.monotonic() at that score)
+        # Source candle time, not processing time: identical ordered 1m
+        # candles must produce identical Acceleration at every replay pace.
+        self._prev_trend: dict[str, tuple[float, datetime]] = {}  # symbol -> (trend_score, source candle_ts)
         self._cross_symbol_trend: dict[str, float] = {}  # "SPY"/"QQQ"/"IWM" -> latest trend_score (M3)
 
         # Read-side snapshot cache (decision #98, M4) — see get_snapshot()'s
@@ -229,8 +230,31 @@ class MarketStateEngine:
                 name=f"market-state-{symbol}",
             )
             self._schedulers[symbol] = scheduler
-            await scheduler.start()
+            # Replay advances explicitly and flushes each candle below;
+            # a periodic ceiling would duplicate the latest candle during
+            # a long replay step. Live/default construction is unchanged.
+            if not self._is_backtest:
+                await scheduler.start()
         await scheduler.trigger()
+
+    async def settle_replay(self, symbol: str) -> None:
+        """Immediately settle the latest replay-only 1m payload.
+
+        The scheduler atomically consumes any pending floor-delayed run,
+        then the authoritative worker queue drains through compute,
+        persistence, cache-before-publish, and event publication. Live
+        callers cannot use this path and retain the normal debounce floor
+        and ceiling unchanged.
+        """
+        if not self._is_backtest:
+            raise RuntimeError("MarketStateEngine.settle_replay() is only valid for a backtest engine")
+        scheduler = self._schedulers.get(symbol)
+        if scheduler is None or (symbol, "1m") not in self._latest_features:
+            raise RuntimeError(
+                f"MarketStateEngine.settle_replay({symbol!r}) called before a 1m FeaturesUpdated payload arrived"
+            )
+        await scheduler.flush()
+        await self._queue.join()
 
     # --- background worker (owns all compute + I/O + publish) -------------------
 
@@ -350,13 +374,15 @@ class MarketStateEngine:
 
         t_score = trend_score(features.get("sma_20_slope_angle", 0.0))
 
-        now = time.monotonic()
+        raw_candle_ts = payload["candle_ts"]
+        candle_ts = datetime.fromisoformat(raw_candle_ts) if isinstance(raw_candle_ts, str) else raw_candle_ts
         prev = self._prev_trend.get(symbol)
         accel = None
         if prev is not None:
-            prev_score, prev_time = prev
-            accel = acceleration_score(t_score, prev_score, now - prev_time)
-        self._prev_trend[symbol] = (t_score, now)
+            prev_score, prev_candle_ts = prev
+            elapsed_seconds = (candle_ts - prev_candle_ts).total_seconds()
+            accel = acceleration_score(t_score, prev_score, elapsed_seconds)
+        self._prev_trend[symbol] = (t_score, candle_ts)
 
         return MarketState(
             timeframe=payload["timeframe"],
