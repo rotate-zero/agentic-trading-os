@@ -28,6 +28,7 @@ from app.strategy_engine.momentum_strategy import DEFAULT_ACCELERATION_SCORE_THR
 FIRST_PULLBACK_SYMBOL = "ZBTR1"
 VOLUME_GATED_SYMBOL = "ZBTR2"
 MOMENTUM_SYMBOL = "ZBTR3"
+D20_ISOLATION_SYMBOL = "ZBTRD20"
 
 
 def _db_available() -> bool:
@@ -74,10 +75,12 @@ def _clean_before_and_after():
     _clean_test_symbol(FIRST_PULLBACK_SYMBOL)
     _clean_test_symbol(VOLUME_GATED_SYMBOL)
     _clean_test_symbol(MOMENTUM_SYMBOL)
+    _clean_test_symbol(D20_ISOLATION_SYMBOL)
     yield
     _clean_test_symbol(FIRST_PULLBACK_SYMBOL)
     _clean_test_symbol(VOLUME_GATED_SYMBOL)
     _clean_test_symbol(MOMENTUM_SYMBOL)
+    _clean_test_symbol(D20_ISOLATION_SYMBOL)
 
 
 def test_run_backtest_first_pullback_scenario_fires_and_persists():
@@ -129,6 +132,120 @@ def test_run_backtest_first_pullback_scenario_fires_and_persists():
     # Scenario has 130 candles, while the route intentionally passes
     # end=candles[-1].candle_ts to a [start,end) provider: 129 are replayed.
     assert market_state_count == 129
+
+
+def test_two_separate_runs_isolate_level_interaction_state_and_events():
+    """Two ordinary route calls for the same symbol must be independent.
+
+    Keep the deterministic outcome assertion before the new-column queries:
+    on pre-D20 ``main`` this fails with the confirmed ``[1, 0]`` result,
+    demonstrating the inherited-state defect itself rather than merely the
+    absence of the migration's columns.
+    """
+    with TestClient(app) as client:
+        responses = [
+            client.post(
+                "/backtest/run",
+                params={
+                    "strategy_name": "FirstPullback",
+                    "symbol": D20_ISOLATION_SYMBOL,
+                    "scenario": "first_pullback_vwap_dip",
+                },
+            )
+            for _ in range(2)
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    bodies = [response.json() for response in responses]
+    assert [body["outcomes_recorded"] for body in bodies] == [1, 1]
+    run_ids = [uuid.UUID(body["run_id"]) for body in bodies]
+    assert run_ids[0] != run_ids[1]
+
+    session = SessionLocal()
+    try:
+        state_rows = session.execute(
+            text(
+                "SELECT lis.id, lis.is_backtest, lis.backtest_run_id, lis.level_key, "
+                "lis.trading_day, lis.touch_count_today, lis.zone, lis.zone_entered_ts, "
+                "lis.touch_anchor_price, lis.touch_entered_ts, lis.touch_entered_from "
+                "FROM level_interaction_state lis "
+                "JOIN symbols s ON s.id = lis.symbol_id "
+                "WHERE s.ticker = :ticker ORDER BY lis.backtest_run_id, lis.level_key"
+            ),
+            {"ticker": D20_ISOLATION_SYMBOL},
+        ).mappings().all()
+        event_rows = session.execute(
+            text(
+                "SELECT lie.id, lie.is_backtest, lie.backtest_run_id, lie.level_key, "
+                "lie.trading_day, lie.outcome, lie.entered_from, lie.exited_to, "
+                "lie.entered_ts, lie.exited_ts, lie.seconds_in_zone, lie.anchor_price, "
+                "lie.distance_pct, lie.observed_via "
+                "FROM level_interaction_events lie "
+                "JOIN symbols s ON s.id = lie.symbol_id "
+                "WHERE s.ticker = :ticker ORDER BY lie.backtest_run_id, lie.id"
+            ),
+            {"ticker": D20_ISOLATION_SYMBOL},
+        ).mappings().all()
+    finally:
+        session.close()
+
+    expected_run_ids = set(run_ids)
+    assert state_rows
+    assert event_rows
+    assert {row["backtest_run_id"] for row in state_rows} == expected_run_ids
+    assert {row["backtest_run_id"] for row in event_rows} == expected_run_ids
+    assert all(row["is_backtest"] is True for row in state_rows + event_rows)
+
+    states_by_run = {
+        run_id: [row for row in state_rows if row["backtest_run_id"] == run_id]
+        for run_id in run_ids
+    }
+    assert all(states_by_run.values())
+    assert {row["id"] for row in states_by_run[run_ids[0]]}.isdisjoint(
+        row["id"] for row in states_by_run[run_ids[1]]
+    )
+
+    # VWAP is a stable key in both identical fixture replays (unlike Daily
+    # Level IDs, whose identifiers are deliberately minted per run). Inspect
+    # the persisted state values directly, not merely the row counts. The
+    # final checkpoint identity/zone/timestamps are the isolation contract;
+    # touch_count_today is inspected independently rather than made an
+    # equality precondition for the strategy outcome this regression proves.
+    vwap_rows = {
+        run_id: next(row for row in states_by_run[run_id] if row["level_key"] == "vwap")
+        for run_id in run_ids
+    }
+
+    def vwap_state(run_id):
+        row = vwap_rows[run_id]
+        return (
+            row["trading_day"],
+            row["zone"],
+            row["zone_entered_ts"],
+            row["touch_anchor_price"],
+            row["touch_entered_ts"],
+            row["touch_entered_from"],
+        )
+
+    assert vwap_state(run_ids[0]) == vwap_state(run_ids[1])
+    assert all(
+        isinstance(vwap_rows[run_id]["touch_count_today"], int)
+        and vwap_rows[run_id]["touch_count_today"] >= 0
+        for run_id in run_ids
+    )
+
+    def normalized_events(run_id):
+        return [
+            tuple(row[key] for key in (
+                "level_key", "trading_day", "outcome", "entered_from", "exited_to",
+                "entered_ts", "exited_ts", "seconds_in_zone", "anchor_price",
+                "distance_pct", "observed_via",
+            ))
+            for row in event_rows
+            if row["backtest_run_id"] == run_id
+        ]
+
+    assert normalized_events(run_ids[0]) == normalized_events(run_ids[1])
 
 
 def test_run_backtest_volume_gated_strategy_returns_honest_zero():

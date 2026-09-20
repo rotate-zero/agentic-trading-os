@@ -826,6 +826,74 @@ for (symbol, scenario) in pairs:
 
 **A second, deeper finding surfaced during verification — not a sweep defect, but real and worth recording here.** Running the *same symbol* through two separate real runs — whether two pairs in one sweep, or two separate calls to the existing, unmodified `POST /backtest/run` — can legitimately produce different `outcomes_recorded` between them. Confirmed directly: calling `/backtest/run` twice in a row against one fresh symbol, no sweep code involved at all, reproduced the identical discrepancy (1, then 0). Root cause, confirmed by reading the models rather than assumed: `daily_levels_state` got per-run isolation via `backtest_run_id` (decision #141/D19), but `LevelInteractionState`/`LevelInteractionEvent` (`app/models/trading_intelligence.py`) never did — `LevelInteractionState`'s own unique constraint is `(symbol_id, timeframe, level_key)`, with no `backtest_run_id` column at all, so a second run of the same symbol inherits real leftover touch/resolution state from the first. This is a pre-existing `BacktestRunner` characteristic that predates this delivery and applies equally to single runs; the sweep endpoint is simply the first caller likely to request the same symbol twice in quick succession. **Not fixed here** — out of this task's scope, and a fix would mean giving `level_interaction_state` the same per-run-isolation treatment D19 gave `daily_levels_state`, a change of that same shape and size. `docs/architecture/strategy-engine-open-decisions.md` is owned by a parallel session for this delivery and wasn't touched; flagged to Saqib directly to route as he judges best (a new D-item, most likely).
 
+### D20 as built — Level Interaction persistence is isolated per run
+
+The finding above remains the historical record of what decision #159
+discovered. D20 (decision #160) closes it without changing strategy logic.
+The runner already minted the run UUID and persisted its `backtests` parent
+before replaying the first candle; the missing edge was producer → Level
+Interaction Engine threading and run-aware persistence.
+
+Cross-component flow:
+
+```
+BacktestRunner.run()
+  │  mint run_id; persist backtests parent
+  ▼
+EngineBackedReplayStateProducer(backtest_run_id=run_id)
+  │
+  ├─► FeatureEngine(is_backtest=True, backtest_run_id=run_id)
+  │      └─► run-scoped daily_levels_state          (D19)
+  │
+  └─► LevelInteractionEngine(is_backtest=True,
+                             backtest_run_id=run_id)
+         ├─► level_interaction_state
+         │      one checkpoint per symbol/timeframe/key/run
+         └─► level_interaction_events
+                append-only; every replay event carries run_id
+
+Live singleton construction
+  └─► LevelInteractionEngine(is_backtest=False, backtest_run_id=None)
+         ├─► one live checkpoint per symbol/timeframe/key
+         └─► live events carry no run_id
+```
+
+Internal persistence flow:
+
+```
+FeaturesUpdated(symbol, timeframe, candle_ts)
+  │
+  ▼
+in-memory key: (symbol, timeframe, level_key)
+  │  one engine instance belongs to one live process or replay run
+  ├─ cache miss ─► LOAD persisted checkpoint
+  │                 WHERE symbol namespace = engine origin
+  │                   AND backtest_run_id = engine run (NULL for live)
+  │
+  ├─ first observation / transition
+  │       └─► UPSERT state in the identical origin + run scope
+  │
+  └─ concluded touch
+          └─► APPEND event with identical origin + run attribution
+
+Database boundary for BOTH tables:
+  (symbol_id, is_backtest) → symbols(id, is_backtest)
+  live     ⇔ backtest_run_id IS NULL
+  backtest ⇔ backtest_run_id IS NOT NULL → backtests.run_id CASCADE
+
+State uniqueness:
+  live     UNIQUE (symbol_id, timeframe, level_key)
+  backtest UNIQUE (symbol_id, timeframe, level_key, backtest_run_id)
+
+Events: no state-style uniqueness; append-only by design.
+```
+
+Migration `0011` derives legacy origin from the related namespaced Symbol,
+keeps live rows, and removes only legacy backtest state/events because their
+run provenance cannot be recovered honestly. Downgrade likewise removes
+replay-derived rows before restoring the legacy state unique constraint;
+otherwise two isolated runs for one symbol could not fit the old schema.
+
 **`sweep_id` threading — confirmed a small, additive constructor change, not a larger one.** `BacktestRunner.run()` already minted its own `sweep_id = uuid4()` as a local — "a sweep of one," per decision #155's own note on the schema. The only change: `__init__` now accepts `sweep_id: UUID | None = None`, resolving to a fresh `uuid4()` when omitted (`self._sweep_id = sweep_id if sweep_id is not None else uuid4()`) and to the caller's value otherwise; `run()` reads `self._sweep_id` instead of minting its own. Every existing caller (`/backtest/run`, `/backtest/run/ibkr`, every direct-construction test) passes nothing and gets byte-for-byte the same behavior as before — confirmed via the full existing backtest test suite, unchanged pass count.
 
 **Live-trading guard (decision #132), checked once before the sweep starts, not per-pair.** Same reasoning `/backtest/run` itself already rests on: a single run's own several-second replay never re-checks mid-run either, so treating a sequence of those same runs identically is consistent with existing precedent, not a new weaker standard invented for sweeps specifically.

@@ -1,6 +1,16 @@
-# CHANGES — decision #159: POST /backtest/sweep (batch/sweep endpoint v1)
+# CHANGES — decision #160: Level Interaction persistence isolated per backtest run
 
 ## Current delivery
+
+- D20 resolved: Level Interaction persistence is now isolated and attributable per backtest run. Two identical `/backtest/run` calls and duplicate same-symbol sweep pairs no longer inherit touch/zone/resolution state and both produce the same deterministic outcome count.
+- `level_interaction_state` and `level_interaction_events` now carry `is_backtest` plus nullable `backtest_run_id`, with composite symbol-namespace FKs, database CHECKs enforcing exactly live/NULL or backtest/non-NULL, and cascading run FKs for replay-derived lifecycle ownership.
+- State uses separate partial unique indexes for the live singleton and backtest run scopes, avoiding PostgreSQL nullable-unique semantics. Events remain append-only and gain only run attribution plus a run-read/cleanup index.
+- Migration `0011` preserves legacy live rows and removes legacy backtest Level Interaction rows whose run provenance cannot be recovered. Downgrade removes replay-derived rows before restoring the legacy state uniqueness constraint. A real PostgreSQL `0010 → 0011 → 0010 → 0011` round-trip passed with legacy and two-run fixtures.
+- `LevelInteractionEngine` now requires `backtest_run_id` exactly when `is_backtest=True`; cold-start load, state lookup/upsert, and event append all use the exact origin/run scope. `EngineBackedReplayStateProducer` passes through its existing run UUID. `BacktestRunner` remains unchanged.
+- The confirmed route regression failed `[1, 0]` before the fix and passed `[1, 1]` afterward while directly validating distinct state rows, semantic state values, and event ownership. Constructor, database invariant, cascade, live, replay-producer, and sweep coverage were added or strengthened.
+- `backtest-runner-design.md` documents the as-built runner-to-persistence flow and internal load/upsert/append flow with the required diagrams. D20 is resolved as decision #160.
+
+## Prior delivery record — decision #159: POST /backtest/sweep (batch/sweep endpoint v1)
 
 - New, additive `POST /backtest/sweep` route: one strategy across an explicit `symbols` × `scenarios` cross-product, run sequentially through the exact existing `BacktestRunner`/`_RUN_LOCK` path (no new locking mechanism), sharing one real `sweep_id` across every resulting `backtests` row. Existing `/backtest/run`, `/backtest/run/ibkr` unmodified.
 - `BacktestRunner.__init__` gains one new, optional, additive parameter: `sweep_id: UUID | None = None`. Every existing caller is unaffected — omitting it still mints a fresh `uuid4()` per run, exactly as before.

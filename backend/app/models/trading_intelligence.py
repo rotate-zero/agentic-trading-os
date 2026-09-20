@@ -16,12 +16,14 @@ reconstruct. Corrected here per decision #93, in the same change that
 built that table.
 
 Two tables, deliberately split by lifecycle, not one:
-- `level_interaction_state` — one row per (symbol, timeframe, level_key),
-  overwritten in place. This is the restart checkpoint: on boot, the
+- `level_interaction_state` — one live row per (symbol, timeframe,
+  level_key), or one backtest row per that identity and run, overwritten
+  in place. This is the restart checkpoint: on boot, the
   engine has no in-memory state at all, and needs to know "was AMD
   already mid-touch on SMA-9 when the process went down" without
   replaying an entire day of candles to reconstruct it.
-- `level_interaction_events` — append-only, one row per CONCLUDED touch
+- `level_interaction_events` — append-only, one row per CONCLUDED touch,
+  with replay events attributed to their owning backtest run
   (rejected, conquered, or an unresolved cold-start edge case). This is
   the actual analytical log — what a future Strategy Engine reads, and
   exactly the shape Saqib flagged as useful for training-data purposes.
@@ -88,13 +90,16 @@ from datetime import date, datetime
 from sqlalchemy import (
     Boolean,
     BigInteger,
+    CheckConstraint,
     Date,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
+    Index,
     Integer,
     Numeric,
     String,
-    UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -105,19 +110,55 @@ from app.db.base import Base
 
 
 class LevelInteractionState(Base):
-    """Current zone + in-progress touch (if any) for one (symbol, timeframe,
-    level_key). `level_key` is whatever key FeatureEngine published under
+    """Current zone + in-progress touch for one live level or replay run.
+
+    `level_key` is whatever key FeatureEngine published under
     `FeaturesUpdated.features` — e.g. "sma_9" — deliberately not a
     hardcoded enum, so this table (and the engine) needs zero changes when
     EMA/VWAP/pivots start publishing under their own keys later."""
 
     __tablename__ = "level_interaction_state"
     __table_args__ = (
-        UniqueConstraint("symbol_id", "timeframe", "level_key", name="uq_level_state_symbol_tf_key"),
+        ForeignKeyConstraint(
+            ["symbol_id", "is_backtest"],
+            ["symbols.id", "symbols.is_backtest"],
+            name="fk_level_interaction_state_symbol_namespace",
+        ),
+        CheckConstraint(
+            "(is_backtest IS FALSE AND backtest_run_id IS NULL) OR "
+            "(is_backtest IS TRUE AND backtest_run_id IS NOT NULL)",
+            name="ck_level_interaction_state_origin_run_pair",
+        ),
+        Index(
+            "uq_level_interaction_state_live_scope",
+            "symbol_id",
+            "timeframe",
+            "level_key",
+            unique=True,
+            postgresql_where=text("is_backtest IS FALSE"),
+        ),
+        Index(
+            "uq_level_interaction_state_backtest_run_scope",
+            "symbol_id",
+            "timeframe",
+            "level_key",
+            "backtest_run_id",
+            unique=True,
+            postgresql_where=text("is_backtest IS TRUE"),
+        ),
+        Index(
+            "ix_level_interaction_state_backtest_run_id",
+            "backtest_run_id",
+            postgresql_where=text("backtest_run_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
-    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_backtest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("backtests.run_id", ondelete="CASCADE"), nullable=True
+    )
     timeframe: Mapped[str] = mapped_column(String(10), nullable=False)
     level_key: Mapped[str] = mapped_column(String(32), nullable=False)
 
@@ -136,16 +177,46 @@ class LevelInteractionState(Base):
 
 
 class LevelInteractionEvent(Base):
-    """One row per concluded touch. `outcome` is NULL for the rare
+    """One append-only row per concluded touch, attributed to its origin.
+
+    `outcome` is NULL for the rare
     cold-start case where this process's very first observation of a
     (symbol, timeframe, level_key) was already inside the Aura — with no
     known entry side, "rejected vs. conquered" isn't a meaningful
     classification for that specific touch (see engine docstring)."""
 
     __tablename__ = "level_interaction_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["symbol_id", "is_backtest"],
+            ["symbols.id", "symbols.is_backtest"],
+            name="fk_level_interaction_events_symbol_namespace",
+        ),
+        CheckConstraint(
+            "(is_backtest IS FALSE AND backtest_run_id IS NULL) OR "
+            "(is_backtest IS TRUE AND backtest_run_id IS NOT NULL)",
+            name="ck_level_interaction_events_origin_run_pair",
+        ),
+        Index(
+            "ix_level_events_symbol_tf_key_day",
+            "symbol_id",
+            "timeframe",
+            "level_key",
+            "trading_day",
+        ),
+        Index(
+            "ix_level_interaction_events_backtest_run_id",
+            "backtest_run_id",
+            postgresql_where=text("backtest_run_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
-    symbol_id: Mapped[int] = mapped_column(ForeignKey("symbols.id"), nullable=False)
+    symbol_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_backtest: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false())
+    backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("backtests.run_id", ondelete="CASCADE"), nullable=True
+    )
     timeframe: Mapped[str] = mapped_column(String(10), nullable=False)
     level_key: Mapped[str] = mapped_column(String(32), nullable=False)
     trading_day: Mapped[date] = mapped_column(Date, nullable=False)

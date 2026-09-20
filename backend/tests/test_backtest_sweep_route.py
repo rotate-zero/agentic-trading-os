@@ -9,15 +9,10 @@ sequential-execution/shared-sweep_id contract proven against the actual
 lock (not mocked), deterministic response ordering, and partial-failure
 handling.
 
-One real, load-bearing finding this suite deliberately does NOT paper
-over: `level_interaction_state`/`level_interaction_events` carry no
-`backtest_run_id` (unlike `daily_levels_state`, decision #141/D19), so a
-second real run against the *same symbol* can legitimately produce a
-different `outcomes_recorded` than the first — confirmed reproducible
-via the existing, unmodified `/backtest/run` route called twice, so this
-is a pre-existing `BacktestRunner` characteristic, not a sweep defect.
-See this delivery's decision-log entry. No test here asserts that
-repeat-symbol runs produce identical outcome counts.
+D20's run-scoped Level Interaction persistence is exercised here at the
+route most likely to request the same symbol twice: duplicate pairs must
+produce deterministic results and persist state/events under their own
+run IDs.
 """
 from __future__ import annotations
 
@@ -409,9 +404,8 @@ def test_sweep_partial_failure_continues_and_preserves_earlier_successes(monkeyp
 def test_sweep_processes_duplicate_requested_pairs_as_independent_real_runs():
     """Same (symbol, scenario) pair listed twice: both are executed as
     real, independent runs — no crash, no dedup, matching the confirmed
-    design (the caller says exactly what to sweep). Deliberately does
-    NOT assert both produce identical outcomes_recorded — see this
-    file's module docstring for why that assumption would be false."""
+    design (the caller says exactly what to sweep). D20 requires their
+    Level Interaction checkpoints and events to remain run-scoped."""
     with TestClient(app) as client:
         resp = client.post(
             "/backtest/sweep",
@@ -430,9 +424,32 @@ def test_sweep_processes_duplicate_requested_pairs_as_independent_real_runs():
     runs = body["runs"]
     assert runs[0]["run_id"] != runs[1]["run_id"]
     assert runs[0]["error"] is None and runs[1]["error"] is None
+    assert [run["outcomes_recorded"] for run in runs] == [1, 1]
 
     rows = _sweep_rows(body["sweep_id"])
     assert len(rows) == 2
+
+    run_ids = {run["run_id"] for run in runs}
+    session = SessionLocal()
+    try:
+        state_owners = session.execute(
+            text(
+                "SELECT DISTINCT lis.backtest_run_id FROM level_interaction_state lis "
+                "JOIN symbols s ON s.id = lis.symbol_id WHERE s.ticker = :ticker"
+            ),
+            {"ticker": SWEEP_DUP},
+        ).scalars().all()
+        event_owners = session.execute(
+            text(
+                "SELECT DISTINCT lie.backtest_run_id FROM level_interaction_events lie "
+                "JOIN symbols s ON s.id = lie.symbol_id WHERE s.ticker = :ticker"
+            ),
+            {"ticker": SWEEP_DUP},
+        ).scalars().all()
+    finally:
+        session.close()
+    assert {str(run_id) for run_id in state_owners} == run_ids
+    assert {str(run_id) for run_id in event_owners} == run_ids
 
 
 # --- Existing single-run route stays intact ---------------------------------

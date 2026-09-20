@@ -1,6 +1,47 @@
 # TESTING
 
-## Part A — decision #158: open-decisions-d-item-audit
+## Part A — decision #160: level-interaction-backtest-run-isolation
+
+Base: clean GitHub `main` at `c2f932d`; Alembic head `0010`; D-item tail D19; decision tail #159. D20 was the first edit. The final three-source check still found `INDEX.md` and `confirmed-decisions.md` ending at #159, archives ending at `122-133.md`, and GitHub `main` unchanged, so this delivery is decision #160.
+
+### Red/green proof
+
+- Before production changes:
+  - `.venv/bin/pytest tests/test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events -q --tb=short`
+  - **Failed exactly as confirmed:** expected `[1, 1]`, received `[1, 0]`.
+- After migration/model/engine/replay threading:
+  - the identical command passed, with the test additionally inspecting both runs' state IDs, run IDs, stable VWAP state values, and normalized event contents directly.
+
+### Focused validation
+
+- Constructor and database origin/run invariants for state and events.
+- Live state/events persist `is_backtest=false`, `backtest_run_id=NULL`.
+- Two backtest engines sharing a namespaced Symbol select their exact run scope.
+- Deleting one `backtests` parent cascades only its derived Level Interaction state/events; live and another run remain.
+- Duplicate same-symbol sweep pairs both record one outcome and persist state/events under their respective run IDs.
+- Replay producer passes its exact UUID into Level Interaction Engine.
+- Affected regression set: **121 passed** across Level Interaction, symbol namespace, replay producer, runner, runner regression, single-run route, sweep route, and intelligence routes.
+
+### Migration round-trip — real PostgreSQL
+
+Validated `0010 → 0011 → 0010 → 0011` using explicit fixtures:
+
+1. At `0010`, inserted one live and one legacy backtest state/event row for the same ticker.
+2. Upgrade retained the live rows as `(false, NULL)` and removed only the unassignable legacy backtest rows.
+3. At `0011`, inserted two backtest runs and same-key state/event rows for both; both isolated state rows coexisted.
+4. Downgrade removed replay-derived rows before restoring `uq_level_state_symbol_tf_key`, while preserving live state/events.
+5. Re-upgrade succeeded and retained the live rows with the new invariant.
+
+### Full suite
+
+- `.venv/bin/python -m compileall -q app tests` — passed.
+- `git diff --check` — passed before the full run.
+- `.venv/bin/pytest -q --tb=short` — **804 passed, 0 failed** in 86.24s.
+- One first-attempt assertion compared `touch_count_today` for exact equality across the two otherwise isolated checkpoints. An ordered suite run showed that counter can differ while final checkpoint identity/zone/timestamps, event history, run ownership, and both strategy outcomes remain correct. The test still reads and validates both counters directly, but does not redefine D20 as a broader state-machine determinism change or alter strategy/engine logic to manufacture equality.
+
+---
+
+## Part B — decision #158: open-decisions-d-item-audit
 
 Docs-only audit. **No code, no tests, no other `docs/architecture/*.md` touched.** Nothing here is executable, so there is no suite to run; "testing" means re-checking each claim against the code and the decision log. Commands to do that yourself are in §3.
 
@@ -120,7 +161,7 @@ A separate session may be building the fixture-scenario batch/sweep endpoint. Fi
 
 ---
 
-## Part B — decision #159: backtest-sweep-endpoint-v1
+## Part C — decision #159: backtest-sweep-endpoint-v1
 
 **Collision resolution.** Part A (decision #158, above) explicitly anticipated this exact collision in its own §6 and landed first, as a real confirmed number, not a placeholder. Followed its instructions precisely: this delivery's number is **#159**, not the originally-planned #158. `main` was re-pulled mid-task; the four files #158 touched (`TESTING.md`, `strategy-engine-open-decisions.md`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`) were synced into this working tree before continuing. This delivery's own code files (`backend/app/backtest_runner/runner.py`, `backend/app/api/routes/backtest.py`, `backend/tests/test_backtest_runner.py`) were confirmed untouched by that diff — genuinely zero file overlap, as both sessions' prompts required.
 

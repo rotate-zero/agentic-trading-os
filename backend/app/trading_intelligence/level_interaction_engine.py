@@ -151,6 +151,7 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -316,10 +317,20 @@ def classify_zone(close: float, level_value: float, aura_pct: float) -> str:
 
 
 class LevelInteractionEngine:
-    def __init__(self, bus: EventBus, aura_pct: float | None = None, *, is_backtest: bool = False) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        aura_pct: float | None = None,
+        *,
+        is_backtest: bool = False,
+        backtest_run_id: UUID | None = None,
+    ) -> None:
+        if is_backtest != (backtest_run_id is not None):
+            raise ValueError("LevelInteractionEngine requires backtest_run_id exactly when is_backtest=True")
         self._bus = bus
         self._aura_pct = aura_pct if aura_pct is not None else get_settings().trading_intelligence_aura_pct
         self._is_backtest = is_backtest
+        self._backtest_run_id = backtest_run_id
 
         self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()  # object half is _STOP_SENTINEL only
         self._worker_task: asyncio.Task | None = None
@@ -709,6 +720,8 @@ class LevelInteractionEngine:
                 .where(
                     Symbol.ticker == symbol,
                     Symbol.is_backtest.is_(self._is_backtest),
+                    LevelInteractionState.is_backtest.is_(self._is_backtest),
+                    LevelInteractionState.backtest_run_id == self._backtest_run_id,
                     LevelInteractionState.timeframe == timeframe,
                     LevelInteractionState.level_key == level_key,
                 )
@@ -737,12 +750,20 @@ class LevelInteractionEngine:
             existing = session.execute(
                 select(LevelInteractionState).where(
                     LevelInteractionState.symbol_id == symbol_id,
+                    LevelInteractionState.is_backtest.is_(self._is_backtest),
+                    LevelInteractionState.backtest_run_id == self._backtest_run_id,
                     LevelInteractionState.timeframe == timeframe,
                     LevelInteractionState.level_key == level_key,
                 )
             ).scalar_one_or_none()
             if existing is None:
-                existing = LevelInteractionState(symbol_id=symbol_id, timeframe=timeframe, level_key=level_key)
+                existing = LevelInteractionState(
+                    symbol_id=symbol_id,
+                    is_backtest=self._is_backtest,
+                    backtest_run_id=self._backtest_run_id,
+                    timeframe=timeframe,
+                    level_key=level_key,
+                )
                 session.add(existing)
             existing.trading_day = state.trading_day
             existing.touch_count_today = state.touch_count_today
@@ -768,7 +789,9 @@ class LevelInteractionEngine:
             symbol_id = self._get_or_create_symbol_id(session, symbol)
             session.add(
                 LevelInteractionEvent(
-                    symbol_id=symbol_id, timeframe=timeframe, level_key=level_key, trading_day=trading_day,
+                    symbol_id=symbol_id, is_backtest=self._is_backtest,
+                    backtest_run_id=self._backtest_run_id, timeframe=timeframe,
+                    level_key=level_key, trading_day=trading_day,
                     outcome=outcome, entered_from=entered_from, exited_to=exited_to, entered_ts=entered_ts,
                     exited_ts=exited_ts, seconds_in_zone=seconds_in_zone, anchor_price=anchor_price,
                     distance_pct=distance_pct, observed_via=observed_via,

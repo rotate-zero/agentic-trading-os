@@ -139,11 +139,10 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
        queue. The worker's compute, persistence, cache-before-publish and
        `MarketStateChanged` event remain the only authoritative path.
 
-    ``backtest_run_id`` is required at construction and passed only to
-    Feature Engine, whose Daily Levels checkpoint is run-scoped. Market
-    State and Level Interaction retain decision #140's live/backtest
-    namespace because neither table is part of Daily Levels identity
-    reconciliation and this change does not alter their schemas.
+    ``backtest_run_id`` is required at construction and passed to Feature
+    Engine and Level Interaction Engine. Daily Levels and both Level
+    Interaction persistence tables are run-scoped; Market State retains
+    decision #140's live/backtest namespace.
     """
 
     def __init__(
@@ -160,7 +159,11 @@ class EngineBackedReplayStateProducer(ReplayStateProducer):
             is_backtest=True,
             backtest_run_id=backtest_run_id,
         )
-        self.level_interaction_engine = LevelInteractionEngine(self.bus, is_backtest=True)
+        self.level_interaction_engine = LevelInteractionEngine(
+            self.bus,
+            is_backtest=True,
+            backtest_run_id=backtest_run_id,
+        )
         self.market_state_engine = MarketStateEngine(self.bus, is_backtest=True)
         providers, symbol_providers = context_provider.build_engine_providers()
         self.context_engine = ContextEngine(self.bus, providers=providers, symbol_providers=symbol_providers)

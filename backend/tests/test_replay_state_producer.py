@@ -74,6 +74,16 @@ def _clean_test_symbol(ticker: str) -> None:
 pytestmark = pytest.mark.skipif(not _db_available(), reason="Postgres not reachable at the configured DATABASE settings")
 
 
+def test_replay_producer_threads_run_id_to_level_interaction_engine():
+    run_id = uuid4()
+    producer = EngineBackedReplayStateProducer(
+        context_provider=FixtureBacktestContextProvider(),
+        backtest_run_id=run_id,
+    )
+    assert producer.level_interaction_engine._is_backtest is True
+    assert producer.level_interaction_engine._backtest_run_id == run_id
+
+
 def _fixture_candles(n: int, start: datetime) -> list[Candle]:
     price = 50.0
     candles = []

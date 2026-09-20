@@ -241,6 +241,27 @@ async def test_touch_then_rejected():
         assert rejected["observed_via"] == "dwell"
         assert rejected["seconds_in_zone"] == 60
         assert rejected["distance_pct"] == -1.0  # (99-100)/100 * 100
+
+        session = SessionLocal()
+        try:
+            state_origin = session.execute(
+                text(
+                    "SELECT lis.is_backtest, lis.backtest_run_id FROM level_interaction_state lis "
+                    "JOIN symbols s ON s.id = lis.symbol_id WHERE s.ticker = :ticker"
+                ),
+                {"ticker": ticker},
+            ).one()
+            event_origin = session.execute(
+                text(
+                    "SELECT lie.is_backtest, lie.backtest_run_id FROM level_interaction_events lie "
+                    "JOIN symbols s ON s.id = lie.symbol_id WHERE s.ticker = :ticker"
+                ),
+                {"ticker": ticker},
+            ).one()
+        finally:
+            session.close()
+        assert state_origin == (False, None)
+        assert event_origin == (False, None)
     finally:
         await engine.stop()
         await bus.stop()
