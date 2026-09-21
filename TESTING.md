@@ -1,3 +1,192 @@
+# TESTING — decision #169: Phase 4 scale/load investigation (`phase4-scale-load-measurement`)
+
+## Baseline and evidence
+
+Repository: `rotate-zero/agentic-trading-os`, `main`, pulled as a tarball
+(`codeload.github.com/.../tar.gz/refs/heads/main`; no `.git` metadata in this
+sandbox). Highest decision at task start: **#167** (three-source check
+agreed: `INDEX.md` last row #167, `confirmed-decisions.md` tail #167, archive
+files `001-060`…`134-160` — open log held #161–#167). A second, fresh pull
+taken immediately before assigning a real decision number found the parallel
+`execution-engine-design` sibling had already landed **#168** — confirmed by
+the same three-source check against the fresh pull (`INDEX.md` last row
+#168, `confirmed-decisions.md` tail #168, archive files unchanged). That
+sibling's own `TESTING.md` record (retained below) named this task by its
+exact slug in a "Manual merge notes" section and anticipated exactly this
+ordering, including exactly which four files are shared and how to merge
+them. Diffed the fresh pull against this session's working tree for every
+file outside the four shared ones this task might touch
+(`docs/roadmap/phase-roadmap.md`, `docs/architecture/scanner-design.md`,
+`backend/scripts/`): identical — zero collision on this task's own file
+boundary. **#169 assigned only after that re-check.**
+
+## What changed (exact five-file footprint)
+
+| File | Change |
+|---|---|
+| `backend/scripts/measure_live_pipeline_scale.py` | **new** — opt-in harness, not pytest-collected (matches no glob in `pytest.ini`) |
+| `docs/roadmap/phase-roadmap.md` | one sentence — Phase 4 exit-criterion status, now measured-on-synthetic-input |
+| `docs/decisions/confirmed-decisions.md` | decision #169 appended at the true end (`### 169. …`) |
+| `docs/decisions/INDEX.md` | row #169 appended after #168 |
+| `CHANGES.md`, `TESTING.md` | this delivery's records, prepended above the #168 record (kept intact below) |
+
+**Not touched:** `backend/app/**`, `frontend/**`, `backend/tests/**`,
+`docs/architecture/system-design.md`, `docs/architecture/scanner-design.md`
+(see the decision entry for why — a different, still-open question), any
+existing decision text.
+
+## Environment
+
+1 vCPU / 3.9 GB sandbox (`nproc`=1, `os.cpu_count()`=1), Ubuntu 24.04, Python
+3.12.3, PostgreSQL 16.15 (apt, freshly installed this session — not present
+at container start). Scratch database only:
+
+```bash
+# one-time setup
+service postgresql start
+su postgres -c "psql -c \"CREATE USER trading WITH PASSWORD 'trading' SUPERUSER;\""
+su postgres -c "psql -c \"CREATE DATABASE trading_scale_scratch OWNER trading;\""
+su postgres -c "psql -c \"ALTER SYSTEM SET fsync = off;\""   # matches decision #155's own precedent
+su postgres -c "psql -c \"SELECT pg_reload_conf();\""
+
+cd backend
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DB=trading_scale_scratch \
+  POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/python -m alembic upgrade head   # -> head 0011, clean
+```
+
+SQLAlchemy `create_engine()` (`app/db/session.py`) takes no explicit
+`pool_size`/`max_overflow` — confirmed by reading the call site — so both are
+library defaults (`pool_size=5`, `max_overflow=10`). Default
+`asyncio.to_thread` executor size on this box: `min(32, cpu+4) == 5` threads
+(process-wide, shared by every stage).
+
+## Reproduction
+
+```bash
+cd backend
+POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DB=trading_scale_scratch \
+  POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/python scripts/measure_live_pipeline_scale.py \
+  --ramp 1,10,25,50,100 --bursts 16 --tick-minutes 3 --ticks-per-minute 3 \
+  --output full_ramp_results.json
+
+# supplementary stress point (N=100, 60-candle burst — beyond the requested ramp)
+POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DB=trading_scale_scratch \
+  POSTGRES_USER=trading POSTGRES_PASSWORD=trading \
+  .venv/bin/python scripts/measure_live_pipeline_scale.py \
+  --ramp 100 --bursts 60 --tick-minutes 3 --ticks-per-minute 3 \
+  --output stress_n100_k60.json
+```
+
+The script refuses to run unless `POSTGRES_DB` contains `"scratch"`
+(`_require_scratch_db()`) — a hard guard, not a convention, since it
+`TRUNCATE`s application tables between ramp steps.
+
+## Results
+
+Full numeric results are in the decision #169 entry (`confirmed-decisions.md`)
+— tables reproduced from this run's own JSON output, not hand-transcribed.
+Summary:
+
+| N | FeaturesUpdated | drain | LevelInteraction (queue-verified) | drain | MarketStateChanged | 1m coverage |
+|---|---|---|---|---|---|---|
+| 1 | 21 | 0.031s | queue fully drained (3 events) | 0.058s | 1 | 1/1 |
+| 10 | 210 | 0.236s | queue fully drained (17 events) | 0.427s | 20 | 10/10 |
+| 25 | 525 | 0.673s | queue fully drained (36 events) | 1.203s | 50 | 25/25 |
+| 50 | 1050 | 1.157s | queue fully drained (57 events) | 2.205s | 124 | 50/50 |
+| 100 | 2100 | 2.744s | queue fully drained (125 events) | 4.194s | 400 | **100/100** |
+
+Stress point N=100/K=60: 7,700 FeaturesUpdated in 9.11s; LevelInteraction
+queue fully drained (`queue.join()`) in 14.03s (1,038 events); 1m coverage
+100/100. `MarketStateChanged` settle timed out at its fixed 2.0s window
+(`"timed out after 2.0s at count=1051"`) — a documented lower bound for that
+one number at K=60 only (the settle window is sized for the K=16 primary
+ramp); does not affect the FeatureEngine/LevelInteractionEngine coverage or
+drain-time numbers.
+
+Stage A (tick ingestion), every N: `PriceUpdated` observed == expected and
+`CandleClosed` observed == expected (10/10 … 1000/1000 ticks; 3/3 … 300/300
+candles); zero `LiveTickRelay` active-symbol gating violations at any N.
+
+Full per-burst queue-depth telemetry, per-symbol coverage arrays, and raw
+timing are in `full_ramp_results.json` / `stress_n100_k60.json` (not
+committed — regenerate via the commands above; each run TRUNCATEs and
+reseeds the scratch database itself, so results are exactly reproducible
+modulo this sandbox's own timing noise).
+
+## Checks and results
+
+- **Footprint:** `diff -rq` of a fresh untouched `main` pull (post-#168)
+  against the working tree lists exactly the five files above and nothing
+  else.
+- **No production code changed:** confirmed no `backend/app/**` file's
+  content differs from the fresh pull (`diff -rq`); this harness only reads
+  private `_queue` attributes and calls existing public methods
+  (`bus.subscribe_all`, `queue.join()`, `evaluate_for_symbol` indirectly via
+  `ContextEngine.start()`'s own bootstrap) — nothing under
+  `backend/app/**` was edited to make any of this observable.
+- **No suite-time impact:** `backend/scripts/measure_live_pipeline_scale.py`
+  matches no glob `pytest.ini` collects (`grep -n "python_files\|testpaths"
+  backend/pytest.ini` — scripts/ is not a testpath; the file also has no
+  `test_` prefix). Not run as part of the backend test suite; full suite was
+  not re-run for this delivery since no application code changed (same
+  posture as decision #155/#158/#168's own precedent for docs/investigation-
+  only deliveries).
+- **Harness self-verification (smoke test, N=1):** cross-checked
+  `LevelInteractionChanged`'s low count directly against
+  `level_interaction_state` — 6 rows (vwap/vwap_ext/regular_open × 1m/5m),
+  `updated_at` spanning the whole run, confirming the engine really
+  processed every item even though it published only 1 transition event
+  (see decision entry Finding 1).
+- **Coverage is per-symbol, not just aggregate:** every ramp step asserts
+  `min == max == burst_count` across all N symbols' individual
+  `FeaturesUpdated(1m)` counts, not just that the total matches.
+
+## Not covered / limitations
+
+- No real broker/feed exercised — everything upstream of `CandleClosed`
+  publication in Stage B, and the tick source in Stage A, is synthetic.
+- Real tick burstiness, reconnects, and partial/duplicate provider delivery
+  are not represented.
+- Production hardware was not used; this sandbox's `fsync=off` is a real
+  advantage a production database likely won't have, and its 1 vCPU is a
+  real disadvantage a production host likely won't have — both stated, not
+  netted against each other.
+- `ContextEngine`, `StrategyScheduler`, and `OpportunityCache` ran (so
+  `StrategyScheduler` genuinely evaluated all 7 strategies per
+  `MarketStateChanged`, via seeded `scanner_universe_symbols` rows) but
+  their own throughput was not separately measured or reported.
+- N was not pushed past 100 (K was, at fixed N=100, to 60). The
+  `MarketStateChanged` settle-wait limitation at K=60 is noted above and in
+  the decision entry.
+
+## Manual merge notes (parallel session)
+
+This delivery landed **second**, after the sibling `execution-engine-design`
+task's #168. Per that sibling's own anticipated merge notes (retained
+below): `confirmed-decisions.md`/`INDEX.md` keep both entries in numerical
+order (#168 then #169 — already true, appended at the true end); `CHANGES.md`
+keeps both records (this one prepended on top); `TESTING.md` keeps this
+record on top and the sibling's retained directly below, unedited.
+
+## Baseline SHA-256
+
+The five pre-existing files this delivery edits were clean at baseline
+(matching the fresh post-#168 pull) with these hashes (the new file has
+none until after this delivery):
+
+```text
+docs/decisions/confirmed-decisions.md 79a37d3b51d782c627ff6988e8ea2781709128e59f0857eef39ce70726abd152
+docs/decisions/INDEX.md               15b84c8293501d5558ab012d2e1cae0877e525e3ab2ebae116cc06cfd7839d88
+CHANGES.md                            61faa01cf81ca90eac4b29fcf82e69312edbb5a7879f437214de6b609437284d
+TESTING.md                            41723b3f0ffd301495e45f806968b3c1cb61037241e6d601ecade799473ce83e
+docs/roadmap/phase-roadmap.md         473239117a5c5f08ffa2a0930a981a27963c3e252445d9d5a842933bb8380651
+```
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #168: Execution Engine & Portfolio State design doc (`execution-engine-design`)
 
 ## Baseline and evidence

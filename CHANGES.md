@@ -1,3 +1,71 @@
+# CHANGES — decision #169: Phase 4 scale/load investigation (`phase4-scale-load-measurement`)
+
+## Current delivery
+
+Added `backend/scripts/measure_live_pipeline_scale.py`, an opt-in measurement
+harness (not pytest-collected) that finally measures Phase 4's exit
+criterion — "100-symbol streaming with a `FeatureSet` per symbol and no
+dropped ticks" — which decision #164 recorded as never having been
+demonstrated. The harness wires the real live-path objects (`FeatureEngine`,
+`LevelInteractionEngine`, `MarketStateEngine`, `ContextEngine`,
+`StrategyScheduler`, `OpportunityCache`, `CandleRecorder`, `LiveTickRelay`),
+in the same classes and start order `main.py`'s `lifespan()` uses, against a
+real scratch PostgreSQL 16 database, driven by a synthetic in-process tick/
+candle provider — never a real feed. It ramps N = 1, 10, 25, 50, 100
+synthetic symbols through a tick-ingestion stage and a candle-burst stage,
+using `queue.join()` (the same primitive `MarketStateEngine.settle_replay()`
+already uses) for authoritative per-stage drain detection rather than
+polling published-event counts, which would have been wrong for
+`LevelInteractionEngine` specifically (it only publishes on a zone
+transition, not once per item processed — verified directly against
+`level_interaction_state`'s own `updated_at` timestamps during the harness's
+own smoke test).
+
+**Result: at N=100 with a 16-candle burst, both engines fully drained with
+exact 100/100 per-symbol coverage and no drops — FeatureEngine in 2.74s,
+LevelInteractionEngine in 4.19s, both 14–20x inside the 60-second
+per-candle-minute production budget.** A supplementary stress point (same
+N=100, a 60-candle burst — beyond the requested ramp, added because it was
+cheap and directly answers "how much margin") still held 100/100 coverage at
+9.11s/14.03s. `MarketStateChanged` coalescing under a fast synthetic burst
+(400 of a possible 1,600 at N=100/K=16) is `DebounceScheduler` (decision
+#10/#155) working exactly as designed, not evidence of a drop.
+
+Three real methodology bugs were found and fixed during the harness's own
+development — documented as findings in the decision entry rather than
+silently patched: (1) an event-count-based drain check that would have
+declared "done" while `LevelInteractionEngine` still had real backlog; (2) a
+tight burst-publish loop that gave downstream worker tasks zero chance to
+run between bursts, because an unbounded `asyncio.Queue.put()` never
+actually suspends the coroutine; (3) this harness's own synthetic
+historical `candle_ts` colliding with `TickIngestBridge`'s real-wall-clock
+stale-bucket safety net, producing a harmless but noisy spurious
+duplicate-candle warning — never occurs in production, where `candle_ts`
+always tracks real time.
+
+`docs/roadmap/phase-roadmap.md`'s Phase 4 status paragraph: the exit-criterion
+sentence rewritten from "has not been demonstrated in the repository record"
+to a measured statement citing decision #169's numbers and what remains
+unmeasured (real feed, real tick burstiness, provider symbol caps).
+
+**Deliberately NOT touched:** `docs/architecture/scanner-design.md`'s §7
+"100-symbol concurrency prerequisite" bullet — that bullet is about Finnhub's
+free-tier WebSocket symbol-count ceiling (a data-*provider* question, still
+genuinely open, unrelated to and unverified by this backend-processing
+measurement) — reported as a follow-up in the decision entry rather than
+edited, since this measurement's synthetic in-process provider never
+exercised a real feed. Investigation only: no fix implemented, no option
+chosen — four options laid out for Saqib in the decision entry. Zero
+`backend/app/**`, `frontend/**`, or `backend/tests/**` changes.
+
+## Boundary
+
+Exactly five files change: the new harness script, `docs/roadmap/phase-roadmap.md`
+(one sentence), the two live decision-log files, `CHANGES.md`, and
+`TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #168: Execution Engine & Portfolio State design doc landed (`execution-engine-design`)
 
 ## Current delivery

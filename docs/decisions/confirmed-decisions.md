@@ -316,3 +316,120 @@ disagreeing prose definitions of `TradePlanned`, and §18.8's reference to a
 **Documentation updated in this delivery.** `docs/architecture/execution-engine-design.md`
 (new), `docs/architecture/system-design.md` (pointers only), this entry and its
 `INDEX.md` row, `CHANGES.md`, `TESTING.md`.
+
+### 169. Phase 4 scale/load investigation — measured the exit criterion for the first time: FeatureEngine and LevelInteractionEngine keep up with a synthetic 100-symbol burst, 14–20x inside the 60s budget; MarketStateEngine's own debounce (decision #10/#155) coalesces by design; nothing decided or changed
+
+**Status: investigation only — nothing decided, built, or migrated.** (slug `phase4-scale-load-measurement`; number assigned after re-checking `main` immediately before writing this entry — found the parallel `execution-engine-design` sibling had already landed #168, confirmed via three-source check: `INDEX.md` last row #168, `confirmed-decisions.md` tail #168, archive files `001-060`…`134-160` unchanged and non-overlapping. Assigned #169 per that sibling's own manual-merge notes in `TESTING.md`, which named this task by its exact slug and anticipated exactly this ordering.) Zero application code changed — `backend/app/**`, `frontend/**`, `backend/tests/**` untouched. Only `backend/scripts/measure_live_pipeline_scale.py` (new), this entry, its `INDEX.md` row, `CHANGES.md`, `TESTING.md`, and one sentence of `docs/roadmap/phase-roadmap.md`'s Phase 4 status paragraph changed.
+
+**Why now.** Decision #164 recorded explicitly that "the Phase 4 exit criterion — 100-symbol streaming with a FeatureSet per symbol and no dropped ticks — has not been demonstrated in the repository record." Tracing the live wiring (`backend/app/main.py`'s `lifespan()`) found every stage from `CandleClosed` onward — `CandleRecorder`, `FeatureEngine`, `LevelInteractionEngine`, `MarketStateEngine` — is one asyncio worker draining an **unbounded** `asyncio.Queue` (`put_nowait`, no `maxsize`) with per-item `asyncio.to_thread` work; `MarketStateEngine` additionally runs one `DebounceScheduler` (1.0s floor, decision #10/#155) per symbol. So "dropped ticks" cannot come from queue overflow — nothing here has a ceiling. The real question is BACKLOG/LAG: does the pipeline drain a same-second 100-symbol burst before the next one arrives, 60 real seconds later in production. This had never been measured.
+
+**Environment.** 1 vCPU / 3.9 GB sandbox, Ubuntu 24.04, Python 3.12.3, PostgreSQL 16.15 (apt), scratch database `trading_scale_scratch` (owner `trading`, migrated to head `0011`), **`fsync = off`** the only Postgres tuning (matching decision #155's own precedent) — never a dev/prod database, name-guarded in code (`_require_scratch_db()` refuses to run unless `POSTGRES_DB` contains `"scratch"`). `os.cpu_count() == 1`, so the default `asyncio.to_thread` executor is `min(32, cpu+4) == 5` threads (process-wide, shared by every stage). SQLAlchemy `create_engine()` (`app/db/session.py`) takes no explicit `pool_size`/`max_overflow`, so both are library defaults (`pool_size=5`, `max_overflow=10`, ceiling 15 connections) — confirmed by reading the call site, not assumed.
+
+**The harness (`backend/scripts/measure_live_pipeline_scale.py`, not collected by pytest).** Constructs the real `EventBus`, `CandleRecorder`, `LiveTickRelay`, `FeatureEngine`, `LevelInteractionEngine`, `MarketStateEngine` (`is_backtest=False`, the live namespace), `ContextEngine`, `StrategyScheduler`, `OpportunityCache`, `FundamentalsRefreshJobs` — same classes and start order `main.py`'s `lifespan()` uses (FastAPI app, WebSocket Gateway, and provider auto-connect omitted — not part of the pipeline under test). Fresh instances per ramp step, not the `get_xxx()` singletons `main.py` itself uses — the singleton cache exists so route handlers share one cross-request instance; reusing it across ramp steps would leak in-memory state (rolling windows, per-symbol debounce schedulers, daily-levels cache) between different N values and bias the very timing this harness measures. A `SyntheticProvider(MarketDataProvider)` stands in for a real feed; `bus.subscribe_all()` (an existing public API — the WebSocket Gateway's own production caller) is the harness's only hook into the pipeline. No historical/streaming broker is registered, so Daily Levels correctly takes its designed no-provider no-op path (confirmed: `broker_registry.get_historical_provider()` returns `None`, asserted at harness start) — an honest gap, not a workaround.
+
+```
+SyntheticProvider.push(tick)                                   (harness-only, satisfies MarketDataProvider)
+        │ registered via provider.on_tick(bridge._on_tick)
+        ▼
+TickIngestBridge._on_tick ──► asyncio.create_task(_handle_tick)     (tick_ingest.py — one task PER TICK, no queue)
+        │ publish PriceUpdated (always)
+        │ minute rollover keyed on tick.exchange_ts, NOT wall clock ──► publish CandleClosed
+        ▼
+EventBus._consume() — normal lane, ONE consumer task, unbounded asyncio.Queue        (event_bus/bus.py)
+        │ dequeues one envelope, awaits asyncio.gather(*handlers) before the next     ◄═ SERIALIZATION POINT
+        ├─► CandleRecorder: put_nowait ─► worker: to_thread(persist)      (1 worker, unbounded queue)
+        ├─► LiveTickRelay: gated to ≤8 active symbols, 5s real-wall-clock flush ─► PriceSnapshot
+        └─► FeatureEngine: put_nowait ─► worker: [maybe_refresh_daily_levels/premarket — to_thread,
+             cold-start-only] → to_thread(_compute_one, PURE CPU, no DB) ─► up to 4 FeaturesUpdated
+                    │  (1m + any of 5m/15m/1h this candle completes)     (1 worker, unbounded)  ◄═ HARNESS
+                    ▼                                                                              OBSERVES:
+             LevelInteractionEngine: put_nowait ─► worker: to_thread(_process_one — REAL DB WRITE      engine._queue
+                    │  EVERY item: level_interaction_state upsert + level_interaction_events append)   .qsize() +
+                    │  LevelInteractionChanged published ONLY on an actual zone TRANSITION,             .join();
+                    │  verified against level_interaction_state's own updated_at during this            bus.sub-
+                    │  harness's own smoke test — NOT once per item processed                           scribe_all
+                    ▼
+             MarketStateEngine._on_features_updated (1m only) ─► DebounceScheduler.trigger() (one/symbol)
+                    │ elapsed ≥ 1.0s real monotonic ─► run now
+                    │ otherwise ─► _pending=True; ONE _run_after_delay(1.0−elapsed) task   ◄═ REAL WAIT,
+                    ▼                                                                        coalesces every
+             put_nowait(symbol) ─► worker: to_thread(_compute+_persist) ─► MarketStateChanged  intervening
+                    ▼                                                                            trigger
+             StrategyScheduler._on_market_state_changed — NO queue, runs INLINE inside the       ◄═ SECOND
+                    │ bus's own gather() above: 7 strategies' evaluate() execute synchronously      SERIALIZATION
+                    │ in the bus's normal-lane consumer task before it dequeues the next envelope   POINT
+                    ▼
+             OpportunityCreated (if any) ─► OpportunityCache (no queue, direct dict write)
+```
+
+```
+run_pipeline_for(N)                                              (measure_live_pipeline_scale.py)
+        │
+        ├─ _reset_scratch_db(): TRUNCATE … RESTART IDENTITY CASCADE      (name-guarded, never dev/prod)
+        ├─ _seed_scanner_universe(N synthetic SYNnnnn symbols)            real Symbol/ScannerUniverseSymbol
+        │                                                                  rows — ContextEngine's own
+        │                                                                  bootstrap reads this table, so
+        │                                                                  StrategyScheduler really evaluates
+        ├─ construct + start all stages, same classes/order as main.py's lifespan()
+        ├─ bus.subscribe_all(recorder.handler)      ◄══ harness's ONLY hook; no backend/app/** file touched
+        │
+        ├─ Stage A — tick ingestion (SCOPE 2a)
+        │     SyntheticProvider.push(Tick, synthetic exchange_ts) × N×(minutes·ticks_per_minute+1)
+        │     assert PriceUpdated observed==expected, CandleClosed observed==expected (both, every N)
+        │     assert PriceSnapshot only for LiveTickRelay's ≤8 active symbols (zero violations, every N)
+        │     bridge.stop()  ◄══ FOUND EMPIRICALLY, fixed: must stop here, before Stage B (see Finding 3)
+        │
+        └─ Stage B — candle burst (SCOPE 2b)
+              for k in range(K): publish N CandleClosed at synthetic candle_ts = start + k·1m
+                  record each engine's queue.qsize() BEFORE this burst (backlog check)
+                  await asyncio.sleep(0)  ◄══ REQUIRED for the backlog check to mean anything — see Finding 2
+              await feature_engine._queue.join() / level_engine._queue.join() / market_state_engine._queue.join()
+                  ◄══ authoritative drain detection (same primitive settle_replay() itself already uses),
+                       not a published-event-count poll — see Finding 1 for why that would be wrong here
+              + bounded extra settle for MarketStateChanged only (catches a trailing DebounceScheduler
+                catch-up scheduled up to 1.0s after its last trigger, outside any queue this harness can join)
+              → per-symbol coverage tally, last-symbol timing, compare drain_s against the 60s deadline
+```
+
+**Finding 1 — `LevelInteractionChanged` is not a per-item heartbeat; queue-drain is the correct throughput proxy, not event count.** `LevelInteractionEngine._process_one` runs on every `FeaturesUpdated` (no debounce) and always writes `level_interaction_state`, but only *publishes* `LevelInteractionChanged` on an actual zone transition. Verified directly in the harness's own smoke test (N=1, 5 `FeaturesUpdated`): `level_interaction_state` held 6 rows (vwap/vwap_ext/regular_open × 1m/5m) with `updated_at` spanning the full run, while only 1 `LevelInteractionChanged` published — near-flat synthetic prices rarely cross a zone boundary. The harness's first drain-detection design (event-count polling) would have silently declared "done" while real backlog remained; fixed by switching to `queue.join()` (Finding 3 lists the fix).
+
+**Finding 2 — an unbounded `asyncio.Queue.put()` never actually suspends the coroutine, so a bare `await bus.publish(...)` loop gives every downstream worker task zero chance to run.** First burst-loop version recorded queue depth 0 before every single burst at every N, including N=100 — impossible if any real processing were happening between bursts. Confirmed against `asyncio.queues.py`: `Queue.put()` only awaits when the queue is `full()`; an unbounded queue is never full, so `put_nowait()` runs and returns with no yield point. Fixed with one `await asyncio.sleep(0)` per burst — long enough for the bus's consumer task and each engine's worker task to run as far as they can before their own yield points, short enough that K bursts still complete in a small fraction of a real second.
+
+**Finding 3 — synthetic historical `candle_ts` collides with `TickIngestBridge`'s real-wall-clock safety-net flush.** `_flush_loop`'s stale-bucket check compares `bucket.minute_ts` against real `datetime.now(timezone.utc)` (`tick_ingest.py`'s own module docstring) — by design, for production. This harness's Stage A deliberately leaves one bucket open per symbol at a synthetic 2026-01-05 timestamp; when the harness's own real wall-clock crossed a real minute boundary mid-run, that safety net correctly saw a "stale" bucket (Jan 2026 is always less than the real current minute) and force-published it, which `FeatureEngine`'s real duplicate/out-of-order guard then correctly rejected — harmless (logged, not counted, no data lost) but noisy, and never happens in production, where `candle_ts` always tracks real time. Fixed by calling `bridge.stop()` immediately after Stage A, before Stage B (which never needs the bridge — it publishes `CandleClosed` directly).
+
+**Results — primary ramp** (K=16 synthetic 1m candles from session open 09:34–09:49 ET, spanning two 5m boundaries and one 15m boundary; Stage A precedes each row with 3 synthetic minutes / 3 ticks-per-minute, strictly before Stage B's candle_ts range).
+
+| N | FeaturesUpdated (count / expected N×16) | FeatureEngine drain | LevelInteraction (queue-verified full drain) | LevelInteraction drain | MarketStateChanged | MarketState drain | 1m coverage | ≤60s, every stage |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 21 / 16 (+5 for the 5m/15m boundary crossings) | 0.031s | 3 events; queue fully drained | 0.058s | 1 | ~0.000s | 1/1 | yes |
+| 10 | 210 / 160 | 0.236s | 17 events; queue fully drained | 0.427s | 20 | ~0.000s | 10/10 | yes |
+| 25 | 525 / 400 | 0.673s | 36 events; queue fully drained | 1.203s | 50 | ~0.000s | 25/25 | yes |
+| 50 | 1050 / 800 | 1.157s | 57 events; queue fully drained | 2.205s | 124 | ~0.000s | 50/50 | yes |
+| 100 | 2100 / 1600 | 2.744s | 125 events; queue fully drained | 4.194s | 400 | ~0.000s | **100/100** | **yes** |
+
+1m coverage is exact (every symbol produced exactly 16 `FeaturesUpdated(1m)` — no drops, verified per-symbol, not just in aggregate). `FeaturesUpdated` count exceeds N×16 by the expected 5m/15m-boundary extras (module docstring: up to 4 FeatureSets per 1m close). Sustained throughput computed from these numbers: FeatureEngine ~700–900 `FeaturesUpdated`/s, LevelInteractionEngine ~350–500 items/s (the slower stage — its worker does a real DB write every item, unlike FeatureEngine's post-warmup pure-CPU `_compute_one`) — consistent across N, this sandbox's real ceiling, not a per-N artifact.
+
+**MarketStateChanged coalescing is DebounceScheduler working as designed (decision #10/#155), not a drop — and, counterintuitively, faster upstream stages mean FEWER distinct recomputes, not more.** DebounceScheduler's 1.0s floor is real-wall-clock, not synthetic-`candle_ts`. Because the whole 16-candle burst publishes in milliseconds, most of a symbol's 16 triggers arrive well inside its own 1.0s floor and coalesce into one pending catch-up that reflects only the LATEST close by the time it fires — at N=100, mean coverage was 4.0 recomputes/symbol out of 16 triggers, because the OTHER stages' own real processing time (LevelInteractionEngine's ~4.2s drain) stretched the burst's real duration past several 1.0s floors, each one allowing one more genuine "immediate" run. A system with faster upstream stages would show fewer, not more, MarketStateChanged events per burst. This is the same mechanism decision #155 already measured for backtest replay and decision #157 already addressed there (`settle_replay()`); nothing here touches that path or reopens it.
+
+**Results — Stage A (tick ingestion + `LiveTickRelay` gating), every N.** `PriceUpdated` observed == expected and `CandleClosed` observed == expected at N=1/10/25/50/100 (10/10, 100/100, 250/250, 500/500, 1000/1000 ticks; 3/3, 30/30, 75/75, 150/150, 300/300 candles) — zero drops on the ingestion side at any scale tested. `LiveTickRelay.set_active_symbols()` gating: zero symbols outside the active ≤8-symbol subset ever received a `PriceSnapshot`, at every N, confirming the gate holds under a 100-symbol backing set, not just a small one.
+
+**Results — supplementary stress point, N=100 / K=60 (one simulated hour, beyond the requested ramp — cheap to run, directly answers "how much margin," so included).** 7,700 `FeaturesUpdated` fully drained in **9.11s**; LevelInteractionEngine's queue fully drained (`queue.join()`) in **14.03s** for 6,000+ items (1,038 `LevelInteractionChanged` published on transitions). Both still **1m coverage 100/100** — zero drops even at 4× the primary ramp's burst depth. At the slower stage's ~500 items/s ceiling, LevelInteractionEngine used **14.03 of the 60s per-candle-minute budget — about 4.3× headroom remains even here**; the primary ramp's N=100/K=16 row used only 4.19s, ~14× headroom. **Known limitation of this one supplementary row:** the harness's `MarketStateChanged` settle wait is a fixed window sized for the K=16 primary ramp; at K=60 a `wait_until_quiet` timeout fired (`"timed out after 2.0s at count=1051"`), so the reported MarketState count there is a documented lower bound, not the fully-settled figure — this affects only that one diagnostic number in the stress row, not the FeatureEngine/LevelInteractionEngine coverage or drain-time findings the exit criterion turns on.
+
+**Does this bear on `scanner-design.md`'s §7 "100-symbol concurrency prerequisite" bullet? No — reported as a follow-up, not edited, per this task's own file boundary.** That bullet is about DATA-PROVIDER concurrency — how many symbols Finnhub's free WebSocket tier can stream simultaneously versus IBKR's 100-line default — a question about the provider connection, unverified for Finnhub either way before or after this task. This investigation used a synthetic in-process provider and never touched real Finnhub/IBKR streaming; it measured the BACKEND's own downstream processing throughput once ticks/candles already arrive, an orthogonal question. Conflating the two into one bullet would misrepresent what got measured. Left untouched; flagged here for whoever picks up real-feed validation next.
+
+**Roadmap wording changed** (`docs/roadmap/phase-roadmap.md`, Phase 4 status paragraph) — from "has not been demonstrated in the repository record" to a measured-on-synthetic-input statement citing this decision, the N/coverage/drain numbers above, and that real-feed delivery remains open. Exact diff in `CHANGES.md`.
+
+**What this does NOT prove (synthetic input; stated plainly, not left implicit).** No real Finnhub delivery was exercised — `TickIngestBridge` ran against a harness-only `SyntheticProvider`, not a real WebSocket connection. No provider symbol-count cap was tested (see the scanner-design.md paragraph above — that remains a genuinely separate, still-open question). Real tick burstiness (uneven arrival, reconnects, partial ticks) is not represented — this harness's Stage A pushes ticks at a fixed synthetic cadence. Real DB latency on production hardware may differ from this 1 vCPU / `fsync=off` sandbox in either direction — `fsync=off` is a real, stated advantage this measurement enjoys that a production database likely won't have; the sandbox's single vCPU is a real, stated disadvantage a production host likely won't have. The Core-100 symbol list itself remains unsettled (decision #164, unchanged by this task — not this task's call). `ContextEngine`, `StrategyScheduler`, and `OpportunityCache` were wired and running (so `StrategyScheduler` really evaluated all 7 strategies per `MarketStateChanged`, not skipped via a missing context) but their own throughput was not the object of measurement and is not separately reported here.
+
+**Options for the found headroom margin, and the one already-flagged real gap — Saqib's call, nothing chosen here.**
+
+| | What it would address | Trade-off | Saving (estimate unless noted) |
+|---|---|---|---|
+| **(a) Do nothing** | — | Matches what was measured: comfortable margin (14–20× at K=16, 4.3–6.5× even at K=60) at today's per-item cost on weaker-than-production hardware | — |
+| **(b) Real-Finnhub validation pass** | Closes the one gap this task explicitly could not close (a real feed, real burstiness, real provider symbol cap) | New task, needs a funded/keyed Finnhub connection and, per scanner-design.md §7, eventually an answer on Finnhub's free-tier WS symbol ceiling | Unmeasured — the actual next question, not a savings trade |
+| **(c) Bound the per-stage queues** | Turns silent backlog into an observable, alertable condition (`qsize()` growing) instead of relying on this task's one-off measurement staying true as the codebase changes | Additive; a `maxsize` choice and a policy for what happens when full (block vs. drop vs. alert) is a real design question, not free | Prevents an undetected future regression; does not speed anything up today |
+| **(d) Batch LevelInteractionEngine's DB writes** | Addresses the one real per-item cost this task found (a DB write every candle, not just on cold start) — the slowest stage by a clear margin | Changes `level_interaction_state`/`level_interaction_events` write timing; needs its own correctness pass, not attempted here | Unmeasured — LevelInteractionEngine is not currently the constraint, so this is a future-headroom option, not an urgent one |
+
+**Not measured (explicit follow-ups, not implemented).** Real Finnhub/IBKR delivery; Finnhub's free-tier WS symbol-count ceiling (scanner-design.md §7, still open); genuine tick burstiness; production hardware timing; `ContextEngine`/`StrategyScheduler`/`OpportunityCache` throughput in isolation; behavior beyond N=100 (K was pushed to 60 at fixed N=100; N itself was not pushed past 100); the MarketStateChanged trailing-catch-up undercounting noted above at K=60.
+
+**Documentation updated in this delivery.** This entry, its `INDEX.md` row, `CHANGES.md`, `TESTING.md`, one sentence of `docs/roadmap/phase-roadmap.md`'s Phase 4 status paragraph, and the new `backend/scripts/measure_live_pipeline_scale.py`. `docs/architecture/scanner-design.md` deliberately left untouched (see above). No `backend/app/**`, `frontend/**`, or `backend/tests/**` file changed.
