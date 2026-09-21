@@ -71,12 +71,12 @@ const PHASES = [
     ],
   },
   {
-    id: "p3", title: "First real data — Alpaca adapter",
+    id: "p3", title: "First real data — Finnhub streaming + Polygon history",
     exit: "Live ticks for one symbol flow adapter → engine → chart.",
     items: [
-      "BrokerAdapter interface finalized",
-      "AlpacaAdapter implementation (paper account)",
-      "Live ticks reach the chart in real time",
+      "MarketDataProvider interface finalized with independent streaming and historical roles",
+      "FinnhubAdapter provides genuine real-time WebSocket streaming; historical stock candles are unsupported",
+      "PolygonAdapter provides historical candles and delayed polling fallback; manually connected IBKR can take over both roles",
     ],
   },
   {

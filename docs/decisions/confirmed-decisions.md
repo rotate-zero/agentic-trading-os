@@ -193,3 +193,34 @@ entry, its `docs/decisions/INDEX.md` row, `CHANGES.md`, and `TESTING.md`.
 dependencies, lockfiles, architecture documents, roadmap documents, and
 decision archives remain unchanged. Workspace preset save/export was not
 implemented.
+
+---
+
+### 167. Close the two low-risk documentation status-drift follow-ups from #164
+
+Decision #164 recorded two low-risk, read-only documentation findings for a
+later focused pass. This delivery closes exactly those two findings and does
+not expand into the other drift identified there.
+
+`docs/README.md`'s `diagrams/` row no longer calls the folder a placeholder.
+It identifies the one current standalone diagram,
+`diagrams/trading-intelligence-overview.md`, and accurately summarizes its
+Mermaid flowcharts for live component links and compact internal views of the
+trading-intelligence modules. The `api/` row is unchanged because that folder
+still contains only its explanatory placeholder README.
+
+`milestone-tracker.html`'s Phase 3 keeps `id: "p3"`, its existing exit
+criterion, exactly three checklist items, and its phase-id-plus-item-index
+checked-state keys. Only the stale Alpaca title and checklist wording changed:
+the title now names Finnhub streaming plus Polygon history; the checklist
+records the independent streaming/historical provider roles, Finnhub's genuine
+real-time WebSocket stream and lack of free-tier historical stock candles,
+Polygon's historical service and delayed polling fallback, and manually
+connected IBKR's ability to take over both roles. These roles match the
+provider implementations and registrations in `backend/app/main.py`,
+`finnhub_data.py`, `market_data.py`, `broker.py`, and `broker_registry.py`, and
+the early Alpaca rejection plus provider decisions #1 and #28–#33.
+
+This is documentation synchronization only. No backend or frontend application
+code, Phase 3 exit criterion, other phase, other drift finding, or architecture
+document changed.

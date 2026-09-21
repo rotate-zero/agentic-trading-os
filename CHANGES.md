@@ -1,3 +1,25 @@
+# CHANGES — decision #167: close the two low-risk documentation status-drift follow-ups
+
+## Current delivery
+
+Closed the two low-risk documentation drift follow-ups recorded by decision
+#164. The `docs/README.md` folder table now identifies the existing standalone
+`trading-intelligence-overview.md` diagram while leaving the accurate `api/`
+placeholder unchanged. Phase 3 in `milestone-tracker.html` now reflects the
+verified Finnhub streaming, Polygon historical/fallback, and manually connected
+IBKR both-role provider architecture; its exit criterion and three-item shape
+are unchanged.
+
+No backend or frontend application code changed.
+
+## Boundary
+
+Exactly six documentation files change: `docs/README.md`,
+`milestone-tracker.html`, the two live decision-log files, `CHANGES.md`, and
+`TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #166: explicitly exclude the deferred GridPresetPicker sketch
 
 ## Current delivery

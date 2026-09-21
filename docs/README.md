@@ -11,7 +11,7 @@
 | [`architecture/`](./architecture/) | The two living architecture documents — `system-design.md` (how it's built) and `trading-intelligence-architecture.md` (how it thinks). These describe the system *as it's meant to be built*, not a decision log or a plan. |
 | [`decisions/`](./decisions/) | `confirmed-decisions.md` (settled, numbered, append-only) and `future-ideas.md` (deliberately deferred, with trigger conditions). See that folder's own `README.md` for the convention. |
 | [`roadmap/`](./roadmap/) | `phase-roadmap.md` — the phased delivery plan, deliverables, exit criteria, and a living status per phase. |
-| [`diagrams/`](./diagrams/) | Standalone rendered diagrams (Mermaid/SVG), for anything too complex for the inline ASCII diagrams already in `architecture/`. Currently just a placeholder. |
+| [`diagrams/`](./diagrams/) | The current standalone diagram, [`trading-intelligence-overview.md`](./diagrams/trading-intelligence-overview.md), uses Mermaid flowcharts for live component links and compact internal views of the trading-intelligence modules. |
 | [`api/`](./api/) | External-facing REST/WebSocket contracts (as opposed to the internal Event Bus contracts in `architecture/system-design.md` §10). Currently just a placeholder. |
 
 ## Reading order
