@@ -1,3 +1,137 @@
+# TESTING — decision #170: Execution Engine design amended — Slice A approved in principle (`execution-engine-design-amendment`)
+
+## Baseline and evidence
+
+Repository: `rotate-zero/agentic-trading-os`, `main`, pulled as a tarball (no `.git` metadata in this sandbox). At the start of this revision `main` carried decisions **#168** (the original design delivery) and **#169** (the Phase 4 measurement). Verified, not assumed: the design doc on `main` is byte-identical to the delivery it came from (`cmp`), and the #168 entry in `confirmed-decisions.md` matches it. A second fresh pull taken immediately before packaging was compared with the first by `diff -rq` — **identical**, so nothing landed in between. Three-source check for the number: `INDEX.md` last row **#169**, `confirmed-decisions.md` tail **#169**, archive files `001-060` … `134-160` unchanged — so **#170** was assigned only after that re-check.
+
+**Why a new decision instead of editing #168.** #168 is merged, and `AGENTS.md` §6 says existing decision content is immutable and is corrected by a new entry that references the original (check C68). So #170 *amends* #168; #168's text is untouched, and the living design doc is revised in place.
+
+This delivery is **documentation only**. No file under `backend/` or `frontend/` changed; no application code, migration, schema, configuration key, or event model was written. No application tests were run for that reason.
+
+## What changed (exact six-file footprint)
+
+| File | Change |
+|---|---|
+| `docs/architecture/execution-engine-design.md` | revised in place: status (approved in principle), §0 summary, F6/F10b/F11 notes, invariants (I4, I6, I7, I8 amended; **I10–I15 added**), §4 rows, §5 decision, **§6 rewritten** (revised data-flow diagram; authorizer stub with four fail-closed layers, rules and the daily-loss gate; Execution Engine with client-order IDs, dedupe, and persist-before-publish; the `OrderVenue` port and `execution` registry role; Portfolio State as a ledger-backed cache; `OutcomeRecorder` with nullable snapshots + reasons; persistence and migration sketch; **new §6.9 restart recovery**, **new §6.10 configuration**, §6.11 mechanisms), §7 fork statuses and §7.1, §8–§9, and findings R7–R9 in §10 |
+| `docs/architecture/system-design.md` | the companion-doc entry and the two pointer paragraphs under §4.6 and §4.9 only; no other text touched |
+| `docs/decisions/confirmed-decisions.md` | decision #170 appended (`### 170. …`); #168 and every earlier entry untouched |
+| `docs/decisions/INDEX.md` | row #170 appended |
+| `CHANGES.md`, `TESTING.md` | this delivery's records |
+
+## Checks and results
+
+- **Footprint:** `diff -rq` of a fresh untouched `main` pull against the working tree lists exactly the six files above.
+- **Claim-to-source check: 72 of 72 pass** against latest `main`. The original 54 checks (code and doc facts behind the design) still hold on `main` with #169 merged; **18 were added for this revision** (C55–C72), covering exactly the facts the amendments rest on: the bus's handler-failure isolation and fire-and-forget `publish` (C55, C56, plus the existing C37/C38), the registry's two `MarketDataProvider`-typed role slots (C57, C58), `Settings` as the single configuration source and the paper-default IBKR port (C59, C60), the four snapshot columns being `NOT NULL` today and the `schema_version` rule (C61, C62), the `ExecutionMode` naming collision (C63), the Backtest Runner's `to_thread` call and `DiscardedSignal` (C64, C65), `MarketClock.is_regular_session` (C66), the absence of any order-status event (C67), the immutability rule (C68), #168/#169 on `main` (C69), and that none of the proposed new names (`execution_mode`, `execution_venue`, `OrderVenue`) exist in `backend/` yet (C70, C71, C72) — so the doc's "new work" claims are true. Code-level claims use Python `ast`.
+- **Internal consistency of the doc (scripted):** 7 relative links, 0 unresolved; every `EX-n`, `I1`–`I15`, and `§6.x`/`§7.1` reference resolves to a defined target; 14 fork headings — 6 RESOLVED (EX-1, 2, 3, 4, 6, 7), 1 SETTLED (EX-10), 7 OPEN (EX-5, 8, 9, 11, 12, 13, 14); 9 fenced blocks (the revised data-flow diagram, the authorizer stub's gate flow and daily-loss formula, the Execution Engine flow and order state machine, Portfolio State, `OutcomeRecorder`, restart recovery, and the slice sketch); no placeholders or TODOs.
+- **Decision-log format:** heading is `### 170. …` (the repo's grep `^### [0-9]+\.|^[0-9]+\. \*\*` finds it), appended after #169; no earlier text changed.
+- **Fidelity to Saqib's instructions:** each of the six resolutions, the six added requirements, and the three limits appears in the doc (§3, §6.2, §6.3, §6.4, §6.5, §6.7–§6.10, §7), the decision entry, and the acceptance criteria (§9, items 3–18).
+
+## Claim-to-source table (machine-checked)
+
+| ID | Claim (design doc or decision #170) | Result | Where checked |
+|---|---|---|---|
+| C1 | All 8 execution-side EventType names exist | PASS | envelope.py:EventType |
+| C2 | Payload models exist for GovernorDecision, OrderApproved, PlanRejected, OrderFilled | PASS | models in execution.py = GovernorDecision,OrderApproved,PlanRejected,… |
+| C3 | No Pydantic class TradePlanned/OpportunitySelected/PositionAdjusted/PositionClosed anywhere in backend/app/schemas | PASS | grep class defs in schemas/ |
+| C4 | Critical set = exactly OrderFilled, PlanRejected, GovernorDecision, OrderApproved | PASS | CRITICAL_EVENT_TYPES = { EventType.ORDER_FILLED, EventType.PLAN_REJEC… |
+| C5 | channels.py routes ORDER_APPROVED/PLAN_REJECTED/ORDER_FILLED/GOVERNOR_DECISION/OPPORTUNITY_SELECTED | PASS | channels.py |
+| C6 | channels.py has no route for TRADE_PLANNED / POSITION_ADJUSTED / POSITION_CLOSED | PASS | channels.py |
+| C7 | No application code (AST: names/attrs/imports, docstrings and comments ignored) other than execution.py/envelope.py/channels.py/dev.py references any of the 8 execution events | PASS | code references elsewhere = 0 |
+| C8 | dev.py publishes a GovernorDecision | PASS | api/routes/dev.py |
+| C9 | OrderApproved fields = order_id,symbol,side,qty,order_type,limit_price | PASS | execution.py (no fill_id anywhere) |
+| C10 | OrderFilled has no symbol field and no fill_id/cumulative_qty/venue | PASS | OrderFilled body |
+| C11 | base.py declares BrokerAdapter, OrderRequest, OrderAck, Position + place_order/cancel_order/get_positions | PASS | base.py |
+| C12 | OrderAck.status is submitted\|rejected only | PASS | OrderAck body |
+| C13 | No order-update/fill callback, client order id, TIF, or bracket method/field in base.py (AST: defs and annotated fields) | PASS | offending identifiers = [] |
+| C14 | BrokerAdapter extends MarketDataProvider | PASS | base.py |
+| C15 | IBKRAdapter connects readonly=True | PASS | ibkr_adapter.py |
+| C16 | IBKRAdapter place_order and cancel_order raise NotImplementedError | PASS | NotImplementedError x3 |
+| C17 | get_positions() has zero callers (app/tests/frontend) | PASS | callers=0 |
+| C18 | No call to place_order()/cancel_order() anywhere in backend/app or backend/tests (AST calls) | PASS | calls=[] |
+| C19 | broker_registry has streaming+historical roles and no execution role | PASS | broker_registry.py |
+| C20 | config.py has no dry_run/execution setting | PASS | config.py |
+| C21 | No trades/orders/positions/ai_decisions/feature_snapshots/market_events tables | PASS | tables=daily_levels_state,symbols,candles,market_state_history,scanne… |
+| C22 | strategy_outcomes and backtests tables exist | PASS | models |
+| C23 | Migration head is 0011 | PASS | 0011_level_interaction_backtest_run_isolation.py |
+| C24 | StrategyOutcomeRecord: strategy_name/strategy_version/opportunity_id/structural_*/final_*/confidence_at_signal/evidence NOT NULL | PASS | StrategyOutcomeRecord |
+| C25 | StrategyOutcomeRecord has is_backtest Boolean and no CheckConstraint | PASS | StrategyOutcomeRecord |
+| C26 | StrategyOutcomeRecord has no venue column | PASS | StrategyOutcomeRecord |
+| C27 | record_strategy_outcome is sync def, uses SessionLocal, and docstring forbids live wiring without Execution Engine | PASS | performance.py |
+| C28 | record_strategy_outcome has exactly one application user (AST name reference; runner.py passes it to asyncio.to_thread): backtest_runner/runner.py | PASS | ['backend/app/backtest_runner/runner.py'] |
+| C29 | state_snapshot: capture_strategy_outcome_snapshots + capture_market_state_snapshot + capture_context_snapshot | PASS | state_snapshot.py |
+| C30 | MarketStateEngine.get_snapshot returns candle_ts per symbol | PASS | market_state_engine/engine.py |
+| C31 | performance_queries._common_filters filters on is_backtest | PASS | performance_queries.py |
+| C32 | World View portfolio slot is None | PASS | composite.py |
+| C33 | Opportunity has no id, symbol, or entry-price field | PASS | Opportunity body |
+| C34 | Backtest Runner mints opportunity_id with uuid4 | PASS | runner.py |
+| C35 | OpportunityCache overwrites latest per (symbol, strategy) | PASS | opportunity_cache.py |
+| C36 | fill_simulator: simulate_entry/simulate_exit/compute_realized_r/compute_realized_pnl/regular_session_close_utc + InsufficientReplayDataError | PASS | fill_simulator.py |
+| C37 | EventBus._consume awaits asyncio.gather over handlers; _safe_call exists | PASS | bus.py |
+| C38 | Event Bus is in-memory (asyncio.Queue) with no persistence import | PASS | bus.py |
+| C39 | No frontend consumer of orders.status | PASS | matches=0 |
+| C40 | No frontend Positions/ApprovalQueue/TradeManagement code | PASS | matches=0 |
+| C41 | No TradeRequest/ExecutionMode/ManualConfirm*/PlanAwaiting* code | PASS | matches=0 |
+| C42 | MarketClock.trading_day exists | PASS | market_clock.py |
+| C43 | PriceUpdated has exchange_ts | PASS | schemas/events/market_data.py |
+| C44 | A strategy declares gate_conditions {'session': 'regular'} | PASS | strategy_engine/*.py |
+| C45 | FeatureEngine._on_candle_closed exists (subscribe -> queue pattern) | PASS | feature_engine/engine.py |
+| C46 | system-design §10.3 TradePlanned row has max_hold_minutes; TIA §18.3 TradePlan has max_hold_seconds | PASS | system-design.md / TIA |
+| C47 | system-design §4.8 table: Position Monitor -> PositionAdjusted/PositionClosed -> positions; Performance Intelligence consumes PositionClosed | PASS | system-design.md |
+| C48 | system-design still names AlpacaAdapter in §4.1, and folder tree says 'Alpaca deferred, not stubbed' | PASS | system-design.md |
+| C49 | TIA §18.5: ExecutionMode owned by Portfolio State; ManualConfirmOrder calls place_order | PASS | TIA §18.5 |
+| C50 | TIA §18.8 says filled manual plan recorded in 'the existing `trades` table' | PASS | TIA §18.8 |
+| C51 | TradeRequest has no stop field; TradePlan.stop required | PASS | TIA §18.2-18.3 |
+| C52 | future-ideas has entries #14, #16, #27 | PASS | future-ideas.md |
+| C53 | system-design folder tree names execution_engine/, portfolio_state/, position_monitor/, governor/ | PASS | system-design.md §8 |
+| C54 | decision #95 documents Finnhub free-tier IEX-only trade feed | PASS | archive/091-106.md |
+| C55 | EventBus._safe_call catches Exception, logs it, and never re-raises (handler failures are isolated, not propagated) | PASS | bus.py:_safe_call |
+| C56 | EventBus.publish only enqueues onto an in-memory queue (never awaits a handler) | PASS | bus.py:publish = async def publish(self, envelope: EventEnvelope) -> … |
+| C57 | broker_registry holds exactly two role slots, both MarketDataProvider-typed (_streaming_provider, _historical_provider); no OrderVenue | PASS | broker_registry.py |
+| C58 | broker_registry docstring names the roles as decision #33's pattern | PASS | broker_registry.py docstring |
+| C59 | config.py: Settings(BaseSettings) is the documented single source of configuration | PASS | config.py |
+| C60 | config.py: ibkr_port default 4002 documented as the PAPER Gateway | PASS | config.py |
+| C61 | StrategyOutcomeRecord: the four snapshot columns are currently NOT NULL | PASS | StrategyOutcomeRecord |
+| C62 | StrategyOutcome.schema_version description: a new OPTIONAL field doesn't bump; changing a field's meaning does | PASS | schemas/performance.py |
+| C63 | TIA §18.5 defines ExecutionMode as auto\|manual (the naming collision with execution_mode) | PASS | TIA §18.5 |
+| C64 | Backtest Runner passes record_strategy_outcome to asyncio.to_thread | PASS | runner.py |
+| C65 | Backtest Runner turns a None snapshot into a DiscardedSignal (decision #128) | PASS | runner.py |
+| C66 | MarketClock.is_regular_session exists | PASS | market_clock.py |
+| C67 | No order-status/venue-rejection EventType exists (ORDER_REJECTED / ORDER_STATUS_CHANGED) | PASS | envelope.py |
+| C68 | AGENTS.md: existing decision content is immutable; correct by adding a new entry that references the original | PASS | AGENTS.md |
+| C69 | Main already carries #168 (this design) and #169 (Phase 4 measurement) in both decision-log files | PASS | INDEX.md / confirmed-decisions.md |
+| C70 | Registry role for an OrderVenue does not exist yet (proposal is new work): no set_execution_venue anywhere in backend/app | PASS | grep backend/app |
+| C71 | No execution_mode / execution_venue column or field exists yet (proposal is new work) | PASS | grep backend/app, alembic |
+| C72 | Only IBKRAdapter overrides place_order among BrokerAdapter subclasses (dormant stubs, unwired) | PASS | def place_order count (base + ibkr) |
+
+## Not covered / limitations
+
+- **Nothing was built or run.** The amended design is a specification; no prototype, migration, or test of any proposed constraint, recovery path, or gate exists. The acceptance criteria (§9) are what a build task must turn into tests.
+- **Two proposals rest on judgment, not on Saqib's instruction** and are listed for confirmation in §7.1 (J1–J5) — chiefly that the daily-loss gate also counts the candidate trade's own stop-out loss (J2), the `schema_version` bump and backtest-row labels (J3), and cancelling unsent entry orders at recovery (J4).
+- **EX-5 and EX-12 remain open** and need confirmation before a build task.
+- The claim check proves cited symbols exist and behave as stated at this `main`; it cannot prove the proposals correct.
+- Left alone per the boundary: `docs/roadmap/phase-roadmap.md`, `docs/architecture/trading-intelligence-architecture.md`, `docs/architecture/strategy-engine-open-decisions.md`, `docs/architecture/scanner-design.md`, `backend/`, `frontend/`.
+
+## Manual merge notes (parallel session)
+
+If another session lands a decision first, renumber this one and re-run the three-source check. **`#170` appears in exactly these places:** the design doc (status line, §3 table, §6, §7, §7.1, §8–§10 — every `#170`/`decision #170` token), the `### 170.` heading in `confirmed-decisions.md`, the `| 170 |` row in `INDEX.md`, the three pointers in `system-design.md`, and the title lines of `CHANGES.md` and `TESTING.md`. A single find-and-replace of the token `#170` (and `| 170 |`, `### 170.`) across those six files covers it; no other `#170` exists in the repository (verified). `CHANGES.md`: keep both records. `TESTING.md`: keep this record on top and the other directly below.
+
+## Baseline SHA-256
+
+The five pre-existing files this delivery edits were clean at baseline with these hashes (the design doc's baseline is the #168 delivery, byte-identical to `main`):
+
+```text
+docs/architecture/execution-engine-design.md 4b3127ea6b287ab949e6510bea7f45b14c488dac17240d195203f5dddc434a27
+docs/architecture/system-design.md e35e42fde8b4a4a350797a74c00198cb00f5197241cbf8efbc2d854ace09ccbc
+docs/decisions/INDEX.md 1a7b276a24c7bf69f97927890a5fa2a77d83513fd503aac1d995ab3438c87264
+docs/decisions/confirmed-decisions.md 07e4ff1dd43ccb4dfe5631605ada67a5fbec7d3728108428bea2be3cc61fb83c
+CHANGES.md 06280c9dcbf93b65907af488f89d4f39f6af35a6b45b60709393c791c323eee0
+TESTING.md 276a21d77f65cb0676c61a993d0b6cbb29ba393e42a2e908b06f90ebbef9b9bb
+```
+
+Design doc after this delivery: `docs/architecture/execution-engine-design.md 4827c1101fee4c5d08cb442c4599641569c90f98505ae8329d28b696a10199fa` (recompute after any renumbering).
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #169: Phase 4 scale/load investigation (`phase4-scale-load-measurement`)
 
 ## Baseline and evidence
@@ -183,190 +317,4 @@ docs/decisions/INDEX.md               15b84c8293501d5558ab012d2e1cae0877e525e3ab
 CHANGES.md                            61faa01cf81ca90eac4b29fcf82e69312edbb5a7879f437214de6b609437284d
 TESTING.md                            41723b3f0ffd301495e45f806968b3c1cb61037241e6d601ecade799473ce83e
 docs/roadmap/phase-roadmap.md         473239117a5c5f08ffa2a0930a981a27963c3e252445d9d5a842933bb8380651
-```
-
-<!-- Previous delivery record retained below. -->
-
-# TESTING — decision #168: Execution Engine & Portfolio State design doc (`execution-engine-design`)
-
-## Baseline and evidence
-
-Repository: `rotate-zero/agentic-trading-os`, `main`, pulled as a tarball
-(`codeload.github.com/.../tar.gz/refs/heads/main`; no `.git` metadata in the
-sandbox, and a GitHub API commit-SHA lookup returned no data, so no remote SHA
-was retrieved). Latest-`main` equality was established a second way: a second,
-fresh tarball pull taken immediately before packaging was compared to the pull
-taken at task start with `diff -rq` — **identical**, i.e. nothing landed in
-between. Highest decision before this delivery: **#167**; the three-source
-check agreed — `INDEX.md` last row #167, `confirmed-decisions.md` tail #167,
-archive files `001-060` … `134-160` (open log holds #161–#167). #168 was
-assigned only after that re-check.
-
-This delivery is **documentation only**. No file under `backend/` or
-`frontend/` changed, and no application, migration, schema, or event-model
-change was made. No application tests were run for that reason.
-
-## What changed (exact six-file footprint)
-
-| File | Change |
-|---|---|
-| `docs/architecture/execution-engine-design.md` | **new** — DRAFT design pass (§0 summary, §1 verified inventory, §2 thirteen findings, §3 invariants, §4 `StrategyOutcome` source map, §5 slice analysis, §6 component design + four diagrams, §7 fourteen open forks, §8 deferred prerequisites, §9 proposed acceptance criteria, §10 out-of-boundary findings) |
-| `docs/architecture/system-design.md` | pointers only: one companion-doc entry, one paragraph under §4.6, one under §4.9; no existing text rewritten, version/status header untouched |
-| `docs/decisions/confirmed-decisions.md` | decision #168 appended at the true end (`### 168. …`) |
-| `docs/decisions/INDEX.md` | row #168 appended |
-| `CHANGES.md`, `TESTING.md` | this delivery's records |
-
-## Checks and results
-
-- **Footprint:** `diff -rq` of a fresh untouched `main` pull against the working tree lists exactly the six files above and nothing else (no `backend/`, `frontend/`, `phase-roadmap.md`, `scanner-design.md`, `trading-intelligence-architecture.md`, or `strategy-engine-open-decisions.md` difference).
-- **Claim-to-source check:** every claim in the design doc about current code or current docs was turned into a machine check (file/AST/regex against the tarball) — **54 of 54 pass**. Code-level claims (usage, callers, definitions) use Python `ast`, so docstrings and comments are not mistaken for code. Four checks first failed for exactly that reason (docstrings/comments naming an event, `.place_order()`, or `record_strategy_outcome()`; a comment containing "backfill"; and `to_thread(fn, …)` passing the function by reference rather than calling it); the checks were tightened, not the claims. Table below.
-- **Relative links** in the new doc: 7 found, 0 unresolved (script: extract `](./…)` targets, `os.path.exists` on each).
-- **Structure:** 14 fork headings `### EX-n`, all marked OPEN; 13 findings F1–F13; six fenced blocks (four architecture diagrams plus the slice sketch and the order state machine); no `{…}` placeholders left; no CR characters or tabs; LF endings preserved in the three edited existing files.
-- **Decision-log format:** heading is `### 168. …` (the format the repo's grep pattern `^### [0-9]+\.|^[0-9]+\. \*\*` detects); appended after #167; existing decision text untouched.
-- **Quotes** of existing docs (`§4.9` lifecycle wording, `base.py`/`ibkr_adapter.py` Governor wording, `runner.py`'s "first thing to mint one", `§18.8`'s "existing `trades` table", `§2` principle 1) were compared verbatim against the source.
-
-## Claim-to-source table (machine-checked)
-
-| ID | Claim in the design doc | Result | Where checked |
-|---|---|---|---|
-| C1 | All 8 execution-side EventType names exist | PASS | envelope.py:EventType |
-| C2 | Payload models exist for GovernorDecision, OrderApproved, PlanRejected, OrderFilled | PASS | models in execution.py = GovernorDecision,OrderApproved,PlanRejected,… |
-| C3 | No Pydantic class TradePlanned/OpportunitySelected/PositionAdjusted/PositionClosed anywhere in backend/app/schemas | PASS | grep class defs in schemas/ |
-| C4 | Critical set = exactly OrderFilled, PlanRejected, GovernorDecision, OrderApproved | PASS | CRITICAL_EVENT_TYPES = { EventType.ORDER_FILLED, EventType.PLAN_REJEC… |
-| C5 | channels.py routes ORDER_APPROVED/PLAN_REJECTED/ORDER_FILLED/GOVERNOR_DECISION/OPPORTUNITY_SELECTED | PASS | channels.py |
-| C6 | channels.py has no route for TRADE_PLANNED / POSITION_ADJUSTED / POSITION_CLOSED | PASS | channels.py |
-| C7 | No application code (AST: names/attrs/imports, docstrings and comments ignored) other than execution.py/envelope.py/channels.py/dev.py references any of the 8 execution events | PASS | code references elsewhere = 0 |
-| C8 | dev.py publishes a GovernorDecision | PASS | api/routes/dev.py |
-| C9 | OrderApproved fields = order_id,symbol,side,qty,order_type,limit_price | PASS | execution.py (no fill_id anywhere) |
-| C10 | OrderFilled has no symbol field and no fill_id/cumulative_qty/venue | PASS | OrderFilled body |
-| C11 | base.py declares BrokerAdapter, OrderRequest, OrderAck, Position + place_order/cancel_order/get_positions | PASS | base.py |
-| C12 | OrderAck.status is submitted\|rejected only | PASS | OrderAck body |
-| C13 | No order-update/fill callback, client order id, TIF, or bracket method/field in base.py (AST: defs and annotated fields) | PASS | offending identifiers = [] |
-| C14 | BrokerAdapter extends MarketDataProvider | PASS | base.py |
-| C15 | IBKRAdapter connects readonly=True | PASS | ibkr_adapter.py |
-| C16 | IBKRAdapter place_order and cancel_order raise NotImplementedError | PASS | NotImplementedError x3 |
-| C17 | get_positions() has zero callers (app/tests/frontend) | PASS | callers=0 |
-| C18 | No call to place_order()/cancel_order() anywhere in backend/app or backend/tests (AST calls) | PASS | calls=[] |
-| C19 | broker_registry has streaming+historical roles and no execution role | PASS | broker_registry.py |
-| C20 | config.py has no dry_run/execution setting | PASS | config.py |
-| C21 | No trades/orders/positions/ai_decisions/feature_snapshots/market_events tables | PASS | tables=daily_levels_state,symbols,candles,market_state_history,scanne… |
-| C22 | strategy_outcomes and backtests tables exist | PASS | models |
-| C23 | Migration head is 0011 | PASS | 0011_level_interaction_backtest_run_isolation.py |
-| C24 | StrategyOutcomeRecord: strategy_name/strategy_version/opportunity_id/structural_*/final_*/confidence_at_signal/evidence NOT NULL | PASS | StrategyOutcomeRecord |
-| C25 | StrategyOutcomeRecord has is_backtest Boolean and no CheckConstraint | PASS | StrategyOutcomeRecord |
-| C26 | StrategyOutcomeRecord has no venue column | PASS | StrategyOutcomeRecord |
-| C27 | record_strategy_outcome is sync def, uses SessionLocal, and docstring forbids live wiring without Execution Engine | PASS | performance.py |
-| C28 | record_strategy_outcome has exactly one application user (AST name reference; runner.py passes it to asyncio.to_thread): backtest_runner/runner.py | PASS | ['backend/app/backtest_runner/runner.py'] |
-| C29 | state_snapshot: capture_strategy_outcome_snapshots + capture_market_state_snapshot + capture_context_snapshot | PASS | state_snapshot.py |
-| C30 | MarketStateEngine.get_snapshot returns candle_ts per symbol | PASS | market_state_engine/engine.py |
-| C31 | performance_queries._common_filters filters on is_backtest | PASS | performance_queries.py |
-| C32 | World View portfolio slot is None | PASS | composite.py |
-| C33 | Opportunity has no id, symbol, or entry-price field | PASS | Opportunity body |
-| C34 | Backtest Runner mints opportunity_id with uuid4 | PASS | runner.py |
-| C35 | OpportunityCache overwrites latest per (symbol, strategy) | PASS | opportunity_cache.py |
-| C36 | fill_simulator: simulate_entry/simulate_exit/compute_realized_r/compute_realized_pnl/regular_session_close_utc + InsufficientReplayDataError | PASS | fill_simulator.py |
-| C37 | EventBus._consume awaits asyncio.gather over handlers; _safe_call exists | PASS | bus.py |
-| C38 | Event Bus is in-memory (asyncio.Queue) with no persistence import | PASS | bus.py |
-| C39 | No frontend consumer of orders.status | PASS | matches=0 |
-| C40 | No frontend Positions/ApprovalQueue/TradeManagement code | PASS | matches=0 |
-| C41 | No TradeRequest/ExecutionMode/ManualConfirm*/PlanAwaiting* code | PASS | matches=0 |
-| C42 | MarketClock.trading_day exists | PASS | market_clock.py |
-| C43 | PriceUpdated has exchange_ts | PASS | schemas/events/market_data.py |
-| C44 | A strategy declares gate_conditions {'session': 'regular'} | PASS | strategy_engine/*.py |
-| C45 | FeatureEngine._on_candle_closed exists (subscribe -> queue pattern) | PASS | feature_engine/engine.py |
-| C46 | system-design §10.3 TradePlanned row has max_hold_minutes; TIA §18.3 TradePlan has max_hold_seconds | PASS | system-design.md / TIA |
-| C47 | system-design §4.8 table: Position Monitor -> PositionAdjusted/PositionClosed -> positions; Performance Intelligence consumes PositionClosed | PASS | system-design.md |
-| C48 | system-design still names AlpacaAdapter in §4.1, and folder tree says 'Alpaca deferred, not stubbed' | PASS | system-design.md |
-| C49 | TIA §18.5: ExecutionMode owned by Portfolio State; ManualConfirmOrder calls place_order | PASS | TIA §18.5 |
-| C50 | TIA §18.8 says filled manual plan recorded in 'the existing `trades` table' | PASS | TIA §18.8 |
-| C51 | TradeRequest has no stop field; TradePlan.stop required | PASS | TIA §18.2-18.3 |
-| C52 | future-ideas has entries #14, #16, #27 | PASS | future-ideas.md |
-| C53 | system-design folder tree names execution_engine/, portfolio_state/, position_monitor/, governor/ | PASS | system-design.md §8 |
-| C54 | decision #95 documents Finnhub free-tier IEX-only trade feed | PASS | archive/091-106.md |
-
-## Not covered / limitations
-
-- **Nothing was executed against a real broker.** Every statement about `IBKRAdapter` is about the code as written; its live behavior remains unverified (`future-ideas.md` #27).
-- **The design is unvalidated by construction:** no prototype, no load test, no schema migration was attempted. Fill-model parity (EX-8) and outcome-population labelling (EX-2) are proposals whose consequences appear only when a build task implements them.
-- The claim check proves cited symbols exist and behave as stated at this `main`; it cannot prove the *proposals* are right. That is what the fork list is for.
-- Two files that would normally change with an architecture doc were deliberately left alone per the task boundary: `docs/roadmap/phase-roadmap.md` and `docs/architecture/strategy-engine-open-decisions.md` (see design doc §10, R4).
-
-## Manual merge notes (parallel session)
-
-A sibling task, `phase4-scale-load-measurement`, was specified as file-disjoint from this one but shares the same four delivery files: the two decision-log files, `CHANGES.md`, `TESTING.md`. If it lands first:
-
-1. Renumber this delivery to the next free number. **#168 appears in exactly these places:** the `Status` line of `execution-engine-design.md`, the `### 168.` heading in `confirmed-decisions.md`, the `| 168 |` row in `INDEX.md`, and the title lines of this `CHANGES.md` and `TESTING.md`. (`grep -rn "168" docs/architecture/execution-engine-design.md docs/decisions/confirmed-decisions.md docs/decisions/INDEX.md CHANGES.md TESTING.md` finds them; other hits are unrelated digits.)
-2. `confirmed-decisions.md` / `INDEX.md`: keep both entries, the sibling's and this one, in numerical order; re-run the three-source check first.
-3. `CHANGES.md`: keep both records. `TESTING.md`: keep this record on top and the sibling's directly below.
-
-## Baseline SHA-256
-
-The five pre-existing files this delivery edits were clean at baseline with these hashes (the new file has none):
-
-```text
-docs/architecture/system-design.md d57349d4e69f27ec5ab2055612f925577ca3ce3d8f3209ccc8ab0395dc894500
-docs/decisions/INDEX.md 2983e5a2a4b3926aaf3775241b4ebf79a5eb635b7ff2693fb20fdef39777eb2e
-docs/decisions/confirmed-decisions.md bc103962ec165a842f06d7eafe6acb827343b8869b15551a8fa16a351d00b4e9
-CHANGES.md 4298be8cde53f2e7384bed65971e2bd0ad80d6110b7e87a705c5814f9d2a86d5
-TESTING.md 77b9614876044108241380e723cb43467ced6858ee0eb7b4eacf60384fee26ea
-```
-
-New file after this delivery: `docs/architecture/execution-engine-design.md 4b3127ea6b287ab949e6510bea7f45b14c488dac17240d195203f5dddc434a27` (recompute after any renumbering).
-
-<!-- Previous delivery record retained below. -->
-
-# TESTING — decision #167: close the two low-risk documentation status-drift follow-ups
-
-## Baseline and evidence
-
-Repository root: `/home/rotate_zero/projects/agentic-trading-os`; branch:
-`main`; HEAD and existing `origin/main`: `6c4f2ba22bc46dff9d76980e006ae656bf880777`;
-working tree: clean; highest decision: #166. A fetch refresh could not update
-`.git/FETCH_HEAD` because the workspace exposes `.git` read-only, so the
-existing `origin/main` ref was used and its equality with HEAD was confirmed.
-The required direct `git ls-remote` check immediately before assigning #167 was
-also attempted, but GitHub DNS was unavailable in this environment; no remote
-SHA could be retrieved.
-
-Decision #164's two selected read-only findings are the only changes in scope;
-the final decision number is #167 after the local index/log cross-check.
-`docs/README.md` called both `diagrams/` and `api/` placeholders; the current
-diagram README and `trading-intelligence-overview.md` show that only `api/`
-remains a placeholder. The overview is one standalone Mermaid document with
-live component flow plus compact internal flowcharts for Feature, Level
-Interaction, Market State, Context, Scanner, Strategy Scheduler, and
-performance evidence.
-
-The milestone artifact's Phase 3 still has `id: "p3"`, the unchanged exit
-criterion, exactly three checklist items, and state keys generated as
-`phaseId:itemIndex`. Current implementation evidence confirms Finnhub is
-registered only as the genuine real-time streaming provider; Polygon is the
-historical provider and delayed polling streaming fallback; and manually
-connected IBKR is registered for both streaming and historical roles. Decision
-#1 rejects Alpaca as the first broker, while decisions #28–#33 establish the
-provider split and its implementation.
-
-## Checks
-
-- `git diff --check`
-- exact six-file footprint review
-- Phase 3 item-count, `p3` id, exit-criterion, and state-key checks
-- provider-role checks against `backend/app/main.py`, the three provider
-  implementations/registrations, and decisions #1 and #28–#33
-- existing `api/` placeholder row unchanged
-- existing decisions and decision archives unchanged
-
-No application tests were run because this delivery changes documentation only.
-
-## Baseline SHA-256
-
-The six editable files were clean at baseline with these hashes:
-
-```text
-docs/README.md 1496c430eeacadcac8fedbeb645cd6ef453cbef2b7e6e4c26ffeeaf20f3a81e9
-milestone-tracker.html f9d686f85d7bf27427c9bb6c2acac12852763e52559494c20fb14f97ad6307ab
-CHANGES.md 819d477f517f4c2ecdfdbedc0f601792ac52fa69f01e70c7b76f63bfc4631462
-TESTING.md 327fa7c3f3ac8491d0e2f0f5b7d562ba5670c60b972ddbc1bdac45d154d55a9a
-docs/decisions/INDEX.md a28686c5eddb3709f0f58458bd883d86cec3aba0e7dfec610e2add98eb61af67
-docs/decisions/confirmed-decisions.md 9fc7e8d9a39129e151686c1e8f2c68c7bc9dd482304dc0d78488a9a38851638d
 ```

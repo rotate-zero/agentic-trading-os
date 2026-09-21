@@ -433,3 +433,113 @@ run_pipeline_for(N)                                              (measure_live_p
 **Not measured (explicit follow-ups, not implemented).** Real Finnhub/IBKR delivery; Finnhub's free-tier WS symbol-count ceiling (scanner-design.md §7, still open); genuine tick burstiness; production hardware timing; `ContextEngine`/`StrategyScheduler`/`OpportunityCache` throughput in isolation; behavior beyond N=100 (K was pushed to 60 at fixed N=100; N itself was not pushed past 100); the MarketStateChanged trailing-catch-up undercounting noted above at K=60.
 
 **Documentation updated in this delivery.** This entry, its `INDEX.md` row, `CHANGES.md`, `TESTING.md`, one sentence of `docs/roadmap/phase-roadmap.md`'s Phase 4 status paragraph, and the new `backend/scripts/measure_live_pipeline_scale.py`. `docs/architecture/scanner-design.md` deliberately left untouched (see above). No `backend/app/**`, `frontend/**`, or `backend/tests/**` file changed.
+
+### 170. Execution Engine design amended — the simulated-venue automatic path (Slice A) approved in principle; `execution_mode` and `execution_venue` split; narrow `OrderVenue` port; ledger-authoritative recovery; first limits set — amends #168, which stays as merged; nothing built
+
+**Status: design approved in principle and amended; no application code, schema,
+migration, or event model written or changed.** This entry **amends decision
+#168** (`docs/architecture/execution-engine-design.md` landed there with every
+fork open). Per `AGENTS.md` §6, existing decision content is immutable and is
+corrected by a new entry that references the original, so #168 is untouched;
+the living design doc is revised in place and is now the implementation
+specification for the slice. Number #170 assigned after the three-source
+re-check of latest `main` (`INDEX.md` last row #169, `confirmed-decisions.md`
+tail #169, archive list unchanged).
+
+**Saqib's resolutions (2026-09-22).**
+- **EX-1 — Execution first** using the stub authorizer and `SimulatedVenue`. The
+  stub is **technically restricted to simulated execution and fails closed for
+  `paper`/`live`**: startup refusal, per-decision refusal, mode stamp plus a
+  venue `supported_modes` check, and no non-simulated venue in existence
+  (doc §6.2). #168's "dry-run is the default" invariant is replaced by this.
+- **EX-2 — venue identity and capital mode are different concepts.** Add
+  **`execution_mode`** (`backtest | simulated | paper | live`) and
+  **`execution_venue`** (`simulated | ibkr | …`); keep `is_backtest`
+  temporarily for compatibility only, derived from the mode, not the long-term
+  classifier. Supersedes #168's recommendation of `execution_venue` alone.
+- **EX-3 — a new narrow `OrderVenue` interface and an `execution` registry
+  role; `BrokerAdapter` is not enlarged** (its job is market-data connectivity).
+  Supersedes #168's recommended option in which `BrokerAdapter` would inherit
+  the port. A future IBKR order venue is a separate class with its own
+  connection.
+- **EX-4 — one stub; initial values, all configurable rather than hardcoded:**
+  maximum concurrent positions **1**, fixed size **$1,000 notional** per trade,
+  daily loss cap **$100**. Conservative first-slice defaults for validating the
+  lifecycle, not final trading-risk settings.
+- **EX-6 — Portfolio State owns position accounting, in-flight orders, and
+  daily P&L.** `PositionClosed` may use the critical lane **only after the
+  closure is committed to the database.**
+- **EX-7 — the snapshot requirement is a pre-trade gate; once any venue reports
+  a fill it is always persisted and processed; an unexpectedly missing snapshot
+  is recorded as nullable snapshot fields plus a missing-data reason — never a
+  discarded fill.** Decision #128's discard stays for backtest rows only.
+
+**Requirements added before implementation** (doc §3, I10–I15; §6.3, §6.5,
+§6.9): every order has a stable, deterministic client-order ID; order and fill
+updates are deduplicated by database constraint; restart recovery scans
+non-terminal ledger orders and reconciles them with the venue before any new
+authorization; the database ledger is authoritative and in-memory Portfolio
+State is reconstructable from it; persist-before-publish applies to order
+fills and position closures; the daily-loss gate counts realized loss plus
+current unrealized loss and open risk, not realized P&L alone.
+
+**Two precisions made while writing this in (stated, not silent).**
+1. *The critical lane's guarantees.* Verified against `bus.py`, the lane gives
+   FIFO ordering, isolation from normal-lane backlog, and isolation of one
+   handler's failure from the others — it does **not** give persistence,
+   delivery guarantees, crash recovery, **or propagation of a handler's failure
+   to the publisher** (`_safe_call` swallows and logs; `publish()` only
+   enqueues). The doc says so explicitly (F6, I7, §6.5) and builds "failure
+   propagation" where it can actually exist: persist-before-publish,
+   idempotent consumers, rebuild-from-ledger.
+2. *A naming collision.* `trading-intelligence-architecture.md` §18.5 already
+   defines `ExecutionMode` as `auto | manual`. The design calls that *placement
+   mode* so `execution_mode` means the capital mode only (reported as a
+   follow-up, not edited).
+
+```
+ Authorizer stub ── fails CLOSED unless execution_mode == simulated (4 layers) ── COMMIT decision ─► OrderApproved
+        │  (limits: 1 position · $1,000 notional · $100 daily-loss cap, from Settings; gate counts realized + unrealized + open risk)
+        ▼
+ Execution Engine ── idempotent insert (client_order_id UNIQUE) ── COMMIT ─► OrderVenue port  ◄── `execution` registry role
+        │                                                                        │            (BrokerAdapter untouched)
+        │                                                                 SimulatedVenue  (IBKROrderVenue: deferred, separate)
+        ◄── dedupe (execution_venue, venue_fill_id) ── COMMIT fill ─► publish OrderFilled  (critical: ordering + isolation only)
+        ▼
+ Portfolio State ── replays the fills ledger; COMMIT position / closure ─► publish PositionClosed (critical, after commit)
+        ▼
+ OutcomeRecorder ── entry/exit snapshots best-effort (NULL + reason if missing, fill never discarded) ─► StrategyOutcome
+        ▼                                                     (execution_mode, execution_venue)
+ record_strategy_outcome() ─► strategy_outcomes          RESTART: rebuild from ledger ─► reconcile non-terminal orders with the
+                                                          venue ─► recover closed-without-outcome trades; bus is never the source
+```
+The full data-flow diagram and the internal flows of the authorizer stub,
+Execution Engine, Portfolio State, `OutcomeRecorder`, and restart recovery are
+in the design doc §6.1–§6.9.
+
+**Still open.** **EX-5** (protective exits need no fresh authorization, only a
+reduce-only guard) and **EX-12** (`strategy_outcomes` holds strategy-attributed
+trades only; `OutcomeRecorder` writes it) need Saqib's confirmation before a
+build task. EX-10 is treated as settled by the ledger requirement. EX-8, the
+rest of EX-9, EX-11, EX-13, EX-14 proceed on their recommendations unless
+Saqib objects. **Judgment calls in this revision to confirm or overrule
+(doc §7.1):** J1 the placement-mode rename; J2 the daily-loss gate also counts
+the candidate trade's own stop-out loss (a $1,000 trade with a stop more than
+10% away is refused at the initial values); J3 `StrategyOutcome.schema_version`
+1 → 2, backtest rows labelled `backtest`/`simulated`, and a migration that
+aborts if any `is_backtest = false` rows exist; J4 unsent approved entry
+orders are cancelled, not re-sent, at recovery; J5 EX-10 settled.
+
+**Not done.** No code, schema, migration, event model, configuration key, or
+test was written; the World View `portfolio` slot stays `null`; no real
+broker session was reached. Related follow-ups reported, not fixed (doc §10):
+R7 the `ExecutionMode` naming, R8 `BrokerAdapter`'s dormant order stubs, R9
+`system-design.md` §2 principle 1's wording, alongside #168's R1–R6.
+
+**Documentation updated in this delivery.**
+`docs/architecture/execution-engine-design.md` (revised in place: status,
+invariants I4/I6–I8 amended and I10–I15 added, §6 rewritten with revised
+diagrams and new recovery/configuration sections, §7 fork statuses, §8–§9),
+`docs/architecture/system-design.md` (the two pointer paragraphs and the
+companion-doc entry only), this entry and its `INDEX.md` row, `CHANGES.md`,
+`TESTING.md`.

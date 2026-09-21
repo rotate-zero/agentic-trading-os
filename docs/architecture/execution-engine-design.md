@@ -1,6 +1,6 @@
-# Execution Engine & Portfolio State — Design (DRAFT, forks open)
+# Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
 **Owner:** Saqib
-**Status:** DRAFT — a design pass only. **Nothing in this document is decided, built, or migrated.** Baseline: `main` through decision #167. Recorded by decision #168 (temp id `execution-engine-design`; number assigned at merge after the three-source re-check). Design forks carry provisional labels **EX-1 … EX-14** (§7) — they are not D-numbers and not decision numbers; Saqib assigns those when a fork is resolved.
+**Status:** **Approved in principle** by Saqib (2026-09-22) — the simulated-venue automatic path (Slice A) with the corrections recorded in decision #170; **this revised text is the implementation specification for that slice.** Nothing is built: no application code, schema, migration, or event model exists, and this revision changed none. Baseline: `main` through decision #169. Originally recorded by decision #168, which stays exactly as merged (decision content is immutable — `AGENTS.md` §6); decision #170 amends it. **Fork status (§7):** EX-1, EX-2, EX-3, EX-4, EX-6, EX-7 are **RESOLVED** by #170, and EX-10 is settled by its added ledger requirement; the remaining forks stay open with their recommendations — **EX-5 and EX-12 still need Saqib's confirmation before a build task** (§7.1). Fork labels `EX-n` are provisional and are not D-numbers.
 **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
 
 **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
@@ -15,11 +15,11 @@
 
 ## 0. Summary
 
-1. **The goal of the first build is narrow and measurable:** one real, non-backtest `StrategyOutcome` row, produced end to end, closing D17's live half — with every population boundary (live / backtest / simulated) kept honest.
+1. **The goal of the first build is narrow and measurable:** one real, non-backtest `StrategyOutcome` row, produced end to end, closing D17's live half — with every population boundary (`execution_mode`: backtest / simulated / paper / live) kept honest.
 2. **The code disagrees with the prose in ways that change the design** (§2): the execution-side events are declared but have no payload models for four of eight types and no publisher or subscriber for any of them; the `BrokerAdapter` contract cannot report a fill; `IBKRAdapter` connects `readonly=True` and its order methods are stubs; the Event Bus's critical lane awaits every handler serially and persists nothing; `Opportunity` has no identity; `StrategyOutcome` cannot represent a manual trade with no strategy behind it; and `is_backtest` is a two-valued flag with no way to keep *simulated-money* outcomes apart from *real-money* ones.
 3. **"Only the Governor can place orders" needs one reconciliation, not a new rule** (§3, I2): the Governor is the only *authorizer*; the Execution Engine is the only *placer*; manual mode adds a human confirmation *after* the Governor, it does not replace it. The task brief's shorthand "human as Governor" for manual-first was imprecise — §18.5 keeps the Governor in the path even for manual, sized requests.
-4. **Recommended first slice (§5, Slice A):** a simulated venue, the auto path, and one deliberately thin, clearly-labelled authorizer stub in place of the unbuilt Decision/Planning/Governor stages — with fixed sizing, one position per symbol, protective exits monitored in-process, and an `OutcomeRecorder` that writes the outcome. It inverts the roadmap's stage order (Execution before its Phase 5 predecessors), which is itself a fork (EX-1).
-5. **Fourteen forks are open (§7).** The five that unblock a build task are EX-1 (slice order), EX-2 (how simulated outcomes are labelled), EX-3 (the venue port), EX-6 (who owns position accounting), and EX-7 (D17's live policy).
+4. **Approved first slice (§5, Slice A; decision #170):** a simulated venue, the auto path, and one deliberately thin, clearly-labelled authorizer stub in place of the unbuilt Decision/Planning/Governor stages — **technically restricted to simulated execution and failing closed for `paper`/`live`** (§6.2) — with fixed sizing, protective exits monitored in-process, and an `OutcomeRecorder` that writes the outcome. It inverts the roadmap's stage order (Execution before its Phase 5 predecessors); Saqib approved that inversion (EX-1).
+5. **Six forks are resolved and six requirements are added by #170 (§7, §3):** `execution_mode` and `execution_venue` are separate columns (EX-2); the venue seam is a new narrow `OrderVenue` port and an `execution` registry role, and `BrokerAdapter` is not enlarged (EX-3); Portfolio State owns accounting and `PositionClosed` is published only after its commit (EX-6); the snapshot requirement is a pre-trade gate and a reported fill is never discarded (EX-7); and every order has a stable client-order ID, fills and updates are deduplicated, restart recovery reconciles non-terminal orders with the venue, the database ledger is authoritative, persist-before-publish covers fills and closures, and the daily-loss gate counts unrealized loss and open risk (§3 I10–I15, §6.9). Initial limits: 1 concurrent position, $1,000 notional per trade, $100 daily loss cap — all configurable (§6.10).
 
 ---
 
@@ -106,6 +106,8 @@ Each finding below changes a design choice later in this document.
 
 **F6 — The bus's critical lane is a single serial consumer, and it forgets.** `EventBus._consume` awaits all handlers of one event before dequeuing the next event on that lane, so a handler that awaits a network `place_order()` stalls every other critical event (`OrderFilled`, `GovernorDecision`, …) behind it. A handler exception is logged and dropped. Queues are in-memory: a process crash between publish and handle loses the event, and `market_events` (the durable event log) does not exist. The repository's existing answer to slow work is "subscribe, `put_nowait` onto the engine's own queue, drain in a worker" (`FeatureEngine._on_candle_closed`, `LevelInteractionEngine._on_features_updated`, `MarketStateEngine`). An execution ledger must additionally be durable *independently of the bus*.
 
+**What the critical lane provides — and does not (verified against `bus.py`; documented here on purpose).** It provides (a) FIFO *ordering* among critical events, (b) *isolation* from normal-lane backlog, because it has its own queue and consumer task, and (c) *isolation of handler failures from each other* — `_safe_call` catches, logs, and swallows each handler's exception so one subscriber cannot break another. It does **not** provide persistence (the queue is an in-memory `asyncio.Queue`), a delivery guarantee, or crash recovery (an event published but not yet handled is lost with the process), and it does **not** propagate a handler's failure back to the publisher (`publish()` only enqueues; the publisher never learns whether any handler ran, or failed). **Anything that must survive a failure therefore has to be built into the modules, not assumed from the lane:** commit to the database first and publish afterwards (I8), make every consumer idempotent (I11), and rebuild state from the ledger at startup rather than from the bus (§6.9).
+
 **F7 — No trade-side tables exist.** `trades`, `orders`, `positions` are prose (`system-design.md` §4.13; `trading-intelligence-architecture.md` §18.8 even says a filled manual plan is recorded in "the existing `trades` table"). Migration head is `0011`. Every table in §6.8 is new.
 
 **F8 — `Opportunity` has no identity, and the cache forgets.** `StrategyOutcome.opportunity_id` is required, but `Opportunity` carries no id and `OpportunityCache` overwrites the previous `Opportunity` for the same `(symbol, strategy)`. The Backtest Runner minted the first id (`uuid4()` at the moment a signal is accepted; its docstring calls itself "the first thing to mint one"). A live path must choose where to mint it and must persist the thesis (`structural_*`, `confidence`, `evidence`) at that moment, because the cache will not still hold it at close.
@@ -114,9 +116,9 @@ Each finding below changes a design choice later in this document.
 
 **F10 — `StrategyOutcome` has two representational gaps.**
 (a) *No strategy, no row.* `strategy_name`, `strategy_version`, `opportunity_id`, `structural_invalidation`, `structural_target`, `final_stop`, `final_target`, `confidence_at_signal`, `evidence` are all required and `NOT NULL`. A manual trade with no corroborating strategy has none of them — and `TradeRequest` (§18.2) has no stop field while `TradePlan.stop` is required, so even the plan cannot be completed without one. `origin: "manual"` exists in the schema, but only a corroborated manual trade fits it.
-(b) *No way to say "simulated money".* `is_backtest` is boolean and every performance query treats it as a hard population boundary. Outcomes from a simulated live venue would have to be stored either as `is_backtest = False` (they would blend with real-money rows the day a real venue exists, in every query, silently) or as `is_backtest = True` (which claims a `backtests` run that does not exist). Neither is honest. This is EX-2, and it must be settled before the first row is written.
+(b) *No way to say "simulated money".* `is_backtest` is boolean and every performance query treats it as a hard population boundary. Outcomes from a simulated live venue would have to be stored either as `is_backtest = False` (they would blend with real-money rows the day a real venue exists, in every query, silently) or as `is_backtest = True` (which claims a `backtests` run that does not exist). Neither is honest. **Resolved by decision #170 (EX-2):** population is identified by two new, separate fields — `execution_mode` (`backtest | simulated | paper | live`, the capital mode) and `execution_venue` (`simulated | ibkr | …`, where fills come from) — and `is_backtest` is kept only as a temporary compatibility field (§6.8).
 
-**F11 — D17's live half is a different problem from its backtest half.** Decision #128 resolved the backtest path by turning a `None` snapshot into a `DiscardedSignal` (no row). For a *live* fill the money is already on the line: discarding the outcome would drop a real (or simulated-real) win or loss from the evidence table, a survivorship bias in exactly the table meant to judge strategies. Also, `capture_strategy_outcome_snapshots()` reads *current* engine state, not state as of `fill_ts`; a fill handled late reads a later state. The market-state half carries `candle_ts` so staleness is checkable; the context half does not.
+**F11 — D17's live half is a different problem from its backtest half.** Decision #128 resolved the backtest path by turning a `None` snapshot into a `DiscardedSignal` (no row). For a *live* fill the money is already on the line: discarding the outcome would drop a real (or simulated-real) win or loss from the evidence table, a survivorship bias in exactly the table meant to judge strategies. Also, `capture_strategy_outcome_snapshots()` reads *current* engine state, not state as of `fill_ts`; a fill handled late reads a later state. The market-state half carries `candle_ts` so staleness is checkable; the context half does not. **Resolved by decision #170 (EX-7):** a pre-trade gate, plus never discarding a reported fill (§6.7).
 
 **F12 — Position-effect and direction vocabulary is not aligned.** `Opportunity`, `StrategyOutcome`, `OrderRequest`, `OrderApproved` use `BUY`/`SELL`; `TradeRequest`/`TradePlan` use `long`/`short`. A `SELL` is ambiguous between closing a long and opening a short — the same ambiguity `trading-intelligence-architecture.md` §18.6 removed from the *hotkey* vocabulary but which reappears one level down at the order. Something must carry "opens" vs "closes" (EX-14).
 
@@ -126,19 +128,25 @@ Each finding below changes a design choice later in this document.
 
 ## 3. Invariants this design must honor
 
-Restated from existing decisions and code; **I2 is the one reconciliation** (F5), proposed here, not decided.
+Restated from existing decisions and code, with I2 as the one reconciliation (F5). **I4, I6, I7, I8 are amended and I10–I15 are added by decision #170.**
 
 | # | Invariant | Source |
 |---|---|---|
 | I1 | The Execution Engine is the only module that calls a venue's `place_order()`. | `system-design.md` §4.9 |
 | I2 | *(reconciled)* No **risk-increasing** order reaches a venue without a Governor-class authorization decision on record; the Execution Engine places, the Governor authorizes, and manual mode adds a human confirmation *after* authorization. Whether protective exits also need one is EX-5. | `base.py:BrokerAdapter` docstring; §4.9; §18.5 |
 | I3 | Honest absence over fabricated state: no invented fills, snapshots, commissions, or account values; `None`/absent means "not known". | `strategy-engine-design.md` §11; `state_snapshot.py`; `world_view/composite.py` |
-| I4 | Live, backtest, and simulated-money populations are never blended in a query. | `performance_queries.py:_common_filters`; decisions #128, #140 |
-| I5 | Compute once, own once: exactly one module owns each piece of shared state (positions, buying power, daily P&L, execution mode). | `system-design.md` §2 principles 3, 8 |
-| I6 | Dry-run is the default; nothing leaves the process without an explicit switch. | `system-design.md` §4.9 |
-| I7 | A critical-lane handler must never wait on the network. | `bus.py:EventBus._consume` (F6) |
-| I8 | Order and fill facts are durable before they are announced. | F6, F7 (proposal) |
+| I4 | Populations are identified by `execution_mode` (`backtest`, `simulated`, `paper`, `live`) and are never blended in a query; `execution_venue` says where fills came from and never substitutes for the mode. `is_backtest` survives temporarily as a derived compatibility field. | `performance_queries.py:_common_filters`; decisions #128, #140; #170 (EX-2) |
+| I5 | Compute once, own once: exactly one module owns each piece of shared state (positions, in-flight orders, daily P&L, buying power). | `system-design.md` §2 principles 3, 8 |
+| I6 | **Fail closed.** In this slice no configuration can make a `paper` or `live` order possible: the authorizer stub refuses to start and refuses every authorization unless `execution_mode == simulated`, the Execution Engine refuses any order whose mode the routed venue does not declare, and no non-simulated `OrderVenue` exists. An unknown, missing, or unsupported mode rejects; it never falls back to `simulated` silently. | `system-design.md` §4.9 (dry-run default), #170 (EX-1) |
+| I7 | A critical-lane handler must never wait on the network. The lane gives ordering and handler-failure *isolation* — not persistence, delivery guarantees, crash recovery, or failure propagation to the publisher (F6). | `bus.py:EventBus._consume`, `_safe_call`, `publish` |
+| I8 | **Persist before publish.** An order fill is committed to the ledger before `OrderFilled` is published; a position closure is committed before `PositionClosed` is published; an authorization decision is committed before `TradePlanned`/`GovernorDecision`/`OrderApproved`. An event is a notification, never the record. | F6, F7; #170 (EX-6) |
 | I9 | Tests run against real PostgreSQL 16, never SQLite or mocks; strategies and engines never read wall-clock where an event timestamp exists. | project testing baseline; `fill_simulator.py`, `runner.py` |
+| I10 | **Every order has a stable client-order ID** (deterministic from the trade and leg, minted before the order is persisted, unique in the ledger, and carried to the venue as its idempotency key). | #170 |
+| I11 | **Order and fill updates are deduplicated** by database constraint — `orders(client_order_id)` and `fills(venue_id, venue_fill_id)` — never by an in-memory set; a duplicate is a no-op that publishes nothing; order status only moves forward. | #170 |
+| I12 | **The database ledger is authoritative.** In-memory Portfolio State is a cache that must be reconstructable from the ledger alone; on any disagreement the ledger wins. | #170 (EX-6) |
+| I13 | **Restart recovery** scans every non-terminal ledger order and reconciles it with the venue *before* any new authorization is accepted; unresolved discrepancies halt new entries (fail closed). | #170 |
+| I14 | **A venue-reported fill is never discarded.** It is persisted and processed even when something else is missing (a snapshot, a matching order, a plan); missing data is recorded as `NULL` plus a reason, and anomalies halt *new entries*, never the recording. | #170 (EX-7) |
+| I15 | **The daily-loss gate counts realized loss plus current unrealized loss and open risk** (including the candidate trade's own stop-out loss), never realized P&L alone; an unknown mark or stop counts as unbounded and rejects. | #170 (EX-4) |
 
 ---
 
@@ -150,7 +158,7 @@ The first build succeeds when a row exists. This table is the minimum plumbing, 
 |---|---|---|
 | `outcome_id` | minted by the writer (`uuid4()`) | trivial |
 | `opportunity_id` | minted where the signal is accepted (EX-9) and persisted with the thesis | **new** (F8) |
-| `schema_version`, `origin`, `is_backtest`, `backtest_run_id` | constants for the auto/live path (`1`, `"auto"`, `False`, `None`) — **plus a venue label** so simulated money is separable (EX-2) | **new label** (F10b) |
+| `schema_version`, `origin`, `is_backtest`, `backtest_run_id` | constants for the auto path: `schema_version = 2` (bumped by decision #170, §6.8), `"auto"`, `is_backtest = False` (derived from the mode), `None` — **plus `execution_mode = "simulated"` and `execution_venue = "simulated"`** so simulated money is separable (EX-2, resolved) | **new columns** (F10b) |
 | `strategy_name`, `strategy_version`, `direction`, `structural_invalidation`, `structural_target`, `confidence_at_signal`, `evidence`, `setup_detected_at`, `signal_confirmed_at` | the `OpportunityCreated` payload (`Opportunity`), snapshotted at acceptance | built, but must be **persisted at acceptance** (the cache overwrites) |
 | `symbol` | envelope `symbol` | built |
 | `trading_day` | `MarketClock.trading_day(entry fill ts)` | built |
@@ -162,17 +170,17 @@ The first build succeeds when a row exists. This table is the minimum plumbing, 
 | `slippage_entry` | `entry_price − TradePlanned.entry` — needs a `TradePlanned` with an entry price; `None` if the slice has no Planning stage | **new / `None`** |
 | `realized_pnl`, `realized_r` | `compute_realized_pnl` / `compute_realized_r` (pure, in `fill_simulator.py`; reuse question is EX-8) | built (reuse TBD) |
 | `final_stop`, `final_target` | Trade Planning's numbers; in v1 equal to `structural_*` exactly as the Backtest Runner does | built convention |
-| `market_state_at_entry`, `context_at_entry` | `capture_strategy_outcome_snapshots()` at the entry fill (F11 / EX-7) | built, policy open |
-| `market_state_at_exit`, `context_at_exit` | same, at the exit fill | built, policy open |
+| `market_state_at_entry`, `context_at_entry` | `capture_strategy_outcome_snapshots()` at the entry fill (F11); pre-trade gate, and `NULL` + a reason in `snapshot_missing_reasons` if unexpectedly missing (EX-7, resolved) | built; policy resolved; nullable columns are new (§6.8) |
+| `market_state_at_exit`, `context_at_exit` | same, at the exit fill | built; policy resolved; nullable columns are new (§6.8) |
 | `feature_snapshot_id` | `None` — `feature_snapshots` does not exist | honest `None` |
 
-Reading the table: everything except **opportunity identity, order/fill linkage, exit-reason plumbing, and the population label** already exists. That is the size of the gap the Execution/Portfolio slice has to close.
+Reading the table: everything except **opportunity identity, order/fill linkage, exit-reason plumbing, the `execution_mode`/`execution_venue` columns, and the stable client-order ID** already exists. That is the size of the gap the Execution/Portfolio slice has to close.
 
 ---
 
 ## 5. Slice analysis
 
-"Smallest vertical slice" = the smallest set of new modules that turns one actionable `OpportunityCreated` into one `strategy_outcomes` row for a *non-backtest* trade. Three candidates were evaluated; none is locked here.
+"Smallest vertical slice" = the smallest set of new modules that turns one actionable `OpportunityCreated` into one `strategy_outcomes` row for a *non-backtest* trade (`execution_mode = simulated`). Three candidates were evaluated; **Slice A was approved in principle by decision #170** (the trade-offs below are the analysis behind that approval).
 
 ### Slice A — simulated venue, auto path, thin authorizer stub
 
@@ -184,7 +192,7 @@ OpportunityCreated → [authorizer stub] → OrderApproved → Execution Engine 
 
 - **New modules:** authorizer stub (emits `TradePlanned` → `GovernorDecision` → `OrderApproved`/`PlanRejected`), `SimulatedVenue`, Execution Engine, Portfolio State Engine, Position Monitor-lite, `OutcomeRecorder`, order/position ledger tables, and the four missing payload models.
 - **Deliberately not in the slice:** ranking (D4), arbitration (D1), Kelly sizing (needs outcome data — the chicken-and-egg this slice exists to break), correlation, scaling/trailing stops, manual mode and the Approval Queue, emergency actions, real broker connectivity.
-- **Pro:** needs no external service; fully testable against real Postgres with deterministic fixtures; produces the D17-live row; every module it builds is one the eventual real path also needs; the venue is behind a port, so IBKR paper slots in later.
+- **Pro:** needs no external service; fully testable against real Postgres with deterministic fixtures; produces the D17-live row; every module it builds is one the eventual real path also needs; the venue is behind the `OrderVenue` port, so a real venue slots in later without touching Execution.
 - **Con:** inverts the roadmap's stage order (Phase 6's Execution before Phase 5's Decision/Planning/Governor), so the stub authorizer must not calcify into "the Governor" (EX-4, EX-1). Outcomes come from *simulated* fills, so EX-2 (labelling) is a precondition, and fill quality is only as good as the fill model (EX-8) and the tick feed (the free-tier Finnhub trade feed is IEX-only, not the consolidated tape — decision #95).
 
 ### Slice B — manual-first (Approval Queue, human in the loop)
@@ -196,183 +204,272 @@ OpportunityCreated → [authorizer stub] → OrderApproved → Execution Engine 
 
 ### Slice C — IBKR paper venue
 
-- **Recorded as deferred, not designed around.** `future-ideas.md` #27 is blocked and deliberately set aside; F4 lists what the adapter needs (writable connection, paper-only guard, client-id policy, fill callbacks, `fetchFields` decision) and all of it would be unverified live. §8 lists these as prerequisites. Nothing here recommends unblocking #27.
+- **Recorded as deferred, not designed around.** `future-ideas.md` #27 is blocked and deliberately set aside; F4 and §8 list what a real venue needs — and after decision #170 it would be a *separate* `IBKROrderVenue` behind the new `OrderVenue` port with its own connection, leaving `BrokerAdapter`'s read-only market-data connection untouched — and all of it would be unverified live. §8 lists these as prerequisites. Nothing here recommends unblocking #27.
 
-### Recommendation (not a decision)
+### Decision (Saqib, 2026-09-22; recorded by decision #170)
 
-**Slice A**, with the venue behind a narrow port (EX-3) so Slice C is additive, and with Slice B's `ExecutionMode` gate present as a seam (a mode value the engine already understands) without building the queue. If Saqib prefers to wait for a real Decision/Planning/Governor before any Execution work, that is a legitimate answer to EX-1 — the cost is that D4 and D17 stay blocked for as long as those stages take.
+**Slice A is approved in principle**, with the venue behind a narrow `OrderVenue` port (EX-3) so Slice C is additive, the authorizer stub technically restricted to simulated execution (EX-1), and Slice B's placement-mode (`auto`/`manual`) gate present only as a seam without building the queue. The cost accepted with it: D4 and D17 stay blocked no longer than this slice takes, and the stub must not calcify into "the Governor" (EX-4).
 
 ---
 
-## 6. Component design for the recommended slice (Slice A)
+## 6. Component design for the approved slice (Slice A)
 
-Everything in this section is **proposal**. Module names follow `system-design.md` §8's planned folder tree where it has one (`execution_engine/`, `portfolio_state/`, `position_monitor/`, `governor/`); names it lacks are suggestions.
+Approved in principle by Saqib and amended by decision #170; this section is the implementation specification for the slice. Module names follow `system-design.md` §8's planned folder tree where it has one (`execution_engine/`, `portfolio_state/`, `position_monitor/`, `governor/`); names it lacks are suggestions. Terminology: **`execution_mode`** is the *capital mode* (`backtest | simulated | paper | live`); **`execution_venue`** is where fills come from (`simulated | ibkr | …`); **placement mode** (`auto | manual`) is what `trading-intelligence-architecture.md` §18.5 calls `ExecutionMode` — renamed here so the two never collide (§10, R7).
 
 ### 6.1 Data flow between modules
 
 ```
- Feature Engine ─► Market State Engine ─► Context Engine                       [built]
+ Feature Engine ─► Market State Engine ─► Context Engine                                  [built]
                           │
                           ▼
-              Strategy Scheduler + gate_conditions                             [built]
+              Strategy Scheduler + gate_conditions                                        [built]
                           │  OpportunityCreated  (normal lane)
             ┌─────────────┴────────────────┐
             ▼                              ▼
-   Opportunity Cache  [built]      Authorizer stub  [slice A — EX-4; D1 stays open]
-   latest per symbol+strategy;     1. mint opportunity_id, persist the thesis   (EX-9)
-   overwrites; no ids              2. v0 rules  ◄── Portfolio State (positions, in-flight
-                                      orders, daily realized loss), MarketClock
-                                   3. emit TradePlanned ─► GovernorDecision
+   Opportunity Cache  [built]      Authorizer stub  [slice A — fails CLOSED unless execution_mode == simulated]
+   latest per symbol+strategy;     0 mode guard  1 session  2 actionable  3 snapshot gate (EX-7)
+   overwrites; no ids              4 slots / duplicates  5 reference price + stop geometry + sizing  6 daily-loss gate (I15)
+                                   ◄── reads Portfolio State (ledger-backed), MarketClock, limits (§6.10)
+                                   then: mint opportunity_id + client_order_id ─► COMMIT trade + decision ─► publish
                                                 │
                               ┌─────────────────┴───────────────────┐
                               ▼                                     ▼
-                    PlanRejected (critical)                OrderApproved (critical)
-                    [model built]                          [model built; extended — EX-9]
+                    PlanRejected (critical)                OrderApproved (critical; stamped execution_mode = simulated;
+                    [model built]                          order_id IS the client_order_id — I10)
                                                                     │  subscribe ─► own queue ─► worker  (I7)
                                                                     ▼
                                                         Execution Engine  [slice A]
-                                        write-ahead ledger ─► mode gate ─► venue port  (EX-3)
-                                          orders/fills (new)                │ place_order()
-                                                 ▲                          ▼
-                                                 │        ┌────────────────┴────────────────────┐
-                                                 │        ▼                                     ▼
-                                                 │  SimulatedVenue [slice A]        IBKRAdapter [partial: readonly=True,
-                                                 │  fills on PriceUpdated ticks     place_order = NotImplementedError,
-                                                 │        │                         unverified live — §8, #27]
-                                                 └────────┘ order updates (new callback — EX-3)
-                                                 │
-                                                 │  OrderFilled (critical) — payload extended (EX-9)
-                    ┌────────────────────────────┼─────────────────────────────┐
-                    ▼                            ▼                             ▼
+                      idempotent ledger insert (client_order_id UNIQUE) ─► COMMIT ─► mode/venue check ─► venue call
+                                                                    │
+                                                        OrderVenue port  (NOT BrokerAdapter — EX-3)
+                                                        obtained via the `execution` registry role
+                                                                    │
+                                                  ┌─────────────────┴───────────────────────┐
+                                                  ▼                                         ▼
+                                       SimulatedVenue  [slice A]                 IBKROrderVenue  [not built; deferred, #27:
+                                       supported_modes = {simulated}             a SEPARATE class with its own connection —
+                                                  │                              BrokerAdapter's read-only market-data
+                                                  │                              connection is not touched]
+                                                  │ order / fill updates (client_order_id, venue_fill_id)
+                                                  ▼
+                       Execution Engine: dedupe (execution_venue, venue_fill_id) ─► COMMIT fill + order status
+                                                  │ ─► publish OrderFilled (critical lane: ordering + handler-failure isolation ONLY)
+                    ┌─────────────────────────────┼──────────────────────────────┐
+                    ▼                             ▼                              ▼
           Portfolio State [slice A]     Position Monitor-lite [slice A]   OutcomeRecorder [slice A]
-          owns positions, in-flight     reads PriceUpdated/CandleClosed   captures ENTRY snapshots
-          orders, daily P&L (EX-6)      for held symbols; stop / target /  (state_snapshot.py)
-                    │                   EOD ─► reduce-only exit order            │
-                    │                            │ (back into Execution Engine)  │
-                    │ PositionClosed             ▼                               │
-                    │ (lane: EX-6;        OrderFilled (exit) ─► Portfolio State  │
-                    │  model not built)                                          │
-                    └────────────────────────────────────────────────────────────┤
-                                                                                  ▼
-                              OutcomeRecorder: capture EXIT snapshots ─► build StrategyOutcome
-                                              (population label EX-2; snapshot policy EX-7)
-                                                                                  │ asyncio.to_thread
-                                                                                  ▼
-                       record_strategy_outcome()  [built; backtest is its only caller] ─► strategy_outcomes [built]
-                                                                                  ▼
-                       performance_queries [built] ─► World View [built; portfolio slot stays null until Portfolio State exists]
+          applies fills from the LEDGER stop / target / EOD ─► reduce-only  captures ENTRY snapshots, best-effort,
+          COMMIT position / closure     exit order (own client_order_id)    never on a fill's critical path
+                    │ ─► publish PositionClosed (critical) — ONLY AFTER the COMMIT
+                    ▼
+          OutcomeRecorder: EXIT snapshots (NULL + reason if missing) ─► StrategyOutcome (execution_mode, execution_venue)
+                    │ asyncio.to_thread
+                    ▼
+          record_strategy_outcome()  [built; backtest is its only user] ─► strategy_outcomes [built; new columns §6.8]
+                    ▼
+          performance_queries [built; gain an execution_mode filter] ─► World View [built; portfolio slot stays null]
+
+ RESTART (§6.9): the bus is never the recovery source. Portfolio State is rebuilt from the fills ledger; non-terminal
+ orders are reconciled with the venue; closed trades without an outcome go back to the OutcomeRecorder.
 ```
 
-Read the diagram as: **solid new work is the middle column** (authorizer stub → Execution → venue → Portfolio State / Position Monitor-lite / OutcomeRecorder); everything above the stub and below `record_strategy_outcome()` already exists.
+Read the diagram as: **the middle column is the new work**; everything above the authorizer stub and below `record_strategy_outcome()` already exists, apart from the additive columns and filters in §6.8.
 
 ### 6.2 Authorizer stub (`governor/` — name deliberately provisional)
 
-**What it is.** One small subscriber that stands in for the unbuilt Decision → Trade Planning → Governor chain so downstream modules see the *real* vocabulary (`TradePlanned`, `GovernorDecision`, `OrderApproved`/`PlanRejected`) from day one. It is not a commitment to any of D1's shapes (merged Decision+Governor, or two components): it emits the three events in order and nothing more.
+**What it is.** One small subscriber standing in for the unbuilt Decision → Trade Planning → Governor chain, so downstream modules see the *real* vocabulary (`TradePlanned`, `GovernorDecision`, `OrderApproved`/`PlanRejected`) from day one. It is not a commitment to any of D1's shapes and it must not rank, arbitrate between strategies (D4/D1), size by Kelly, or modify a `StrategyConfig` (`strategy-engine-design.md` §6).
 
-**What it does (proposal, all parameters Saqib's to set — EX-4):**
-1. For an `OpportunityCreated` with `status == "actionable"`: mint `opportunity_id`, persist the `Opportunity` snapshot (thesis fields) to the `trades` ledger row (F8).
-2. Evaluate v0 rules, every one reading state rather than owning it: regular session only (`MarketClock`, same shape as `gate_conditions` `{"session": "regular"}`); no open position or in-flight order for the symbol (Portfolio State); max concurrent positions; daily realized-loss cap (Portfolio State); **both snapshot halves available for the symbol** (the pre-trade gate that lets EX-7 avoid discarding a real fill later); fixed quantity.
-3. Publish `TradePlanned` (entry = none/"market", stop/target = `structural_*`, size = fixed — mirroring the Backtest Runner's `final_* == structural_*` and `qty = 1` conventions), then `GovernorDecision` (`approved` or `rejected`, `reasons` always populated — a rejection is logged like an approval, `trading-intelligence-architecture.md` §12), then `OrderApproved` or `PlanRejected`.
+**Technically restricted to simulated execution — four independent layers (I6, EX-1).**
+1. **Startup refusal.** Wiring reads `execution_mode` from `Settings` (§6.10). Anything other than `simulated` — `paper`, `live`, `backtest` (a per-run label, never a live-pipeline setting), or an unrecognized value — makes the stub refuse to start: the execution pipeline is not wired, an error is logged, and the app does **not** fall back to `simulated`.
+2. **Per-decision refusal.** Every authorization re-checks the current mode; unless it is `simulated` the decision is `rejected` with reason `execution_mode_not_permitted`, before any other rule runs. (Defense in depth: v1 applies configuration changes only at restart, so this covers a mode changed at runtime or a wiring bug.)
+3. **Mode stamp and venue check.** Every event and ledger row it produces carries `execution_mode = simulated`; the Execution Engine routes an order only to a venue whose `supported_modes` includes that mode (§6.3, §6.4). The registry also refuses to register a venue that does not support the configured mode.
+4. **No other venue exists.** No `OrderVenue` other than `SimulatedVenue` is implemented in this slice, and the stub imports no broker or venue module beyond the port's types (an import-boundary test, §9). Even a mislabelled order has nowhere real to go.
 
-**What it must not do:** rank, arbitrate between strategies (D4/D1), size by Kelly, or modify a `StrategyConfig` (`strategy-engine-design.md` §6's boundary).
+**Rules, in evaluation order — every rejection is committed and published with its reasons** (`trading-intelligence-architecture.md` §12):
+
+| # | Rule | Reject reason |
+|---|---|---|
+| 0 | `execution_mode == simulated` | `execution_mode_not_permitted` |
+| 1 | regular session (`MarketClock.is_regular_session`) | `outside_regular_session` |
+| 2 | opportunity `status == "actionable"` | `not_actionable` |
+| 3 | **snapshot gate (EX-7):** `capture_market_state_snapshot(symbol)` and `capture_context_snapshot(symbol)` are both non-`None` | `snapshot_unavailable:market_state` / `:context` |
+| 4 | no open position or in-flight entry for the symbol; `open_positions + in_flight_entries < max_concurrent_positions` | `symbol_busy` / `max_concurrent_positions` |
+| 5 | a reference price exists (the last observed trade price for the symbol, from the same stream the venue fills against); `structural_invalidation` lies on the correct side of it for the direction (long: below, short: above); `qty = floor(fixed_notional / reference_price) ≥ 1` | `no_reference_price` / `invalid_stop_geometry` / `notional_below_one_share` |
+| 6 | **daily-loss gate (I15, below)** | `daily_loss_cap_reached` / `projected_loss_exceeds_daily_cap` / `loss_exposure_unknown` |
+
+**The daily-loss gate (EX-4, I15).** Population-scoped: only trades with the same `execution_mode`, bucketed by `MarketClock.trading_day`.
+
+```
+ realized_loss_today  = max(0, −Σ realized_pnl of positions closed today)
+ open_exposure_loss   = Σ over open positions AND in-flight entries of
+                          max( qty × |avg_entry − stop| ,  −unrealized_pnl )
+                          (worst realistic loss if the stop is hit, or the loss already marked if price gapped through it;
+                           a missing mark or stop makes the term UNKNOWN ⇒ treated as unbounded ⇒ reject)
+ candidate_loss       = qty_new × |reference_price − structural_invalidation|
+
+ reject  daily_loss_cap_reached            if realized_loss_today + open_exposure_loss ≥ cap
+ reject  projected_loss_exceeds_daily_cap  if realized_loss_today + open_exposure_loss + candidate_loss > cap
+ reject  loss_exposure_unknown             if any term is unknown
+```
+
+With the initial values (§6.10) the `open_exposure_loss` term is zero at a legitimate entry, because only one position may exist; it is specified now because the limit is configurable and the term must already be correct when the limit is raised. It counts an *in-flight* entry order as exposure so two signals cannot slip past it. The candidate term means a $1,000 trade whose stop is more than 10% away is refused even on a clean day, because its own stop-out would breach a $100 cap (§7.1, judgment call J2).
+
+```
+ OpportunityCreated ─► on_opportunity() ─► [ authorizer queue ] ─► _worker_loop()   single decision at a time
+                                                     │
+   ┌──────────┬──────────┬────────────┬───────────┬───────────┬────────────┬───────────────┐
+   ▼ 0        ▼ 1        ▼ 2          ▼ 3         ▼ 4         ▼ 5            ▼ 6
+   mode ==    regular    actionable?  both        slots &     ref price +    daily-loss gate
+   simulated? session?                snapshots   symbol      stop geometry  realized + open
+   (fail      (Market-                present?    free?       + qty ≥ 1?     + candidate vs cap
+   closed)    Clock)                  (EX-7)
+   └──── any check fails ─► COMMIT trade row (decision = rejected, reasons) ─► publish GovernorDecision(rejected) ─► PlanRejected
+                                    all pass ─► mint opportunity_id, client_order_id = "<trade_id>:entry"
+                                             ─► COMMIT trade row (decision = approved, thesis snapshot, limits in effect, snapshots)
+                                             ─► publish TradePlanned ─► GovernorDecision(approved) ─► OrderApproved
+```
+
+**Money and sizing.** USD, US equities. `TradePlanned` carries the intended notional and the integer `qty`; the actual filled notional is whatever the venue reports and is recorded as-is (no adjustment, I3). Entry is a market order in v1; stop and target are `structural_*` exactly as the Backtest Runner does (`final_* == structural_*`).
 
 ### 6.3 Execution Engine (`execution_engine/`)
 
-**What it is.** The only module that talks to a venue (I1). It turns an authorization (or a reduce-only exit intent) into a durable order, sends it, and turns every venue update into ledger state and an `OrderFilled`.
+**What it is.** The only module that talks to a venue (I1). It turns an authorization (or a reduce-only exit intent) into a durable, idempotent order, sends it, and turns every venue update into ledger state and an `OrderFilled` — deduplicated, persisted first, published second.
 
 ```
- OrderApproved (critical lane)                     exit intent (Position Monitor-lite; reduce-only)
-          │                                                        │
-          ▼                                                        ▼
-  on_order_approved()  ── put_nowait ──►  [ execution queue ]  ◄── put_nowait ── on_exit_intent()
-  (returns at once: the bus's critical                 │
-   lane never waits on the network — I7)               ▼
-                                              _worker_loop()   single writer
-                                                       │
-        ┌──────────────────────────────────────────────┼──────────────────────────────┐
-        ▼                                              ▼                              ▼
- 1. validate + dedupe                        2. WRITE-AHEAD ledger row          3. mode gate
-    order_id already seen? drop                orders.status = approved          dry_run → log intent, stop
-    reduce-only guard (exit orders:            (asyncio.to_thread; durable       manual  → approval queue  [deferred]
-    Portfolio State must show a                before any venue call — I8)       auto    → venue.place_order()
-    matching open position)                                                                │
-                                                                                            ▼
-                                              4. OrderAck: submitted | rejected  ◄──────────┘
-                                                 persist status; publish rejection [event: EX-9]
-                                                                │
-   venue.on_order_update(cb) ── put_nowait ──► [ execution queue ] ──► 5. apply update
-                                                                          dedupe (order_id, fill_id)
-                                                                          cumulative qty ≤ ordered qty (else: halt, alert)
-                                                                          status → partially_filled | filled | cancelled
-                                                                          persist fill, THEN publish OrderFilled (critical)
+ OrderApproved (critical)                                   exit intent (Position Monitor-lite; reduce-only)
+   order_id == client_order_id                                client_order_id = "<trade_id>:exit:<n>"
+          │                                                            │
+          ▼                                                            ▼
+  on_order_approved() ── put_nowait ──► [ execution queue ] ◄── put_nowait ── on_exit_intent()
+  (returns at once — I7)                        │
+                                                ▼
+                                       _worker_loop()   single writer
+                                                │
+     ┌──────────────────────────────────────────┼───────────────────────────────────────────┐
+     ▼                                          ▼                                           ▼
+ 1. validate                          2. IDEMPOTENT LEDGER INSERT                 3. mode / venue check (fail closed)
+    reduce-only guard (exits: a          INSERT orders                               order.execution_mode ∈
+    matching open position must          (client_order_id UNIQUE)                    venue.supported_modes ?
+    exist in Portfolio State)            conflict ⇒ duplicate ⇒ log, return          no ⇒ terminal `rejected`
+    execution_mode present               the stored row, send nothing                (mode_not_supported), never routed
+                                         status = approved
+                                         COMMIT before ANY venue call (I8)                          │ yes
+                                                                                                    ▼
+                                                                                4. venue.place_order(instruction)   [OrderVenue port]
+                                                                                   idempotent on client_order_id
+                                                                                                    │ ack: submitted | rejected
+                                                                                                    ▼
+                                                                                5. COMMIT status
+                                                                                   (rejection event: EX-9)
+
+  venue.on_order_update(cb) ── put_nowait ──► [ execution queue ] ──► 6. apply update (one transaction)
+                                                                          INSERT fills — (execution_venue, venue_fill_id) UNIQUE,
+                                                                             conflict ⇒ duplicate ⇒ no-op and NO publish (I11)
+                                                                          advance order status monotonically; a stale or
+                                                                             out-of-order update is ignored and logged
+                                                                          overfill, or a fill for an unknown order ⇒ STILL persist
+                                                                             the fill (I14), flag it `anomaly`, halt NEW entries
+                                                                          COMMIT fill + order status + flag together
+                                                                                                    │
+                                                                                                    ▼
+                                                                          7. publish OrderFilled (critical) — only after COMMIT (I8)
+
+  startup ─► recovery (§6.9) completes BEFORE this worker consumes its first OrderApproved (I13)
 ```
 
-**Order state machine** (proposal; the persisted `status` column):
+**Order state machine** (persisted `status`):
 
 ```
- approved ──► submitted ──► partially_filled ──► filled
+ approved ──► submitted ──► partially_filled ──► filled                       terminal: filled
     │             │  │              │
-    │             │  └──► cancelled ◄┘          (cancel_order acknowledged)
-    │             └─────► rejected              (venue refused; reason kept)
-    └─ duplicate order_id ─► dropped (no new row; logged)
- submitted | partially_filled ──(no update within T)──► unknown ──► reconciled against the venue ──► any of the above
+    │             │  └──► cancelled ◄┘                                       terminal: cancelled
+    │                                                                        (also: approved ──► cancelled at recovery — a stale entry that was never sent)
+    │             └─────► rejected                                           terminal: rejected
+    └─ duplicate client_order_id ─► no new row (logged)
+ approved | submitted | partially_filled ──(no update within T, or a restart)──► unknown ──► reconciled with the venue ──► any state above
+ unknown, and the venue has no record (SimulatedVenue after a restart) ──► expired    terminal: expired, reason venue_lost_state_on_restart
+
+ Non-terminal = approved, submitted, partially_filled, unknown — exactly what restart recovery scans (§6.9).
 ```
 
-**Mode gate.** Three orthogonal ideas that the prose uses interchangeably are separated here (EX-2, EX-13): *dry-run* = the order never leaves the process and **no fill exists** (so no outcome is produced); *simulated* = an in-process venue produces fills (outcomes are produced and must be labelled); *paper/live* = a real broker. `ExecutionMode` (`auto` | `manual`, `trading-intelligence-architecture.md` §18.5) is a separate axis — *who triggers placement* — and is present in slice A only as a seam (`auto`), with the Approval Queue not built.
+**Client-order ID and idempotency (I10, I11).** `OrderApproved.order_id` — an existing field — *is* the client-order ID: deterministic and stable across retries, `"<trade_id>:entry"` for the entry and `"<trade_id>:exit:<n>"` for the n-th exit attempt (`n` persisted on the position). It is minted before persistence and is unique in the ledger. Re-delivery of the same authorization, a restart-time replay, and a duplicate venue update all collapse into no-ops because the *database constraint* decides, not process memory. The venue receives the same ID as its idempotency key: `OrderVenue.place_order` returns the original acknowledgement for a known ID and never creates a second order; a venue that cannot guarantee this is wrapped by a check-before-submit using `get_order` (§6.4).
 
-**Payload and event work this implies** (all additive-optional per `system-design.md` §10.2, so no `version` bumps; EX-9):
-- `OrderApproved` += `opportunity_id`, `position_effect` (`open`|`close`), `origin`, and for exits `exit_reason`.
-- `OrderFilled` += `fill_id`, `cumulative_qty`, `leaves_qty`, `venue`, optional `commission` (`None` unless the venue supplies it).
-- New models: `TradePlanned`, `OpportunitySelected` (reserved, unused in slice A), `PositionAdjusted` (reserved), `PositionClosed` (§6.5).
-- A venue-level rejection/cancel needs a representation distinct from the plan-level `PlanRejected{symbol, reasons}` (EX-9).
+**Placement mode.** `auto | manual` (§18.5's `ExecutionMode`) exists in slice A only as a seam — the engine understands the value, only `auto` is implemented, the Approval Queue is not built (EX-13). *Dry-run* survives as an optional switch that records the order and suppresses the venue call (no fill, therefore no outcome); it is not a capital mode.
 
-### 6.4 `SimulatedVenue` (`broker_adapters/`, behind the venue port — EX-3)
+**Payload and event work this implies** (additive-optional per `system-design.md` §10.2, so no event `version` bumps; EX-9, EX-14):
+- `OrderApproved` += `execution_mode`, `opportunity_id`, `position_effect` (`open`|`close`), `origin`, and for exits `exit_reason`. `order_id` semantics become "the client-order ID".
+- `OrderFilled` already carries `order_id` (= the client-order ID); it gains `venue_fill_id`, `cumulative_qty`, `leaves_qty`, `execution_venue`, and an optional `commission` (`None` unless the venue supplies it).
+- New models: `TradePlanned`, `PositionClosed` (§6.5), and reserved `OpportunitySelected`, `PositionAdjusted`; `PositionClosed` joins `CRITICAL_EVENT_TYPES` (EX-6); a venue-level rejection/cancel needs a representation distinct from plan-level `PlanRejected{symbol, reasons}` (EX-9).
 
-- **Behaves like a broker, owns no truth:** `place_order()` acks; fills arrive through the same order-update callback a real adapter would use; its own `get_positions()` exists for reconciliation tests only — Portfolio State is the source of position truth (I5).
-- **Price source:** subscribes to `PriceUpdated`. A market order fills at the first tick at or after acceptance; a limit order when a tick crosses it. Fill timestamps are the tick's `exchange_ts` (event time, I9). Slippage and commission are `None`/zero by default (I3) and parameters of EX-8.
-- **Session guard:** rejects outside the regular session in v1 (`MarketClock`).
-- **Deterministic under test:** tick source and clock are injectable; a partial-fill injector exists so the state machine's partial path is exercised even though v1 fills whole.
-- **Parity with the backtest, stated not assumed:** the Backtest Runner fills at the *next candle's open* and exits *at the stop/target price*; a tick-driven venue fills at the *observed tick* and exits at the tick that breached the level. Those differ, and expectancy from one is not directly comparable with the other until EX-8 fixes the convention and the doc records the delta.
+### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
+
+**A new narrow interface; `BrokerAdapter` is not enlarged.** `BrokerAdapter` keeps its job — market-data connectivity (it extends `MarketDataProvider`). Its dormant `place_order`/`cancel_order`/`get_positions` declarations stay exactly as they are: unwired, not extended, not implemented (their eventual removal is a later decision — §10, R8). The Execution Engine depends only on `OrderVenue`.
+
+| `OrderVenue` member | Purpose |
+|---|---|
+| `venue_id` | stable string (`simulated`, `ibkr`, …); stored as `execution_venue` |
+| `supported_modes` | subset of `{simulated, paper, live}`; `SimulatedVenue` = `{simulated}` |
+| `connect()` / `disconnect()` / `is_connected()` | lifecycle |
+| `place_order(instruction) → ack` | **idempotent on `client_order_id`**; `instruction` = client order ID, symbol, side, qty, order type, limit price, position effect |
+| `cancel_order(client_order_id)` | cancel; acknowledged asynchronously through the update callback |
+| `get_order(client_order_id)` | reconciliation after a restart or timeout; `None` = the venue has no record |
+| `list_open_orders()` | reconciliation: venue orders the ledger does not know |
+| `get_fills(client_order_id)` | reconciliation: fills the process missed |
+| `get_positions()` | reconciliation only — never the source of position truth (I12) |
+| `on_order_update(callback)` | pushes `client_order_id`, `venue_order_id`, status, optional `venue_fill_id`, fill qty/price, cumulative/leaves qty, venue timestamp, optional commission |
+
+**The `execution` registry role.** `broker_registry.py` gains a third role beside `streaming` and `historical` (decision #33's pattern): typed `OrderVenue | None`, with `set_execution_venue()`, `get_execution_venue()`, `clear_execution_venue()`. It is a *separate slot with a separate type* — an `OrderVenue` is never stored in a role that holds a `BrokerAdapter`/`MarketDataProvider`, and `IBKRAdapter` connecting for market data never fills it. `set_execution_venue()` refuses a venue whose `supported_modes` does not contain the configured `execution_mode` (fail closed, I6). A future `IBKROrderVenue` is a separate class with its own connection and client-ID policy (§8).
+
+**`SimulatedVenue` (`broker_adapters/simulated_venue.py`, name provisional).**
+- **Behaves like a broker, owns no truth:** it acknowledges, then reports fills through the same update callback a real venue would use; Portfolio State and the ledger — not the venue — are the source of truth (I12).
+- **Price source:** subscribes to `PriceUpdated`. A market order fills at the first tick at or after acceptance; a limit order when a tick crosses it. Fill timestamps are the tick's `exchange_ts` (event time, I9). Slippage and commission default to zero/`None` (I3) and are EX-8's parameters.
+- **Deterministic identity:** `venue_fill_id = "<client_order_id>:f<n>"`, so re-reported fills dedupe by construction; its own in-memory order/fill book answers `get_order`, `list_open_orders`, and `get_fills`.
+- **Not durable:** the book is lost on a restart; recovery (§6.9) marks non-terminal ledger orders it no longer knows `expired` while fills already in the ledger stand.
+- **Session guard:** rejects outside the regular session in v1 (`MarketClock`). **Injectable** tick source and clock for tests, plus a partial-fill injector so the partial path is exercised even though v1 fills whole.
+- **Parity with the backtest, stated not assumed:** the Backtest Runner fills at the *next candle's open* and exits *at the stop/target price*; a tick-driven venue fills at the *observed tick* and exits at the tick that breached the level. The delta is recorded, not hidden (EX-8).
 
 ### 6.5 Portfolio State Engine (`portfolio_state/`)
 
-**What it is.** The single owner of account/position truth (I5): positions, in-flight orders, realized P&L for the trading day, gross exposure, execution mode. Read synchronously by the authorizer, the Position Monitor, the Execution Engine's reduce-only guard, and (later) World View.
+**What it is.** The single owner of position accounting, in-flight orders, and daily P&L (I5, EX-6). It is a **cache over the ledger, never the record** (I12): read synchronously by the authorizer, the Position Monitor, the Execution Engine's reduce-only guard, and (later) World View.
 
 ```
- OrderApproved (critical) ─┐                       [in-flight order recorded — see below]
+ OrderApproved (critical) ─┐   in_flight[client_order_id] added (a second signal on the same symbol sees it before the fill lands)
  OrderFilled   (critical) ─┼─► on_*() ── put_nowait ──► [ portfolio queue ] ──► _worker_loop()   single writer
- PlanRejected  (critical) ─┘                                                        │
-                                                                     apply(event)
-                              ┌───────────────────────────────┬───────────────────┴────────────┐
-                              ▼                               ▼                                ▼
-                    OrderApproved: add to           OrderFilled, position_effect=open:  OrderFilled, position_effect=close:
-                    in_flight[order_id]             positions[symbol] = qty, avg_price,  realized_pnl_today += (exit − avg) × qty × sign
-                    (so a second signal on the      opened_at, opportunity_id, side;     if qty == 0 → position closed
-                    same symbol sees it before      remove/reduce in_flight              │
-                    the first fill lands)                        │                        │
-                              └───────────────────────────────┴────────────┬───────────┘
-                                                                            ▼
-                                                        persist positions row (asyncio.to_thread)
-                                                                            │
-                                            ┌───────────────────────────────┴───────────────┐
-                                            ▼                                               ▼
-                                  in-memory snapshot updated               publish PositionClosed (when closed)
-                                  (get_snapshot(), sync, no I/O)           [lane and owner: EX-6; model not built]
+ PriceUpdated  (normal; held symbols only) ─► marks{symbol → last price, ts}      (memory only, no DB write)
+                                                             │
+                     apply(fill) — read from the fills LEDGER by ledger_seq, not trusted from the event alone
+                          ┌──────────────────────────────────┴───────────────────────────────┐
+                          ▼ position_effect = open / add                                     ▼ position_effect = close / reduce
+             positions[symbol] = qty, avg_price, opened_at,                     realized_pnl += (exit − avg) × qty × side_sign
+             trade_id, side, stop, target, status = open                        qty == 0 ⇒ status = closed, closed_at, realized_pnl final
+                          └──────────────────────────────────┬───────────────────────────────┘
+                                                             ▼
+                          ONE TRANSACTION: upsert positions row + advance cursor last_applied_ledger_seq  ── COMMIT
+                                                             │
+                                  ┌──────────────────────────┴───────────────────────────┐
+                                  ▼                                                      ▼
+                   in-memory snapshot refreshed                         if a position closed: publish PositionClosed (critical lane)
+                   get_snapshot() — sync, no I/O                        ONLY AFTER the COMMIT above  (I8, EX-6)
+
+ read side: realized_loss_today · unrealized (positions × marks) · open_risk_to_stop · open_count · in_flight
+            — a missing mark or stop makes that term UNKNOWN; the daily-loss gate treats unknown as unbounded (I15)
+
+ startup:  rebuild_from_ledger() — apply every fill with ledger_seq > cursor, in order; assert in-memory == ledger replay;
+           on any disagreement the ledger wins and the discrepancy is logged (I12)
 ```
 
-- **State (proposal):** `positions{symbol → side, qty, avg_price, opened_at, opportunity_id, status: open|closing}`, `in_flight{order_id → symbol, side, qty, position_effect}`, `realized_pnl_today` (bucketed by `MarketClock.trading_day`), `gross_exposure`, `open_position_count`, `execution_mode`. **`buying_power`/cash is `None`** unless a venue supplies it (I3); slice A's rules do not need it.
-- **Deviation from §4.6 worth naming:** the prose has Portfolio State consume only `OrderFilled` and `PositionClosed`. That leaves a race: two `OpportunityCreated` events for one symbol milliseconds apart would both see "no position" before the first fill lands. Consuming `OrderApproved` as an *in-flight* record closes it without a second owner of the fact. (Part of EX-6.)
+- **State:** `positions{symbol → side, qty, avg_price, opened_at, trade_id, stop, target, status: open|closing|closed, exit_attempt}`, `in_flight{client_order_id → symbol, side, qty, position_effect}`, `marks`, derived `realized_pnl_today` (per `execution_mode`, bucketed by `MarketClock.trading_day`), `unrealized_pnl`, `open_risk`, `open_position_count`. **`buying_power`/cash is `None`** (I3); no rule in this slice needs it.
+- **Critical-lane statement (EX-6).** `PositionClosed` may ride the critical lane **only because** the closure is committed first. The lane provides ordering and handler-failure isolation, **not persistence, delivery guarantees, crash recovery, or failure propagation** (F6): if the commit fails, nothing is published, the position is flagged and retried; if the process dies after the commit and before the publish, consumers recover from the ledger (§6.7, §6.9). `PositionClosed` therefore gets a `CRITICAL_EVENT_TYPES` entry (a two-line change in the build task) so that Governor-side reads are not stuck behind a tick burst — never as a durability mechanism.
+- **Deviation from §4.6/§4.8 worth naming:** Portfolio State also consumes `OrderApproved` (in-flight orders) and emits `PositionClosed`; Position Monitor is a *decision* module that reads Portfolio State and issues exit intents (departing from §4.8's row that has it emit `PositionClosed`).
 - **Honesty convention:** `get_snapshot(symbol=None)` mirrors `MarketStateEngine.get_snapshot()` — absent means not-yet, never a fabricated default; World View's `portfolio=None` stays `None` until this exists and is wired in a *separate* task.
-- **Restart:** rebuild `positions` and in-flight orders from the ledger before accepting events; venue reconciliation for real venues (§8); the simulated venue's book is rebuilt from the ledger, and pending orders older than the restart are marked `unknown` then cancelled.
-- **Not in slice A:** pairwise correlation, buying power, risk-budget consumption, `ExecutionModeChanged`.
+- **Not in slice A:** pairwise correlation, buying power, risk-budget consumption, placement-mode change events.
 
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 
-**What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14) and emergency actions (#16) are out of scope.
+**What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
-- **Inputs:** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the same derivation `fill_simulator.regular_session_close_utc` uses).
-- **Output:** one reduce-only exit intent per position (idempotent: the position moves to `closing` first), carrying `exit_reason ∈ {stop, target, eod_flatten}`.
-- **Stop/target enforcement is in-process here** — acceptable for a simulated venue with no broker. It is *not* acceptable for a real venue (a crash would leave a position without a stop): broker-side protective orders become a hard prerequisite before any real venue (§8, EX-11).
+- **Inputs:** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).
+- **Output:** one reduce-only exit intent per position (idempotent: the position moves to `closing` first), carrying `exit_reason ∈ {stop, target, eod_flatten}` and its own client-order ID `"<trade_id>:exit:<n>"`; after a restart it is re-armed from the ledger (§6.9).
+- **Stop/target enforcement is in-process** — acceptable for a simulated venue with no broker, **not** for a real one (a crash would leave a position without a stop): broker-side protective orders are a hard prerequisite before any real venue (§8, EX-11).
 
 ### 6.7 `OutcomeRecorder` and D17's live half (`trading_intelligence/`)
 
@@ -380,151 +477,200 @@ Read the diagram as: **solid new work is the middle column** (authorizer stub �
 
 ```
  OrderFilled (entry) ─► on_order_filled() ─► [ recorder queue ] ─► _worker_loop()
-                                                   │   entry fill?
-                                                   ▼
-                     capture_strategy_outcome_snapshots(symbol)   ← market_state carries its own candle_ts
-                     persist {market_state, context, captured_at} on the trade row   (survives a restart)
+                                                    │   best-effort; NEVER on the fill's critical path (I14)
+                                                    ▼
+                            capture_strategy_outcome_snapshots(symbol)   ← market_state carries its own candle_ts
+                               ├─ both present ─► store snapshots + captured_at on the trade row
+                               └─ missing, or raises ─► store NULL + a reason on the trade row
+                                    ("engine_cold_start" | "engine_state_lost_on_restart" | "snapshot_capture_error"
+                                     | "recorder_unavailable") — the fill and the position are unaffected
 
- PositionClosed ─► on_position_closed() ─► [ recorder queue ] ─► _worker_loop()
-                                                   ▼
-                     load trade row: thesis, entry snapshots, order/fill ids, exit_reason
-                     capture EXIT snapshots ──► EX-7 policy applied
-                     build StrategyOutcome  (field-by-field map: §4)
-                     asyncio.to_thread(record_strategy_outcome, outcome)      ← same call shape BacktestRunner uses
-                        ├─ ok    ─► trade.outcome_id set
-                        └─ raises ─► trade.outcome_status = pending_retry; log loudly — never drop
-                                     (record_strategy_outcome() raises by design, performance.py docstring)
+ PositionClosed (critical) ─► on_position_closed() ─► [ recorder queue ] ─► _worker_loop()
+                                                    ▼
+                            load trade row: thesis, entry snapshots + reasons, order/fill ids, exit_reason, mode/venue
+                            capture EXIT snapshots — same rule: NULL + reason, never a discard
+                            build StrategyOutcome (§4 map + execution_mode + execution_venue + snapshot_missing_reasons)
+                            asyncio.to_thread(record_strategy_outcome, outcome)      ← same call shape BacktestRunner uses
+                               ├─ ok    ─► trades.outcome_id set (idempotent: a repeated PositionClosed is a no-op)
+                               └─ raises ─► trades.outcome_status = pending_retry; log loudly; never drop
+
+ startup ─► scan trades WHERE status = closed AND outcome_id IS NULL ─► the same path
+            (the bus lost nothing the ledger still holds — I8, I12)
 ```
 
-**D17's live choice is EX-7.** The four honest options: *(a)* discard, as #128 does for backtests — rejected as a default for live because the trade already happened (F11); *(b)* make the four snapshot columns nullable — a migration and a change to every query that reads them; *(c)* an explicit "unavailable" sentinel inside the dicts — no schema change, but pollutes readers of `trend_score` keys and skirts #128's "never a fabricated `{}`"; *(d)* **a pre-trade gate** — the authorizer refuses to approve a symbol unless both snapshot halves exist, so the remaining `None` case is only "exit after a restart wiped in-memory engine state", which then needs (b) or (c) as its narrow fallback.
+**D17's live policy is resolved (EX-7, decision #170).**
+1. **Pre-trade gate.** The authorizer refuses a symbol unless both snapshot halves exist (rule 3, §6.2). This keeps the missing case rare; it is not the safety net.
+2. **A reported fill is never discarded (I14).** Fill persistence, position accounting, and `OrderFilled` publication do not depend on snapshot capture succeeding.
+3. **If a snapshot is unexpectedly unavailable** (entry or exit — e.g. the engine restarted mid-position, or capture raised), the outcome is still recorded with that snapshot field `NULL` and a machine-readable reason in `snapshot_missing_reasons`. Never a fabricated `{}`, never a sentinel inside the dict, never a discarded row.
+4. **Backtests are unchanged:** decision #128's discard-on-`None` stays for `execution_mode = backtest` rows, and the schema keeps those four columns `NOT NULL` for them (§6.8).
+5. **Capture timing is visible.** Snapshots are read at fill-handling time, not as of `fill_ts`; the market-state dict carries its `candle_ts` and the trade row stores `captured_at`, so late capture is measurable rather than hidden.
 
 ### 6.8 Persistence sketch (proposal — no migration is created by this design)
 
-Names follow `system-design.md` §4.13; columns are illustrative. All writes go through `asyncio.to_thread` (the repository's sync-engine pattern) and precede the corresponding event (I8).
+Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**
 
-| Table | Purpose | Key columns |
+| Table | Purpose | Key columns / constraints |
 |---|---|---|
-| `trades` | One row per authorized plan, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= `opportunity_id`), `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), authorizer decision + `reasons`, `status`, entry snapshots (JSONB), `outcome_id`, `outcome_status`, population label (EX-2) |
-| `orders` | The order ledger and state machine | `order_id`, `trade_id`, `venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
-| `fills` | Every fill, deduplicated | `fill_id` (unique with `order_id`), `qty`, `price`, `fill_ts`, `commission` (nullable) |
-| `positions` | Position accounting (owner per EX-6) | `position_id`, `trade_id`, `symbol`, `side`, `qty`, `avg_price`, `opened_at`, `closed_at`, `status`, `realized_pnl` |
+| `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= `opportunity_id`), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
+| `orders` | The order ledger and state machine | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
+| `fills` | Every fill, deduplicated, in ledger order | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
+| `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills` | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
+| `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
 
-`market_events` (the durable bus log) is **not** required by this design: the ledger is the durable record, which is what I8 needs; `market_events` remains separate future work (EX-10).
+**`strategy_outcomes` changes (EX-2, EX-7; the build task owns the migration):**
+- Add **`execution_mode`** (`backtest | simulated | paper | live`) and **`execution_venue`** (`simulated | ibkr | …`); both set on every new row, both part of the `StrategyOutcome` contract. For `backtest` rows the venue is `simulated` (the `fill_simulator` replay model); for `simulated` rows it is `SimulatedVenue`; the *mode* says which.
+- **Keep `is_backtest` temporarily** for compatibility — no reader is broken — but it is a *derived* value, not the classifier: `CHECK (is_backtest = (execution_mode = 'backtest'))`. New reads filter on `execution_mode`; retiring `is_backtest` is a later decision.
+- **Mode/venue can never disagree with reality:** `CHECK ((execution_venue = 'simulated') = (execution_mode IN ('backtest','simulated')))` — a simulated venue cannot label its rows `paper` or `live`, and a real venue cannot label them `simulated`.
+- **Backfill without guessing:** existing rows with `is_backtest = true` become `execution_mode = 'backtest'`, `execution_venue = 'simulated'`. No legitimate writer of `is_backtest = false` rows exists today, so the migration first counts them and **aborts if any exist**, reporting them for Saqib to review, rather than labelling them `live`.
+- **Snapshots:** the four snapshot columns become nullable and `snapshot_missing_reasons` (JSONB) is added, with `CHECK (execution_mode <> 'backtest' OR all four are NOT NULL)` (preserving #128) and a check that every `NULL` snapshot has its key in `snapshot_missing_reasons`.
+- **`schema_version` bumps** (1 → 2): the record's own rule (`schemas/performance.py:StrategyOutcome.schema_version`) says a change of meaning bumps, and four fields become nullable for non-backtest rows.
+- **Queries:** `performance_queries` gain an `execution_mode` filter; a population is one exact mode, never an implicit union (I4). The Backtest Runner sets `execution_mode = 'backtest'` and `execution_venue = 'simulated'` on its rows (part of the build task's footprint).
 
-### 6.9 Safety invariants → mechanisms
+`market_events` (the durable bus log) is **not** required: the ledger is the durable record, which is all I8/I12 need (EX-10).
+
+### 6.9 Restart recovery and reconciliation (I12, I13)
+
+The bus is in-memory and forgets (F6); recovery runs from the ledger, **before** the pipeline accepts a single new authorization.
+
+```
+ process start
+   │
+   ├─ 1. connect to the database; refuse to wire the execution pipeline unless execution_mode == simulated   (fail closed, I6)
+   │
+   ├─ 2. Portfolio State: rebuild_from_ledger()
+   │        apply every fill with ledger_seq > cursor, in order ─► assert in-memory == replay ─► ledger wins (I12)
+   │
+   ├─ 3. Execution Engine recovery — for every order with status IN (approved, submitted, partially_filled, unknown):
+   │        venue.get_order(client_order_id) and venue.get_fills(client_order_id)
+   │          ├─ venue knows it ─► apply missing fills (dedupe on venue_fill_id), advance status monotonically
+   │          └─ venue has no record ─► approved, never sent:  entry ⇒ cancelled (stale opportunity, not re-submitted)
+   │                                                            exit  ⇒ re-submitted (idempotent on client_order_id)
+   │                                    submitted / partially_filled ⇒ expired (venue_lost_state_on_restart);
+   │                                    fills already in the ledger stand
+   │        venue.list_open_orders() vs ledger ─► an order the ledger does not know ⇒ DISCREPANCY
+   │        venue.get_positions() vs ledger-derived positions ─► a mismatch ⇒ DISCREPANCY
+   │        any DISCREPANCY ⇒ halt NEW entries, alert; never auto-adopt, never discard (I13, I14)
+   │
+   ├─ 4. OutcomeRecorder: trades WHERE status = closed AND outcome_id IS NULL ─► build outcomes (NULL + reason where needed)
+   │
+   ├─ 5. Position Monitor-lite: re-arm stop / target / EOD for every open position from the ledger
+   │
+   └─ 6. only now subscribe to the bus and accept OrderApproved; new entries stay halted while any discrepancy is unresolved
+```
+
+Position closures and outcomes are recovered the same way: a `PositionClosed` published but never handled left its committed closure in the ledger, and step 4 finds it.
+
+### 6.10 Configuration (EX-4) — three limits, configurable, not hardcoded
+
+All values live in `core/config.py`'s `Settings` (the repository's single source of configuration — nothing else reads the environment), overridable by environment/`.env`, validated at startup (each must be positive), and **recorded on every authorization** as `limits_snapshot` so a decision's basis is auditable after the limits change. Changes take effect at restart in v1.
+
+| Setting (names provisional) | Initial value | Meaning |
+|---|---|---|
+| `execution_max_concurrent_positions` | **1** | maximum open positions plus in-flight entries at any moment |
+| `execution_fixed_notional_usd` | **$1,000** | notional per trade; `qty = floor(notional / reference_price)` |
+| `execution_daily_loss_cap_usd` | **$100** | the daily-loss gate's cap (§6.2) |
+| `execution_mode` | `simulated` | the capital mode; only `simulated` is accepted in this slice, anything else fails closed (§6.2) |
+
+**These are conservative first-slice defaults for validating the lifecycle, not final trading-risk settings** (Saqib, 2026-09-22); the code and its config comments must say so.
+
+### 6.11 Safety invariants → mechanisms
 
 | Invariant | Proposed mechanism | Proposed test |
 |---|---|---|
-| I1 only Execution places | the venue is reachable only through the Execution Engine's router; no route/`Depends` hands a venue to any other module | a grep-style test that no other module imports a venue's `place_order` |
-| I2 authorization precedes any risk-increasing order | Execution refuses an entry `OrderApproved` lacking a persisted authorizer decision for its `trade_id` | an `OrderApproved` published with no decision row is rejected and logged |
+| I1 only Execution places | the venue is reachable only through the Execution Engine's router via the `execution` registry role | a grep-style test that no other module imports an `OrderVenue`'s `place_order` |
+| I2 authorization precedes any risk-increasing order | Execution refuses an entry `OrderApproved` lacking a committed `trades` decision row | an `OrderApproved` published with no decision row is rejected and logged |
 | I3 honest absence | `commission`, `slippage`, `buying_power` stay `None`; no fabricated snapshot | outcome rows with `commission_total IS NULL` on the simulated venue |
-| I4 population separation | the population label (EX-2) is written on every row and defaulted into every query | a live-labelled query never returns a simulated-labelled row |
+| I4 population separation | `execution_mode`/`execution_venue` on every row, DB `CHECK`s (§6.8), reads filter by exact mode | a query for one mode never returns another; a `simulated` row cannot be inserted as `live` |
 | I5 single owner | only Portfolio State writes `positions`; others read `get_snapshot()` | a second-writer grep test |
-| I6 dry-run default | venue selection defaults to `dry_run`; simulated/paper/live need an explicit setting | default-config test produces no fill |
+| I6 fail closed | four layers (§6.2), registry refusal, no non-simulated venue | `paper`/`live`/unknown/missing mode ⇒ pipeline unwired and every decision rejected; no fallback to `simulated` |
 | I7 no network on the critical lane | handlers only `put_nowait` | a slow fake venue does not delay an unrelated critical event |
-| I8 durable before announced | ledger write awaited before `publish` | kill-between-write-and-publish restart test |
+| I8 persist before publish | fill, closure, and authorization commit first, publish second | fault injection between commit and publish, then restart, recovers state and outcome without a duplicate |
 | I9 event time | fills stamped from tick `exchange_ts`; no `datetime.now()` in fill logic | fixture replay yields identical rows across runs |
+| I10 stable client-order ID | deterministic `"<trade_id>:entry"` / `":exit:<n>"`; `UNIQUE` in `orders` | the same authorization delivered twice yields one order and one venue submission |
+| I11 dedupe | `UNIQUE` constraints; monotonic status | a replayed `venue_fill_id` is a no-op and publishes nothing; a stale status update is ignored |
+| I12 ledger authoritative | `rebuild_from_ledger()` with a cursor; assert in-memory == replay | corrupt the in-memory state, rebuild, and the ledger wins |
+| I13 restart recovery | §6.9, before the pipeline accepts anything | kill with non-terminal orders, restart, assert reconciliation and no duplicate order |
+| I14 never discard a fill | fill commit is independent of snapshots, plans, and matching orders; anomalies flag and halt entries | an overfill and an unmatched fill are persisted and flagged; a missing snapshot still yields an outcome with `NULL` + reason |
+| I15 daily-loss gate | realized + open exposure + candidate vs cap; unknown ⇒ reject (§6.2) | tables of cases including unrealized loss, an in-flight entry, a missing mark, and a limit raised above 1 |
 
 ---
 
-## 7. Open forks (nothing below is decided)
+## 7. Forks — six resolved by decision #170, the rest still open
 
-Provisional labels **EX-1 … EX-14**. "Needs Saqib" marks forks where the answer depends on product, risk, or ordering judgment; the rest carry a recommendation the build task can proceed on unless Saqib objects.
+Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7 (the resolutions below are binding for the slice); added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the "ledger is authoritative" requirement (I12) — an inference stated openly so it can be overruled (§7.1). The other forks keep their recommendations, which the build task may proceed on unless Saqib objects — except **EX-5 and EX-12, which still need his confirmation** (§7.1).
 
-| Fork | Question | Recommendation | Needs Saqib |
+| Fork | Question | Status | Outcome / recommendation |
 |---|---|---|---|
-| EX-1 | Build order: Execution-first with a stub authorizer, manual-first, or wait for the roadmap's Phase 5 stages? | Slice A | **yes** |
-| EX-2 | How are simulated-money outcomes kept apart from real-money ones? | an explicit `execution_venue` label | **yes** |
-| EX-3 | What is the venue port, and how does Execution obtain a venue? | a narrow order-venue port + an `execution` registry role | **yes** |
-| EX-4 | Shape of the authorizer stub and its v0 rule *numbers* | one stub emitting the real event vocabulary | **yes (numbers)** |
-| EX-5 | Do protective exits need a Governor-class decision? | no, but reduce-only and Portfolio-State-checked | yes (amends I2) |
-| EX-6 | Who owns position accounting, in-flight orders, and `PositionClosed`'s lane? | Portfolio State; in-flight from `OrderApproved`; `PositionClosed` on the critical lane | **yes** |
-| EX-7 | D17's live policy for missing snapshots | pre-trade gate + a narrow post-restart fallback | **yes** |
-| EX-8 | Simulated fill model; reuse of `fill_simulator` | conventions shared, incremental model new, parity delta documented | no |
-| EX-9 | Identity and payloads: `opportunity_id`, `order_id`, `fill_id`, new models, venue-level rejection | mint at acceptance; additive fields | no (mostly) |
-| EX-10 | Durability: ledger tables vs a durable event log | ledger only; `market_events` stays separate | no |
-| EX-11 | Exit enforcement: in-process vs broker-side | in-process for simulated; broker-side mandatory before any real venue | no |
-| EX-12 | Who writes `StrategyOutcome`, and does every trade become one? | `OutcomeRecorder`; strategy-attributed trades only | yes |
-| EX-13 | Is manual mode / the Approval Queue in the first build? | no — keep the `ExecutionMode` seam | no |
-| EX-14 | `BUY/SELL` vs `long/short`, and how an order says "opens" vs "closes" | keep `BUY/SELL` on orders + explicit `position_effect` | no |
+| EX-1 | Build order | **RESOLVED (#170)** | Execution first with the stub authorizer and `SimulatedVenue`; the stub is technically restricted to simulated execution and fails closed for paper/live |
+| EX-2 | Labelling simulated-money outcomes | **RESOLVED (#170)** | separate `execution_mode` (`backtest\|simulated\|paper\|live`) and `execution_venue` (`simulated\|ibkr\|…`); `is_backtest` kept temporarily for compatibility |
+| EX-3 | Venue port and registry role | **RESOLVED (#170)** | new narrow `OrderVenue` interface + an `execution` registry role; `BrokerAdapter` not enlarged |
+| EX-4 | Authorizer stub shape and numbers | **RESOLVED (#170)** | one stub; 1 concurrent position, $1,000 notional per trade, $100 daily loss cap — all configurable |
+| EX-5 | Do protective exits need authorization? | OPEN — needs confirmation | no, but reduce-only and Portfolio-State-checked |
+| EX-6 | Position accounting, in-flight orders, `PositionClosed` lane | **RESOLVED (#170)** | Portfolio State owns them; `PositionClosed` on the critical lane only after the commit |
+| EX-7 | D17 live policy for missing snapshots | **RESOLVED (#170)** | pre-trade gate; a reported fill is never discarded; else nullable fields + a missing-data reason |
+| EX-8 | Simulated fill model; `fill_simulator` reuse | OPEN — proceed on recommendation | conventions shared, incremental model new, parity delta documented |
+| EX-9 | Identity and payloads | OPEN in part — proceed on recommendation | the client-order-ID part is settled by I10; `opportunity_id` minting, new models, venue-level rejection event remain |
+| EX-10 | Durability | **Settled by I12** | ledger-first; `market_events` stays independent future work |
+| EX-11 | Exit enforcement | OPEN — proceed on recommendation | in-process for simulated; broker-side mandatory before any real venue |
+| EX-12 | Who writes `StrategyOutcome`; what belongs in it | OPEN — needs confirmation | `OutcomeRecorder`; strategy-attributed trades only |
+| EX-13 | Manual mode in the first build | OPEN — proceed on recommendation | no — keep the placement-mode seam |
+| EX-14 | `BUY/SELL` vs `long/short`; position effect | OPEN — proceed on recommendation | keep `BUY/SELL` on orders + explicit `position_effect` |
 
-### EX-1 — Slice order  · OPEN · needs Saqib
+### EX-1 — Slice order  · RESOLVED (decision #170)
 **Question.** Build the Execution/Portfolio core first (Slice A, §5) with a stubbed authorizer, start with manual mode (Slice B), or wait for a real Decision/Planning/Governor?
-**Options.** (a) **Slice A** — simulated venue, auto path, stub authorizer. (b) **Slice B** — manual-first with Approval Queue and Input Layer. (c) **Roadmap order** — build Opportunity Engine → Decision → Planning → Governor first, then Execution.
-**Evidence.** Decision Engine/Governor "genuinely wait for real outcome data" (D4, D17); the only source of that data is a trade lifecycle; the IBKR path is unverified (#27); no manual-trading code or UI exists (F4, §1); manual trades cannot be `StrategyOutcome`s without a strategy (F10a).
-**Consequence.** (a) unblocks D17-live and D4's data starvation soonest but must keep the stub honest; (b) needs the largest frontend build and still needs an authorizer and a venue; (c) preserves stage order but leaves every downstream module blocked on data that cannot exist yet, and Kelly-style sizing in Planning has no edge estimate to use.
-**Recommendation.** (a).
+**Resolution.** Slice A: Execution first, using the stub authorizer and `SimulatedVenue`. **The stub must be technically restricted to simulated execution and must fail closed for paper or live modes** — implemented as four independent layers (§6.2) and required by I6.
+**Why (evidence).** Decision Engine/Governor "genuinely wait for real outcome data" (D4, D17); the only source is a trade lifecycle; the IBKR path is unverified (#27); no manual-trading code or UI exists (F4, §1); a strategy-less manual trade cannot be a `StrategyOutcome` (F10a).
 
-### EX-2 — Population label for simulated-money outcomes  · OPEN · needs Saqib
-**Question.** `StrategyOutcome.is_backtest` is a boolean and every query treats it as a hard boundary (I4). Where do outcomes from a *simulated live venue* go?
-**Options.** (a) **Add an `execution_venue` value** (`simulated | paper | live`; backtests keep `is_backtest = True`) as an additive column and make every live query default-filter to the venue it means. (b) **A synthetic `backtests` row per paper session** with `is_backtest = True` — no migration, but claims a run that is not a backtest and inherits `config_hash`/data-version meaning that does not apply. (c) **A separate table** for simulated live outcomes — clean separation, but a parallel query layer.
-**Evidence.** F10b; `performance_queries.py:_common_filters`; `strategy_outcomes` has no venue column and no DB check tying `is_backtest` to `backtest_run_id` (§1.3).
-**Consequence.** (a) touches `StrategyOutcome` (additive field — `schema_version` policy per `strategy-engine-design.md` §5 must be checked), one migration, and every read query gains a venue predicate; (b) hides a semantic lie in the most-queried table; (c) doubles read code.
-**Recommendation.** (a), decided **before the first row is written** — retrofitting a label onto rows already stored as `is_backtest = False` is not possible without guessing.
+### EX-2 — Population labels for simulated-money outcomes  · RESOLVED (decision #170)
+**Question.** `is_backtest` is boolean and every query treats it as a hard boundary (I4). Where do outcomes from a *simulated live venue* go?
+**Resolution.** **`execution_venue` alone is not enough — venue identity and capital mode are different concepts.** Add **`execution_mode`** (`backtest | simulated | paper | live`) and **`execution_venue`** (`simulated | ibkr | …`). Retain `is_backtest` **temporarily for compatibility** only; it is derived (`is_backtest = (execution_mode = 'backtest')`) and is not the long-term classifier. Details, constraints, and the migration's fail-closed backfill: §6.8. The population label is decided before the first row is written; retrofitting one onto already-stored rows would mean guessing.
+**Rejected.** A synthetic `backtests` row per paper session (a semantic lie in the most-queried table); a separate table (a parallel query layer).
 
-### EX-3 — Venue port and registry role  · OPEN · needs Saqib
-**Question.** How does the Execution Engine talk to a venue, given F3 (no fill callback) and that `BrokerAdapter` extends `MarketDataProvider` (a simulated venue would have to stub streaming and history)?
-**Options.** (a) **Extend `BrokerAdapter`** with an order-update callback, client order id, and open-order query; the simulated venue subclasses it and stubs the data methods. (b) **A new narrow `OrderVenue` port** (`place_order`, `cancel_order`, `get_positions`, `on_order_update`, open-order query) that `BrokerAdapter` inherits, so `IBKRAdapter` satisfies it and `SimulatedVenue` implements *only* it. (c) **Composition** — an adapter class wrapping a `BrokerAdapter`; more code, no contract change.
-**Evidence.** `base.py`; `broker_registry.py` has `streaming`/`historical` only; `system-design.md` §2 principle 1 ("nothing above the adapter layer knows IBKR or Alpaca exists. Everything talks to a `BrokerAdapter` interface").
-**Consequence.** (a) is smallest but makes the simulated venue a lie about being a data provider; (b) is a small refactor of `base.py` (a code change for the build task, not this one) and keeps principle 1; (c) grows a wrapper layer. Whichever is chosen, the registry needs an `execution` role distinct from streaming/historical so Execution can be pointed at `simulated` while IBKR keeps streaming.
-**Recommendation.** (b) plus the `execution` registry role.
+### EX-3 — Venue port and registry role  · RESOLVED (decision #170)
+**Question.** How does the Execution Engine talk to a venue, given F3 (no fill callback) and that `BrokerAdapter` extends `MarketDataProvider`?
+**Resolution.** A **new narrow `OrderVenue` interface** and an **`execution` registry role**. **`BrokerAdapter` is not enlarged** — its responsibility stays market-data connectivity, and it does not inherit the port (this replaces the earlier draft's option (b), which had it inherit). The port, its idempotency contract, and the registry role's typing and mode check: §6.4. A real venue later is a separate class with its own connection (§8).
+**Evidence.** `base.py`; `broker_registry.py` has `streaming`/`historical` only; `system-design.md` §2 principle 1 ("Everything talks to a `BrokerAdapter` interface") — which the build task must qualify for the execution path (§10, R9).
 
-### EX-4 — Authorizer stub: shape and rule numbers  · OPEN · needs Saqib (numbers)
-**Question.** What stands in for Decision → Planning → Governor in slice A, and what are its v0 numbers?
-**Options.** (a) **One stub** emitting `TradePlanned → GovernorDecision → OrderApproved/PlanRejected` (§6.2). (b) **Two thin modules** — a fixed-size Planning passthrough and a rules-only Governor v0. (c) **A human approving each order** (needs the Approval Queue, EX-13).
-**Evidence.** D1 (Decision Engine and Governor separate or merged) is open; §6.2's stub is not a commitment to either; the four rule inputs it needs exist or are in this design.
-**Consequence.** (b) is closer to the final shape but pre-empts D1; (a) keeps D1 open at the cost of one module that will be split or absorbed later. **The numbers are risk policy, not engineering:** maximum concurrent positions, daily realized-loss cap, and the fixed quantity (or fixed dollar-risk) per trade. This design will not invent them.
-**Recommendation.** (a); Saqib supplies the three numbers (the simulated venue makes any values safe to start with).
+### EX-4 — Authorizer stub: shape and rule numbers  · RESOLVED (decision #170)
+**Resolution.** **Shape:** one stub emitting `TradePlanned → GovernorDecision → OrderApproved/PlanRejected` (§6.2), not a commitment to any D1 shape. **Initial values, all configurable rather than hardcoded (§6.10):** maximum concurrent positions **1**; fixed size **$1,000 notional** per trade; daily loss cap **$100**. These are conservative first-slice defaults for validating the lifecycle, not final trading-risk settings. **The daily-loss gate considers realized loss plus current unrealized loss and open risk, not realized P&L alone** (I15, §6.2).
 
-### EX-5 — Do protective exits need authorization?  · OPEN · amends I2
+### EX-5 — Do protective exits need authorization?  · OPEN · amends I2 · needs Saqib's confirmation
 **Question.** I2 as reconciled covers *risk-increasing* orders. Does a stop, target, or EOD-flatten exit also need a Governor-class decision?
-**Options.** (a) **No** — exits are *reduce-only*, checked by the Execution Engine against Portfolio State, carrying an `exit_reason`. (b) **Yes** — every order, including exits, gets a `GovernorDecision`.
-**Evidence.** `trading-intelligence-architecture.md` §12 frames the Governor as a *risk gate* on new exposure and §13's Position Monitor issues exits; an authorization round-trip on a stop adds latency exactly when it hurts; the emergency-action design (#16) is the same shape (reduce/flatten without approval).
-**Recommendation.** (a) with the reduce-only guard as the enforced mechanism (§6.3 step 1).
+**Options.** (a) **No** — exits are *reduce-only*, checked by the Execution Engine against Portfolio State, carrying an `exit_reason` and their own client-order ID. (b) **Yes** — every order, including exits, gets a `GovernorDecision`.
+**Evidence.** `trading-intelligence-architecture.md` §12 frames the Governor as a *risk gate* on new exposure and §13's Position Monitor issues exits; an authorization round-trip on a stop adds latency exactly when it hurts; the emergency-action design (#16) is the same shape.
+**Recommendation.** (a), with the reduce-only guard as the enforced mechanism (§6.3 step 1).
 
-### EX-6 — Position accounting owner, in-flight orders, `PositionClosed` lane  · OPEN · needs Saqib
-**Question.** F13: two modules are documented as owning open positions, and the lane for `PositionClosed` can lag Governor decisions.
-**Options.** (a) **Portfolio State owns accounting** (fills → positions → closure), tracks in-flight orders from `OrderApproved`, and emits `PositionClosed`; Position Monitor is a decision module that reads it and emits exit intents; `PositionClosed` joins the critical lane. (b) **Position Monitor owns accounting** as `system-design.md` §4.8's table has it; Portfolio State becomes a read aggregate over Position Monitor's `positions`. (c) **Keep §4.6/§4.8 as written** (both consume/emit; `PositionClosed` on the normal lane).
-**Evidence.** §4.6, §4.8, `CRITICAL_EVENT_TYPES`; the double-entry race in §6.5.
-**Consequence.** (a) departs from §4.8's "Position Monitor emits `PositionClosed`" and adds one member to the critical set (two lines in `envelope.py` plus a doc row); (b) leaves exposure reads one hop stale; (c) keeps the double-owner problem and the lane lag.
-**Recommendation.** (a).
+### EX-6 — Position accounting owner, in-flight orders, `PositionClosed` lane  · RESOLVED (decision #170)
+**Resolution.** **Portfolio State owns position accounting, in-flight orders, and daily P&L** (I5), as a cache over the authoritative ledger (I12). **`PositionClosed` may use the critical lane, but only after the position closure has been committed to the database** (I8). **Documented explicitly: the critical lane provides ordering and handler-failure isolation — not persistence, delivery guarantees, crash recovery, or failure propagation to the publisher** (F6, §6.5); recovery comes from the ledger (§6.9). Departure from `system-design.md` §4.8, which has Position Monitor emit `PositionClosed`: Position Monitor is a decision module that reads Portfolio State and issues exit intents (§6.5, §6.6).
 
-### EX-7 — D17 live policy for missing snapshots  · OPEN · needs Saqib
-**Question.** What happens when `capture_strategy_outcome_snapshots()` returns `None` for a real (or simulated-real) fill (F11)?
-**Options.** (a) **Discard** the outcome (#128's backtest convention). (b) **Nullable snapshot columns** (migration + reader changes). (c) **Explicit "unavailable" sentinel** inside the dicts. (d) **Pre-trade gate**: the authorizer will not approve a symbol lacking both snapshots, leaving only the post-restart exit case, which then uses (b) or (c).
-**Evidence.** #128; `state_snapshot.py`; the market-state dict carries `candle_ts`, the context dict does not.
-**Consequence.** (a) is survivorship bias for live money; (b) is honest but the widest change; (c) is cheap but pollutes readers and stretches #128's "never a fabricated `{}`"; (d) shrinks the problem to a rare case and keeps rows honest.
-**Recommendation.** (d), with (b) as the narrow fallback — and capture entry snapshots *at fill handling with `captured_at` and the state's `candle_ts` stored alongside*, so late capture is visible rather than hidden.
+### EX-7 — D17 live policy for missing snapshots  · RESOLVED (decision #170)
+**Resolution.** **The snapshot requirement is a pre-trade gate** (§6.2, rule 3). **Once any venue reports a fill, that fill is always persisted and processed** (I14). **If a snapshot is unexpectedly unavailable, the outcome is recorded with nullable snapshot fields plus a missing-data reason — never discarded** (§6.7, §6.8). Decision #128's discard-on-`None` remains for backtest rows only. Rejected: discarding (survivorship bias for a real fill); an in-dict "unavailable" sentinel (pollutes readers, stretches #128's "never a fabricated `{}`").
 
 ### EX-8 — Simulated fill model and `fill_simulator` reuse  · OPEN
 **Options.** (a) **Reuse conventions only** (session-close EOD, stop-wins-tie, zero slippage/commission), write a new incremental model. (b) **Extract shared pure helpers** from `fill_simulator.py` — changes an existing, decision-locked module. (c) **Call `fill_simulator` incrementally** — impossible as written (F9).
 **Consequence.** (a) leaves two implementations of the same conventions, mitigated by a **parity table** and an acceptance test that replays a fixture through both; (b) is cleaner but expands the build's file footprint into `backtest_runner/`.
 **Recommendation.** (a); record the fills-at-next-tick vs fills-at-next-candle-open delta in the build's decision entry. Proceed unless Saqib objects.
 
-### EX-9 — Identity and payloads  · OPEN
-**Question.** Where is `opportunity_id` minted, who owns `order_id`, and what do the events carry?
-**Options for `opportunity_id`.** (a) At the **authorizer's acceptance** (matches #128's "mint when the signal is accepted"; no change to `Opportunity`). (b) At `OpportunityCreated` publish (needs an `Opportunity`/payload field, a `base_strategy` change).
-**`order_id`.** Minted by the stage that authorizes (`OrderApproved` already carries it); the venue's own id is stored as `venue_order_id`; Execution dedupes on `order_id`. **`fill_id`** is venue-supplied (simulated: deterministic).
-**Payloads.** Additive fields in §6.3; new models `TradePlanned`, `PositionClosed` (and reserved `OpportunitySelected`, `PositionAdjusted`); **venue-level rejection/cancel** needs either a new critical event (e.g. an `OrderStatusChanged`) or reuse of `PlanRejected` (a semantic stretch — that event is plan-level and has no `order_id`). `TradePlanned`'s two prose definitions disagree (§10, finding R2).
+### EX-9 — Identity and payloads  · OPEN in part
+**Settled by decision #170 (I10, I11):** every order has a stable, deterministic client-order ID (`OrderApproved.order_id`), minted before persistence and unique in the ledger; venue order IDs are stored separately as `venue_order_id`; fills carry a venue-supplied (simulated: deterministic) `venue_fill_id`; updates and fills are deduplicated by database constraint.
+**Still open.** *`opportunity_id`:* (a) minted at the **authorizer's acceptance** (matches #128's "mint when the signal is accepted"; no change to `Opportunity`) or (b) at `OpportunityCreated` publish (needs an `Opportunity`/payload field, a `base_strategy` change). *Payloads:* the additive fields in §6.3; new models `TradePlanned`, `PositionClosed` (and reserved `OpportunitySelected`, `PositionAdjusted`); a **venue-level rejection/cancel** needs either a new critical event (e.g. an `OrderStatusChanged`) or reuse of `PlanRejected` (a semantic stretch — that event is plan-level). `TradePlanned`'s two prose definitions disagree (§10, R2).
 **Recommendation.** (a) for id minting; a new order-status event rather than stretching `PlanRejected`; proceed unless Saqib objects.
 
-### EX-10 — Durability  · OPEN
-**Options.** (a) **Ledger-first**: `orders`/`fills`/`trades`/`positions` written before events are published (I8); no durable event log. (b) **Build `market_events`** as the durable log and derive state from it.
-**Consequence.** (b) is a much larger piece of infrastructure than the slice needs; (a) satisfies I8 for execution and leaves `market_events` as independent future work.
-**Recommendation.** (a).
+### EX-10 — Durability  · SETTLED by I12
+**Outcome.** **Ledger-first:** `orders`/`fills`/`trades`/`positions` are committed before events are published (I8) and are authoritative (I12); no durable event log is required. `market_events` remains independent future work. *(Inferred from Saqib's "the database ledger is authoritative" requirement; stated openly so it can be overruled.)*
 
 ### EX-11 — Exit enforcement  · OPEN
-**Options.** (a) **In-process monitoring** (Position Monitor-lite) — the only option for a simulated venue. (b) **Broker-side protective orders** (bracket/OCO) — required for any real venue because a process crash must not leave an unprotected position; `OrderRequest` has no stop fields today.
+**Options.** (a) **In-process monitoring** (Position Monitor-lite) — the only option for a simulated venue. (b) **Broker-side protective orders** (bracket/OCO) — required for any real venue because a process crash must not leave an unprotected position; the venue port's instruction has no stop fields yet.
 **Recommendation.** (a) for slice A; **(b) recorded as a hard prerequisite** for any real-money venue (§8).
 
-### EX-12 — Who writes `StrategyOutcome`; what belongs in it  · OPEN · needs Saqib
+### EX-12 — Who writes `StrategyOutcome`; what belongs in it  · OPEN · needs Saqib's confirmation
 **Question.** F10a and F13: `PositionClosed{position_id, exit_price, realized_pnl, r_multiple_achieved, closed_ts}` (prose) cannot build a `StrategyOutcome`, and a strategy-less manual trade cannot be one at all.
 **Options.** (a) A dedicated **`OutcomeRecorder`** joins the `trades`/`orders`/`fills` ledger with persisted snapshots; **`strategy_outcomes` holds strategy-attributed trades only** (corroborated manual trades included), while `trades` records everything. (b) **Enrich `PositionClosed`** so Performance Intelligence can build the row from the event alone. (c) **Relax the NOT NULL columns** so strategy-less manual trades fit `strategy_outcomes`.
-**Consequence.** (b) fattens an event with data the ledger already holds; (c) is a broad schema change that dilutes what `strategy_outcomes` means (evidence about strategy configurations).
-**Recommendation.** (a).
+**Consequence.** (b) fattens an event with data the ledger already holds; (c) is a broad schema change that dilutes what `strategy_outcomes` means (evidence about strategy configurations). The `execution_mode`/`execution_venue` columns (EX-2) apply to whichever rows it holds.
+**Recommendation.** (a). The §6.7 design already assumes it.
 
 ### EX-13 — Manual mode in the first build  · OPEN
-**Options.** (a) **Not in scope** — the `ExecutionMode` gate exists as a seam (`auto` only); Approval Queue, Input Layer, and `TradeRequest` wait. (b) **In scope.** 
+**Options.** (a) **Not in scope** — the placement-mode gate (`auto|manual`, §18.5's `ExecutionMode`) exists as a seam (`auto` only); Approval Queue, Input Layer, and `TradeRequest` wait. (b) **In scope.**
 **Evidence.** §5 Slice B blockers; `TradeRequest` has no stop field while `TradePlan.stop` is required (F10a) — the manual design must answer where a manual trade's stop comes from, and that answer is not in `trading-intelligence-architecture.md` §18.
 **Recommendation.** (a).
 
@@ -533,34 +679,73 @@ Provisional labels **EX-1 … EX-14**. "Needs Saqib" marks forks where the answe
 **Evidence.** F12; `StrategyOutcome.direction` is `BUY|SELL`.
 **Recommendation.** (a).
 
+### 7.1 Before a build task starts — what still needs Saqib
+
+1. **EX-5** — confirm that stop, target, and EOD-flatten exits need no fresh Governor-class decision, only the reduce-only guard (this amends I2).
+2. **EX-12** — confirm that `strategy_outcomes` holds strategy-attributed trades only, with `trades` recording everything and `OutcomeRecorder` as the writer.
+3. **Judgment calls made in this revision — confirm or overrule:**
+   - **J1 — naming.** `trading-intelligence-architecture.md` §18.5's `ExecutionMode` (`auto|manual`) is called *placement mode* here, so that `execution_mode` means the capital mode and nothing else (§10, R7).
+   - **J2 — the daily-loss gate also counts the candidate trade's own stop-out loss** ("open risk"), so at the initial values a $1,000 trade whose stop is more than 10% away is refused even on a clean day.
+   - **J3 — schema details:** `StrategyOutcome.schema_version` bumps 1 → 2; backtest rows become `execution_mode = 'backtest'`, `execution_venue = 'simulated'`; the migration aborts if any `is_backtest = false` rows exist.
+   - **J4 — recovery policy:** an entry order that was approved but never sent is *cancelled*, not re-submitted, at recovery (its opportunity is stale); exit orders are always re-submitted.
+   - **J5 — EX-10** is treated as settled by the ledger requirement.
+
+Everything else open (EX-8, the rest of EX-9, EX-11, EX-13, EX-14) proceeds on its recommendation unless Saqib objects.
+
 ---
 
 ## 8. Deferred prerequisites — not forks, and not designed here
 
 These are recorded so they are not rediscovered; none is recommended for now.
 
-- **IBKR paper/live venue** (`future-ideas.md` #27, blocked): writable connection (today `readonly=True`); a paper-only guard (the configured endpoint is the paper Gateway port, and a live port must be structurally unreachable, not merely unconfigured); a client-id policy for an order-owning connection versus the streaming connection; broker-side protective orders (EX-11); fill/status callbacks mapped into the venue port (F3, EX-3), including partials, cancels, and commissions; on-connect reconciliation of positions **and open orders** (the contract has no open-orders query); short-selling availability. **All of it is unverifiable until a real session is reached** — the adapter path is unverified live.
+- **A real venue — IBKR paper/live** (`future-ideas.md` #27, blocked): after decision #170 this is a **separate `IBKROrderVenue`** implementing the `OrderVenue` port with **its own connection and client-ID policy**; `BrokerAdapter`'s read-only market-data connection is not reused, widened, or made writable. It also needs: a paper-only guard (the configured port default is the paper Gateway; a live port must be structurally unreachable, not merely unconfigured); broker-side protective orders (EX-11); updates mapped into the port including partials, cancels, and commissions; on-connect reconciliation of positions **and open orders** (the port has both); an explicit policy for *unmatched* fills (recorded and flagged today; whether a real venue's unmatched fill may ever be adopted into positions is a decision for that design); short-selling availability; a `supported_modes` of `{paper}` or `{live}` and the registry refusal that goes with it. **All of it is unverifiable until a real session is reached.**
 - **Emergency actions** (`future-ideas.md` #16, PANIC / flatten): a real-money venue should not be enabled before flatten-everything exists. Recommendation, not a locked rule.
-- **Manual mode** — Input Layer, `TradeTarget`, hotkeys, Approval Queue UI, `ExecutionModeChanged`, and the manual trade's stop source (F10a).
+- **Manual mode** — Input Layer, `TradeTarget`, hotkeys, Approval Queue UI, placement-mode change events, and the manual trade's stop source (F10a).
 - **A real Governor rule engine, Decision Engine (D1), and Opportunity Engine (D4)** — the stub is designed so these replace it without changing Execution.
 - **Position Monitor proper** — thesis-validity checks, stop management, partials, reversal, manual-position handling (`future-ideas.md` #14).
 - **Frontend** — Positions / Trade Management / order-status widgets, and any consumer of `orders.status`.
 - **World View `portfolio` slot** — filled by a separate task once Portfolio State exists.
+- **Retiring `is_backtest`** — kept only for compatibility; its removal is a later decision.
 
 ---
 
 ## 9. Acceptance criteria proposed for the eventual build task
 
-1. **End-to-end fixture:** a scripted `OpportunityCreated` produces exactly one `strategy_outcomes` row — `is_backtest = False`, the EX-2 label set, `origin = "auto"`, every field per §4 — via the real Execution Engine, `SimulatedVenue`, Portfolio State, Position Monitor-lite, and `OutcomeRecorder`, against real PostgreSQL 16.
-2. **Idempotency:** a duplicate `OrderApproved` (same `order_id`) creates no second order; a duplicate `fill_id` creates no second fill.
-3. **Authorization gate:** an entry `OrderApproved` with no persisted authorizer decision is refused and logged (I2).
-4. **Reduce-only guard:** an exit order with no matching open position is refused.
-5. **Critical-lane isolation:** a venue whose `place_order()` blocks does not delay an unrelated critical event (I7).
-6. **Durability/restart:** killing the process between the ledger write and the publish, then restarting, rebuilds Portfolio State and resumes without a duplicate order (I8).
-7. **Honesty:** no fabricated commission, slippage, or snapshot; `outcome_status = pending_retry` (not a silent drop) when `record_strategy_outcome()` raises.
-8. **Population separation:** a live-labelled query never returns a simulated-labelled or backtest row (I4).
-9. **Parity:** the same fixture replayed through the Backtest Runner and through the live path yields outcomes whose differences are exactly those tabulated for EX-8.
-10. **Regression:** the existing suite's known-clean baseline is unchanged; `record_strategy_outcome()` gains no new signature.
+**Lifecycle**
+1. **End-to-end fixture:** a scripted `OpportunityCreated` produces exactly one `strategy_outcomes` row — `execution_mode = 'simulated'`, `execution_venue = 'simulated'`, `is_backtest = false`, `origin = 'auto'`, every field per §4 — via the real Execution Engine, `SimulatedVenue`, Portfolio State, Position Monitor-lite, and `OutcomeRecorder`, against real PostgreSQL 16.
+2. **Parity:** the same fixture replayed through the Backtest Runner and through the live path yields outcomes whose differences are exactly those tabulated for EX-8.
+
+**Fail closed (EX-1, I6)**
+3. With `execution_mode` set to `paper`, `live`, `backtest`, an unknown value, or unset-with-invalid-config, the authorizer stub does not start, the execution pipeline is not wired, and no order is ever created; there is no fallback to `simulated`.
+4. Changing the mode after startup (in a test, by replacing the mode holder) makes every subsequent decision `rejected` (`execution_mode_not_permitted`).
+5. `set_execution_venue()` refuses a venue whose `supported_modes` lacks the configured mode; the Execution Engine refuses an order whose mode the venue does not support.
+6. The stub imports no broker/venue module beyond the port's types (import-boundary test), and no other module reaches a venue's `place_order` (I1).
+
+**Ledger, idempotency, recovery (I10–I13)**
+7. The same `OrderApproved` delivered twice creates one `orders` row and one venue submission; the client-order ID is deterministic across retries.
+8. A replayed `venue_fill_id` inserts nothing and publishes nothing; a stale or out-of-order status update is ignored and logged.
+9. **Persist-before-publish:** fault injection between the commit and the publish of a fill, then of a position closure, followed by a restart, recovers Portfolio State and the outcome from the ledger with no duplicate order, fill, or outcome.
+10. **Restart recovery:** killing the process with orders in each non-terminal status and restarting reconciles each with the venue as §6.9 specifies (including `expired` for a venue that lost state, cancelled-not-resent for a stale entry, re-submitted exit) *before* any new authorization is accepted; a venue/ledger discrepancy halts new entries.
+11. **Ledger authoritative:** corrupting in-memory Portfolio State and calling `rebuild_from_ledger()` restores the ledger-derived state; a disagreement is logged and the ledger wins.
+12. A critical-lane test documents the boundary: a published-but-unhandled critical event is lost across a restart and everything it announced is still recovered from the ledger.
+
+**Never discard a fill (EX-7, I14)**
+13. An overfill and a fill for an unknown order are persisted, flagged `anomaly`, and halt new entries; they are not dropped.
+14. A missing entry snapshot, a missing exit snapshot, and a capture that raises each still yield an outcome with the field `NULL` and a reason in `snapshot_missing_reasons`; the database checks reject a `NULL` snapshot without a reason and any `NULL` snapshot on a `backtest` row.
+15. The pre-trade gate rejects a symbol lacking either snapshot half.
+
+**Limits (EX-4, I15)**
+16. Each of the three limits is read from `Settings`, overridable by environment, validated positive, and recorded in `limits_snapshot` on every decision; none appears as a literal in the authorizer.
+17. Daily-loss gate table tests: realized loss only; unrealized loss on an open position; an in-flight entry; a gap through the stop; a missing mark; a missing stop; the candidate's own stop-out loss; and a raised `max_concurrent_positions` (the open-exposure term active).
+
+**Populations (EX-2, I4)**
+18. A query for one `execution_mode` never returns another; a `simulated`-venue row cannot be inserted as `paper` or `live` and vice versa; `is_backtest` always equals `(execution_mode = 'backtest')`; the migration aborts on pre-existing `is_backtest = false` rows.
+
+**Other**
+19. **Authorization gate (I2):** an entry `OrderApproved` with no committed authorizer decision is refused and logged. **Reduce-only:** an exit with no matching open position is refused.
+20. **Critical-lane isolation (I7):** a venue whose `place_order()` blocks does not delay an unrelated critical event.
+21. **Honesty (I3):** no fabricated commission, slippage, or snapshot; `outcome_status = 'pending_retry'` (not a silent drop) when `record_strategy_outcome()` raises.
+22. **Regression:** the existing suite's known-clean baseline is unchanged except where the schema change (`schema_version`, new columns) is deliberately reflected.
 
 ---
 
@@ -572,3 +757,6 @@ These are recorded so they are not rediscovered; none is recommended for now.
 - **R4 — Related follow-up.** `performance.py`'s docstring forbids a live caller without a real Execution Engine; when the build lands, that docstring and D17's "live half" note in `strategy-engine-open-decisions.md` need the corresponding update (a docs step for the build task, not for this one).
 - **R5 — Related follow-up.** `system-design.md` §4.9 names the `OrderApproved` payload `ApprovedOrder`; no such class exists — the model is `OrderApproved` itself (`schemas/events/execution.py`). Docs-only naming drift, folded into R1's fix.
 - **R6 — Unrelated.** `IBKRAdapter.get_positions()` has no caller and no test today (§1.2). Noted, untouched.
+- **R7 — Related follow-up (naming).** `trading-intelligence-architecture.md` §18.5 defines `ExecutionMode` as `auto | manual` (who triggers placement). Decision #170 introduces `execution_mode` (`backtest | simulated | paper | live`, the capital mode). This design calls §18.5's concept *placement mode* to keep the two apart; §18.5 (and `system-design.md` §4.9's "Mode-aware" wording) should be reconciled to the same name when the manual-mode design is next touched. Left untouched here.
+- **R8 — Related follow-up.** `BrokerAdapter` still declares `place_order`/`cancel_order`/`get_positions` (and `IBKRAdapter` still stubs them) even though, after decision #170, order placement belongs to the `OrderVenue` port. They stay unwired and unchanged; whether to remove them is a later decision for the build task or after it.
+- **R9 — Related follow-up.** `system-design.md` §2 principle 1 says everything talks to a `BrokerAdapter` interface. For the execution path it will be an `OrderVenue`; the principle needs one clarifying sentence when the build lands. Left untouched here.
