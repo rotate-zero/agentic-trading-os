@@ -1,84 +1,98 @@
-# TESTING.md — Fixed five stale "no caller/writer yet" docstrings (decision #161)
+# TESTING.md — Strategy Performance strategy-name filter (decision #162)
 
-## What this closes
+Temp id during parallel work: `strategy-performance-name-filter`.
 
-Decision #158's own D-item audit of `strategy-engine-open-decisions.md`
-inventoried five stale docstring claims and one architecture question,
-explicitly leaving all six "for a future task or for Saqib's call." This
-delivery closes that list.
+## What changed
 
-## The five stale claims — verified directly, then corrected
+Frontend-only, one code file: `frontend/src/components/workspace/InfoTab.tsx`,
+inside `StrategyPerformanceSummary` and the comment block above it.
 
-All five shared the same root cause: written before decision #128's
-Backtest Runner became a real caller/writer of the persistence layer
-decision #120 built.
+- **New control:** a native `<select>` labelled "Strategy" — "All strategies"
+  (default) plus the 7 names from `BACKTEST_STRATEGY_NAMES` (imported from
+  `api-client.ts`, which is untouched). It sits between the Live/Backtest
+  header row and the source line.
+- **State:** `strategyName`, `undefined` = All strategies. Passed straight into
+  the existing `usePerformanceAnalytics({ isBacktest, strategyName })` call. No
+  hook, api-client, route or backend change was needed (the hook already had
+  `strategyName` in its filters and its `load()` dependency array since #127).
+- **Header:** names the strategy when one is selected —
+  "Strategy Performance — Backtest · ORB".
+- **Empty state:** Backtest + a selected strategy now names it; Backtest + All
+  strategies and Live are byte-for-byte unchanged (Live's reason — no Execution
+  Engine — is strategy-independent).
+- **Comment block:** the #137 paragraph claiming "no existing source of
+  selectable strategy names" is replaced with a correction citing #127/#131/
+  #133/#137/#138 and this decision.
+- **`strategyVersion`:** deliberately NOT exposed (no version source exists;
+  backend requires a name with it). Deferred, stated in the code comment and the
+  decision entry.
 
-1. **`docs/architecture/strategy-engine-design.md` §5** — "a real
-   (unwired) writer" → decision #128 is now a real, wired writer. Also
-   corrected the paragraph's "what still doesn't exist" framing (narrowed
-   to the LIVE-path caller specifically) and D17's status (resolved for
-   Backtest Runner, open for live — matching #158's own wording).
-2. **`backend/app/trading_intelligence/performance.py`** module docstring
-   — "no real caller wired into it... its only caller today is this
-   task's own test suite" → distinguished LIVE (still absent) from
-   Backtest Runner (real, since #128, via `BacktestRunner.run()`).
-3. **`backend/app/models/trading_intelligence.py`**'s `strategy_outcomes`
-   bullet — "no real caller wired yet" → corrected in the same style
-   already used one bullet down for `backtests`/#136.
-4. **`backend/app/trading_intelligence/state_snapshot.py`** — two
-   separate claims: "no migration exists yet" (migration 0008 built at
-   #120) and "a Backtest Runner" listed as hypothetical (confirmed via
-   `runner.py`'s two real `capture_strategy_outcome_snapshots()` call
-   sites — it's real now).
-5. **`backend/app/schemas/performance.py`**'s D17 discussion —
-   "deliberately UNRESOLVED" / "no code in this module resolves it either
-   way" → decision #128 chose option (a) from D17's own text (only call
-   `record_strategy_outcome()` once both snapshots are non-`None`,
-   discarding otherwise) — resolved for Backtest Runner, still open for
-   the live path.
+Docs, same delivery: `docs/architecture/strategy-engine-design.md` §5 (correction
+pointer on the #137 note + a short as-built note with two delta diagrams), the
+decision entry in `docs/decisions/confirmed-decisions.md`, and its `INDEX.md` row.
 
-Every claim was verified directly against the live file (`grep`/read)
-before editing — none were corrected on the strength of #158's summary
-alone.
+## Verified
 
-## D13 — reaffirmed, not silently left stale
+| Check | Result |
+|---|---|
+| `npx tsc -b` | Output identical to a fresh untouched clone: only the 4 known #35 `GridPresetPicker` errors, zero new |
+| `npx vite build` | Clean. Built CSS is byte-identical before/after (same hash) — no new Tailwind classes |
+| Throwaway vitest/jsdom harness (real edited `InfoTab.tsx` + real hook + real `api-client.ts`; only unrelated sibling hooks and `fetch` stubbed) | 8/8 passed |
+| Harness mutation checks | 3 mutations, each failed exactly one test: reverting to the pre-#137 `loading && isEmpty` gate; removing the hook's cancelled guard; sending `""` instead of `undefined` |
+| Footprint | `diff -rq` against a freshly re-pulled clone — see the decision entry's footprint paragraph |
 
-D13's resolution ("import `Opportunity` directly, don't move it") rested
-on "no cross-module consumer today." Confirmed directly:
-`backend/app/backtest_runner/fill_simulator.py` and `runner.py` both
-`from app.strategy_engine.base_strategy import Opportunity`. A real
-cross-module consumer exists now — but it's Backtest Runner, not the
-Opportunity Engine (§9) D13's own text named as its anticipated trigger.
+The harness lives outside the repo and is NOT shipped (no frontend test
+framework exists here; adding one is a `package.json` change and its own
+decision). What it asserted: default requests carry no `strategy_name`;
+selecting ORB sends `strategy_name=ORB&is_backtest=true` to both routes and
+shows "Loading…" instead of the previous rows; `Volume Spike` is sent as
+`Volume%20Spike`; returning to All drops the param entirely; the selection
+survives the Live toggle (`is_backtest=false`); the three empty/error messages;
+a rapid ORB→Gap change never lets ORB's late response overwrite Gap's.
 
-**Call made, stated plainly rather than deferred again:** reaffirmed
-as import-directly, not moved. D13's own text already said "no code
-change required by this resolution either way," the existing import
-already works correctly, and moving the class now would be a pure
-consistency change with no functional necessity behind it. This is a
-low-stakes, trivially reversible call — if you'd rather have
-`Opportunity` moved into `schemas/events/opportunity.py` for consistency
-with `MarketState`/`ContextChanged`/`FeatureSet`, that's a small,
-easily-scheduled follow-up, not something this correction blocks. The
-Opportunity Engine trigger D13 originally named has still not occurred.
+## Not covered
 
-## Scope discipline
+- **No real backend/Postgres round trip.** `fetch` was stubbed. The backend is
+  untouched, and `test_performance_analytics_routes.py` (#127) already covers the
+  route-side `strategy_name` filtering; I did not re-run the backend suite.
+- **No browser paint check.** The harness runs inside React's `act`, so it cannot
+  observe a paint between commit and effect. That rests on React 18.3.1
+  (`createRoot`) flushing passive effects synchronously for discrete events —
+  the same mechanism #137's Live/Backtest toggle already relies on.
+- **Which strategies have backtest data.** Not checked; the empty message is
+  deliberately worded so a strategy with zero recorded outcomes reads honestly.
 
-No code logic, test, or persistence behavior changed anywhere — every
-edit is a docstring, a design-doc paragraph, or the D13 table row.
+## Manual check (5 minutes, needs the backend and one backtest run)
 
-## Verification
+1. Run a backtest from the Backtest panel (e.g. ORB or FirstPullback on a
+   fixture scenario).
+2. Info tab → General → Strategy Performance. Default should read
+   "— Backtest" with "All strategies" selected.
+3. Pick the strategy you ran. Header becomes "— Backtest · <name>"; browser
+   Network tab shows `...?strategy_name=<name>&is_backtest=true` on both routes.
+4. Pick a strategy you did not run. Expect the strategy-named empty message.
+5. Click Live with a strategy still selected. Selection stays; Live's original
+   empty message shows.
+6. Pick "All strategies". Requests drop `strategy_name`.
 
-- All four edited `.py` files confirmed to still compile
-  (`python3 -m py_compile`) — clean.
-- `diff -rq` against a freshly-pulled `main` confirms exactly six files
-  changed: `docs/architecture/strategy-engine-design.md`,
-  `docs/architecture/strategy-engine-open-decisions.md`,
-  `backend/app/trading_intelligence/performance.py`,
-  `backend/app/models/trading_intelligence.py`,
-  `backend/app/trading_intelligence/state_snapshot.py`,
-  `backend/app/schemas/performance.py` — plus this file,
-  `confirmed-decisions.md`, and `INDEX.md`.
-- Decision log tail re-checked both before starting and immediately
-  before writing entry #161: #160 was latest both times, no collision.
-- No tests run — docs/docstring-only change, matching decision #158's
-  own precedent for this exact class of correction.
+## Merge notes
+
+- **Zero file overlap** with `backtest-sweep-frontend-ui` (`BacktestPanel.tsx`,
+  `BacktestResultsPanel.tsx`, `api-client.ts`, `useBacktest*.ts`) — no manual
+  merge expected. `CHANGES.md` was deliberately not touched.
+- **`TESTING.md`** is delete-first per repo convention. If another delivery's
+  `TESTING.md` lands too, keep both as sections.
+- **Decision number.** `main` was at #161 on every check (start, mid-task, just
+  before packaging), so this delivery took #162. If another delivery lands
+  #162 first, renumber only this delivery's own references:
+  `grep -rn "#162" frontend/src/components/workspace/InfoTab.tsx docs/architecture/strategy-engine-design.md docs/decisions/confirmed-decisions.md docs/decisions/INDEX.md TESTING.md`
+  (the entry heading and INDEX row are the two that must match). Never change
+  another delivery's number.
+
+## Found, not fixed (out of this task's file boundary)
+
+`api-client.ts:830` (the `BACKTEST_STRATEGY_NAMES` comment block) and `:914`,
+`useBacktestRun.ts:7`, and `backtest-runner-design.md` §7 (lines 153/570) still
+cite "decision #130" for `POST /backtest/run`; #131 says that citation should be
+#131. #131's own footprint list never corrected `api-client.ts`. Suitable for a
+small future citation-only task.

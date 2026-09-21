@@ -394,7 +394,61 @@ fetch resolves
                       not live trading results."
 ```
 
-`strategyName`/`strategyVersion` — also real filters on the same hook/routes — deliberately NOT exposed by this toggle: no source of selectable strategy names exists anywhere in this codebase today (checked directly), and building one is a separate UI/data-source design question, not a natural extension of a two-state provenance toggle. Stays real, deferred future work, same as `future-ideas.md`'s own pattern for named-but-not-yet-triggered ideas.
+`strategyName`/`strategyVersion` — also real filters on the same hook/routes — deliberately NOT exposed by this toggle: no source of selectable strategy names exists anywhere in this codebase today (checked directly), and building one is a separate UI/data-source design question, not a natural extension of a two-state provenance toggle. Stays real, deferred future work, same as `future-ideas.md`'s own pattern for named-but-not-yet-triggered ideas. *(Correction, decision #162 — the "no source of selectable strategy names" claim was inaccurate when written: `BACKTEST_STRATEGY_NAMES` in `api-client.ts` already existed, predating #133. `strategyName` is now exposed — see the as-built note immediately below. `strategyVersion` remains deferred. Also superseded since: the default view is Backtest, not `"live"` (decision #138).)*
+
+**As-built note (decision #162) — `strategyName` filter added to `StrategyPerformanceSummary`.** A native `<select>` ("All strategies" + the 7 names from `BACKTEST_STRATEGY_NAMES`, the same list `BacktestPanel.tsx`'s Strategy `<select>` renders) drives the hook's existing `strategyName` argument. Frontend-only, one file (`InfoTab.tsx`): `usePerformanceAnalytics.ts`, `api-client.ts`, both routes and `performance_queries.py` are unchanged. This note is a delta on the #137 diagrams above, which hard-code `usePerformanceAnalytics({ isBacktest })` and a bare `?is_backtest=<bool>` query and therefore no longer describe the full chain.
+
+**Cross-component data flow — only what the filter adds:**
+
+```
+BACKTEST_STRATEGY_NAMES   (api-client.ts — imported, UNCHANGED)
+   the 7 names; each == that Strategy's own `.name` in default_registry(), i.e. the
+   string BacktestRunner writes to strategy_outcomes.strategy_name
+              │  one <option> per name, plus a leading "All strategies"
+              ▼
+Native <select>   (InfoTab.tsx, StrategyPerformanceSummary)
+              │
+              ▼
+Local state: strategyName  (name | undefined; undefined == All)
+              │             ◄── NOT WorkspaceContext, same reasoning as `view`
+              ▼
+usePerformanceAnalytics({ isBacktest, strategyName })       ◄── hook UNCHANGED
+              │
+              ▼
+GET /win-rate-by-hour?[strategy_name=<name>&]is_backtest=<bool>
+GET /expectancy-by-session-type?[strategy_name=<name>&]is_backtest=<bool>
+              │   param OMITTED for All — never sent as ""; routes UNCHANGED
+              ▼
+get_win_rate_by_hour() / get_expectancy_by_session_type()
+              │   strategy_name applied in SQL (#122/#124); UNCHANGED
+              ▼
+strategy_outcomes
+```
+
+**Internal flow — inside `StrategyPerformanceSummary` when the selection changes:**
+
+```
+<select> change ──► strategyName  (undefined == All strategies)
+        │
+        ├──► header: "— Backtest"  or  "— Backtest · ORB"    (label always matches the request)
+        │
+        └──► hook dependency array [strategyName, strategyVersion, isBacktest]  (#127)
+                    │  re-runs load()
+                    ▼
+             loading = true ──► #137's `loading`-only gate shows "Loading…" — never the
+                    │           previous selection's rows; a superseded in-flight fetch
+                    │           is cancelled, not rendered
+                    ▼
+             fetch resolves
+                    ├── error → distinct error state (unchanged)
+                    ├── empty → Live:              unchanged message (no Execution Engine —
+                    │                              strategy-independent)
+                    │           Backtest + All:    unchanged message
+                    │           Backtest + name:   message names the strategy
+                    └── data  → existing win-rate / expectancy rows
+```
+
+`strategyVersion` stays deferred, and deliberately so: unlike names, no list of selectable versions exists (versions are per-strategy strings such as `"orb_v1"`, minted in each strategy's `default_config()`; the UI only ever shows one as a read-only field on a single result), and `_validate_strategy_filters()` rejects a version without a name (400, #127), so a version control would also have to depend on the name selection. That is its own design/data-source question.
 
 ---
 

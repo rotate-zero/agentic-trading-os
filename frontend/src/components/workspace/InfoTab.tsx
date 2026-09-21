@@ -11,7 +11,11 @@ import { useMarketState } from "../../hooks/useMarketState";
 import { useWorldView } from "../../hooks/useWorldView";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
-import type { HourlyWinRateWireShape, SessionTypeExpectancyWireShape } from "../../services/api-client";
+import {
+  BACKTEST_STRATEGY_NAMES,
+  type HourlyWinRateWireShape,
+  type SessionTypeExpectancyWireShape,
+} from "../../services/api-client";
 
 const CONNECTOR_COLORS: Record<number, string> = {
   0: "#F85149",
@@ -118,14 +122,50 @@ function RecentClosedTrades() {
 // precedent of pinning isBacktest explicitly rather than relying on
 // the backend's implicit default.
 //
-// strategyName/strategyVersion (also supported by the hook/route)
-// deliberately NOT exposed here — kept to the same "minimal surfacing
-// of an existing capability, not a new dashboard" posture decision
-// #127 itself established. There is no existing source of selectable
-// strategy names anywhere in this codebase (checked directly); adding
-// selectors would mean solving that data-source/UX question too,
-// which is a separate, later task, not a natural extension of a
-// two-state provenance toggle. Deliberate deferral, not an omission.
+// Decision #162 — strategyName filter added; #137's deferral of it is
+// CLOSED here, and the reason #137 gave for it was wrong. #137 wrote
+// "There is no existing source of selectable strategy names anywhere
+// in this codebase (checked directly)." In fact BACKTEST_STRATEGY_NAMES
+// (api-client.ts) — the 7 real v1 strategy names, each equal to that
+// Strategy's own `.name` in default_registry() and so to the
+// strategy_name every backtest outcome row is written under — already
+// existed, and was already rendered as BacktestPanel.tsx's Strategy
+// <select>, when #137 was written. It arrived with BacktestPanel's own
+// frontend delivery (unnumbered, self-cited as "decision #130";
+// decision #134 later calls it "decision #131's frontend"), ahead of
+// #133 and #137. The claim was inaccurate when written, not overtaken
+// since. #138 then restated the deferral as "choosing a strategy is a
+// separate UI decision" — this is that decision:
+//   - Control: a native <select> ("All strategies" + the 7 names), not
+//     a button row like the Live/Backtest toggle. Eight options, some
+//     as long as "FirstPullback", don't fit one row in this narrow,
+//     resizable panel, and BacktestPanel already uses a <select> for
+//     the same list. The toggle stays a button row (two states); the
+//     <select> reuses its font-mono / text-[10px] / base-border look.
+//   - "All strategies" is the default and means strategyName =
+//     undefined — today's exact request, no strategy_name param —
+//     never a strategy picked on the person's behalf. undefined, not
+//     "": _performanceAnalyticsQuery only omits the param for
+//     undefined, so "" would send `strategy_name=` and match nothing.
+//   - The selection is independent of Live/Backtest and survives
+//     switching between them. Local state, same reason `view` is.
+//   - usePerformanceAnalytics.ts, api-client.ts and the backend are
+//     unchanged: the hook's own [strategyName, strategyVersion,
+//     isBacktest] dependency array (#127) already refetches on a name
+//     change, through the same load()/`loading` gate #137 built.
+//   - The header names the strategy when one is selected, and the
+//     Backtest empty message names it too: a strategy filter can now
+//     itself be why nothing matches, and "run a backtest" has to say
+//     which strategy. The Live message is unchanged — its stated reason
+//     (no Execution Engine) is strategy-independent.
+// strategyVersion is STILL deliberately not exposed. Unlike names, no
+// list of selectable versions exists (strategy_version is a per-
+// strategy string like "orb_v1", minted in each strategy's
+// default_config(); the UI only ever shows it as a read-only field on
+// a single result), and the backend rejects a version without a name
+// (400, #127), so a version control would also have to depend on the
+// name selection. That is its own design/data-source question —
+// deferred, not improvised here.
 //
 // Found while wiring the toggle, not part of the original ask: with a
 // static filters argument (the only way this hook was ever called
@@ -152,28 +192,45 @@ function formatHourEt(hourEt: number): string {
 
 type StrategyPerformanceView = "live" | "backtest";
 
+// One selectable strategy name; `undefined` is "All strategies".
+type StrategyPerformanceStrategy = (typeof BACKTEST_STRATEGY_NAMES)[number] | undefined;
+
 function StrategyPerformanceSummary() {
   // Decision #138: backtests currently produce the only persisted outcomes.
   const [view, setView] = useState<StrategyPerformanceView>("backtest");
+  // Decision #162: undefined = "All strategies" (no strategy_name param).
+  const [strategyName, setStrategyName] = useState<StrategyPerformanceStrategy>(undefined);
   const isBacktest = view === "backtest";
-  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics({ isBacktest });
+  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics({ isBacktest, strategyName });
   const isEmpty = winRateByHour.length === 0 && sessionExpectancy.length === 0;
 
   // Honest, view-specific absence — "no live data" and "no backtest
   // data" are different facts, not one collapsed message: the former
   // because no Execution Engine exists to write live rows at all; the
   // latter because no backtest run happens to have produced a matching
-  // row (a fixable, per-run fact, not a structural one).
+  // row (a fixable, per-run fact, not a structural one). With a
+  // strategy selected, the Backtest message names it — the filter can
+  // itself be the reason nothing matches, and a run of THAT strategy is
+  // what would change it (a run can also legitimately record none:
+  // decision #131). The Live message stays as-is: no Execution Engine
+  // means no live rows for any strategy, so naming one would imply a
+  // strategy-specific absence that isn't the real reason.
   const emptyMessage =
     view === "live"
       ? "No live performance data is available yet — no Execution Engine exists to write it."
-      : "No matching backtest performance data is available yet — run a backtest to populate this.";
+      : strategyName === undefined
+        ? "No matching backtest performance data is available yet — run a backtest to populate this."
+        : `No backtest performance data for ${strategyName} is available yet — run a backtest with this strategy (a run can legitimately record none).`;
 
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center justify-between gap-2">
         <div className="text-[11px] uppercase tracking-wide text-text-muted">
-          Strategy Performance <span className="text-text-primary">— {view === "live" ? "Live" : "Backtest"}</span>
+          Strategy Performance{" "}
+          <span className="text-text-primary">
+            — {view === "live" ? "Live" : "Backtest"}
+            {strategyName !== undefined && ` · ${strategyName}`}
+          </span>
         </div>
         <div className="flex gap-1">
           <button
@@ -198,6 +255,21 @@ function StrategyPerformanceSummary() {
           </button>
         </div>
       </div>
+      <label className="flex items-center gap-2">
+        <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Strategy</span>
+        <select
+          value={strategyName ?? ""}
+          onChange={(e) => setStrategyName(BACKTEST_STRATEGY_NAMES.find((name) => name === e.target.value))}
+          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary outline-none focus:border-signal"
+        >
+          <option value="">All strategies</option>
+          {BACKTEST_STRATEGY_NAMES.map((name) => (
+            <option key={name} value={name}>
+              {name}
+            </option>
+          ))}
+        </select>
+      </label>
       <div className="text-[10px] text-text-muted">
         {view === "backtest"
           ? "Backtest-derived performance from simulated StrategyOutcome data."
