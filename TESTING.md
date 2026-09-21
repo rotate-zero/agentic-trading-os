@@ -1,74 +1,68 @@
-# TESTING — decision #165: first-class sweep outcome filtering
-
-## Behavior changed
-
-`GET /intelligence/strategy-outcomes` now accepts `sweep_id` and resolves
-sweep membership with a SQL join from `strategy_outcomes.backtest_run_id` to
-`backtests.run_id` and `backtests.sweep_id`. It requires `is_backtest=true`,
-rejects malformed UUIDs with 400, returns an honest empty 200 for an unknown
-valid sweep, AND-combines with `backtest_run_id`, and applies ordering and
-`limit` once globally.
-
-`fetchStrategyOutcomes()` accepts the additive optional `sweepId`. A sweep
-refresh now performs exactly two requests: `/backtest-runs?sweep_id=...` for
-all run metadata and `/strategy-outcomes?is_backtest=true&sweep_id=...` for
-all outcomes. The hook retains both collections so zero-outcome runs remain
-visible.
+# TESTING — decision #166: explicitly exclude the deferred GridPresetPicker sketch
 
 ## Baseline and validation
 
 Starting repository: `/home/rotate_zero/projects/agentic-trading-os`, branch
-`main`, commit `57157cce7cce04a2172e97047c9dcf64f6ff03f9`, clean and equal to
-`origin/main`. Starting decision tail: #164. The nine-file start hashes were
-recorded before editing; no allowed file differed from `origin/main`.
+`main`, commit `1fd925bef115233bcae812d2fade0e7db5238b2b`, clean and equal to
+`origin/main` after the required fetch. The refreshed `main` already included
+the parallel sweep-filter delivery at decision #165.
 
-Clean-main baselines:
+Before the change, `cd frontend && npx tsc -b` exited 1 with exactly these four
+known decision-#35 errors:
 
-- targeted route module: `12 passed`;
-- full backend suite: `804 passed, 0 failed, 0 skipped`;
-- `npx tsc -b`: four known decision-#35 `GridPresetPicker.tsx` errors only.
+- `src/components/workspace/GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.`
+- `src/components/workspace/GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.`
+- `src/components/workspace/GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.`
+- `src/components/workspace/GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.`
 
-Post-change targeted real-Postgres validation used an isolated PostgreSQL 18
-instance on port 55434 with migrations through 0011:
+After the change, `cd frontend && npx tsc -b` passed with zero TypeScript
+errors, and `npm run build` passed (`tsc -b && vite build`). The compiler file
+list from `npx tsc --noEmit --listFiles -p tsconfig.json` contains no
+`GridPresetPicker.tsx`.
 
-- Alembic upgrade through 0011 — passed;
-- targeted route module — `18 passed`.
+## Reachability and integrity
 
-Post-change validation:
+Before and after editing, `rg -n "GridPresetPicker" frontend/src` reported only
+the component's own declaration/file path; no application file imports it. The
+component therefore remains unreachable, and TypeScript will still include it if
+a live file imports it in the future.
 
-- full backend suite against the isolated database: `810 passed, 0 failed, 0 skipped`;
-- `npx tsc -b`: the same four known `GridPresetPicker.tsx` errors, with no new errors;
-- `npx vite build`: passed, 101 modules transformed;
-- `git diff --check`: passed;
-- source review confirms one sweep outcomes request, no per-run outcomes map, no client merge/re-sort, and no model/schema/migration changes.
-- `unzip -l backtest-sweep-outcomes-filter.zip`: exactly the nine listed root-relative files, with no wrapper directory or metadata.
+The start SHA-256 for
+`frontend/src/components/workspace/GridPresetPicker.tsx` was
+`cfae235139c8a7c1f270db32a54a80fb4e2c5ba13381e4adbad1813bb5e89599`; the final
+hash is identical. `GridPicker.tsx`, `WorkspaceContext.tsx`, and
+`types/workspace.ts` also remain unchanged. The exact compiler exclusion is:
 
-## Coverage
+```json
+"exclude": ["src/components/workspace/GridPresetPicker.tsx"]
+```
 
-The added real-Postgres tests cover two runs in one sweep, exclusion of a
-different sweep and live outcomes, unknown and malformed sweep IDs, missing
-backtest isolation, consistent and inconsistent combined filters, global
-newest-first ordering, and one global limit across runs. Existing route tests
-remain in the same module. No frontend test framework was added; TypeScript,
-Vite, static source checks, and request-shape review cover the hook/client
-change.
+No strictness, emit, library-check, dependency, script, live-source, or backend
+behavior was changed. Workspace preset save/export was deliberately not
+implemented, the sketch was not repaired or deleted, and no backend tests were
+run because no backend code changed.
 
 ## Collision, continuity, and footprint
 
-The final remote fetch confirmed `origin/main == 57157cce7cce04a2172e97047c9dcf64f6ff03f9`, unchanged from the starting commit. All nine origin blobs matched the nine recorded start hashes, so there was no collision. Archives cover contiguous `001-060`, `061-079`, `080-090`, `091-106`, `107-121`, and `134-160` plus the existing `122-133` range; the live index/log end at #164 on refreshed `main`, so this delivery is #165. Existing decision bodies and archive files remain unchanged.
+The required initial fetch found `HEAD == origin/main` at the start commit. A
+final collision fetch was performed immediately before decision-log numbering;
+the parallel sweep-filter delivery was already landed and its bookkeeping was
+refreshed rather than overwritten. The final check compared all seven allowed
+files with their start versions, then confirmed the refreshed decision index/log
+tail and archive ranges were contiguous and non-overlapping before assigning the
+next decision number.
 
-The exact allowed footprint is:
+`git diff --check` passed. Markdown links in edited files resolve. The complete
+diff contains only intentional changes, and the exact changed-file footprint is:
 
-1. `backend/app/api/routes/intelligence.py`
-2. `backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`
-3. `frontend/src/services/api-client.ts`
-4. `frontend/src/hooks/useBacktestSweepOutcomes.ts`
-5. `docs/architecture/backtest-runner-design.md`
-6. `docs/decisions/INDEX.md`
-7. `docs/decisions/confirmed-decisions.md`
-8. `CHANGES.md`
-9. `TESTING.md`
+1. `frontend/tsconfig.json`
+2. `backend/README.md`
+3. `docs/decisions/future-ideas.md`
+4. `docs/decisions/INDEX.md`
+5. `docs/decisions/confirmed-decisions.md`
+6. `CHANGES.md`
+7. `TESTING.md`
 
-No model, schema, migration, sweep execution code, panel, unrelated hook or
-route is permitted to change. The delivery archive will contain exactly these
-nine root-relative paths and no wrapper directory, logs, caches, or metadata.
+The delivery archive contains exactly these seven root-relative files and no
+wrapper directory, build output, cache, logs, node modules, Git metadata, or
+unchanged files.

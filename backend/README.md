@@ -403,15 +403,15 @@ npm install
 npm run dev
 ```
 
-Verified before shipping: a full `tsc -b && vite build` succeeds, and the actual
-CORS headers + error-response JSON shape were checked against a real running
+Verified before shipping: `npm run build` (`tsc -b && vite build`) succeeds, and the
+actual CORS headers + error-response JSON shape were checked against a real running
 backend (not assumed to match what the frontend's error handling expects).
 
-**One pre-existing, unrelated bug worth knowing about:** `GridPresetPicker.tsx`
+`GridPresetPicker.tsx` is an unreachable, deferred workspace-preset sketch. It
 references a `GRID_PRESETS` export and `preset`/`setPreset` context fields that don't
-exist anywhere in the codebase — confirmed via `git diff` that this wasn't touched by
-any of the backend/data-provider work, and it's not imported by anything else either,
-so it's dead code rather than something actively broken at runtime. Only `tsc -b`'s
-full-project type-check catches it (`vite build` alone, and `npm run dev`, won't).
-Worth deciding whether to finish it or delete it — not touched here since it's out of
-scope for a data-source swap.
+exist in the real workspace model, and it is not imported by any application file.
+The exact file is explicitly excluded from the active TypeScript project in
+`frontend/tsconfig.json`, so `npm run build` provides a genuinely clean frontend
+build baseline. This exclusion neither implements nor abandons the wanted workspace
+preset save/export feature; Future Ideas entry 18 remains the authority for
+revisiting it.

@@ -224,7 +224,12 @@
 
 **Correction to the record:** `confirmed-decisions.md` #35 characterized `frontend/src/components/workspace/GridPresetPicker.tsx` as an unrelated pre-existing bug — dead code referencing a `GRID_PRESETS` export and `preset`/`setPreset` context fields that don't exist anywhere, found incidentally during an unrelated task and flagged for a fix-or-delete decision. That technical description is still accurate (the file is still broken exactly that way, and still not imported by anything real). What #35 didn't know: the file isn't random abandoned code — it's an incomplete first attempt at *this* feature, wired against a `preset`/`setPreset` shape `WorkspaceContext` never actually grew, while the real, live grid implementation (`GridPicker.tsx`, `gridLayout`/`setGridLayout`) went a different direction. So the honest status is "a real, wanted feature with one abandoned false start sitting in the tree," not "dead code, disposition TBD."
 
-**Priority:** explicitly not now. `GridPresetPicker.tsx` stays exactly as it is — untouched, still filtered out of `tsc -b` output per #35's existing convention — until this is actually picked up.
+**Priority:** explicitly not now. `GridPresetPicker.tsx` stays exactly as it is —
+untouched, with the exact file explicitly excluded from the active TypeScript
+project in `frontend/tsconfig.json` — until this is actually picked up.
+
+When the feature is activated, the implementation must be redesigned against the
+real workspace model and the exclusion removed as part of that future delivery.
 
 **Trigger to revisit:** whenever workspace preset save/(export) actually becomes the next thing to build.
 

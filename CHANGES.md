@@ -1,3 +1,26 @@
+# CHANGES — decision #166: explicitly exclude the deferred GridPresetPicker sketch
+
+## Current delivery
+
+Restored a clean active frontend TypeScript/build baseline by explicitly excluding
+the unreachable, deferred `frontend/src/components/workspace/GridPresetPicker.tsx`
+sketch from `frontend/tsconfig.json`. The sketch remains untouched and workspace
+preset save/export remains deferred; no live frontend source, backend code, or
+dependencies changed.
+
+Updated the frontend-build note in `backend/README.md`, Future Ideas entry 18, the
+decision index/log, and this task's testing record. The active program now passes
+`npx tsc -b`, and `npm run build` passes its TypeScript and Vite stages.
+
+## Boundary
+
+Exactly seven files change: `frontend/tsconfig.json`, the scoped frontend note in
+`backend/README.md`, Future Ideas entry 18, the two live decision-log files,
+`CHANGES.md`, and `TESTING.md`. No backend tests are run because no backend code
+changes.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #165: first-class sweep outcome filtering
 
 ## Current delivery

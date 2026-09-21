@@ -146,3 +146,50 @@ The exact footprint is `backend/app/api/routes/intelligence.py`,
 row, `CHANGES.md`, and `TESTING.md`. Deliberately unchanged are models,
 schemas, migrations, sweep execution, `BacktestResultsPanel.tsx`, unrelated
 hooks/routes, and all other documentation.
+
+---
+
+### 166. Explicitly exclude the deferred `GridPresetPicker` sketch from the active TypeScript project
+
+The clean-main baseline was not clean because the full frontend TypeScript
+program included `frontend/src/components/workspace/GridPresetPicker.tsx`, an
+unreachable abandoned first sketch for the deferred workspace-preset feature.
+Before this delivery, `npx tsc -b` reported exactly four errors in that file:
+
+- `GridPresetPicker.tsx(2,10): error TS2305: Module '"../../types/workspace"' has no exported member 'GRID_PRESETS'.`
+- `GridPresetPicker.tsx(6,11): error TS2339: Property 'preset' does not exist on type 'WorkspaceContextValue'.`
+- `GridPresetPicker.tsx(6,19): error TS2339: Property 'setPreset' does not exist on type 'WorkspaceContextValue'.`
+- `GridPresetPicker.tsx(19,30): error TS7006: Parameter 'p' implicitly has an 'any' type.`
+
+The component was not repaired because its `GRID_PRESETS`/`preset`/`setPreset`
+shape is not the real workspace model, and it was not deleted because Future
+Ideas #18 records workspace preset save/export as a wanted but explicitly
+deferred feature. The exact narrow resolution is an `exclude` entry in
+`frontend/tsconfig.json`:
+
+```json
+"exclude": ["src/components/workspace/GridPresetPicker.tsx"]
+```
+
+This does not weaken checks for live code: the exclusion names one file only,
+does not change strictness or any other compiler behavior, and TypeScript would
+still include the file if a live source file imported it. A source search before
+and after the change found only the sketch's own declaration/path and no
+application import. The live `GridPicker.tsx` uses the real `gridLayout` and
+`setGridLayout` workspace contract and was not changed.
+
+**Verification.** After the exclusion, `npx tsc -b` passed with zero errors and
+`npm run build` passed its `tsc -b && vite build` stages, with Vite transforming
+101 modules. `npx tsc --noEmit --listFiles -p tsconfig.json` produced no
+`GridPresetPicker.tsx` entry. The component's SHA-256 remained
+`cfae235139c8a7c1f270db32a54a80fb4e2c5ba13381e4adbad1813bb5e89599`. No backend
+tests were run because no backend code changed.
+
+**Exact footprint.** The seven changed files are `frontend/tsconfig.json`, the
+scoped frontend-build note in `backend/README.md`, entry 18 of
+`docs/decisions/future-ideas.md`, this `docs/decisions/confirmed-decisions.md`
+entry, its `docs/decisions/INDEX.md` row, `CHANGES.md`, and `TESTING.md`.
+`GridPresetPicker.tsx`, all other frontend source, backend code/tests,
+dependencies, lockfiles, architecture documents, roadmap documents, and
+decision archives remain unchanged. Workspace preset save/export was not
+implemented.

@@ -15,5 +15,6 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/components/workspace/GridPresetPicker.tsx"]
 }
