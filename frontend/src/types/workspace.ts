@@ -744,4 +744,15 @@ export interface MainWindowState {
   // once per active-window shell (App.tsx), not per sub-window or
   // globally. `null` = no run has finished yet in this Main Window.
   lastBacktestRunId: string | null;
+  // Backtest Runner's most recent sweep_id (decision #163) — same "one
+  // panel sets a piece of shared state, a sibling
+  // panel reads it" pattern as lastBacktestRunId immediately above, kept
+  // as its OWN separate field rather than overloading lastBacktestRunId:
+  // a finished sweep produces many run_ids (one per symbol×scenario
+  // pair), so there is no single "the" run_id a sweep could set here —
+  // BacktestPanel.tsx's sweep mode sets this field instead, and
+  // BacktestResultsPanel.tsx's own sweep_id filter mode reads it to
+  // default its filter, mirroring lastBacktestRunId's own read side
+  // exactly. `null` = no sweep has finished yet in this Main Window.
+  lastBacktestSweepId: string | null;
 }

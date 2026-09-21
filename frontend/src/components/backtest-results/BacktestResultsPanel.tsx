@@ -1,8 +1,9 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestOutcomes } from "../../hooks/useBacktestOutcomes";
 import { useBacktestRuns } from "../../hooks/useBacktestRuns";
+import { useBacktestSweepOutcomes } from "../../hooks/useBacktestSweepOutcomes";
 import { useWorkspace } from "../../state/WorkspaceContext";
-import type { StrategyOutcomeWireShape } from "../../services/api-client";
+import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -283,127 +284,87 @@ function RunMetadataCard({ runId }: { runId: string }) {
   );
 }
 
-// Decision #134's own filter-mode split. `lastBacktestRunId` (shared
-// WorkspaceContext state, set by BacktestPanel.tsx when a run finishes)
-// is a DEFAULT, never a forced value — the task's own scope explicitly
-// requires that a person can still type or clear the filter and look at
-// something else, and that a run finishing elsewhere must never silently
-// overwrite an in-progress manual lookup already sitting in this filter.
+// Compact per-run strip for sweep_id filter mode — one line per
+// BacktestRunRecord resolved for the applied sweep_id (GET
+// /intelligence/backtest-runs?sweep_id=..., decision #136, confirmed
+// directly to already support this filter). Deliberately NOT a second
+// RunMetadataCard per run: that card's full field grid (11 rows) times up
+// to BACKTEST_SWEEP_MAX_PAIRS (20) runs would dwarf the outcomes list
+// below it for a browsing view whose real subject is the sweep's own
+// outcomes, not any one run's full settings — a person who wants a
+// specific run's own full metadata can already get it by switching this
+// panel's filter type to run_id and pasting that run_id in, so this strip
+// only needs to answer "which pairs make up this sweep, and how many
+// outcomes did each one produce" at a glance.
 //
-// The real, stated decision (not a silent default): this panel starts
-// in "auto" mode and stays there — continuously following whatever
-// `lastBacktestRunId` currently is, including across new runs finishing
-// while this panel is already open — right up until the person
-// interacts with the filter themselves (Apply OR Clear), at which point
-// it switches to "manual" and freezes: further runs finishing elsewhere
-// update the SHARED value (so BacktestPanel.tsx's own "prefilled" note
-// stays true) but no longer touch what THIS panel is showing, exactly
-// the "don't clobber an in-progress manual lookup" requirement. A small
-// explicit "↺ follow latest run" control is the only way back to "auto"
-// from "manual" — re-collapsing/re-expanding the panel would also reset
-// it (this component unmounts on collapse), but that's not a
-// discoverable way to ask for it, so this task adds the explicit control
-// rather than relying on that side effect.
-type RunIdFilterMode = "auto" | "manual";
-
-function BacktestResultsBody() {
-  const { lastBacktestRunId } = useWorkspace();
-  const [mode, setMode] = useState<RunIdFilterMode>("auto");
-  const [runIdInput, setRunIdInput] = useState(lastBacktestRunId ?? "");
-  const [appliedRunId, setAppliedRunId] = useState<string | undefined>(lastBacktestRunId ?? undefined);
-  const runIdInputRef = useRef<HTMLInputElement>(null);
-
-  // Only fires while in "auto" mode — see this function's own comment
-  // block above for why "manual" deliberately stops following.
-  useEffect(() => {
-    if (mode !== "auto") return;
-    setRunIdInput(lastBacktestRunId ?? "");
-    setAppliedRunId(lastBacktestRunId ?? undefined);
-  }, [lastBacktestRunId, mode]);
-
-  const { outcomes, loading, error, refetch } = useBacktestOutcomes({
-    limit: OUTCOMES_LIMIT,
-    backtestRunId: appliedRunId,
-  });
-
-  const applyFilter = () => {
-    const trimmed = runIdInput.trim();
-    setMode("manual");
-    setAppliedRunId(trimmed === "" ? undefined : trimmed);
-  };
-
-  const clearFilter = () => {
-    setRunIdInput("");
-    setAppliedRunId(undefined);
-    setMode("manual"); // explicit "show everything" is itself a manual choice — it must stick, not silently flip back to auto on the next finished run
-  };
-
-  const followLatestRun = () => {
-    setMode("auto");
-    setRunIdInput(lastBacktestRunId ?? "");
-    setAppliedRunId(lastBacktestRunId ?? undefined);
-  };
+// `outcomeCountByRunId` is computed by the caller (BacktestResultsBody)
+// from the same merged outcomes list already fetched for the list below —
+// this component does no fetching of its own. Existing purely to make an
+// honest outcomes_recorded=0 pair visible even though it contributes zero
+// rows to the merged list underneath (see useBacktestSweepOutcomes.ts's
+// own comment for why this matters) — reusing "known 0" vs "still
+// loading" distinction via the `loading` prop, same honest-state
+// discipline the rest of this panel already follows.
+function RunsInSweepStrip({
+  runs,
+  outcomeCountByRunId,
+  loading,
+}: {
+  runs: BacktestRunWireShape[];
+  outcomeCountByRunId: Map<string, number>;
+  loading: boolean;
+}) {
+  if (loading && runs.length === 0) {
+    return <p className="px-2 py-1 font-mono text-[10px] text-text-muted">Resolving sweep…</p>;
+  }
+  if (runs.length === 0) return null;
 
   return (
-    <>
-      <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">
-        <div className="flex items-center justify-between">
-          <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Filter by run_id</span>
-          {mode === "auto" && lastBacktestRunId && (
-            <span
-              className="font-mono text-[9px] text-signal"
-              title="Automatically following the most recently finished Backtest Runner run"
-            >
-              auto
-            </span>
-          )}
-        </div>
-        <div className="flex gap-1">
-          <input
-            ref={runIdInputRef}
-            value={runIdInput}
-            onChange={(e) => setRunIdInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && applyFilter()}
-            placeholder="optional — paste a run_id"
-            className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-[10px] text-text-primary placeholder:text-text-muted focus:border-signal focus:outline-none"
-          />
-          <button
-            onClick={applyFilter}
-            className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
-          >
-            Apply
-          </button>
-          {appliedRunId && (
-            <button
-              onClick={clearFilter}
-              className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
-            >
-              Clear
-            </button>
-          )}
-        </div>
-        {mode === "manual" && lastBacktestRunId && (
-          <button
-            onClick={followLatestRun}
-            className="self-start rounded border border-base-border px-1.5 py-0.5 font-mono text-[9px] text-text-muted hover:border-signal hover:text-text-primary"
-            title="Switch back to automatically following the most recently finished run"
-          >
-            ↺ Follow latest run
-          </button>
-        )}
-        {appliedRunId && (
-          <span className="truncate font-mono text-[9px] text-text-muted" title={appliedRunId}>
-            Showing run_id={appliedRunId} {mode === "auto" ? "(auto)" : "(manually set)"}
-          </span>
-        )}
+    <div className="mb-2 rounded border border-base-border bg-base-bg/40 p-2">
+      <div className="mb-1 font-mono text-[9px] uppercase tracking-wide text-text-muted">
+        Runs in this sweep ({runs.length})
       </div>
-
-      <div className="flex-1 overflow-y-auto p-2">
-        {appliedRunId && (
-          <div className="mb-2">
-            <RunMetadataCard runId={appliedRunId} />
+      <div className="flex flex-col gap-1">
+        {runs.map((r) => (
+          <div key={r.run_id} className="flex items-center justify-between gap-2 font-mono text-[10px]">
+            <span className="min-w-0 flex-1 truncate text-text-primary" title={r.run_id}>
+              {r.symbol_universe.join(", ") || "—"} <span className="text-text-muted">{r.run_id}</span>
+            </span>
+            <span className="shrink-0 text-text-muted">{outcomeCountByRunId.get(r.run_id) ?? 0} outcome(s)</span>
           </div>
-        )}
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Shared scrollable outcomes list + footer, reused by both filter types
+// below (run_id and sweep_id resolve to a `StrategyOutcomeWireShape[]`
+// through two different hooks/paths, but render identically once they
+// have one — OutcomeRow above already handles a mixed-symbol,
+// mixed-strategy list correctly, which is exactly what a sweep's own
+// merged outcomes are). `extraContent` is rendered above the list —
+// RunMetadataCard for run_id mode, RunsInSweepStrip for sweep_id mode —
+// kept as a slot here rather than duplicating this whole block twice.
+function OutcomesListSection({
+  outcomes,
+  loading,
+  error,
+  refetch,
+  emptyMessage,
+  extraContent,
+}: {
+  outcomes: StrategyOutcomeWireShape[];
+  loading: boolean;
+  error: string | null;
+  refetch: () => void;
+  emptyMessage: string;
+  extraContent?: React.ReactNode;
+}) {
+  return (
+    <>
+      <div className="flex-1 overflow-y-auto p-2">
+        {extraContent}
         {error && (
           <div className="rounded border border-bear/40 px-2 py-3 font-mono text-[11px] text-bear">
             Failed to load: {error}
@@ -413,11 +374,7 @@ function BacktestResultsBody() {
           <p className="p-1 font-mono text-[11px] text-text-muted">Loading…</p>
         )}
         {!error && !loading && outcomes.length === 0 && (
-          <p className="p-1 font-mono text-[11px] text-text-muted">
-            {appliedRunId
-              ? `No backtest outcomes found for run_id "${appliedRunId}".`
-              : "No backtest outcomes recorded yet."}
-          </p>
+          <p className="p-1 font-mono text-[11px] text-text-muted">{emptyMessage}</p>
         )}
         {outcomes.length > 0 && (
           <div className="flex flex-col gap-1.5">
@@ -436,10 +393,351 @@ function BacktestResultsBody() {
         >
           {loading ? "…" : "Refresh"}
         </button>
-        <span className="font-mono text-[9px] text-text-muted">{outcomes.length} row{outcomes.length === 1 ? "" : "s"}</span>
+        <span className="font-mono text-[9px] text-text-muted">
+          {outcomes.length} row{outcomes.length === 1 ? "" : "s"}
+        </span>
       </div>
     </>
   );
+}
+
+// Decision #134's own filter-mode split, UNCHANGED below for run_id.
+// `lastBacktestRunId` (shared WorkspaceContext state, set by
+// BacktestPanel.tsx when a run finishes) is a DEFAULT, never a forced
+// value — the task's own scope explicitly requires that a person can
+// still type or clear the filter and look at something else, and that a
+// run finishing elsewhere must never silently overwrite an in-progress
+// manual lookup already sitting in this filter.
+//
+// The real, stated decision (not a silent default): this panel starts
+// in "auto" mode and stays there — continuously following whatever
+// `lastBacktestRunId` currently is, including across new runs finishing
+// while this panel is already open — right up until the person
+// interacts with the filter themselves (Apply OR Clear), at which point
+// it switches to "manual" and freezes: further runs finishing elsewhere
+// update the SHARED value (so BacktestPanel.tsx's own "prefilled" note
+// stays true) but no longer touch what THIS panel is showing, exactly
+// the "don't clobber an in-progress manual lookup" requirement. A small
+// explicit "↺ follow latest run" control is the only way back to "auto"
+// from "manual" — re-collapsing/re-expanding the panel would also reset
+// it (this component unmounts on collapse), but that's not a
+// discoverable way to ask for it, so this task adds the explicit control
+// rather than relying on that side effect.
+type RunIdFilterMode = "auto" | "manual";
+
+// decision #163: sweep_id gets its OWN explicit
+// filter mode/type, not a generalized "run_id or sweep_id" single value.
+// Considered and rejected: both are real UUID strings with no way to
+// tell them apart from the string alone without a round-trip query, so a
+// single merged input would need to guess which endpoint to call, or
+// call both and pick whichever resolves — either adds real, invisible
+// complexity for a person who already knows which kind of ID they're
+// pasting. Two named, explicit filter TYPES (a small tab-style toggle,
+// same visual language BacktestPanel.tsx's own fixture/IBKR/sweep mode
+// toggle already establishes) is clearer both to read and to type
+// against. sweep_id's own auto/manual state mirrors RunIdFilterMode's
+// exactly, driven by lastBacktestSweepId instead of lastBacktestRunId —
+// the same real, valuable follow-through decision #134 built for run_id,
+// scoped IN here rather than deferred, since the mechanism (one more
+// WorkspaceContext field, mirrored end to end) already existed to extend.
+type SweepIdFilterMode = "auto" | "manual";
+type FilterType = "run_id" | "sweep_id";
+
+function BacktestResultsBody() {
+  const { lastBacktestRunId, lastBacktestSweepId } = useWorkspace();
+  const [filterType, setFilterType] = useState<FilterType>("run_id");
+
+  // --- run_id filter state — unchanged from before this delivery ---
+  const [mode, setMode] = useState<RunIdFilterMode>("auto");
+  const [runIdInput, setRunIdInput] = useState(lastBacktestRunId ?? "");
+  const [appliedRunId, setAppliedRunId] = useState<string | undefined>(lastBacktestRunId ?? undefined);
+  const runIdInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (mode !== "auto") return;
+    setRunIdInput(lastBacktestRunId ?? "");
+    setAppliedRunId(lastBacktestRunId ?? undefined);
+  }, [lastBacktestRunId, mode]);
+
+  // --- sweep_id filter state — new, mirrors run_id's exactly ---
+  const [sweepMode, setSweepMode] = useState<SweepIdFilterMode>("auto");
+  const [sweepIdInput, setSweepIdInput] = useState(lastBacktestSweepId ?? "");
+  const [appliedSweepId, setAppliedSweepId] = useState<string | undefined>(lastBacktestSweepId ?? undefined);
+  const sweepIdInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (sweepMode !== "auto") return;
+    setSweepIdInput(lastBacktestSweepId ?? "");
+    setAppliedSweepId(lastBacktestSweepId ?? undefined);
+  }, [lastBacktestSweepId, sweepMode]);
+
+  // Both hooks are always called (React's own rules of hooks forbid
+  // calling one of them only when filterType matches) — `enabled`/a
+  // `sweepId` of `undefined` is each hook's own explicit way to skip its
+  // real network call while the OTHER filter type is the one currently
+  // shown, rather than always fetching in the background for a result
+  // that will never render. See each hook's own comment for this exact
+  // reasoning.
+  const {
+    outcomes: runOutcomes,
+    loading: runLoading,
+    error: runError,
+    refetch: runRefetch,
+  } = useBacktestOutcomes({
+    limit: OUTCOMES_LIMIT,
+    backtestRunId: appliedRunId,
+    enabled: filterType === "run_id",
+  });
+
+  const {
+    runs: sweepRuns,
+    outcomes: sweepOutcomes,
+    loading: sweepLoading,
+    error: sweepError,
+    refetch: sweepRefetch,
+  } = useBacktestSweepOutcomes({
+    limit: OUTCOMES_LIMIT,
+    sweepId: filterType === "sweep_id" ? appliedSweepId : undefined,
+  });
+
+  const outcomeCountByRunId = useMemoOutcomeCounts(sweepOutcomes);
+
+  const applyRunFilter = () => {
+    const trimmed = runIdInput.trim();
+    setMode("manual");
+    setAppliedRunId(trimmed === "" ? undefined : trimmed);
+  };
+
+  const clearRunFilter = () => {
+    setRunIdInput("");
+    setAppliedRunId(undefined);
+    setMode("manual"); // explicit "show everything" is itself a manual choice — it must stick, not silently flip back to auto on the next finished run
+  };
+
+  const followLatestRun = () => {
+    setMode("auto");
+    setRunIdInput(lastBacktestRunId ?? "");
+    setAppliedRunId(lastBacktestRunId ?? undefined);
+  };
+
+  const applySweepFilter = () => {
+    const trimmed = sweepIdInput.trim();
+    setSweepMode("manual");
+    setAppliedSweepId(trimmed === "" ? undefined : trimmed);
+  };
+
+  const clearSweepFilter = () => {
+    setSweepIdInput("");
+    setAppliedSweepId(undefined);
+    setSweepMode("manual");
+  };
+
+  const followLatestSweep = () => {
+    setSweepMode("auto");
+    setSweepIdInput(lastBacktestSweepId ?? "");
+    setAppliedSweepId(lastBacktestSweepId ?? undefined);
+  };
+
+  return (
+    <>
+      <div className="flex shrink-0 rounded-none border-b border-base-border font-mono text-[10px]" role="tablist" aria-label="Filter type">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={filterType === "run_id"}
+          onClick={() => setFilterType("run_id")}
+          className={`flex-1 px-2 py-1 ${
+            filterType === "run_id" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+          }`}
+        >
+          run_id
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={filterType === "sweep_id"}
+          onClick={() => setFilterType("sweep_id")}
+          className={`flex-1 px-2 py-1 ${
+            filterType === "sweep_id" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+          }`}
+        >
+          sweep_id
+        </button>
+      </div>
+
+      {filterType === "run_id" && (
+        <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Filter by run_id</span>
+            {mode === "auto" && lastBacktestRunId && (
+              <span
+                className="font-mono text-[9px] text-signal"
+                title="Automatically following the most recently finished Backtest Runner run"
+              >
+                auto
+              </span>
+            )}
+          </div>
+          <div className="flex gap-1">
+            <input
+              ref={runIdInputRef}
+              value={runIdInput}
+              onChange={(e) => setRunIdInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applyRunFilter()}
+              placeholder="optional — paste a run_id"
+              className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-[10px] text-text-primary placeholder:text-text-muted focus:border-signal focus:outline-none"
+            />
+            <button
+              onClick={applyRunFilter}
+              className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+            >
+              Apply
+            </button>
+            {appliedRunId && (
+              <button
+                onClick={clearRunFilter}
+                className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          {mode === "manual" && lastBacktestRunId && (
+            <button
+              onClick={followLatestRun}
+              className="self-start rounded border border-base-border px-1.5 py-0.5 font-mono text-[9px] text-text-muted hover:border-signal hover:text-text-primary"
+              title="Switch back to automatically following the most recently finished run"
+            >
+              ↺ Follow latest run
+            </button>
+          )}
+          {appliedRunId && (
+            <span className="truncate font-mono text-[9px] text-text-muted" title={appliedRunId}>
+              Showing run_id={appliedRunId} {mode === "auto" ? "(auto)" : "(manually set)"}
+            </span>
+          )}
+        </div>
+      )}
+
+      {filterType === "sweep_id" && (
+        <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Filter by sweep_id</span>
+            {sweepMode === "auto" && lastBacktestSweepId && (
+              <span
+                className="font-mono text-[9px] text-signal"
+                title="Automatically following the most recently finished sweep"
+              >
+                auto
+              </span>
+            )}
+          </div>
+          <div className="flex gap-1">
+            <input
+              ref={sweepIdInputRef}
+              value={sweepIdInput}
+              onChange={(e) => setSweepIdInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && applySweepFilter()}
+              placeholder="paste a sweep_id"
+              className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-[10px] text-text-primary placeholder:text-text-muted focus:border-signal focus:outline-none"
+            />
+            <button
+              onClick={applySweepFilter}
+              className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+            >
+              Apply
+            </button>
+            {appliedSweepId && (
+              <button
+                onClick={clearSweepFilter}
+                className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          {sweepMode === "manual" && lastBacktestSweepId && (
+            <button
+              onClick={followLatestSweep}
+              className="self-start rounded border border-base-border px-1.5 py-0.5 font-mono text-[9px] text-text-muted hover:border-signal hover:text-text-primary"
+              title="Switch back to automatically following the most recently finished sweep"
+            >
+              ↺ Follow latest sweep
+            </button>
+          )}
+          {appliedSweepId && (
+            <span className="truncate font-mono text-[9px] text-text-muted" title={appliedSweepId}>
+              Showing sweep_id={appliedSweepId} {sweepMode === "auto" ? "(auto)" : "(manually set)"}
+            </span>
+          )}
+          {/* Deliberately no "show everything" default the way run_id
+              mode's own empty-filter state has — see
+              useBacktestSweepOutcomes.ts's own comment for why there is
+              no meaningful "every sweep merged together" view. */}
+          {!appliedSweepId && (
+            <span className="font-mono text-[9px] leading-snug text-text-muted">
+              No "show everything" view for sweeps — paste or wait for a sweep_id to browse its combined outcomes.
+            </span>
+          )}
+        </div>
+      )}
+
+      {filterType === "run_id" ? (
+        <OutcomesListSection
+          outcomes={runOutcomes}
+          loading={runLoading}
+          error={runError}
+          refetch={runRefetch}
+          emptyMessage={
+            appliedRunId
+              ? `No backtest outcomes found for run_id "${appliedRunId}".`
+              : "No backtest outcomes recorded yet."
+          }
+          extraContent={
+            appliedRunId ? (
+              <div className="mb-2">
+                <RunMetadataCard runId={appliedRunId} />
+              </div>
+            ) : undefined
+          }
+        />
+      ) : (
+        <OutcomesListSection
+          outcomes={sweepOutcomes}
+          loading={sweepLoading}
+          error={sweepError}
+          refetch={sweepRefetch}
+          emptyMessage={
+            appliedSweepId
+              ? `No backtest outcomes found for sweep_id "${appliedSweepId}" (its own runs may have honestly recorded zero each — see the sweep summary above).`
+              : "No sweep_id applied yet."
+          }
+          extraContent={
+            appliedSweepId ? (
+              <RunsInSweepStrip runs={sweepRuns} outcomeCountByRunId={outcomeCountByRunId} loading={sweepLoading} />
+            ) : undefined
+          }
+        />
+      )}
+    </>
+  );
+}
+
+// Small local helper, not a new hooks/ file — groups the sweep's own
+// merged outcomes by backtest_run_id so RunsInSweepStrip can show each
+// resolved run's real outcome count without a second fetch. Recomputed
+// via useMemo only when the outcomes array reference actually changes
+// (a new merged result from useBacktestSweepOutcomes.ts), not on every
+// render.
+function useMemoOutcomeCounts(outcomes: StrategyOutcomeWireShape[]): Map<string, number> {
+  return useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const o of outcomes) {
+      if (!o.backtest_run_id) continue;
+      counts.set(o.backtest_run_id, (counts.get(o.backtest_run_id) ?? 0) + 1);
+    }
+    return counts;
+  }, [outcomes]);
 }
 
 // New sibling panel (decision #133) — the first thing in this codebase

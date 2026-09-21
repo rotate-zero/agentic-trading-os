@@ -61,6 +61,16 @@ interface WorkspaceContextValue {
   // means "no run has finished yet in this Main Window."
   lastBacktestRunId: string | null;
 
+  // Backtest Runner's most recent sweep_id (decision #163) — same
+  // pattern as lastBacktestRunId immediately above, kept
+  // as its own separate field since a finished sweep has many run_ids
+  // (one per symbol×scenario pair) and no single one of them is "the"
+  // run_id a sweep could publish here. BacktestPanel.tsx's sweep mode is
+  // the sole writer; BacktestResultsPanel.tsx's sweep_id filter mode
+  // reads it to default itself, mirroring lastBacktestRunId's own read
+  // side. `null` means "no sweep has finished yet in this Main Window."
+  lastBacktestSweepId: string | null;
+
   // GLOBAL — shared across every Main Window. This is what makes "connector 0
   // in Layout 1" and "connector 0 in Layout 2" the same link group.
   connectorSymbols: ConnectorSymbolMap;
@@ -79,6 +89,7 @@ interface WorkspaceContextValue {
   setScannerCollapsed: (collapsed: boolean) => void;
   setScannerWidthPx: (width: number) => void;
   setLastBacktestRunId: (runId: string | null) => void;
+  setLastBacktestSweepId: (sweepId: string | null) => void;
 
   // No-database save/load — everything lives in localStorage for now. Same
   // JSON shape this produces is what a future workspace_layouts API call
@@ -175,6 +186,7 @@ function makeMainWindow(id: string, label: string, subWindows: SubWindowConfig[]
     scannerCollapsed: true, // starts collapsed, same reasoning as Feature Engine above — a third sidebar shouldn't grab space by default either
     scannerWidthPx: 300,
     lastBacktestRunId: null, // no run has finished yet for a freshly created Main Window
+    lastBacktestSweepId: null, // no sweep has finished yet for a freshly created Main Window
   };
 }
 
@@ -342,6 +354,10 @@ function normalizeMainWindow(w: MainWindowState): MainWindowState {
     // at all, so this keeps it a real `string | null` at runtime instead
     // of `undefined`, same reasoning as every other backfill above.
     lastBacktestRunId: w.lastBacktestRunId ?? null,
+    // Same back-fill, same reason, for lastBacktestSweepId
+    // (decision #163) — sessions persisted before this field
+    // existed won't have it in localStorage at all.
+    lastBacktestSweepId: w.lastBacktestSweepId ?? null,
   };
 }
 
@@ -517,6 +533,7 @@ export function WorkspaceProvider({
   const setScannerWidthPx = (width: number) => updateActive({ scannerWidthPx: width });
   const setFeatureEnginePanelSymbol = (symbol: string) => updateActive({ featureEnginePanelSymbol: symbol });
   const setLastBacktestRunId = (runId: string | null) => updateActive({ lastBacktestRunId: runId });
+  const setLastBacktestSweepId = (sweepId: string | null) => updateActive({ lastBacktestSweepId: sweepId });
 
   const addMainWindow = () => {
     const id = `mw-${Date.now()}`;
@@ -633,6 +650,7 @@ export function WorkspaceProvider({
       scannerCollapsed: activeWindow.scannerCollapsed,
       scannerWidthPx: activeWindow.scannerWidthPx,
       lastBacktestRunId: activeWindow.lastBacktestRunId,
+      lastBacktestSweepId: activeWindow.lastBacktestSweepId,
 
       connectorSymbols,
 
@@ -650,6 +668,7 @@ export function WorkspaceProvider({
       setScannerCollapsed,
       setScannerWidthPx,
       setLastBacktestRunId,
+      setLastBacktestSweepId,
 
       savedLayouts,
       saveCurrentLayout,

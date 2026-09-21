@@ -65,8 +65,21 @@ import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "
  * person picked manually (see that panel's own auto/manual mode
  * comment) — this hook itself has no way to distinguish those cases,
  * that logic lives entirely in the panel above it.
+ *
+ * `enabled` (decision #163, default `true`):
+ * BacktestResultsPanel.tsx now has a second, independent filter mode
+ * (sweep_id, via useBacktestSweepOutcomes.ts) that this hook knows
+ * nothing about. Both hooks are called unconditionally from that panel
+ * (React's own rules of hooks — a component can't call a hook
+ * conditionally), so `enabled: false` is this hook's own explicit way to
+ * skip its real network call while the OTHER filter mode is the one
+ * currently showing, rather than always issuing its own "everything"
+ * fetch in the background whether or not anything will ever render it.
+ * `loading` still resolves to `false` in this state (never left stuck at
+ * its initial `true`) — a disabled hook isn't "still loading," it's
+ * simply not asked to do anything right now.
  */
-export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: string }): {
+export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: string; enabled?: boolean }): {
   outcomes: StrategyOutcomeWireShape[];
   loading: boolean;
   error: string | null;
@@ -78,8 +91,14 @@ export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: s
 
   const limit = params?.limit;
   const backtestRunId = params?.backtestRunId;
+  const enabled = params?.enabled ?? true;
 
   const load = useCallback(() => {
+    if (!enabled) {
+      setLoading(false);
+      return () => {};
+    }
+
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -106,7 +125,7 @@ export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: s
     return () => {
       cancelled = true;
     };
-  }, [limit, backtestRunId]);
+  }, [limit, backtestRunId, enabled]);
 
   useEffect(() => load(), [load]);
 

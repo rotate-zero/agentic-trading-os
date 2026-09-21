@@ -150,7 +150,7 @@ Not built now. Constrains how the first strategy gets written (pure `evaluate()`
 
 `performance_queries.py`'s `_common_filters()` (decision #122) already enforced this exact discipline for the two `GROUP BY` queries next to this route; decision #130 brings `/strategy-outcomes` in line with it via the equivalent single predicate, since this route's raw-row shape doesn't share `_common_filters()`'s `GROUP BY`-oriented signature. `backtest_run_id` is additive-only — it always requires `is_backtest=true` alongside it (a live row never carries one), enforced as a 400, not a silently-empty result.
 
-**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #130) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response. *(Correction, decision #152 — this panel is no longer fixture-scenario-only; see this section's own as-built note at the end for the added "Real IBKR data" mode.)*
+**As-built note (frontend, this delivery) — `POST /backtest/run` (decision #131) gets a real caller for the first time.** Every note above this one describes the route itself; before this delivery the only way to invoke it was constructing a raw HTTP request by hand and reading raw JSON back — the route's own module docstring says as much explicitly ("this route does not add any Performance Analytics UI for inspecting results ... a caller wanting the raw persisted rows can already query the existing route separately"), a deliberate scope boundary at the time, not an oversight. This delivery closes that one specific, narrow gap and nothing else: a new `BacktestPanel.tsx`, mounted as a fourth collapsible sibling panel in `App.tsx` alongside `InfoTab`/`FeatureEnginePanel`/`ScannerPanel` (same collapsible-width convention `ScannerPanel.tsx` already established — see that component's own `MIN_WIDTH`/`MAX_WIDTH`/`COLLAPSED_WIDTH` constants, reused verbatim), lets a person pick one of the 7 real strategy names and one of the 4 real fixture scenarios, submit, and see the real response. *(Correction, decision #152 — this panel is no longer fixture-scenario-only; see this section's own as-built note at the end for the added "Real IBKR data" mode.)* *(Further correction, decision #163 — nor is it two-mode-only anymore; see this section's own as-built note near the end for the added "Sweep" mode.)*
 
 ```
 BacktestPanel.tsx (form: strategy_name / scenario / symbol)
@@ -567,7 +567,7 @@ This is exactly the gap `ibkr_adapter.py`'s own module docstring and decision #1
 
 *Conclusion, stated plainly:* this environment cannot currently produce a real-market-data `BacktestRunner` execution. Nothing was worked around to manufacture rows — `strategy_outcomes`/`backtests` are exactly as empty now as before this attempt, and D4's readiness check still finds zero. Real resolution needs one of: (a) this sandbox given network access to a market-data provider's domain plus a real API key, which by itself still wouldn't produce IBKR data specifically and would need a new non-IBKR replay route built first; (b) `POST /backtest/run/ibkr` run from an environment with a real, reachable IB Gateway/TWS session (Saqib's own machine, per `ibkr_adapter.py`'s own standing caveat) — the fastest path to literally what was asked for, using code that already exists and already works, just never against a reachable Gateway; or (c) accepting a fixture-based real-`trading_workspace`-DB run instead, which is real persistence but not real market data, and wasn't what was asked for here. No code changed as part of this note — decision purely deferred to Saqib.
 
-**As-built note (decision #152) — `BacktestPanel.tsx` stops being fixture-scenario-only.** The as-built note above this section's earlier `POST /backtest/run` diagram (frontend delivery, decision #130) described the only trigger UI that existed at the time — see the correction inline at that note. `POST /backtest/run/ibkr` (previous as-built note, this section) has been reachable from the backend since its own delivery but, until now, only by hand-constructing an HTTP request, the same gap decision #130's own delivery closed for the fixture route. This delivery adds a second mode to the same panel rather than a second panel, confirming directly against `runner.py` (not assumed) that both routes return `dataclasses.asdict()` of the identical `BacktestRunResult` — so the existing `ResultsView` renders either mode's result unchanged.
+**As-built note (decision #152) — `BacktestPanel.tsx` stops being fixture-scenario-only.** The as-built note above this section's earlier `POST /backtest/run` diagram (frontend delivery, decision #131) described the only trigger UI that existed at the time — see the correction inline at that note. `POST /backtest/run/ibkr` (previous as-built note, this section) has been reachable from the backend since its own delivery but, until now, only by hand-constructing an HTTP request, the same gap decision #130's own delivery closed for the fixture route. This delivery adds a second mode to the same panel rather than a second panel, confirming directly against `runner.py` (not assumed) that both routes return `dataclasses.asdict()` of the identical `BacktestRunResult` — so the existing `ResultsView` renders either mode's result unchanged. *(Correction, decision #163 — a third "Sweep" mode joins these two below; see this section's own as-built note near the end.)*
 
 ```
 BacktestPanel.tsx (BacktestForm) — mode: "Fixture scenario" | "Real IBKR data"
@@ -825,6 +825,174 @@ for (symbol, scenario) in pairs:
 ```
 
 **A second, deeper finding surfaced during verification — not a sweep defect, but real and worth recording here.** Running the *same symbol* through two separate real runs — whether two pairs in one sweep, or two separate calls to the existing, unmodified `POST /backtest/run` — can legitimately produce different `outcomes_recorded` between them. Confirmed directly: calling `/backtest/run` twice in a row against one fresh symbol, no sweep code involved at all, reproduced the identical discrepancy (1, then 0). Root cause, confirmed by reading the models rather than assumed: `daily_levels_state` got per-run isolation via `backtest_run_id` (decision #141/D19), but `LevelInteractionState`/`LevelInteractionEvent` (`app/models/trading_intelligence.py`) never did — `LevelInteractionState`'s own unique constraint is `(symbol_id, timeframe, level_key)`, with no `backtest_run_id` column at all, so a second run of the same symbol inherits real leftover touch/resolution state from the first. This is a pre-existing `BacktestRunner` characteristic that predates this delivery and applies equally to single runs; the sweep endpoint is simply the first caller likely to request the same symbol twice in quick succession. **Not fixed here** — out of this task's scope, and a fix would mean giving `level_interaction_state` the same per-run-isolation treatment D19 gave `daily_levels_state`, a change of that same shape and size. `docs/architecture/strategy-engine-open-decisions.md` is owned by a parallel session for this delivery and wasn't touched; flagged to Saqib directly to route as he judges best (a new D-item, most likely).
+
+**As-built note (decision #163) — `POST /backtest/sweep` gets a real caller, and its own results become browsable, for the first time.** Every note above this one describes the sweep route itself, built and tested backend-only; before this delivery the only way to invoke it was constructing a raw HTTP request by hand, and the only way to see a sweep's own results as a group afterward was copy-pasting each individual `run_id` from that raw response — `sweep_id` was already visible per-row in `BacktestResultsPanel.tsx` (decision #133/#136/#139) but not usable as a filter, the exact shape of gap this project has repeatedly closed for `run_id` itself and for several other backend-built, UI-invisible capabilities before it. This delivery closes both ends: a third trigger mode in `BacktestPanel.tsx`, and a new filter type in `BacktestResultsPanel.tsx`. Frontend-only — `backtest.py`'s sweep route, `intelligence.py`, and every other backend file are unchanged.
+
+**Trigger side — `BacktestPanel.tsx` stops being two-mode-only.** A third "Sweep" mode joins the existing tab toggle, following #152's own precedent for adding a mode to the existing panel rather than a new one. Confirmed directly against `runner.py`: `BacktestRunResult` (single-run) and `BacktestSweepResult` (many pairs sharing one `sweep_id`) are different shapes — `SweepResultsView` is a new component, not a reuse of the existing `ResultsView`, but each pair row inside it (`SweepPairRow`) reuses `ResultsView`'s own field layout/labels and the existing `DiscardedSignalRow`, per this task's own "don't reinvent it" scope note.
+
+```
+BacktestPanel.tsx (BacktestForm) — mode: "Fixture scenario" | "Real IBKR data" | "Sweep"
+strategy_name shared across all three modes; symbol (single) shown in
+fixture/ibkr modes only — sweep mode shows its own symbols/scenarios
+inputs instead, described below
+            │
+            └── Sweep ──────► symbols: free-text, comma/space-separated,
+                               parsed+deduped client-side (no multi-select
+                               component exists anywhere in this codebase
+                               today — confirmed directly, not assumed)
+                                       │
+                               scenarios: checkboxes over the existing
+                               BACKTEST_SCENARIOS (all 4 known scenarios,
+                               a small fixed set — no free-text parsing
+                               needed, every option's state visible at
+                               once, unlike a native <select multiple>)
+                                       │
+                                       ▼
+                               pairCount = symbols.length × scenarios.length
+                               checked against BACKTEST_SWEEP_MAX_PAIRS (20,
+                               mirrors backend's own _MAX_SWEEP_PAIRS) —
+                               client-side convenience only; the backend's
+                               own pre-execution check stays the real
+                               authority, same posture BacktestPanel.tsx's
+                               existing IBKR range validation already takes
+                               toward _validate_ibkr_range
+                                       │
+                                       ▼
+                               useBacktestSweepRun.ts — new sibling hook,
+                               mirrors useBacktestRun.ts/useIbkrBacktestRun.ts's
+                               own status-machine/live-elapsed-timer shape
+                               almost exactly; NOT folded into either
+                               (materially different request/result shape,
+                               same "keep each hook small and legible"
+                               reasoning useIbkrBacktestRun.ts's own header
+                               comment already gives for staying separate)
+                                       │
+                                       ▼
+                               triggerBacktestSweep() — new, purely
+                               additive wrapper in api-client.ts; symbols/
+                               scenarios sent as repeated query keys
+                               (confirmed directly against the route's
+                               list[str] = Query(...) params, not a JSON
+                               body); every error is a plain string detail
+                               (confirmed directly), so this reuses the
+                               existing shared ApiError/parseErrorDetail —
+                               no new error class needed, unlike IBKR mode
+                                       │
+                                       ▼
+                               BacktestSweepResult: sweep_id, strategy_name,
+                               pairs_requested/succeeded/failed, runs[]
+                                       │
+                                       ▼
+                               SweepResultsView — new component (the
+                               response shape genuinely differs from
+                               single-run BacktestRunResult); each pair
+                               row (SweepPairRow) reuses ResultsView's own
+                               field layout + the existing
+                               DiscardedSignalRow, not reinvented
+                                       │
+                                       ▼
+                               setLastBacktestSweepId(sweep_id) — NEW
+                               WorkspaceContext field, mirrors
+                               lastBacktestRunId end to end (type, default,
+                               localStorage backfill, setter). Deliberately
+                               does NOT call setLastBacktestRunId — a sweep
+                               has many pairs' own run_ids and no single
+                               one is "the" run this Main Window produced
+```
+
+**Wait-state design, stated explicitly.** Confirmed directly against the backend route: a sweep is one fully synchronous HTTP call running every requested pair sequentially, with no per-pair progress signal of any kind — not even the "still active, no percentage" framing IBKR mode's own copy already uses for its one external acquisition step, since nothing distinguishes pair 1 from pair 20 while a sweep is in flight. `useBacktestSweepRun.ts`'s live-elapsed timer (same real-`Date.now()`-delta mechanism the other two hooks already use, not a re-derived one) is the only honest signal available — no fabricated percentage, no "pair N of M," matching this task's own "set real expectations, don't reuse a shorter mode's timing copy" instruction and decision #152's own precedent for the same call.
+
+**Results side — `BacktestResultsPanel.tsx` gets a second, independent filter type.** Confirmed directly: `GET /intelligence/backtest-runs` already supports a real `sweep_id` filter (decision #136); `GET /intelligence/strategy-outcomes` does not (only `is_backtest`/`backtest_run_id`, decision #123/#130) — adding one there would be the smaller backend change, but this delivery's own file boundary excludes `backend/` entirely, so the frontend resolves the same practical result in two steps instead (flagged as a real, worth-doing backend follow-up, not built here).
+
+Design fork, decided explicitly rather than left ambiguous (per this task's own prompt): **two separate, explicit filter types** (`run_id` | `sweep_id`, a small tab toggle mirroring `BacktestPanel.tsx`'s own mode-toggle visual language) — not one generalized "run_id or sweep_id" field. Both are real UUID strings with no way to tell them apart without a round-trip query; a merged input would have to guess which endpoint to call or call both and pick whichever resolves, adding real, invisible complexity a person who already knows which kind of ID they're pasting shouldn't have to pay for. `sweep_id`'s own auto/manual state (`SweepIdFilterMode`) mirrors `RunIdFilterMode`'s exactly, driven by the new `lastBacktestSweepId` instead of `lastBacktestRunId` — **the auto-link follow-through is scoped IN, not deferred**: `BacktestPanel.tsx`'s sweep mode publishes `lastBacktestSweepId` the moment a sweep finishes (see the trigger-side diagram above), the exact mechanism decision #134 already built once for `run_id`, extended by one mirrored field rather than left as a future task.
+
+```
+BacktestResultsBody (BacktestResultsPanel.tsx)
+        │
+        │  filterType: "run_id" | "sweep_id"  ◄── NEW, this delivery
+        │
+        ├── run_id ──────► appliedRunId (decision #134's own auto/manual
+        │                  state, entirely UNCHANGED) ──► useBacktestOutcomes
+        │                  ({ backtestRunId, enabled: filterType==="run_id" })
+        │                       │
+        │                       ▼
+        │                  GET /strategy-outcomes?is_backtest=true
+        │                  [&backtest_run_id=<run>]   ◄── unchanged route
+        │                       │
+        │                       ▼
+        │                  RunMetadataCard + outcomes list (unchanged)
+        │
+        └── sweep_id ────► appliedSweepId (NEW auto/manual state, mirrors
+                           run_id's exactly, driven by lastBacktestSweepId)
+                                │
+                                ▼
+                           useBacktestSweepOutcomes.ts — NEW hook
+                           ({ sweepId: filterType==="sweep_id" ? appliedSweepId
+                              : undefined })
+                                │
+                                ├─► fetchBacktestRuns(limit, undefined,
+                                │    undefined, sweepId)   ◄── GET
+                                │    /backtest-runs?sweep_id=<uuid>,
+                                │    decision #136, unchanged — resolves
+                                │    every BacktestRunRecord in the sweep
+                                │
+                                ▼
+                           Promise.all: fetchStrategyOutcomes(limit, true,
+                           run.run_id) for EVERY resolved run, in parallel
+                           (no bulk/sweep_id-filtered route exists — see
+                           the flagged backend follow-up above)
+                                │
+                                ▼
+                           merge + re-sort by exit_filled_at desc (restores
+                           the ordering guarantee lost by concatenating
+                           already-sorted per-run arrays)
+                                │
+                                ▼
+                           { runs: BacktestRunRecord[], outcomes:
+                           StrategyOutcome[] } — BOTH returned, not
+                           collapsed into just the merged outcomes: a pair
+                           that ran cleanly but recorded outcomes_recorded=0
+                           (an honest, expected sweep-route result) would
+                           otherwise be invisible — present in `runs`,
+                           absent from `outcomes`, never silently dropped
+                                │
+                                ▼
+                           RunsInSweepStrip (runs, per-run outcome counts
+                           computed client-side from the merged outcomes —
+                           no second fetch) + the same OutcomeRow-based
+                           list the run_id path already uses, via a new
+                           shared OutcomesListSection wrapping both paths
+```
+
+**Internal flow within the changed module (`BacktestResultsBody`, inside `BacktestResultsPanel.tsx`):**
+
+```
+filterType toggle clicked
+        │
+        ▼
+Both useBacktestOutcomes AND useBacktestSweepOutcomes are ALWAYS called
+(React's rules of hooks forbid calling either conditionally) — each is
+given its own explicit "not the active view" signal instead:
+        │
+        ├── useBacktestOutcomes({ enabled: filterType==="run_id" })
+        │   NEW `enabled` param (default true, backward compatible) —
+        │   skips its real fetch entirely when false rather than issuing
+        │   its own "everything" call in the background for a result
+        │   that will never render
+        │
+        └── useBacktestSweepOutcomes({ sweepId: filterType==="sweep_id"
+            ? appliedSweepId : undefined })
+            already no-ops on an undefined sweepId (same "nothing to show
+            without a real filter value" posture useBacktestRuns.ts's own
+            unset-runId branch already established) — reused as-is, no
+            separate enabled flag needed for this one
+        │
+        ▼
+OutcomesListSection renders whichever pair (outcomes/loading/error/refetch)
+belongs to the active filterType — one shared component, not two
+duplicated list+footer blocks, with RunMetadataCard or RunsInSweepStrip
+slotted in above the list via its own `extraContent` prop
+```
 
 ### D20 as built — Level Interaction persistence is isolated per run
 

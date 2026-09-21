@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestRun } from "../../hooks/useBacktestRun";
 import { useIbkrBacktestRun, type IbkrBacktestRunError } from "../../hooks/useIbkrBacktestRun";
+import { useBacktestSweepRun } from "../../hooks/useBacktestSweepRun";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
   BACKTEST_SCENARIOS,
   BACKTEST_STRATEGY_NAMES,
+  BACKTEST_SWEEP_MAX_PAIRS,
+  type BacktestSweepPairResultWireShape,
+  type BacktestSweepResultWireShape,
   type DiscardedSignalWireShape,
 } from "../../services/api-client";
 import { currentEtCalendarDate, etWallClockToUtc } from "./easternTime";
@@ -49,7 +53,7 @@ function formatHoursMinutes(totalMs: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-type BacktestMode = "fixture" | "ibkr";
+type BacktestMode = "fixture" | "ibkr" | "sweep";
 
 // Decision #152. Maps every real failure
 // shape POST /backtest/run/ibkr can return (confirmed directly against
@@ -179,6 +183,103 @@ function ResultsView({
   );
 }
 
+// One (symbol, scenario) pair's own result row within a sweep — reuses
+// ResultsView's own field layout/labels (run_id, outcomes_recorded,
+// discarded_signals via the same DiscardedSignalRow above) rather than
+// inventing a second rendering for what's structurally the same
+// BacktestRunResult-shaped data per pair, per this task's own "don't
+// reinvent it" scope note. The one real difference from ResultsView:
+// `run_id`/`outcomes_recorded` are `null` on a genuine per-pair failure
+// (the route's own SweepPairResult docstring), rendered as "—" rather
+// than the string "null" or an empty cell, and a non-null `error` gets
+// its own inline row, styled the same as fixture mode's plain-string
+// error block above. No `sweep_id` repeated per row — it's shown once at
+// the top of SweepResultsView below, since every pair in one sweep
+// response shares the exact same value.
+function SweepPairRow({ pair }: { pair: BacktestSweepPairResultWireShape }) {
+  return (
+    <div className="flex flex-col gap-1 border-b border-base-border p-2 last:border-b-0">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-xs font-medium text-text-primary">
+          {pair.symbol} <span className="text-text-muted">· {pair.scenario}</span>
+        </span>
+        {pair.error === null ? (
+          <span className="font-mono text-[10px] text-text-muted">
+            outcomes_recorded <span className="font-semibold text-text-primary">{pair.outcomes_recorded}</span>
+          </span>
+        ) : (
+          <span className="font-mono text-[10px] font-semibold text-bear">failed</span>
+        )}
+      </div>
+      <div className="grid grid-cols-[auto_1fr] gap-x-2 font-mono text-[9px]">
+        <span className="text-text-muted">run_id</span>
+        <span className="truncate text-text-primary" title={pair.run_id ?? undefined}>
+          {pair.run_id ?? "—"}
+        </span>
+      </div>
+      {pair.error !== null && <p className="font-mono text-[10px] text-bear">{pair.error}</p>}
+      {pair.discarded_signals.length > 0 && (
+        <div className="rounded border border-base-border">
+          {pair.discarded_signals.map((s, i) => (
+            <DiscardedSignalRow key={`${s.signal_candle_ts}-${i}`} signal={s} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Top-level sweep result: the shared sweep_id + request-level tallies
+// (pairs_requested/succeeded/failed — the route's own honest partial-
+// failure accounting, per its docstring), then every pair in the exact
+// order the backend returned them (symbols outer / scenarios inner,
+// per the route's own docstring — never re-sorted here, so this always
+// lines up with what was actually requested).
+//
+// Deliberately does NOT publish any one pair's run_id to shared
+// WorkspaceContext state the way ResultsView's fixture/IBKR result does
+// (setLastBacktestRunId) — see BacktestForm's own sweep-completion effect
+// below for why: a sweep has no single representative run_id, only a
+// shared sweep_id, which is what gets published instead
+// (setLastBacktestSweepId) for BacktestResultsPanel.tsx's new sweep_id
+// filter mode to pick up.
+function SweepResultsView({ result }: { result: BacktestSweepResultWireShape }) {
+  return (
+    <div className="flex flex-col gap-2 border-t border-base-border p-2">
+      <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 font-mono text-[10px]">
+        <span className="text-text-muted">sweep_id</span>
+        <span className="truncate text-text-primary" title={result.sweep_id}>
+          {result.sweep_id}
+        </span>
+        <span className="text-text-muted">pairs</span>
+        <span className="text-text-primary">
+          <span className="font-semibold">{result.pairs_requested}</span> requested,{" "}
+          <span className="font-semibold text-bull">{result.pairs_succeeded}</span> succeeded
+          {result.pairs_failed > 0 && (
+            <>
+              , <span className="font-semibold text-bear">{result.pairs_failed}</span> failed
+            </>
+          )}
+        </span>
+      </div>
+      <span className="font-mono text-[9px] text-text-muted">
+        → sweep_id prefilled in the Backtest Results panel's sweep_id filter (unless it's currently pinned to a
+        different sweep you picked manually there).
+      </span>
+      <div className="flex flex-col gap-1">
+        <span className="text-[10px] uppercase tracking-wide text-text-muted">
+          runs ({result.runs.length})
+        </span>
+        <div className="rounded border border-base-border">
+          {result.runs.map((pair, i) => (
+            <SweepPairRow key={`${pair.symbol}-${pair.scenario}-${i}`} pair={pair} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Result of validating the two Eastern-time datetime-local inputs against
 // POST /backtest/run/ibkr's own real constraints (backtest.py's
 // _validate_ibkr_range: both tz-aware, start < end, window <= 24 elapsed
@@ -234,7 +335,8 @@ function validateIbkrRange(startLocal: string, endLocal: string): IbkrRangeValid
 function BacktestForm() {
   const fixtureRun = useBacktestRun();
   const ibkrRun = useIbkrBacktestRun();
-  const { setLastBacktestRunId } = useWorkspace();
+  const sweepRun = useBacktestSweepRun();
+  const { setLastBacktestRunId, setLastBacktestSweepId } = useWorkspace();
 
   const [mode, setMode] = useState<BacktestMode>("fixture");
   const [strategyName, setStrategyName] = useState("");
@@ -243,6 +345,35 @@ function BacktestForm() {
   const [startLocal, setStartLocal] = useState("");
   const [endLocal, setEndLocal] = useState("");
   const symbolInputRef = useRef<HTMLInputElement>(null);
+
+  // Sweep mode's own inputs. Symbols: a single free-text field, split on
+  // comma/whitespace, matching the existing single `symbol` text input's
+  // own shape above rather than introducing a new multi-select control —
+  // confirmed directly there is no multi-select/tag-input component
+  // anywhere in frontend/src/ today, and a comma-separated field needs no
+  // new UI primitive, just parsing. Scenarios: checkboxes, not a second
+  // free-text field or a native `<select multiple>` — there are only ever
+  // 4 real scenarios (BACKTEST_SCENARIOS, a small fixed set), so a
+  // checkbox list shows every option and its current state at a glance,
+  // which a `<select multiple>`'s no-visible-state-without-scrolling
+  // native control does not, and needs no parsing at all.
+  const [sweepSymbolsInput, setSweepSymbolsInput] = useState("");
+  const [sweepScenarios, setSweepScenarios] = useState<string[]>([]);
+  const sweepSymbols = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          sweepSymbolsInput
+            .split(/[,\s]+/)
+            .map((s) => s.trim().toUpperCase())
+            .filter((s) => s !== ""),
+        ),
+      ),
+    [sweepSymbolsInput],
+  );
+  const toggleSweepScenario = (name: string) => {
+    setSweepScenarios((prev) => (prev.includes(name) ? prev.filter((s) => s !== name) : [...prev, name]));
+  };
 
   // Decision #134's shared run_id publish, unchanged in spirit but now
   // watching both hooks independently (one effect per hook) rather than
@@ -263,29 +394,60 @@ function BacktestForm() {
     }
   }, [ibkrRun.status, ibkrRun.result, setLastBacktestRunId]);
 
+  // Sweep's own completion effect publishes sweep_id, deliberately NOT
+  // run_id — a sweep response carries many pairs' own run_ids (one each,
+  // some possibly null on a per-pair failure), and no single one of them
+  // is "the" run this Main Window just produced, so setLastBacktestRunId
+  // is never called from here. See SweepResultsView's own comment above
+  // for the read side of this same choice.
+  useEffect(() => {
+    if (sweepRun.status === "done" && sweepRun.result?.sweep_id) {
+      setLastBacktestSweepId(sweepRun.result.sweep_id);
+    }
+  }, [sweepRun.status, sweepRun.result, setLastBacktestSweepId]);
+
   // Only one Backtest Runner execution happens at a time on the backend
-  // regardless of which route started it (both share
-  // engine_singleton_guard.py's _RUN_LOCK) — combining both hooks' status
-  // here disables the mode toggle and both submit paths together, so a
-  // person can't fire a second, wasted long-running request from this tab
-  // while the first is still in flight, the same reasoning each hook's
-  // own single-route guard already gives, extended across the two modes.
-  const running = fixtureRun.status === "running" || ibkrRun.status === "running";
+  // regardless of which route started it (all three share
+  // engine_singleton_guard.py's _RUN_LOCK) — combining all three hooks'
+  // status here disables the mode toggle and every submit path together,
+  // so a person can't fire a second, wasted long-running request from
+  // this tab while the first is still in flight, the same reasoning each
+  // hook's own single-route guard already gives, extended across all
+  // three modes. Especially relevant for sweep: a running sweep can hold
+  // this lock for noticeably longer than a single run (up to
+  // BACKTEST_SWEEP_MAX_PAIRS sequential runs), during which neither of
+  // the other two modes could actually run anyway even if this guard
+  // didn't disable them.
+  const running = fixtureRun.status === "running" || ibkrRun.status === "running" || sweepRun.status === "running";
 
   const selectedScenario = useMemo(() => BACKTEST_SCENARIOS.find((sc) => sc.name === scenario), [scenario]);
   const rangeValidation = useMemo(() => validateIbkrRange(startLocal, endLocal), [startLocal, endLocal]);
 
+  // Mirrors the backend's own _MAX_SWEEP_PAIRS check (backtest.py) —
+  // client-side only, the backend's own pre-execution validation stays
+  // the real authority (see triggerBacktestSweep's own comment in
+  // api-client.ts). Computed even with zero scenarios/symbols selected
+  // (0 pairs) so the count is always visible, not just once the request
+  // would otherwise be valid.
+  const sweepPairCount = sweepSymbols.length * sweepScenarios.length;
+  const sweepExceedsCap = sweepPairCount > BACKTEST_SWEEP_MAX_PAIRS;
+
   const canRunFixture = !running && strategyName !== "" && scenario !== "" && symbol.trim() !== "";
   const canRunIbkr = !running && strategyName !== "" && symbol.trim() !== "" && rangeValidation.canSubmit;
-  const canRun = mode === "fixture" ? canRunFixture : canRunIbkr;
+  const canRunSweep =
+    !running && strategyName !== "" && sweepSymbols.length > 0 && sweepScenarios.length > 0 && !sweepExceedsCap;
+  const canRun = mode === "fixture" ? canRunFixture : mode === "ibkr" ? canRunIbkr : canRunSweep;
 
   const handleRun = () => {
     if (mode === "fixture") {
       if (!canRunFixture) return;
       fixtureRun.run(strategyName, symbol.trim(), scenario);
-    } else {
+    } else if (mode === "ibkr") {
       if (!canRunIbkr || !rangeValidation.startIso || !rangeValidation.endIso) return;
       ibkrRun.run(strategyName, symbol.trim(), rangeValidation.startIso, rangeValidation.endIso);
+    } else {
+      if (!canRunSweep) return;
+      sweepRun.run(strategyName, sweepSymbols, sweepScenarios);
     }
   };
 
@@ -326,11 +488,23 @@ function BacktestForm() {
             aria-selected={mode === "ibkr"}
             onClick={() => setMode("ibkr")}
             disabled={running}
-            className={`flex-1 rounded-r px-2 py-1 ${
+            className={`flex-1 px-2 py-1 ${
               mode === "ibkr" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
             } disabled:opacity-50`}
           >
             Real IBKR data
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "sweep"}
+            onClick={() => setMode("sweep")}
+            disabled={running}
+            className={`flex-1 rounded-r px-2 py-1 ${
+              mode === "sweep" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+            } disabled:opacity-50`}
+          >
+            Sweep
           </button>
         </div>
 
@@ -373,31 +547,91 @@ function BacktestForm() {
           </label>
         )}
 
-        <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Symbol</span>
-          <input
-            ref={symbolInputRef}
-            value={symbol}
-            onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-            onKeyDown={(e) => e.key === "Enter" && handleRun()}
-            disabled={running}
-            placeholder={mode === "fixture" ? "e.g. ZBTR1" : "e.g. AAPL"}
-            maxLength={12}
-            className="rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
-          />
-          {/* Same underlying field/state in both modes (reused, not
-              duplicated) — only the caption changes, since the real
-              semantics genuinely differ: fixture mode's symbol is an
-              arbitrary label on StrategyOutcome rows (route's own param
-              description), IBKR mode's must resolve to a real US-listed
-              contract via SMART/USD or the route 400s
-              (ibkr_contract_unresolved). */}
-          <span className="font-mono text-[9px] text-text-muted">
-            {mode === "fixture"
-              ? "Label only — not a real ticker lookup."
-              : "Must resolve to a real US-listed symbol via IBKR SMART/USD."}
-          </span>
-        </label>
+        {mode !== "sweep" && (
+          <label className="flex flex-col gap-1">
+            <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Symbol</span>
+            <input
+              ref={symbolInputRef}
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+              onKeyDown={(e) => e.key === "Enter" && handleRun()}
+              disabled={running}
+              placeholder={mode === "fixture" ? "e.g. ZBTR1" : "e.g. AAPL"}
+              maxLength={12}
+              className="rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+            />
+            {/* Same underlying field/state in both modes (reused, not
+                duplicated) — only the caption changes, since the real
+                semantics genuinely differ: fixture mode's symbol is an
+                arbitrary label on StrategyOutcome rows (route's own param
+                description), IBKR mode's must resolve to a real US-listed
+                contract via SMART/USD or the route 400s
+                (ibkr_contract_unresolved). Sweep mode uses its own
+                sweepSymbolsInput field below instead — a single label
+                can't represent "one or more symbols," so this shared
+                field is hidden rather than repurposed for sweep mode. */}
+            <span className="font-mono text-[9px] text-text-muted">
+              {mode === "fixture"
+                ? "Label only — not a real ticker lookup."
+                : "Must resolve to a real US-listed symbol via IBKR SMART/USD."}
+            </span>
+          </label>
+        )}
+
+        {mode === "sweep" && (
+          <div className="flex flex-col gap-1.5 rounded border border-base-border p-1.5">
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">
+                Symbols (labels only — comma or space separated)
+              </span>
+              <input
+                value={sweepSymbolsInput}
+                onChange={(e) => setSweepSymbolsInput(e.target.value.toUpperCase())}
+                disabled={running}
+                placeholder="e.g. ZBTR1, ZBTR2, ZBTR3"
+                className="rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+              />
+              <span className="font-mono text-[9px] text-text-muted">
+                {sweepSymbols.length} symbol{sweepSymbols.length === 1 ? "" : "s"}
+                {sweepSymbols.length > 0 && `: ${sweepSymbols.join(", ")}`}
+              </span>
+            </label>
+
+            <div className="flex flex-col gap-1">
+              <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Scenarios</span>
+              {BACKTEST_SCENARIOS.map((sc) => (
+                <label key={sc.name} className="flex items-start gap-1.5">
+                  <input
+                    type="checkbox"
+                    checked={sweepScenarios.includes(sc.name)}
+                    onChange={() => toggleSweepScenario(sc.name)}
+                    disabled={running}
+                    className="mt-0.5 disabled:opacity-50"
+                  />
+                  <span className="flex flex-col">
+                    <span className="font-mono text-[10px] text-text-primary">
+                      {sc.name} (~{sc.candleCount}s)
+                    </span>
+                    <span className="font-mono text-[9px] leading-snug text-text-muted">{sc.description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            <span
+              className={`font-mono text-[10px] ${sweepExceedsCap ? "font-semibold text-bear" : "text-text-muted"}`}
+            >
+              {sweepPairCount} pair{sweepPairCount === 1 ? "" : "s"} ({sweepSymbols.length} × {sweepScenarios.length})
+              {" — "}
+              max {BACKTEST_SWEEP_MAX_PAIRS} per sweep
+            </span>
+            {sweepExceedsCap && (
+              <span className="font-mono text-[9px] leading-snug text-bear">
+                Exceeds the sweep limit — remove symbols or scenarios, or split this into more than one sweep.
+              </span>
+            )}
+          </div>
+        )}
 
         {mode === "ibkr" && (
           <div className="flex flex-col gap-1.5 rounded border border-base-border p-1.5">
@@ -546,6 +780,40 @@ function BacktestForm() {
           discardedSignals={ibkrRun.result.discarded_signals}
         />
       )}
+
+      {/* Sweep's own wait-state copy, deliberately NOT reused from
+          fixture/IBKR mode above (this task's own "set real expectations,
+          don't reuse a shorter mode's timing copy" discipline, same call
+          decision #152 already made adding IBKR mode alongside fixture).
+          Confirmed directly against the backend route: a sweep is one
+          synchronous HTTP call end to end with genuinely no per-pair
+          progress signal of any kind — not even the "still active" framing
+          IBKR mode's own copy uses for ITS one external acquisition step,
+          since a sweep can run up to BACKTEST_SWEEP_MAX_PAIRS sequential
+          replays with no signal distinguishing pair 1 from pair 20 while
+          it's in flight. elapsedSeconds is genuinely the only honest
+          thing this view can show — no percentage, no "pair N of M", no
+          per-pair timing estimate, since none of those exist to report. */}
+      {mode === "sweep" && sweepRun.status === "running" && (
+        <div className="flex flex-col gap-1 border-t border-base-border px-2 py-2">
+          <span className="font-mono text-xs font-semibold text-signal">
+            Running… {formatElapsed(sweepRun.elapsedSeconds)} elapsed
+          </span>
+          <span className="font-mono text-[9px] text-text-muted">
+            One synchronous request running every requested pair sequentially — no per-pair progress signal is
+            available, so this can take meaningfully longer than a single run with no way to show how far through it
+            is. Nothing else in this tab can run a backtest until this finishes.
+          </span>
+        </div>
+      )}
+
+      {mode === "sweep" && sweepRun.status === "error" && sweepRun.error && (
+        <div className="border-t border-base-border px-2 py-2">
+          <p className="font-mono text-[11px] text-bear">{sweepRun.error}</p>
+        </div>
+      )}
+
+      {mode === "sweep" && sweepRun.status === "done" && sweepRun.result && <SweepResultsView result={sweepRun.result} />}
     </>
   );
 }

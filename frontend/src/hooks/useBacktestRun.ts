@@ -4,7 +4,7 @@ import { ApiError, triggerBacktest, type BacktestRunResultWireShape } from "../s
 export type BacktestRunStatus = "idle" | "running" | "done" | "error";
 
 /**
- * Owns one POST /backtest/run (decision #130) call end to end —
+ * Owns one POST /backtest/run (decision #131) call end to end —
  * BacktestPanel.tsx's only piece of non-presentational logic.
  *
  * Unlike every other hook in this codebase (useScannerState's 15s poll,

@@ -827,7 +827,7 @@ export async function removeScannerUniverseSymbol(symbol: string): Promise<boole
 }
 
 // ---------------------------------------------------------------------
-// Backtest Runner trigger route (POST /backtest/run, decision #130) —
+// Backtest Runner trigger route (POST /backtest/run, decision #131) —
 // BacktestPanel.tsx's only backend dependency.
 //
 // The 7 real v1 strategy names and 4 real fixture scenario names below
@@ -911,7 +911,7 @@ export interface BacktestRunResultWireShape {
 }
 
 /**
- * POST /backtest/run (decision #130) — triggers one real BacktestRunner
+ * POST /backtest/run (decision #131) — triggers one real BacktestRunner
  * replay against a named fixture scenario and returns its real
  * BacktestRunResult. All three params are required FastAPI Query(...)
  * params on the real route (confirmed directly against backtest.py —
@@ -1037,6 +1037,104 @@ export async function triggerIbkrBacktest(
     throw new IbkrBacktestError(message, res.status, code);
   }
   return (await res.json()) as BacktestRunResultWireShape;
+}
+
+// ---------------------------------------------------------------------------
+// POST /backtest/sweep (decision #163) — the third,
+// additive trigger path: one strategy across an explicit symbols×scenarios
+// cross-product, run sequentially, sharing one real sweep_id. Confirmed
+// directly against backend/app/api/routes/backtest.py's run_backtest_sweep():
+// same POST-with-query-params convention as triggerBacktest/
+// triggerIbkrBacktest above (no JSON body) — `symbols`/`scenarios` are each
+// sent as a REPEATED query key (`?symbols=A&symbols=B`), FastAPI's own
+// convention for a `list[str] = Query(...)` param, confirmed against the
+// route signature rather than guessed. Every error this route raises
+// (unknown strategy_name/scenario, empty symbols/scenarios, batch-size
+// exceeded, the unchanged decision #132 live-data guard) is a PLAIN STRING
+// `detail` — confirmed directly, every `HTTPException` in this route passes
+// a bare f-string, never the `{code, message}` object shape
+// triggerIbkrBacktest's route uses — so this reuses the existing shared
+// `ApiError`/`parseErrorDetail` exactly like triggerBacktest above, with no
+// new error class needed.
+//
+// Mirrors `_MAX_SWEEP_PAIRS` (backtest.py) as a real, named constant rather
+// than a magic number in BacktestPanel.tsx — client-side enforcement is a
+// convenience so a doomed request is never sent, but the backend's own
+// check (re-verified directly, same value) stays the real authority; if
+// these two numbers were ever changed independently, the backend's own 400
+// message is still the honest last word, same "not a second source of
+// truth" posture BACKTEST_STRATEGY_NAMES/BACKTEST_SCENARIOS's own comment
+// block above already states for the 400 fallback.
+export const BACKTEST_SWEEP_MAX_PAIRS = 20;
+
+// Mirrors backend/app/api/routes/backtest.py's SweepPairResult/
+// BacktestSweepResult dataclasses field-for-field (confirmed directly, not
+// guessed) — the route returns `dataclasses.asdict(sweep_result)` verbatim,
+// same "no reshaping" posture BacktestRunResultWireShape above already
+// documents for the other two trigger routes. `run_id`/`outcomes_recorded`
+// are `null` only for a genuine per-pair failure (the route's own
+// `SweepPairResult` docstring: a `BacktestRunRecord` row may still exist in
+// that case, its `run_id` just isn't retrievable from this response).
+// `discarded_signals` reuses `DiscardedSignalWireShape` above verbatim —
+// same per-signal shape `BacktestRunResult` already carries, unchanged by
+// the sweep route.
+export interface BacktestSweepPairResultWireShape {
+  symbol: string;
+  scenario: string;
+  run_id: string | null;
+  outcomes_recorded: number | null;
+  discarded_signals: DiscardedSignalWireShape[];
+  error: string | null;
+}
+
+export interface BacktestSweepResultWireShape {
+  sweep_id: string;
+  strategy_name: string;
+  pairs_requested: number;
+  pairs_succeeded: number;
+  pairs_failed: number;
+  runs: BacktestSweepPairResultWireShape[];
+}
+
+/**
+ * POST /backtest/sweep — one strategy across the explicit cross-product of
+ * `symbols` × `scenarios`, sequential, sharing one real `sweep_id`.
+ * Fixture-only (no IBKR sweep path exists — see the route's own docstring
+ * for why). `symbols`/`scenarios` are sent as repeated query keys via
+ * `URLSearchParams.append`, matching `list[str] = Query(...)`'s real wire
+ * convention on the backend (confirmed directly, not assumed to be a JSON
+ * array body the way e.g. addScannerUniverseSymbol's POST elsewhere in this
+ * file is).
+ *
+ * This remains one fully synchronous HTTP request for the entire sweep —
+ * the backend gives no per-pair progress signal (confirmed directly against
+ * the route: it builds and returns one complete `BacktestSweepResult` only
+ * after every pair has run), so this wrapper has no partial/incremental
+ * result to expose either; BacktestPanel.tsx's own wait-state copy is
+ * written around that same honest limitation, not routed around it here.
+ *
+ * Batch-size and unknown-strategy/-scenario validation both happen
+ * server-side before any run starts (backend's own pre-execution check) —
+ * this wrapper does not duplicate that validation; BacktestPanel.tsx
+ * enforces `BACKTEST_SWEEP_MAX_PAIRS` client-side only to avoid sending a
+ * request already known to fail, never as a second source of truth for
+ * what the backend will actually accept.
+ */
+export async function triggerBacktestSweep(
+  strategyName: string,
+  symbols: string[],
+  scenarios: string[],
+): Promise<BacktestSweepResultWireShape> {
+  const params = new URLSearchParams();
+  params.append("strategy_name", strategyName);
+  for (const symbol of symbols) params.append("symbols", symbol);
+  for (const scenario of scenarios) params.append("scenarios", scenario);
+  const url = `${API_BASE_URL}/backtest/sweep?${params.toString()}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as BacktestSweepResultWireShape;
 }
 
 // ---------------------------------------------------------------------------
