@@ -1,3 +1,35 @@
+# CHANGES — decision #168: Execution Engine & Portfolio State design doc landed (`execution-engine-design`)
+
+## Current delivery
+
+Added `docs/architecture/execution-engine-design.md`, a DRAFT design pass for
+the Execution Engine and Portfolio State — the modules that gate D17's live
+half and the whole Decision/Governor/Planning tail. It contains a verified
+built / partial / not-built inventory of the downstream pipeline (every claim
+cited to `path:symbol` and machine-checked); thirteen places where the as-built
+code disagrees with the prose design; a field-by-field map of what one live
+`StrategyOutcome` needs; three candidate first slices compared (simulated-venue
+auto path recommended; manual-first and IBKR paper analysed); component designs
+with data-flow and internal-flow diagrams for the Execution Engine, a simulated
+venue, Portfolio State, a minimal Position Monitor, and an `OutcomeRecorder`;
+fourteen open forks `EX-1…EX-14`; deferred prerequisites; and proposed
+acceptance criteria for a later build task.
+
+`docs/architecture/system-design.md` gains pointers only (companion-doc entry,
+one paragraph each under §4.6 and §4.9). Decision #168 and its `INDEX.md` row
+record the delivery. **Nothing is decided, built, or migrated**; every fork is
+left for Saqib.
+
+No backend or frontend application code, schema, migration, event model, or
+test changed.
+
+## Boundary
+
+Exactly six files change: the new design doc, `system-design.md` (pointers
+only), the two live decision-log files, `CHANGES.md`, and `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #167: close the two low-risk documentation status-drift follow-ups
 
 ## Current delivery

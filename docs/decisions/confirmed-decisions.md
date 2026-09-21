@@ -224,3 +224,95 @@ the early Alpaca rejection plus provider decisions #1 and #28–#33.
 This is documentation synchronization only. No backend or frontend application
 code, Phase 3 exit criterion, other phase, other drift finding, or architecture
 document changed.
+
+### 168. Execution Engine & Portfolio State design doc landed: as-built gaps verified, first slice analysed, fourteen forks (EX-1…EX-14) left open — nothing decided or built
+
+**Status: awaiting Saqib's direction — nothing decided, built, migrated, or
+changed in `backend/` or `frontend/`** (the decision #155 posture). Delivery
+slug `execution-engine-design`; number #168 assigned after the three-source
+re-check of latest `main` (INDEX last row, confirmed-decisions tail, archive
+list all at #167). Provisional fork labels `EX-1…EX-14` are not D-numbers and
+not decision numbers; each fork Saqib resolves becomes its own decision.
+
+**Why.** Everything downstream of the Strategy Engine — Decision Engine,
+Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor —
+existed only as prose, while D17's live half (no live caller of
+`record_strategy_outcome()`, decision #158) and D4's data starvation both wait
+on a real trade lifecycle. The Execution Engine is the missing writer.
+
+**What landed.** New `docs/architecture/execution-engine-design.md` (DRAFT):
+a verified inventory of the downstream pipeline (built / partial / not built,
+every claim cited `path:symbol`); thirteen findings where the code disagrees
+with the prose; a field-by-field map of what one live `StrategyOutcome` needs;
+three candidate first slices compared; component designs with diagrams for the
+recommended slice; the fork list; deferred prerequisites; proposed acceptance
+criteria for a build task. `system-design.md` gains a companion-doc entry and one
+pointer paragraph each under §4.6 and §4.9 — no existing text rewritten.
+
+**Findings that shape the design (details in the doc §2).**
+- The execution-side events are declared, not built: four of eight have no
+  payload model and none has a real publisher or subscriber; `PositionClosed`
+  rides the normal lane although Portfolio State must feed the Governor.
+- `BrokerAdapter` cannot report a fill (`OrderAck` is `submitted|rejected`); it
+  has no client order id or bracket fields; the registry has no execution role.
+- `IBKRAdapter` connects `readonly=True`, its order methods are stubs,
+  `get_positions()` has no caller, and it is unverified live (#27) — so the
+  first venue cannot be IBKR paper.
+- "Only the Governor can place orders" reads consistently only as *Governor =
+  the only authorizer; Execution = the only placer; manual mode adds a human
+  confirmation after authorization* — so manual-first does not avoid needing an
+  authorizer (the task brief's "human as Governor" shorthand was imprecise).
+- The critical lane awaits handlers serially and persists nothing, so a venue
+  call must never run inside a handler and the order ledger must be durable
+  independently of the bus.
+- `Opportunity` has no identity (the cache overwrites); `StrategyOutcome` cannot
+  represent a strategy-less manual trade; `is_backtest` cannot label
+  simulated-money outcomes — they would silently blend with real-money rows.
+- `fill_simulator` is a look-ahead model and cannot serve as a live venue as-is.
+- D17's live half differs from #128's backtest half: discarding a `None`
+  snapshot would drop a real fill from the evidence table.
+
+**Recommended first slice (a recommendation, not a decision).** Slice A:
+simulated venue behind a narrow venue port, auto path, one thin clearly-labelled
+authorizer stub, in-process protective exits, and an `OutcomeRecorder` — it
+inverts the roadmap's stage order, which is EX-1. Manual-first is a good second
+slice; IBKR paper stays deferred (#27).
+
+```
+ Strategy Scheduler ─► OpportunityCreated ─► Opportunity Cache                [built]
+        │
+        ▼
+ Authorizer stub ─► TradePlanned ─► GovernorDecision ─► OrderApproved         [slice A — NEW, provisional]
+        │                                            (critical lane)
+        ▼
+ Execution Engine ─► venue port ─┬─► SimulatedVenue                           [slice A — NEW]
+        │                        └─► IBKRAdapter (stub, unverified)           [deferred, #27]
+        │ OrderFilled (critical)
+        ├─► Portfolio State ─► PositionClosed                                 [slice A — NEW]
+        ├─► Position Monitor-lite (stop / target / EOD) ─► reduce-only exit   [slice A — NEW]
+        └─► OutcomeRecorder ─► record_strategy_outcome() ─► strategy_outcomes [recorder NEW; writer + table built]
+```
+Internal flows of the Execution Engine, Portfolio State, and OutcomeRecorder,
+and the full data-flow diagram, are in the design doc §6.1, §6.3, §6.5, §6.7.
+
+**Open forks (all OPEN; each with options, evidence, and a recommendation in
+doc §7).** EX-1 slice order · EX-2 population label for simulated outcomes ·
+EX-3 venue port and `execution` registry role · EX-4 authorizer stub shape and
+v0 rule numbers · EX-5 whether protective exits need authorization · EX-6
+position-accounting owner, in-flight orders, `PositionClosed` lane · EX-7 D17
+live policy for missing snapshots · EX-8 simulated fill model and
+`fill_simulator` reuse · EX-9 identity and payloads · EX-10 durability · EX-11
+exit enforcement (in-process vs broker-side) · EX-12 who writes
+`StrategyOutcome` and what belongs in it · EX-13 manual mode in the first build
+· EX-14 direction vocabulary and position effect.
+
+**Not done.** No code, schema, migration, event model, or test was written; no
+real IBKR session was reached; no fork was resolved; the World View `portfolio`
+slot stays `null`. Related follow-ups found and reported, not fixed (doc §10):
+Alpaca and `ApprovedOrder` naming drift in `system-design.md`, the two
+disagreeing prose definitions of `TradePlanned`, and §18.8's reference to a
+`trades` table that does not exist.
+
+**Documentation updated in this delivery.** `docs/architecture/execution-engine-design.md`
+(new), `docs/architecture/system-design.md` (pointers only), this entry and its
+`INDEX.md` row, `CHANGES.md`, `TESTING.md`.
