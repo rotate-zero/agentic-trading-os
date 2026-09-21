@@ -107,6 +107,42 @@ The living status surfaces had stopped tracking the implementation. `phase-roadm
 
 **Read-only drift sweep, classified under AGENTS.md §9 and not fixed.** No blocker was found. Related follow-ups: `docs/README.md` still calls `diagrams/` a placeholder although `trading-intelligence-overview.md` now exists (its `api/` placeholder claim remains accurate); `milestone-tracker.html` still names an Alpaca Phase 3 despite decision #1 and the implemented providers; `scanner-design.md`'s body still says Strategy Engine is absent and, in §11, that the panel lacks resize/collapse persistence and a universe editor; `future-ideas.md` #13 still bases its deferral on no `strategy_engine/` and no outcome evidence; `backtest-runner-design.md`'s opening design prose still says Strategy Engine and the runner do not exist despite later as-built notes; and `trading-intelligence-architecture.md`'s decision-#92 note still says Market State/its event do not exist even though #93/#97 landed—reconciling the still-unchanged Context signature is an architecture decision, not a wording guess. Unrelated/accurate candidates: `scanner/runner.py`'s “none of that exists yet” refers narrowly to the genuinely absent continuous scanner/cadence/promotion pieces, and `docs/api/README.md` accurately says that contract folder is empty. Precise summaries and supporting evidence are retained in `TESTING.md`.
 
-**Collision, verification and footprint.** All six editable working files were clean and SHA-256-identical to an independent GitHub `main` snapshot at task start. A second independent `main` snapshot immediately before numbering had the same six hashes; its archives covered contiguous #1–#160, and its live index/log both ended at #163, so baseline `B=163` and this entry is the next free `N=164`. Backend/frontend suites were not run because no application code changed. Focused source/decision greps, relative-link validation, decision-continuity and existing-entry immutability checks, `git diff --check`, full diff review, and archive inspection are recorded in `TESTING.md`. Final `diff -rq` against that fresh snapshot reports exactly: `CHANGES.md`, `TESTING.md`, `docs/architecture/scanner-design.md`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`, and `docs/roadmap/phase-roadmap.md`.
+**Collision, verification and footprint.** All six editable working files were clean and SHA-256-identical to an independent GitHub `main` snapshot at task start. A second independent `main` snapshot immediately before numbering had the same hashes; its archives covered contiguous #1–#160, and its live index/log ended at #163. Backend/frontend suites were not run because no application code changed. Focused source/decision greps, relative-link validation, decision-continuity and existing-entry immutability checks, `git diff --check`, full diff review, and archive inspection are recorded in `TESTING.md`. Final `diff -rq` against that fresh snapshot reports exactly: `CHANGES.md`, `TESTING.md`, `docs/architecture/scanner-design.md`, `docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`, and `docs/roadmap/phase-roadmap.md`.
 
 ---
+
+### 165. First-class `sweep_id` filtering removes sweep-results fan-out
+
+Decision #163's sweep results hook necessarily retained one metadata request
+for `/backtest-runs?sweep_id=...`, because every pair must remain visible even
+when it recorded zero outcomes. It then made one
+`/strategy-outcomes?is_backtest=true&backtest_run_id=...` request per resolved
+run and merged/re-sorted those responses in the browser. This delivery
+supersedes that read-path limitation without changing sweep execution or
+persistence.
+
+`GET /intelligence/strategy-outcomes` now accepts optional `sweep_id: str`.
+Supplying it without `is_backtest=true` is HTTP 400; malformed UUIDs are HTTP
+400; a valid unknown sweep is HTTP 200 with `{"outcomes": []}`. Membership is
+resolved database-side by joining `strategy_outcomes.backtest_run_id` to
+`backtests.run_id` and filtering `backtests.sweep_id`. `backtest_run_id` and
+`sweep_id` are independent AND-combined filters, both require backtest mode,
+and ordering (`exit_filled_at DESC`) plus `limit` apply once to the global
+filtered result. No schema or migration change was needed.
+
+The API client exposes the additive optional `sweepId` positional input. The
+sweep hook now runs one `Promise.all` containing exactly the metadata request
+and one global outcomes request, with no per-run map, client merge, or client
+sort. It still returns both `runs` and `outcomes`, preserving zero-outcome-run
+visibility in `BacktestResultsPanel.tsx`. Real-Postgres route tests cover
+multi-run membership, cross-sweep/live exclusion, unknown and malformed IDs,
+isolation, combined filters, global ordering, and global limit behavior.
+
+The exact footprint is `backend/app/api/routes/intelligence.py`,
+`backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`,
+`frontend/src/services/api-client.ts`,
+`frontend/src/hooks/useBacktestSweepOutcomes.ts`,
+`docs/architecture/backtest-runner-design.md`, this entry and its `INDEX.md`
+row, `CHANGES.md`, and `TESTING.md`. Deliberately unchanged are models,
+schemas, migrations, sweep execution, `BacktestResultsPanel.tsx`, unrelated
+hooks/routes, and all other documentation.

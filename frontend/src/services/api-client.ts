@@ -357,7 +357,8 @@ export interface StrategyOutcomesWireShape {
 
 /**
  * GET /intelligence/strategy-outcomes — decision #123, `is_backtest`/
- * `backtest_run_id` isolation added by decision #130. Raw recent-rows
+ * `backtest_run_id` isolation added by decision #130 and `sweep_id`
+ * filtering added by decision #165. Raw recent-rows
  * read, most recent `exit_filled_at` first, capped by `limit` (backend
  * default 50 when omitted, same `Query(default, le=cap)` convention
  * `fetchFeatureSeries`'s `count` param already uses — not `symbol`-scoped
@@ -365,20 +366,21 @@ export interface StrategyOutcomesWireShape {
  * filter on this route (deliberately global — see the route's own
  * docstring).
  *
- * `isBacktest` defaults to the backend's own default (`false`) when
+ * The four supported inputs are `limit`, `isBacktest`, `backtestRunId`,
+ * and `sweepId`. `isBacktest` defaults to the backend's own default (`false`) when
  * omitted — matching the exact live/backtest strict-selector semantics
  * `fetchWinRateByHour`/`fetchExpectancyBySessionType` below already use
  * via `PerformanceAnalyticsFilters.isBacktest`. `backtestRunId` narrows
  * further to one specific backtest run; the backend rejects it with a
  * 400 (surfaced here as a thrown `ApiError`, not a silently-empty
  * result) if `isBacktest` isn't also `true` — see the route's own
- * docstring for why. Kept as three independent, individually-optional
- * positional params rather than an options object: this function has
- * exactly one caller (`useStrategyOutcomes.ts`) today, so a filters-
- * object rewrite would be pure restructuring with no caller it actually
- * helps — same "smallest change that fits" reasoning that kept this
- * function's original single-`limit`-param shape rather than matching
- * `PerformanceAnalyticsFilters`'s object shape below. Query construction
+ * docstring for why. `sweepId` resolves membership through the backend's
+ * `strategy_outcomes.backtest_run_id -> backtests.run_id -> sweep_id`
+ * join and has the same `isBacktest === true` requirement. Both IDs may
+ * be supplied and are AND-combined; malformed IDs surface the backend's
+ * 400 as `ApiError`, while valid unknown IDs return an empty collection.
+ * Kept as independent, individually-optional positional params for
+ * source compatibility with existing callers. Query construction
  * still switches to the conditional-append-if-present pattern
  * `_performanceAnalyticsQuery` below already established, rather than
  * this function's own previous single-param ternary — that ternary
@@ -396,11 +398,13 @@ export async function fetchStrategyOutcomes(
   limit?: number,
   isBacktest?: boolean,
   backtestRunId?: string,
+  sweepId?: string,
 ): Promise<StrategyOutcomesWireShape> {
   const parts: string[] = [];
   if (limit !== undefined) parts.push(`limit=${encodeURIComponent(limit)}`);
   if (isBacktest !== undefined) parts.push(`is_backtest=${isBacktest}`);
   if (backtestRunId !== undefined) parts.push(`backtest_run_id=${encodeURIComponent(backtestRunId)}`);
+  if (sweepId !== undefined) parts.push(`sweep_id=${encodeURIComponent(sweepId)}`);
   const url = `${API_BASE_URL}/intelligence/strategy-outcomes${parts.length > 0 ? `?${parts.join("&")}` : ""}`;
   const res = await fetch(url);
   if (!res.ok) {

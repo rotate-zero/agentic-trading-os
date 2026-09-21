@@ -1062,6 +1062,41 @@ run provenance cannot be recovered honestly. Downgrade likewise removes
 replay-derived rows before restoring the legacy state unique constraint;
 otherwise two isolated runs for one symbol could not fit the old schema.
 
+**As-built note (decision #165) — sweep outcome reads no
+longer fan out in the frontend.** Decision #163's sweep results view kept
+the necessary `/backtest-runs?sweep_id=...` metadata read, but resolved each
+returned `run_id` into its own `/strategy-outcomes?is_backtest=true` request.
+That made the results path N+1 and required client-side merging and sorting.
+This additive correction gives `/strategy-outcomes` a first-class
+`sweep_id` filter. The route joins `strategy_outcomes.backtest_run_id` to
+`backtests.run_id` and filters the existing `backtests.sweep_id` column in
+SQL; no duplicate column, migration, or schema change is needed. `sweep_id`
+and `backtest_run_id` remain independent AND-combined filters, both gated by
+`is_backtest=true`, with one global newest-first `limit`.
+
+The runs request remains necessary because a run can legitimately record zero
+outcomes. The hook therefore performs exactly two requests per refresh — one
+for all run metadata and one for all globally ordered outcomes — and returns
+both collections so the panel continues to show every pair:
+
+```
+BacktestResultsPanel
+        │ sweep_id
+        ▼
+useBacktestSweepOutcomes ── Promise.all ──┬─► GET /backtest-runs?sweep_id=...
+                                         │      every run, including zero outcomes
+                                         └─► GET /strategy-outcomes?
+                                                is_backtest=true&sweep_id=...
+                                                SQL join + global order/limit
+                                                        │
+                                                        ▼
+                                           { runs, outcomes } → panel
+```
+
+The prior per-run fetch map, client-side merged-list construction, and
+client-side re-sort are removed; sweep execution, persistence, and rendering
+remain unchanged.
+
 **`sweep_id` threading — confirmed a small, additive constructor change, not a larger one.** `BacktestRunner.run()` already minted its own `sweep_id = uuid4()` as a local — "a sweep of one," per decision #155's own note on the schema. The only change: `__init__` now accepts `sweep_id: UUID | None = None`, resolving to a fresh `uuid4()` when omitted (`self._sweep_id = sweep_id if sweep_id is not None else uuid4()`) and to the caller's value otherwise; `run()` reads `self._sweep_id` instead of minting its own. Every existing caller (`/backtest/run`, `/backtest/run/ibkr`, every direct-construction test) passes nothing and gets byte-for-byte the same behavior as before — confirmed via the full existing backtest test suite, unchanged pass count.
 
 **Live-trading guard (decision #132), checked once before the sweep starts, not per-pair.** Same reasoning `/backtest/run` itself already rests on: a single run's own several-second replay never re-checks mid-run either, so treating a sequence of those same runs identically is consistent with existing precedent, not a new weaker standard invented for sweeps specifically.

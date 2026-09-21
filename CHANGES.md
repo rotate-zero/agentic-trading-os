@@ -1,3 +1,27 @@
+# CHANGES — decision #165: first-class sweep outcome filtering
+
+## Current delivery
+
+Added first-class `sweep_id` filtering to `GET /intelligence/strategy-outcomes`
+and removed the sweep-results frontend fan-out. The route validates UUIDs,
+requires `is_backtest=true`, joins through `backtests.run_id`, preserves
+global newest-first ordering and limit semantics, and AND-combines with
+`backtest_run_id`. The sweep hook now makes exactly two requests per refresh:
+run metadata plus all sweep outcomes. The runs response remains visible so
+zero-outcome runs are not hidden.
+
+Updated the route regression coverage, API-client documentation, architecture
+record, decision log, and task-specific testing record. Sweep execution,
+outcome persistence, rendering, schemas, models, and migrations are unchanged.
+
+## Boundary
+
+Exactly nine files change in the completed delivery: the existing route and
+route test, the API client and sweep hook, the backtest-runner architecture
+record, the two live decision-log files, `CHANGES.md`, and `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #164: documentation status synchronization
 
 ## Current delivery

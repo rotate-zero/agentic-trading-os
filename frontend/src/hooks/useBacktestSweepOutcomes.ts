@@ -7,19 +7,9 @@ import {
   type StrategyOutcomeWireShape,
 } from "../services/api-client";
 
-// Backend read side for BacktestResultsPanel.tsx's new sweep_id filter
-// mode (decision #163). Confirmed directly: no
-// backend route filters `strategy_outcomes` by `sweep_id` — that table's
-// only filters (GET /intelligence/strategy-outcomes, decision #123/#130)
-// are `is_backtest`/`backtest_run_id`; `sweep_id` lives only on
-// `backtests` (GET /intelligence/backtest-runs, decision #136, which DOES
-// already support a real `sweep_id` filter — checked directly). Adding a
-// `sweep_id` filter to GET /strategy-outcomes directly would be the
-// smaller, more natural backend change, but this delivery's own explicit
-// file boundary excludes everything under `backend/` — flagged here as a
-// real, worth-doing follow-up, not built.
-//
-// This hook is the frontend-only way to get the same practical result:
+// Backend read side for BacktestResultsPanel.tsx's sweep_id filter mode
+// (decision #163), updated by decision #165 to use the
+// route-level sweep filter rather than the original per-run fan-out:
 // 1. Resolve every `BacktestRunRecord` belonging to the sweep via
 //    `fetchBacktestRuns(limit, undefined, undefined, sweepId)` — already
 //    supports `sweepId`, confirmed directly against its own signature.
@@ -30,18 +20,17 @@ import {
 //    "don't silently fall back to the route's smaller live-oriented
 //    default" reasoning BacktestResultsPanel.tsx's own OUTCOMES_LIMIT
 //    comment already gives for the sibling run_id path.
-// 2. Fetch that resolved run's own StrategyOutcome rows for EVERY run in
-//    parallel (`Promise.all`, one `fetchStrategyOutcomes(limit, true,
-//    runId)` call per resolved run_id) and merge them into one list,
-//    re-sorted by `exit_filled_at` descending — the same ordering
-//    GET /strategy-outcomes itself already guarantees per-run, restored
-//    here across the merge since concatenating already-sorted arrays
-//    doesn't keep that guarantee.
+// 2. Fetch every StrategyOutcome in that sweep once with
+//    `fetchStrategyOutcomes(limit, true, undefined, sweepId)`. The
+//    backend joins through `backtest_run_id` and applies global newest-
+//    first ordering plus `limit`, so no client merge or re-sort remains.
+// Both requests run together in one Promise.all: exactly two requests per
+// load regardless of how many runs belong to the sweep.
 //
 // Both `runs` (every resolved BacktestRunRecord in the sweep, including
 // one whose own run genuinely produced outcomes_recorded=0) and the
-// merged `outcomes` are returned — deliberately NOT collapsed into just
-// the merged outcomes list. A pair that ran cleanly but produced zero
+// `outcomes` are returned — deliberately NOT collapsed into just the
+// outcomes list. A pair that ran cleanly but produced zero
 // StrategyOutcome rows (an honest, expected result per the sweep route's
 // own docstring — several strategy/scenario combinations are structurally
 // unreachable) would otherwise be invisible: absent from `outcomes`, but
@@ -58,15 +47,10 @@ import {
 // sweepId resolves to `runs: []`, `outcomes: []`, `error: null` — honest
 // empty, not an error, same distinction useBacktestRuns.ts/
 // useBacktestOutcomes.ts already draw for their own equivalent case.
-// Once ANY resolved run's own outcomes fetch fails, the whole hook
-// surfaces that as `error` and clears both `runs`/`outcomes` rather than
-// showing a partially-merged result silently missing one run's rows —
-// a merged view has no honest way to show "this one run's own outcomes
-// count is unknown" inline the way a per-pair error string could in
-// BacktestPanel.tsx's own sweep RESULTS view right after a sweep finishes
-// (see SweepResultsView there); surfacing a hard error here and letting
-// the person retry is the safer default for a browse-only view with no
-// per-row error slot to put a partial failure in.
+// If either required request fails, the whole hook surfaces that as
+// `error` and clears both `runs`/`outcomes` rather than showing a partial
+// result. Both datasets are required: outcomes render the trade list,
+// while runs preserve visibility for pairs that recorded zero outcomes.
 //
 // Deliberately one-shot on mount + on `sweepId` change, not a WebSocket
 // subscription — same reasoning useBacktestOutcomes.ts/useBacktestRuns.ts
@@ -106,19 +90,14 @@ export function useBacktestSweepOutcomes(params?: { sweepId?: string; limit?: nu
     setLoading(true);
     setError(null);
 
-    fetchBacktestRuns(limit, undefined, undefined, sweepId)
-      .then(async (runsWire) => {
+    Promise.all([
+      fetchBacktestRuns(limit, undefined, undefined, sweepId),
+      fetchStrategyOutcomes(limit, /* isBacktest */ true, undefined, sweepId),
+    ])
+      .then(([runsWire, outcomesWire]) => {
         if (cancelled) return;
-        const resolvedRuns = runsWire.backtest_runs;
-        const outcomesByRun = await Promise.all(
-          resolvedRuns.map((r) => fetchStrategyOutcomes(limit, /* isBacktest */ true, r.run_id)),
-        );
-        if (cancelled) return;
-        const merged = outcomesByRun
-          .flatMap((w) => w.outcomes)
-          .sort((a, b) => (a.exit_filled_at < b.exit_filled_at ? 1 : a.exit_filled_at > b.exit_filled_at ? -1 : 0));
-        setRuns(resolvedRuns);
-        setOutcomes(merged);
+        setRuns(runsWire.backtest_runs);
+        setOutcomes(outcomesWire.outcomes);
         setLoading(false);
       })
       .catch((err: unknown) => {

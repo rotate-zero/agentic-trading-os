@@ -384,6 +384,7 @@ async def get_strategy_outcomes(
     limit: int = Query(50, le=500),
     is_backtest: bool = Query(False),
     backtest_run_id: str | None = Query(None),
+    sweep_id: str | None = Query(None),
 ) -> dict[str, Any]:
     """
     Decision #122 — raw recent-rows observability into `strategy_outcomes`
@@ -437,6 +438,18 @@ async def get_strategy_outcomes(
     that can't exist" look identical to "no rows exist." A malformed
     (non-UUID) `backtest_run_id` is likewise a 400.
 
+    **Decision #165 — first-class sweep filtering.**
+    `sweep_id: str | None = Query(None)` follows the same isolation and
+    validation rules as `backtest_run_id`: it requires
+    `is_backtest=true`, malformed UUIDs are rejected with 400, and a valid
+    unknown UUID returns an honest empty collection. Sweep membership is
+    resolved in SQL through the existing FK relationship
+    `strategy_outcomes.backtest_run_id -> backtests.run_id`, then filtered
+    by `backtests.sweep_id`; `strategy_outcomes` does not duplicate the
+    sweep identifier. When both IDs are supplied they are independent,
+    AND-combined filters. Ordering and `limit` still apply once to the
+    globally filtered outcome rows, not once per run.
+
     `strategy_outcomes` has zero real LIVE rows in production today (no
     Execution Engine/Position Monitor writes to it yet) — but, as of
     decision #128, it does have real, persisted BACKTEST rows
@@ -456,7 +469,7 @@ async def get_strategy_outcomes(
     from sqlalchemy import select
 
     from app.db.session import SessionLocal
-    from app.models.trading_intelligence import StrategyOutcomeRecord
+    from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
     from app.schemas.performance import StrategyOutcome
 
     backtest_run_uuid: _uuid.UUID | None = None
@@ -474,15 +487,38 @@ async def get_strategy_outcomes(
                 detail=f"backtest_run_id {backtest_run_id!r} is not a valid UUID",
             ) from exc
 
+    sweep_uuid: _uuid.UUID | None = None
+    if sweep_id is not None:
+        if not is_backtest:
+            raise HTTPException(
+                status_code=400,
+                detail="sweep_id requires is_backtest=true (a live outcome cannot belong to a backtest sweep)",
+            )
+        try:
+            sweep_uuid = _uuid.UUID(sweep_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"sweep_id {sweep_id!r} is not a valid UUID",
+            ) from exc
+
     filters = [StrategyOutcomeRecord.is_backtest.is_(is_backtest)]
     if backtest_run_uuid is not None:
         filters.append(StrategyOutcomeRecord.backtest_run_id == backtest_run_uuid)
+    if sweep_uuid is not None:
+        filters.append(BacktestRunRecord.sweep_id == sweep_uuid)
+
+    query = select(StrategyOutcomeRecord)
+    if sweep_uuid is not None:
+        query = query.join(
+            BacktestRunRecord,
+            StrategyOutcomeRecord.backtest_run_id == BacktestRunRecord.run_id,
+        )
 
     session = SessionLocal()
     try:
         rows = session.execute(
-            select(StrategyOutcomeRecord)
-            .where(*filters)
+            query.where(*filters)
             .order_by(StrategyOutcomeRecord.exit_filled_at.desc())
             .limit(limit)
         ).scalars().all()

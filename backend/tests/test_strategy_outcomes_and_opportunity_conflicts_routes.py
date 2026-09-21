@@ -163,7 +163,7 @@ def _make_outcome_record(exit_filled_at: datetime, **overrides) -> StrategyOutco
     return StrategyOutcomeRecord(**fields)
 
 
-def _insert_backtest_run() -> "uuid.UUID":
+def _insert_backtest_run(*, sweep_id: "uuid.UUID | None" = None) -> "uuid.UUID":
     """Inserts one real `backtests` row, scoped to `_STRATEGY_NAME` for
     this file's own cleanup, and returns its real generated `run_id`.
     Needed because `strategy_outcomes.backtest_run_id` is a real,
@@ -176,7 +176,7 @@ def _insert_backtest_run() -> "uuid.UUID":
     session = SessionLocal()
     try:
         row = BacktestRunRecord(
-            sweep_id=uuid.uuid4(),
+            sweep_id=sweep_id or uuid.uuid4(),
             strategy_name=_STRATEGY_NAME,
             strategy_version="orb_v1",
             config_hash=f"cfg_{uuid.uuid4().hex[:8]}",
@@ -488,6 +488,165 @@ def test_strategy_outcomes_malformed_backtest_run_id_is_rejected():
         )
 
     assert resp.status_code == 400
+
+
+# --- Decision #165 — first-class sweep filtering ----------------------------
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_sweep_filter_spans_runs_excludes_other_sweep_and_live_and_orders_globally():
+    sweep_id, other_sweep_id = uuid.uuid4(), uuid.uuid4()
+    run_a = _insert_backtest_run(sweep_id=sweep_id)
+    run_b = _insert_backtest_run(sweep_id=sweep_id)
+    other_run = _insert_backtest_run(sweep_id=other_sweep_id)
+    older_id, newer_id, excluded_id, live_id = (uuid.uuid4() for _ in range(4))
+    _insert([
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 1, 9, 0, tzinfo=timezone.utc),
+            outcome_id=older_id,
+            is_backtest=True,
+            backtest_run_id=run_a,
+        ),
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 1, 11, 0, tzinfo=timezone.utc),
+            outcome_id=newer_id,
+            is_backtest=True,
+            backtest_run_id=run_b,
+        ),
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 1, 12, 0, tzinfo=timezone.utc),
+            outcome_id=excluded_id,
+            is_backtest=True,
+            backtest_run_id=other_run,
+        ),
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 1, 13, 0, tzinfo=timezone.utc),
+            outcome_id=live_id,
+            is_backtest=False,
+            backtest_run_id=None,
+        ),
+    ])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 500, "is_backtest": "true", "sweep_id": str(sweep_id)},
+        )
+
+    assert resp.status_code == 200
+    ours = [o for o in resp.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    assert [o["outcome_id"] for o in ours] == [str(newer_id), str(older_id)]
+    assert {o["backtest_run_id"] for o in ours} == {str(run_a), str(run_b)}
+    assert all(o["is_backtest"] is True for o in ours)
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_sweep_limit_applies_once_after_global_ordering():
+    sweep_id = uuid.uuid4()
+    run_a = _insert_backtest_run(sweep_id=sweep_id)
+    run_b = _insert_backtest_run(sweep_id=sweep_id)
+    ids = [uuid.uuid4() for _ in range(3)]
+    _insert([
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 2, hour, 0, tzinfo=timezone.utc),
+            outcome_id=ids[index],
+            is_backtest=True,
+            backtest_run_id=run_a if index != 1 else run_b,
+        )
+        for index, hour in enumerate((9, 11, 10))
+    ])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 2, "is_backtest": "true", "sweep_id": str(sweep_id)},
+        )
+
+    assert resp.status_code == 200
+    assert [o["outcome_id"] for o in resp.json()["outcomes"]] == [str(ids[1]), str(ids[2])]
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_valid_unknown_sweep_id_returns_honest_empty_collection():
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"is_backtest": "true", "sweep_id": str(uuid.uuid4())},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"outcomes": []}
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_malformed_sweep_id_is_rejected():
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"is_backtest": "true", "sweep_id": "not-a-uuid"},
+        )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_sweep_id_without_is_backtest_true_is_rejected():
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"sweep_id": str(uuid.uuid4())},
+        )
+
+    assert resp.status_code == 400
+    assert "sweep_id requires is_backtest=true" in resp.json()["detail"]
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_run_and_sweep_filters_are_and_combined():
+    matching_sweep_id, other_sweep_id = uuid.uuid4(), uuid.uuid4()
+    matching_run = _insert_backtest_run(sweep_id=matching_sweep_id)
+    other_run = _insert_backtest_run(sweep_id=other_sweep_id)
+    matching_id, other_id = uuid.uuid4(), uuid.uuid4()
+    _insert([
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 3, 9, 0, tzinfo=timezone.utc),
+            outcome_id=matching_id,
+            is_backtest=True,
+            backtest_run_id=matching_run,
+        ),
+        _make_outcome_record(
+            exit_filled_at=datetime(2099, 3, 3, 10, 0, tzinfo=timezone.utc),
+            outcome_id=other_id,
+            is_backtest=True,
+            backtest_run_id=other_run,
+        ),
+    ])
+
+    with TestClient(app) as client:
+        consistent = client.get(
+            "/intelligence/strategy-outcomes",
+            params={
+                "limit": 500,
+                "is_backtest": "true",
+                "backtest_run_id": str(matching_run),
+                "sweep_id": str(matching_sweep_id),
+            },
+        )
+        inconsistent = client.get(
+            "/intelligence/strategy-outcomes",
+            params={
+                "limit": 500,
+                "is_backtest": "true",
+                "backtest_run_id": str(matching_run),
+                "sweep_id": str(other_sweep_id),
+            },
+        )
+
+    assert consistent.status_code == 200
+    ours = [o for o in consistent.json()["outcomes"] if o["strategy_name"] == _STRATEGY_NAME]
+    assert [o["outcome_id"] for o in ours] == [str(matching_id)]
+    assert inconsistent.status_code == 200
+    assert inconsistent.json() == {"outcomes": []}
 
 
 # --- GET /intelligence/opportunity-conflicts --------------------------------
