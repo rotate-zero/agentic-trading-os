@@ -543,3 +543,145 @@ diagrams and new recovery/configuration sections, §7 fork statuses, §8–§9),
 `docs/architecture/system-design.md` (the two pointer paragraphs and the
 companion-doc entry only), this entry and its `INDEX.md` row, `CHANGES.md`,
 `TESTING.md`.
+
+### 171. Authorizer stub + entry-order Execution Engine built (`execution-authorizer-and-engine`) — amends nothing, builds the first real slice of #170's Slice A design
+
+**What was built.** Two new packages, `backend/app/governor/` (the authorizer stub, §6.2) and `backend/app/execution_engine/` (entry-order placement only, §6.3), plus additive-only edits to three files already on `main`. This is the first code (not just design) for the Execution Engine — everything above it (Strategy Scheduler, `OpportunityCreated`) was already built; everything below the boundary this task drew (the real `orders`/`trades` ledger, `SimulatedVenue`, `broker_registry`'s `execution` role, Portfolio State, fill processing, Position Monitor-lite, `OutcomeRecorder`) is deliberately not.
+
+**Governor (`backend/app/governor/`).** `rules.py` — a pure, DB-free function, `evaluate_authorization()`, implementing §6.2's seven rules (0–6) in order, short-circuiting at the first failure: execution-mode gate → regular session → actionable → pre-trade snapshot gate → slots/duplicates → reference price + stop geometry + fixed-notional sizing → daily-loss gate (I15, implemented exactly as documented — unrealized loss, open risk including in-flight entries, and the candidate's own stop-out loss, all against the same cap; any missing mark or stop makes the whole open-exposure term `UNKNOWN`, rejected, never estimated). `engine.py` — `AuthorizerStub`, the same subscribe → own-queue → worker pattern every prior engine in this codebase uses (`LevelInteractionEngine`, decision #84): `OpportunityCreated` (normal lane) is re-validated via `Opportunity.model_validate()` (a deliberate departure from `OpportunityCache`'s raw-dict trust boundary — this is the first consumer that acts on an Opportunity with financial consequences), evaluated, and committed via `TradeLedgerPort.commit_decision()` **before** anything is published (mirrors I8's "commit before any venue call" at the decision layer). A rejected decision commits and publishes `PlanRejected` alone. An approved decision mints `opportunity_id` (`uuid4()`, matching `strategy_outcomes.opportunity_id`'s UUID column type — decision #120) and `client_order_id = "<opportunity_id>:entry"` **only at acceptance** (EX-9), then publishes `TradePlanned` → `GovernorDecision(action="approved")` → `OrderApproved` in that order — `TradePlanned`/`GovernorDecision` are NOT published on the rejected path (a judgment call: `TradePlanned`'s `entry`/`stop`/`size` fields have no defaults and are genuinely unavailable for an early rejection, e.g. the mode gate, before rule 5 ever computes them; §6.1's own data-flow diagram shows only `{PlanRejected, OrderApproved}` branching off "publish," which corroborates this reading of this task's own scope-item-1 text). `ports.py` defines `TradeLedgerPort`/`PortfolioStateReader` as narrow `Protocol`s plus their `PortfolioSnapshot`/`OpenExposure`/`TradeDecisionRecord` dataclasses — no concrete implementation ships here (see "Fork 1," below). `reference_price.py` is a small, self-contained last-trade-price cache subscribing to `PriceUpdated`, the same "each engine owns its own read state" pattern `MarketStateEngine`/`ContextEngine` already use.
+
+**Execution Engine (`backend/app/execution_engine/`), entry-order placement only.** `engine.py` — `ExecutionEngine`, same queue+worker shape, subscribed to `OrderApproved` (critical lane; the subscriber callback only ever does `put_nowait`, so a slow venue call delays this engine's own backlog, never an unrelated critical event elsewhere — I7, AC #20, tested directly). Per order: re-validates the payload; drops `position_effect == "close"` (reduce-only/exit path — needs EX-5, still open, left as a marked extension point, not built); derives `trade_id` from `client_order_id` (`"<trade_id>:entry"`, I10 — no re-minting, since governor already mints it); checks `DecisionAuthorizationPort.has_committed_decision(trade_id)` **before writing anything** (I2's authorization gate, AC #19 entry-gate half — a spoofed/stale `OrderApproved` never reaches the ledger); performs an idempotent `OrderLedgerPort.insert_order()` (a duplicate `client_order_id` returns the stored row and sends nothing further — AC #7 client-order-id-mint half); checks the configured venue via `ExecutionVenueProvider.get_execution_venue()` supports the order's `execution_mode` (AC #5 venue-refusal half — no venue configured, or a venue whose `supported_modes` doesn't include the mode, both reject, never routed); and calls `OrderVenue.place_order()`. **Fill processing (§6.3 steps 6–7 — `on_order_update`, dedup, `OrderFilled`) is explicitly NOT built** — a judgment call, flagged: it isn't in this task's owned AC list (no #8/#9/#13/#14) and couples directly to Portfolio State, which the file boundary forbids touching. `place_order()` is still called, so a venue can begin processing an order, but nothing here consumes the resulting update; that consumer is a clearly separate, later increment (Position Monitor-lite's own task), same footing as the reduce-only guard.
+
+**New event: `OrderStatusChanged` (EX-9).** A venue-level order-status/rejection event, distinct from the plan-level `PlanRejected` (fired before any order exists). This delivery only ever publishes `status="rejected"` — for an order that never reaches a venue (the mode/venue check) or one a venue itself rejects; the `status` `Literal` is typed narrowly to what's actually produced rather than widened speculatively for the not-yet-built fill path. Name and shape are a judgment call, overridable, per this task's own instruction.
+
+**`TradePlanned` (R2), reconciled.** `system-design.md` §10.3's prose and `trading-intelligence-architecture.md` §18.3's `TradePlan` prose disagreed. Per this task's own instruction, `TradePlan`'s field set (the more recent document) is the base, adapted two ways, both flagged as judgment calls: `symbol` is dropped from the payload (kept on the envelope only, matching every other payload's convention — `TradePlan`'s own sketch includes it, `OpportunityCreated`/`FeaturesUpdated`/`MarketStateChanged` do not); `direction` stays the planning-layer `long`/`short` vocabulary (matching `TradePlan` exactly), distinct from `OrderApproved.side`'s order-layer `BUY`/`SELL` — the authorizer translates one to the other when it mints `OrderApproved` (EX-14 option (a) in the design doc explicitly allows the two vocabularies to differ by layer). This delivery always publishes `origin="auto"`, `corroboration=[]` (D4/§18's manual path both out of scope), and leaves `max_hold_seconds`/`scaling_plan`/`trailing_stop_rule` at `None` (not built this slice).
+
+**`OrderApproved.position_effect` (EX-14).** Added, required, no default — every instance this codebase currently constructs has `"open"` (entry-only scope); `"close"` is reserved for the unbuilt exit path. §6.3 also lists `execution_mode`/`opportunity_id`/`origin` as eventual additions to `OrderApproved` — deliberately **not** added here (outside this task's exhaustive scope item 3); the Execution Engine derives `trade_id` from `order_id` instead, and reads `execution_mode` fresh from `Settings` rather than trusting a stamped field that doesn't exist yet.
+
+**`opportunity_id` minting (EX-9).** The design doc cites "decision #128's 'mint when the signal is accepted'" — as currently numbered, #128 is "Backtest Runner v1 closed out" and contains no such text (most likely stale due to this log's own documented renumbering drift, e.g. #98/#99, #111/#112, #114/#115, #120/#121, #122/#123, #127/#128). Flagged rather than silently followed or silently ignored: the underlying technical requirement is well-corroborated independently (`strategy_outcomes.opportunity_id`'s UUID column, decision #120; `strategy-engine-design.md`'s own `opportunity_id: UUID` sketch), so `opportunity_id = str(uuid4())`, minted once, only on acceptance, proceeds on that evidence rather than blocking on the citation.
+
+**Fork 1 (Saqib, 2026-09-22) — ledger/Portfolio-State ownership.** This task's file boundary forbids `backend/app/models/**` and any Alembic migration, yet §6.3/§6.2 assign the authorizer a `trades`-row commit and the Execution Engine an idempotent `orders`-row insert. Resolved: the sibling `execution-ledger-and-venue` task owns the real ledger tables, migration, and `SimulatedVenue`; this delivery is built against narrow local `Protocol`s instead (`TradeLedgerPort`, `PortfolioStateReader`, `OrderLedgerPort`, `DecisionAuthorizationPort`, `OrderVenue`, `ExecutionVenueProvider`) — no generic CRUD, each shaped around one domain operation and its failure contract (a required commit failing publishes/routes nothing further). This delivery's own tests exercise these against in-memory fakes — an explicit, scoped departure from "real Postgres 16, never mocks," confirmed with Saqib rather than assumed. `default_execution_venue_provider()` (`execution_engine/ports.py`) duck-types onto `broker_registry.get_execution_venue()` so no code here needs to change once that registry role merges. AC #7/#8/#9/#13/#14/#17(portfolio-computation-only)'s full real-Postgres verification, and AC #5's `set_execution_venue()` refusal half, are explicitly **not** claimed by this delivery — only the consumer-side contract this task owns is.
+
+**Fork 2 (Saqib, 2026-09-22) — the new `EventType`.** `OrderStatusChanged` needs a real `EventType` member (and critical-lane membership) in `backend/app/schemas/events/envelope.py`, outside this task's literal "may edit" list (`execution.py`/`config.py` only). Resolved: one minimal additive line plus one `CRITICAL_EVENT_TYPES` entry, re-confirmed against a fresh `main` pull immediately before editing (no collision — no sibling addition existed). Recorded here as the one necessary exception to the file boundary, alongside a second, smaller one: `backend/tests/conftest.py` gained two lines resetting `governor.engine._authorizer_stub`/`execution_engine.engine._execution_engine` between tests, the same singleton-reset convention every prior engine (`LevelInteractionEngine`, `MarketStateEngine`, `OpportunityCache`, ...) already required there — without it, this task's own new tests would leak state across each other. Both exceptions are necessary registration, not license to broaden scope elsewhere in either file.
+
+**Config (`core/config.py`), append-only.** Exactly the three-setting block specified: `execution_max_concurrent_positions` (default 1), `execution_fixed_notional_usd` (default 1000.0), `execution_daily_loss_cap_usd` (default 100.0) — each validated positive at startup via a new `field_validator` (this file's first; no prior precedent existed to follow). `execution_mode` is deliberately **not** added here — the sibling task's own config.py block, per this task's own instructions.
+
+**AC ownership, exactly as assigned.** #3, #4, #6, #16, #17 (authorizer, fully); #5 venue-refusal half, #7 client-order-id-mint half, #19 entry-gate half, #20, and the authorizer/engine half of #22 (Execution Engine). Not claimed: anything requiring the real ledger/venue (#8, #9, #13, #14, the rest of #5/#7/#19/#22). **EX-5 and EX-12 remain open** — untouched, as this task's own §2 established neither is needed for an entry-only slice.
+
+**Diagrams.**
+
+Data flow, `OpportunityCreated` → authorizer stub → `OrderApproved`/`PlanRejected` → Execution Engine → `OrderVenue.place_order()`:
+
+```
+OpportunityCreated (normal lane)
+        │
+        ▼
+AuthorizerStub._on_opportunity_created()        fast: put_nowait onto own queue (I7)
+        │
+        ▼
+AuthorizerStub._worker_loop() ──► _process_one()
+        │  Opportunity.model_validate()            malformed ──► dropped, no commit
+        │  execution_mode_provider()                defensive getattr — sibling's config field
+        │  MarketClock.is_regular_session()/.trading_day()
+        │  capture_strategy_outcome_snapshots()      real, already-built (decision #98/#128)
+        │  PortfolioStateReader.get_snapshot()        fork 1: Protocol seam, faked in this delivery
+        │  ReferencePriceTracker.get(symbol)           own PriceUpdated subscription
+        ▼
+rules.evaluate_authorization()    pure, §6.2 rules 0-6 (see second diagram)
+        │
+        ├─ rejected ──► TradeLedgerPort.commit_decision() ──► PlanRejected (critical)
+        │
+        └─ approved ──► mint opportunity_id (uuid4) + client_order_id "<id>:entry"  (EX-9: only here)
+                         │
+                         ▼
+                   TradeLedgerPort.commit_decision()     commit fails ──► LedgerCommitError ──► nothing published
+                         │
+                         ▼
+           TradePlanned (normal) ──► GovernorDecision(approved) (critical) ──► OrderApproved (critical)
+                                                                                      │
+                                                                                      ▼
+                                                                ExecutionEngine._on_order_approved()   fast enqueue (I7)
+                                                                                      │
+                                                                                      ▼
+                                                                ExecutionEngine._worker_loop() ──► _process_one()
+                                                                                      │
+                                                      position_effect=="close" ──► dropped (EX-5 not built, extension point)
+                                                                                      │
+                                                      malformed client_order_id ──► dropped
+                                                                                      │
+                                                      DecisionAuthorizationPort.has_committed_decision(trade_id)
+                                                          no ──► OrderStatusChanged(rejected, "no_committed_decision")
+                                                                                      │ yes
+                                                                                      ▼
+                                                      OrderLedgerPort.insert_order()      idempotent — fork 1: Protocol seam
+                                                          duplicate ──► log, send nothing (AC #7)
+                                                                                      │ inserted
+                                                                                      ▼
+                                                      ExecutionVenueProvider.get_execution_venue()
+                                                          duck-types broker_registry.get_execution_venue()
+                                                          once the sibling's registry role merges
+                                                          venue is None, or mode ∉ venue.supported_modes
+                                                              ──► update_order_status(rejected) + OrderStatusChanged
+                                                                  (AC #5 venue-refusal half)
+                                                                                      │ mode OK
+                                                                                      ▼
+                                                      OrderVenue.place_order(instruction)
+                                                          ack.status=="rejected" ──► update_order_status(rejected)
+                                                                                      + OrderStatusChanged
+                                                          ack.status=="submitted" ──► update_order_status(submitted)
+                                                                                      │
+                                                                  [fill processing / Position Monitor-lite —
+                                                                   NOT built here, extension point]
+```
+
+The authorizer's internal rule pipeline:
+
+```
+OpportunityCreated
+        │
+        ▼
+ rule 0  execution_mode == "simulated" ?           no ──► rejected: execution_mode_not_permitted   (AC #3, #4)
+        │ yes
+        ▼
+ rule 1  MarketClock.is_regular_session() ?         no ──► rejected: outside_regular_session
+        │ yes
+        ▼
+ rule 2  opportunity.status == "actionable" ?       no ──► rejected: not_actionable
+        │ yes
+        ▼
+ rule 3  market_state snapshot present              no ──► rejected: snapshot_unavailable:market_state
+         AND context snapshot present               no ──► rejected: snapshot_unavailable:context
+        │ yes
+        ▼
+ rule 4  symbol has no open position/in-flight       no ──► rejected: symbol_busy
+         AND open_count + in_flight_count
+             < max_concurrent_positions               no ──► rejected: max_concurrent_positions
+        │ yes
+        ▼
+ rule 5  reference_price exists                     no ──► rejected: no_reference_price
+         AND stop on the correct side
+             (BUY: stop < ref; SELL: stop > ref)      no ──► rejected: invalid_stop_geometry
+         AND qty = floor(fixed_notional_usd
+             / reference_price) >= 1                  no ──► rejected: notional_below_one_share
+        │ yes
+        ▼
+ rule 6  daily-loss gate (I15)
+         realized_loss_today = max(0, -realized_pnl_today)
+         open_exposure_loss  = Σ max(qty·|avg_entry−stop|, −unrealized_pnl)   over open + in-flight
+                                any missing mark/stop ──► UNKNOWN
+         candidate_loss      = qty · |reference_price − stop|
+        │
+        ├─ open_exposure_loss == UNKNOWN                              ──► rejected: loss_exposure_unknown
+        ├─ realized_loss_today + open_exposure_loss >= cap            ──► rejected: daily_loss_cap_reached
+        ├─ realized_loss_today + open_exposure_loss
+              + candidate_loss > cap                                  ──► rejected: projected_loss_exceeds_daily_cap
+        └─ else                                                       ──► approved (qty, reference_price)
+```
+
+**Footprint, confirmed by `diff -rq` against a freshly re-pulled `main`.** New: `backend/app/governor/` (`__init__.py`, `ports.py`, `reference_price.py`, `rules.py`, `engine.py`), `backend/app/execution_engine/` (`__init__.py`, `ports.py`, `engine.py`), `backend/tests/test_governor_rules.py`, `test_governor_config.py`, `test_governor_engine.py`, `test_execution_engine.py`, `test_execution_event_schemas.py`. Edited, additive only: `backend/app/schemas/events/envelope.py` (one `EventType` member, one `CRITICAL_EVENT_TYPES` entry), `backend/app/schemas/events/execution.py` (`OrderApproved.position_effect`, new `TradePlanned`/`OrderStatusChanged` models), `backend/app/core/config.py` (the three-setting block + validator), `backend/tests/conftest.py` (two singleton-reset lines). Nothing else touched — confirmed against every path this task's own file boundary named "must not touch."
+
+**Verified.** 75 new tests (30 pure rule-pipeline cases covering AC #17's full table including the raised-`max_concurrent_positions` and gap-through-the-stop cases; 11 config-validator cases; 9 `AuthorizerStub` orchestration cases against a real `EventBus` and fake ports; 10 `ExecutionEngine` orchestration cases including the AC #20 critical-lane-isolation timing test; 15 schema/envelope cases), all passing repeatedly and deterministically on their own. Full suite (real local Postgres 16, migrated through 0011): 885 collected; a first run passed 885/885, a second surfaced one intermittent, wall-clock-time-sensitive failure in `test_backtest_routes.py` (this project's own long-documented #119 cluster, e.g. decisions #128/#129/#131) — confirmed pre-existing and unrelated to this delivery by reproducing the identical failure on a freshly re-pulled, completely untouched `main` (809 passed/1 failed there; 809 + this delivery's 75 = 884, matching this delivery's own second-run count exactly). Zero regressions attributable to this delivery.
+
+**Not done, stated precisely rather than left implicit.** No exit path, no reduce-only guard, no `StrategyOutcome` writing (EX-5/EX-12 still open, as this task's own §2 established). No fill processing (`on_order_update`, dedup, `OrderFilled` for entries) — a judgment call, not an oversight, see above. No real Postgres-backed ledger, no `SimulatedVenue`, no `broker_registry` `execution` role — the sibling `execution-ledger-and-venue` task's own scope; this delivery's `TESTING.md` names the exact reconciliation points. `main.py` is not wired to start either engine — outside this task's file boundary (`main.py` isn't in "may edit"); `get_authorizer_stub()`/`get_execution_engine()` both exist and are ready for that wiring once the sibling's concrete ports land.
+
+**Documentation updated in this delivery.** This entry and its `INDEX.md` row, `CHANGES.md`, `TESTING.md`. `docs/architecture/execution-engine-design.md` deliberately **not** touched (outside the file boundary — "must not touch any `docs/architecture/*.md` other than the decision entry").

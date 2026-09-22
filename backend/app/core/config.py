@@ -4,6 +4,8 @@ nothing else in the app should read os.environ directly.
 """
 from functools import lru_cache
 
+from pydantic import field_validator
+from pydantic import ValidationInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -236,6 +238,30 @@ class Settings(BaseSettings):
     # ranking — this default keeps those two decisions apart. Flip above
     # 0 once real values have actually been looked at, not before.
     scanner_weight_premarket_volume_ratio: float = 0.0
+
+    # --- Execution: authorizer limits (decision #171) ---
+    execution_max_concurrent_positions: int = 1
+    execution_fixed_notional_usd: float = 1000.0
+    execution_daily_loss_cap_usd: float = 100.0
+
+    # Conservative first-slice defaults for validating the lifecycle, not
+    # final risk settings (Saqib, 2026-09-22) — do not silently make these
+    # "smarter" (no volatility scaling, no per-symbol overrides, etc.)
+    # without an explicit decision to do so. `execution_mode` is a separate
+    # setting appended by the sibling `execution-ledger-and-venue` task in
+    # its own block — deliberately not added here (AC #16: none of these
+    # three appears as a literal in the authorizer; each is read from
+    # Settings and recorded in `limits_snapshot` on every decision).
+    @field_validator(
+        "execution_max_concurrent_positions",
+        "execution_fixed_notional_usd",
+        "execution_daily_loss_cap_usd",
+    )
+    @classmethod
+    def _execution_limit_must_be_positive(cls, value: int | float, info: ValidationInfo) -> int | float:
+        if value <= 0:
+            raise ValueError(f"{info.field_name} must be positive, got {value!r}")
+        return value
 
 
 @lru_cache

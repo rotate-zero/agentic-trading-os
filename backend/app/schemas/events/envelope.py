@@ -37,6 +37,7 @@ class EventType(StrEnum):
 
     # Execution / positions
     ORDER_FILLED = "OrderFilled"
+    ORDER_STATUS_CHANGED = "OrderStatusChanged"  # decision #171 (EX-9): venue-level order-status/rejection, distinct from plan-level PlanRejected
     POSITION_ADJUSTED = "PositionAdjusted"
     POSITION_CLOSED = "PositionClosed"
 
@@ -53,6 +54,7 @@ CRITICAL_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.PLAN_REJECTED,
         EventType.GOVERNOR_DECISION,
         EventType.ORDER_APPROVED,
+        EventType.ORDER_STATUS_CHANGED,  # decision #171 — order-lifecycle event, same lane as its siblings above
     }
 )
 

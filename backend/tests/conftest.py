@@ -43,7 +43,9 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
     import app.context_engine.fundamentals_refresh as fundamentals_refresh_module
     import app.core.config as config_module
     import app.event_bus.bus as bus_module
+    import app.execution_engine.engine as execution_engine_module
     import app.feature_engine.engine as feature_engine_module
+    import app.governor.engine as governor_engine_module
     import app.market_state_engine.engine as market_state_engine_module
     import app.services.live_tick_relay as live_tick_relay_module
     import app.strategy_engine.scheduler as strategy_scheduler_module
@@ -73,6 +75,8 @@ def _reset_app_singletons(monkeypatch: pytest.MonkeyPatch):
         market_state_engine_module._market_state_engine = None  # ditto — decision #93
         strategy_scheduler_module._strategy_scheduler = None  # ditto — decision #112/#114
         opportunity_cache_module._opportunity_cache = None  # ditto — decision #114/#115 (Track B, restored)
+        governor_engine_module._authorizer_stub = None  # ditto — decision #171
+        execution_engine_module._execution_engine = None  # ditto — decision #171
         broker_registry.clear_all()
         # market_data.py and finnhub_data.py each keep their own local
         # provider reference (see their module docstrings for why) —
