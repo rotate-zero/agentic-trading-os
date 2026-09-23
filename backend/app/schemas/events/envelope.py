@@ -55,6 +55,7 @@ CRITICAL_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.GOVERNOR_DECISION,
         EventType.ORDER_APPROVED,
         EventType.ORDER_STATUS_CHANGED,  # decision #171 — order-lifecycle event, same lane as its siblings above
+        EventType.POSITION_CLOSED,  # decision #173: publish only AFTER closure/cursor commit
     }
 )
 

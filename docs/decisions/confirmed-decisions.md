@@ -806,3 +806,91 @@ in-memory PortfolioSnapshot updated (positions / marks / realized_pnl_today / op
                                          PortfolioState.apply_fill(), same
                                          transaction as the positions upsert
 ```
+
+### 173. Portfolio State accounting and event worker (`portfolio-state-engine`) — commit before publication, fill-day profit/loss/fees, and holding-period-independent positions
+
+**Scope and authorization.** Fresh GitHub `main` was `c341a2c2f3e2e38901fe2ce10a430b826201be11` (decision #172 already merged); the initial `main` checkout was clean. Contrary to the task brief's older inventory, #172 already supplied `portfolio_state/engine.py`, reconciliation, and the execution tables. Work stopped before editing to report that ownership overlap. Saqib subsequently approved revising the existing package around shared pure arithmetic, a local persistence Protocol, and an event worker while preserving reconciliation's callable API. He approved nullable R when no trustworthy immutable risk basis exists, requested **profit, loss, and fees separately**, and clarified that this automation focuses on day trading **but also supports medium- and long-term stock holdings**. This entry corrects the affected #172 behavior without rewriting that entry. The temporary identifier was `portfolio-state-engine`; #173 was assigned only after re-fetching GitHub main and checking index #172, log tail #172, and archive filenames through `134-160` together.
+
+**One accounting implementation, two integration surfaces.** `portfolio_state/accounting.py` is pure and database-free: immutable values, Decimal arithmetic, long/short opens and adds, weighted average cost, partial reductions, full closes, separate realized profit and loss, and separately reported fees. Invalid/nonfinite prices, invalid quantities, mismatched trade/mode/symbol, same-side closes, opposite-side opens, and over-closes are rejected before arithmetic changes any state. `PortfolioState` in `engine.py` supplies the subscribe → own queue → worker path and synchronous read cache. `legacy.py` retains #172's `apply_fill(session, fill)` and `rebuild_from_ledger(session, full_rebuild=False)` for existing reconciliation; it calls the **same** pure arithmetic. A single instance cannot use both the Session API and the Protocol. There is no second independent accounting implementation, no startup wiring, venue placement, exit decision, or `StrategyOutcome` writer.
+
+**Contracts verified against code, not the older design inventory.** `OrderApproved.order_id` is the client-order ID and its payload carries `position_effect`, symbol, side, and quantity, but no execution mode. `OrderFilled` still contains only order ID, side, quantity, fill price, and timestamp: no durable fill ID/sequence, mode, or position effect. No application path publishes it yet. Therefore approval/fill/status events are **wake-ups for authoritative ledger reads**, never a source of fill arithmetic or a reason to label a fill with process configuration. The persisted `fills` row supplies `ledger_seq` and unique `(execution_venue, venue_fill_id)`; its order supplies trade ID, mode, side, symbol, and effect. Repeated notifications are harmless. A notification with unresolved order metadata makes the snapshot unavailable until read-back resolves it; this also covers an approval arriving before Execution inserts its order. No invented in-flight zero is exposed during that race. The eventual adapter must cover durable approved reservations, not only already-inserted orders.
+
+**PositionLedgerPort.** `ports.py` declares four synchronous domain operations, offloaded by the worker with `asyncio.to_thread`: `load_state(mode)`, `pending_fills(mode, after_cursor)`, `get_order(client_order_id)`, and `commit_fill(application)`. The checkpoint includes complete open positions with their durable IDs and lifetime totals, non-terminal orders/reservations, cursor, checkpoint timestamp, and per-symbol/per-day profit/loss/fee aggregates reconstructed from individual realized-fill attributions. Unknown history is explicit, and unresolved anomalies block usable snapshots. A fill application contains its immutable identity, expected cursor, resulting position, and `RealizedFill` attribution (including fill timestamp, MarketClock day, gross realized delta, and nullable commission). An implementation must atomically persist the position/closure, fill attribution or immutable inputs sufficient to reproduce it, and cursor, with durable per-fill idempotency and a compare-and-set against the expected cursor. Exact duplicate returns `applied=False` and committed state; conflicting key reuse or cursor conflict raises. Return success only after durable commit. **No production implementation of this Protocol ships here.**
+
+**Cursor safety is stronger than an Identity column.** `pending_fills` must return a complete, strictly ordered **safe committed prefix** for its mode. Sequence gaps for other modes or aborted transactions are legal. PostgreSQL Identity allocation does not establish commit order: a future adapter must serialize ingestion or establish a safe watermark so a lower sequence cannot commit later behind an advanced cursor. It must not silently skip anomalous/unresolvable fills. The retained Session path refuses to skip an earlier visible fill but still requires serialized ledger writers; this task does not prove arbitrary concurrent ingestion safe. Fake-ledger tests prove consumer behavior, not these database guarantees.
+
+**State and honest reads.** `get_snapshot(symbol=None, *, trading_day=None)` performs no I/O. Each instance is explicitly scoped to one of `backtest`, `simulated`, `paper`, or `live`; this is accounting isolation, not permission to place orders in any mode. Omitted symbol returns the mode-wide view; a supplied symbol filters positions, orders, marks, exposures, and daily totals. An unknown symbol returns `None`; a closed symbol with known history returns a known flat view with its history. Before restoration, during queued accounting, after failure, or while unresolved metadata/anomalies remain, the result is `None`. A successfully restored empty ledger is known flat. Incomplete realized history produces `None` daily amounts, never zeros. Snapshots have detached dictionaries and immutable position/order values. Exposure fields deliberately match the concepts in governor's `PortfolioSnapshot`/`OpenExposure` without importing governor or execution-engine packages; a later adapter must handle unavailable reads explicitly and convert Decimal values as needed. Buying power stays `None`.
+
+**Order lifecycle and marks.** Positions plus only the unfilled remainder of entry orders contribute exposure; exit orders stay visible as in-flight orders without duplicating exposure. Rejection uses the existing `OrderStatusChanged` notification and authoritative read-back. Terminal cancellations/expirations and filled orders are excluded when read back. **Live cancellation/expiration tracking remains incomplete**: #171's event schema permits only `rejected`, and this task does not widen sibling-owned contracts or add their publishers. `refresh()` and restart read-back discover those persisted transitions; production needs a broader status notification or another explicit refresh trigger. Duplicate/stale approvals cannot resurrect a terminal persisted order. EventBus has no symbol-filtered subscriptions, so unheld price events are dropped before queueing and checked again at processing. Marks retain exchange timestamps, reject older/pre-opening observations, and are discarded on closure/reopening or restart; missing marks/stops remain unknown. Mark freshness policy remains a consumer/integration concern.
+
+**Position lifetime and money reporting.** A UUID is minted on opening and persisted in the first successful position-and-cursor transaction. It is retained through adds, partial closes, restarts, and arbitrary holding durations. Full closure retires it; a later opening in the same symbol gets a new UUID, even for the same trade ID. No session-close liquidation, daily position reset, maximum holding duration, or day-trading-only rule is introduced. Every reducing fill's signed gross P&L is attributed via `MarketClock.trading_day(fill.venue_ts)` (ET date); positive deltas sum into profit and negative deltas into a positive loss magnitude. Gross P&L = profit − loss. Fees are independently attributed on each fill's own day, including entry fills; they are never subtracted from gross P&L. `reported_fees` sums supplied charges/rebates; `fees` remains `None` if any included fill's fee is unknown, with an unknown-fee count. A known empty bucket can be zero; absent commission is never asserted to be zero cost. This supports multi-day holdings without moving earlier partial realizations to a later closing day. Stock splits, dividends, financing/borrow costs, and late fee corrections have no input contracts in this slice and are not modelled.
+
+**PositionClosed and R.** The additive payload implements the documented five fields (`position_id`, `exit_price`, `realized_pnl`, `r_multiple_achieved`, `closed_ts`) plus optional trade/mode/venue, separate profit/loss/fee fields, and an R-missing reason. `exit_price` is the quantity-weighted average of **all** reducing fills; P&L is the lifetime gross result, distinct from daily totals. The current ledger has no immutable planned-risk contract adequate for adds/stop changes. Accordingly the worker emits `r_multiple_achieved=None`, `r_multiple_missing_reason="immutable_risk_basis_unavailable"`; it never divides by the current stop distance. Numeric R awaits a persisted, explicitly defined risk basis. Missing R never suppresses a valid closure.
+
+**Commit, then publish; no exactly-once claim.** `PositionClosed` joins the critical lane only after `commit_fill` returns a successful committed application. A required commit failure publishes nothing and makes reads unavailable; retry reloads the committed checkpoint before arithmetic. Exact duplicate application publishes nothing. There is no outbox: a successful commit followed by a crash, lost acknowledgement, publish failure, or unhandled bus event can leave **no delivered PositionClosed**. Normal processing attempts one publication per newly committed closure; there is neither an at-least-once nor an exactly-once delivery guarantee. Consumers must recover committed closed positions independently from the ledger; the future OutcomeRecorder's recovery remains outside this task. Startup does not re-publish already-applied closures.
+
+**Corrections to the retained Session path.** #172 updated its memory after flush but before the caller's commit, removed in-flight orders on the first partial fill, counted only the last reduction on closure day, and restored no daily realized totals. Session callbacks now stage a snapshot before commit and install it only after commit; rollback installs nothing. Complete immutable fill history reconstructs lifetime and daily profit/loss/fees and remaining in-flight quantities. `full_rebuild` audits/reconstructs without resetting the cursor or replacing durable IDs. Already-terminal order status does not by itself invalidate a legitimate unapplied fill (Execution can commit status before notification). Invalid overfills stay persisted and flagged, leave the position quantity/P&L unchanged, and block usable snapshots; the old clamp calculated P&L on excess shares. Reconciliation now reports unavailable accounting as a discrepancy instead of dereferencing an absent snapshot. The Session API does not publish closures and is not claimed as the new Protocol's production adapter. Legacy repeated openings with identical `(trade, symbol, opened_at)` cannot be unambiguously linked by the existing columns and fail explicitly instead of guessing an ID.
+
+**Component flow:**
+
+```text
+OrderApproved / OrderFilled / OrderStatusChanged       PriceUpdated
+                   |                              (held symbols only)
+                   v                                      |
+          fast enqueue, mark read cache stale             v
+                   +------------> portfolio queue <--------+
+                                      |
+                                      v
+                               single worker
+                         /                         \
+           PositionLedgerPort reads                 marks (memory only)
+        persisted fill + order metadata                       |
+                         |                                    |
+                         v                                    |
+                 pure accounting                              |
+                         |                                    |
+     atomic commit: position + realized-fill facts + cursor    |
+                         |                                    |
+                         +------> committed read cache <-------+
+                         |          get_snapshot(): no I/O
+                         v
+                PositionClosed (critical)
+                  notification, no outbox
+
+Existing reconciliation -> Session compatibility -> same pure accounting
+                            caller COMMIT -> cache installation
+Production PositionLedgerPort adapter / startup / outcome recovery: not wired
+```
+
+**Internal fill transition:**
+
+```text
+notification -> load committed checkpoint -> read safe ordered fill prefix
+                                                |
+                          resolve identity / mode / effect from ledger
+                                                |
+                   +----------------------------+---------------------+
+                   | open/add                   | close/reduce        |
+                   v                            v                     |
+             new UUID or same ID          opposite side, qty <= held  |
+             weighted average             gross realized delta       |
+                   +----------------------------+                     |
+                                                v                     |
+                              attribute delta and fee to fill day     |
+                                                |                     |
+                   atomic idempotent commit(position, attribution, cursor)
+                         | failed                 | success           |
+                         v                        v                   |
+                  publish nothing        install committed state      |
+                  read unavailable       qty == 0 and newly applied?  |
+                         |                   no -> next fill           |
+                         v                  yes -> PositionClosed      |
+                  reload on retry                                     |
+                                                                      |
+invalid arithmetic / unresolved data ----------------------------------+
+  -> no guessed position, no closure event; retain source fill, flag/block
+```
+
+**Validation.** 161 focused checks passed, with no skips: 45 pure-arithmetic/fake-ledger worker cases, 15 real-PostgreSQL Session accounting cases, 7 real-PostgreSQL reconciliation cases, plus related execution/governor/ledger/venue/bus/clock regressions. PostgreSQL **18.6** was available here, not 16; a fresh isolated database was migrated through the unchanged `0012`. Tests cover multi-month long/short reductions, per-mode/ET-day attribution, partial entry remainders, fees unknown versus known, duplicate fills/notifications, invalid reversals, stable/reopened IDs, detached/unknown/restored snapshots, rollback, cursor ordering, commit-before-publication, lost commit acknowledgement, post-commit publication failure, price filtering, and worker drain/isolation. Existing close fixtures were corrected from BUY to SELL; overfill tests now verify the persisted position remains unchanged instead of accepting an invented clamp. No full-suite or real-Protocol-adapter claim. Exact command and remaining integration gaps are in `TESTING.md`.
+
+**Documentation and boundary.** Updated §6.5 of the canonical execution design (and its historical-status note and partial-realization formula), this appended entry, `INDEX.md`, `CHANGES.md`, and `TESTING.md`. No model/migration, broker-adapter/registry, governor/execution-engine, websocket channel, main startup, or frontend edits. The decision log was already above the rollover threshold on main; archival maintenance remains outside this delivery's append-only decision-entry boundary, as #172 also recorded.

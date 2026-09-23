@@ -120,3 +120,28 @@ class OrderFilled(BaseModel):
     qty: int
     fill_price: float
     fill_ts: datetime
+
+
+class PositionClosed(BaseModel):
+    """Committed full closure, decision #173 (portfolio-state-engine).
+
+    exit_price is the volume-weighted price of ALL reducing fills. P&L is
+    lifetime gross P&L; fees are separate. R is unknown until an immutable
+    planned-risk basis exists (the current stop is not that basis).
+    Symbol lives on the envelope. No delivery guarantee is implied.
+    """
+
+    position_id: str
+    exit_price: float
+    realized_pnl: float
+    r_multiple_achieved: float | None
+    closed_ts: datetime
+    r_multiple_missing_reason: str | None = None
+    trade_id: str | None = None
+    execution_mode: Literal["backtest", "simulated", "paper", "live"] | None = None
+    execution_venue: str | None = None
+    realized_profit: float | None = None
+    realized_loss: float | None = None
+    fees: float | None = None
+    reported_fees: float | None = None
+    unknown_fee_count: int | None = None

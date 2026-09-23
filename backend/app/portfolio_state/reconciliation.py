@@ -195,7 +195,11 @@ async def _check_open_orders_discrepancy(session: Session, venue: OrderVenue, ex
 
 async def _check_positions_discrepancy(venue: OrderVenue, portfolio_state: PortfolioState, report: ReconciliationReport) -> None:
     venue_positions = {p.symbol: p for p in await venue.get_positions()}
-    ledger_positions = portfolio_state.get_snapshot().positions
+    snapshot = portfolio_state.get_snapshot()
+    if snapshot is None:
+        report.discrepancies.append("Portfolio State unavailable: unresolved accounting or commit failure")
+        return
+    ledger_positions = snapshot.positions
     symbols = set(venue_positions) | set(ledger_positions)
     for symbol in sorted(symbols):
         venue_pos = venue_positions.get(symbol)

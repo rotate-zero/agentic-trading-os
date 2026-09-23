@@ -1,6 +1,6 @@
 # Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
 **Owner:** Saqib
-**Status:** **Approved in principle** by Saqib (2026-09-22) — the simulated-venue automatic path (Slice A) with the corrections recorded in decision #170; **this revised text is the implementation specification for that slice.** Nothing is built: no application code, schema, migration, or event model exists, and this revision changed none. Baseline: `main` through decision #169. Originally recorded by decision #168, which stays exactly as merged (decision content is immutable — `AGENTS.md` §6); decision #170 amends it. **Fork status (§7):** EX-1, EX-2, EX-3, EX-4, EX-6, EX-7 are **RESOLVED** by #170, and EX-10 is settled by its added ledger requirement; the remaining forks stay open with their recommendations — **EX-5 and EX-12 still need Saqib's confirmation before a build task** (§7.1). Fork labels `EX-n` are provisional and are not D-numbers.
+**Status:** **Approved in principle** by Saqib (2026-09-22) — the simulated-venue automatic path (Slice A) with the corrections recorded in decision #170; **this revised text is the implementation specification for that slice.** That approval revision built no application code. **As-built update:** decisions #171–#173 now implement parts of this design; §6.5 below describes the current Portfolio State slice. The original inventory in §§1–2 remains historical, not a current implementation inventory. Baseline: `main` through decision #169. Originally recorded by decision #168, which stays exactly as merged (decision content is immutable — `AGENTS.md` §6); decision #170 amends it. **Fork status (§7):** EX-1, EX-2, EX-3, EX-4, EX-6, EX-7 are **RESOLVED** by #170, and EX-10 is settled by its added ledger requirement; the remaining forks stay open with their recommendations — **EX-5 and EX-12 still need Saqib's confirmation before a build task** (§7.1). Fork labels `EX-n` are provisional and are not D-numbers.
 **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
 
 **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
@@ -299,7 +299,7 @@ Read the diagram as: **the middle column is the new work**; everything above the
 **The daily-loss gate (EX-4, I15).** Population-scoped: only trades with the same `execution_mode`, bucketed by `MarketClock.trading_day`.
 
 ```
- realized_loss_today  = max(0, −Σ realized_pnl of positions closed today)
+ realized_loss_today  = max(0, −Σ gross realized fill P&L today, including partial reductions)
  open_exposure_loss   = Σ over open positions AND in-flight entries of
                           max( qty × |avg_entry − stop| ,  −unrealized_pnl )
                           (worst realistic loss if the stop is hit, or the loss already marked if price gapped through it;
@@ -429,39 +429,68 @@ With the initial values (§6.10) the `open_exposure_loss` term is zero at a legi
 
 ### 6.5 Portfolio State Engine (`portfolio_state/`)
 
-**What it is.** The single owner of position accounting, in-flight orders, and daily P&L (I5, EX-6). It is a **cache over the ledger, never the record** (I12): read synchronously by the authorizer, the Position Monitor, the Execution Engine's reduce-only guard, and (later) World View.
+**Built in decisions #172 and #173; integration remains partial.** Portfolio State owns position accounting, in-flight exposure, marks, and daily realized amounts. It is a cache over the ledger, never the record (I5/I12). Decision #173 revises #172's package with Saqib's approval; the same database-free arithmetic now serves both the event worker and the retained Session/reconciliation API.
 
-```
- OrderApproved (critical) ─┐   in_flight[client_order_id] added (a second signal on the same symbol sees it before the fill lands)
- OrderFilled   (critical) ─┼─► on_*() ── put_nowait ──► [ portfolio queue ] ──► _worker_loop()   single writer
- PriceUpdated  (normal; held symbols only) ─► marks{symbol → last price, ts}      (memory only, no DB write)
-                                                             │
-                     apply(fill) — read from the fills LEDGER by ledger_seq, not trusted from the event alone
-                          ┌──────────────────────────────────┴───────────────────────────────┐
-                          ▼ position_effect = open / add                                     ▼ position_effect = close / reduce
-             positions[symbol] = qty, avg_price, opened_at,                     realized_pnl += (exit − avg) × qty × side_sign
-             trade_id, side, stop, target, status = open                        qty == 0 ⇒ status = closed, closed_at, realized_pnl final
-                          └──────────────────────────────────┬───────────────────────────────┘
-                                                             ▼
-                          ONE TRANSACTION: upsert positions row + advance cursor last_applied_ledger_seq  ── COMMIT
-                                                             │
-                                  ┌──────────────────────────┴───────────────────────────┐
-                                  ▼                                                      ▼
-                   in-memory snapshot refreshed                         if a position closed: publish PositionClosed (critical lane)
-                   get_snapshot() — sync, no I/O                        ONLY AFTER the COMMIT above  (I8, EX-6)
+**Holding period is unrestricted by this component.** Day trading is the primary use, but positions may remain open across days, months, and restarts. No daily position reset, forced EOD exit, or maximum holding period exists here. Exit policy belongs to Position Monitor. A position's UUID is persisted at opening, survives adds/reductions/restarts, and is retired at full closure. A later opening in the same symbol receives a new UUID.
 
- read side: realized_loss_today · unrealized (positions × marks) · open_risk_to_stop · open_count · in_flight
-            — a missing mark or stop makes that term UNKNOWN; the daily-loss gate treats unknown as unbounded (I15)
+```text
+OrderApproved / OrderFilled / OrderStatusChanged        PriceUpdated
+               |                                     held symbols only
+               +------------> own queue <-------------------+
+                                  |
+                              single worker
+                                  |
+                PositionLedgerPort: committed fill/order facts
+                                  |
+                 pure accounting (long/short, average cost)
+                                  |
+       COMMIT position + per-fill realized attribution + cursor
+                                  |
+                    install committed read cache
+                                  |
+              if newly closed: PositionClosed (critical)
 
- startup:  rebuild_from_ledger() — apply every fill with ledger_seq > cursor, in order; assert in-memory == ledger replay;
-           on any disagreement the ledger wins and the discrepancy is logged (I12)
+Session/reconciliation API -> same arithmetic -> caller COMMIT -> cache
+get_snapshot() <- committed cache + memory-only marks (no I/O)
 ```
 
-- **State:** `positions{symbol → side, qty, avg_price, opened_at, trade_id, stop, target, status: open|closing|closed, exit_attempt}`, `in_flight{client_order_id → symbol, side, qty, position_effect}`, `marks`, derived `realized_pnl_today` (per `execution_mode`, bucketed by `MarketClock.trading_day`), `unrealized_pnl`, `open_risk`, `open_position_count`. **`buying_power`/cash is `None`** (I3); no rule in this slice needs it.
-- **Critical-lane statement (EX-6).** `PositionClosed` may ride the critical lane **only because** the closure is committed first. The lane provides ordering and handler-failure isolation, **not persistence, delivery guarantees, crash recovery, or failure propagation** (F6): if the commit fails, nothing is published, the position is flagged and retried; if the process dies after the commit and before the publish, consumers recover from the ledger (§6.7, §6.9). `PositionClosed` therefore gets a `CRITICAL_EVENT_TYPES` entry (a two-line change in the build task) so that Governor-side reads are not stuck behind a tick burst — never as a durability mechanism.
-- **Deviation from §4.6/§4.8 worth naming:** Portfolio State also consumes `OrderApproved` (in-flight orders) and emits `PositionClosed`; Position Monitor is a *decision* module that reads Portfolio State and issues exit intents (departing from §4.8's row that has it emit `PositionClosed`).
-- **Honesty convention:** `get_snapshot(symbol=None)` mirrors `MarketStateEngine.get_snapshot()` — absent means not-yet, never a fabricated default; World View's `portfolio=None` stays `None` until this exists and is wired in a *separate* task.
-- **Not in slice A:** pairwise correlation, buying power, risk-budget consumption, placement-mode change events.
+**Verified event limitations.** `OrderFilled` has no fill ID/sequence, mode, or position effect and still has no application publisher. Approval/fill/status events therefore trigger authoritative ledger catch-up; payload amounts are not used for arithmetic. Mode/effect/trade/symbol/side come from the persisted order; the fill supplies sequence and `(execution_venue, venue_fill_id)`. An unresolved approval is unknown exposure, never an empty account. The eventual adapter must read durable approved reservations even before their order insert. `OrderStatusChanged` currently represents rejection only. Read-back handles cancelled/expired/filled states, but prompt live cancellation tracking needs a future status publisher or explicit refresh trigger; this slice provides `refresh()` and restart catch-up, not polling. The bus has no symbol-filtered subscriptions: unheld ticks are dropped before queueing and checked again during processing.
+
+**Accounting.** `accounting.py` uses immutable values and Decimal arithmetic for opens, same-side adds, average entry cost, opposite-side reductions, and full closes. Invalid quantities/prices, unintended reversals, and incompatible trade/mode/symbol inputs raise before changing state. Exposure includes filled positions and only the remaining entry-order quantity; exit orders do not duplicate exposure. Missing marks/stops remain unknown. Marks have exchange timestamps; older/pre-opening ticks are ignored, and marks are cleared at closure/reopening and restart. Cash/buying power is unavailable (`None`).
+
+**Profit, loss, and fees are separate.** Each reducing fill contributes positive gross P&L to profit or a positive loss magnitude to loss on `MarketClock.trading_day(fill.venue_ts)` (ET calendar date). Gross P&L = profit − loss. Each fill's reported commission is tracked separately on that fill's day, including entries. Unknown commission stays unknown; `reported_fees` and an unknown-fee count distinguish known charges from a complete total. Closing a position later never moves its earlier partial realizations to closure day. Position lifetime totals and daily totals are different views. Stock splits, dividends, financing/borrow costs, and late fee corrections have no input contracts here.
+
+**Persistence Protocol, not a production adapter.** `ports.py:PositionLedgerPort` provides `load_state`, `pending_fills`, `get_order`, and `commit_fill`. Startup read-back must recover durable IDs and lifetime totals, open positions, non-terminal orders/reservations, cursor, and per-symbol/day amounts derived from individual fill attributions. Unknown history is explicit. A fill commit atomically deduplicates its stable venue key, compares the expected cursor, persists position plus realized-fill attribution (or immutable replay inputs sufficient to reproduce it), and advances the cursor. Exact duplicates publish nothing; conflicting keys/cursors raise.
+
+`pending_fills` must expose a complete safe committed prefix. PostgreSQL Identity allocation is not commit order: an adapter must serialize ingestion or establish a safe watermark so a lower-sequence transaction cannot commit behind the cursor. This delivery supplies no production implementation of that Protocol. The retained Session path rejects skipping an earlier visible fill, shares the arithmetic, stages cache installation until `after_commit`, and rebuilds daily totals from full fill history; it still assumes serialized ledger writers. Session and Protocol ownership cannot be mixed on one instance. `full_rebuild` audits without resetting IDs/cursor. Flagged invalid fills remain persisted and block usable snapshots; reconciliation reports unavailable accounting as a discrepancy.
+
+**Read contract.** `get_snapshot(symbol=None, *, trading_day=None)` is synchronous and I/O-free. One instance serves one explicit capital mode. No symbol means the entire mode; a symbol filters positions, orders, marks, exposures, and daily totals. Unknown symbol, unrestored state, accounting backlog/failure, or unresolved order metadata yields `None`. A closed symbol with known history has a flat snapshot; a restored empty ledger is known flat. Incomplete history yields unknown daily amounts, never invented zeros. Default day comes from MarketClock; an explicit day supports historical reads. Returned dictionaries are detached and their position/order values immutable. Fields map to governor's PortfolioSnapshot/OpenExposure concepts without importing that package; consumer adaptation and honest handling of unknown state remain integration work.
+
+```text
+fill -> validate ledger identity/mode/effect and safe cursor order
+                 |
+       +---------+--------------------+
+       | open/add                     | reduce/close
+       v                              v
+ new ID or same ID              opposite side and qty <= held
+ weighted average cost          gross realized delta; qty decreases
+       +------------------------------+
+                       |
+           attribute delta/fee to this fill's day
+                       |
+        atomic position + attribution + cursor COMMIT
+             | fail                         | success
+             v                              v
+      publish nothing                install committed cache
+      read unavailable               newly closed? -> PositionClosed
+      reload before retry            duplicate? -> publish nothing
+```
+
+**Closure contract and delivery guarantee.** `PositionClosed` has the documented position ID, exit price (VWAP of all reductions), lifetime gross realized P&L, nullable achieved R, and closing timestamp, plus optional trade/mode/venue and separate profit/loss/fee fields. With no persisted immutable planned-risk contract for adds/changed stops, the worker emits `r_multiple_achieved=None` and a missing reason. It never uses the current stop to invent historical R. Missing R does not suppress a valid closure.
+
+Only a successful newly applied closure commit can publish `PositionClosed`, on the critical lane. There is **no outbox and no exactly-once or at-least-once delivery guarantee**: commit success followed by crash, lost acknowledgement, publication failure, or an unhandled bus notification can lose the event. Committed state remains recoverable; already-applied closures are not re-published at startup. Consumers need independent ledger recovery. The Session compatibility API does not publish events.
+
+**Not wired:** production PositionLedgerPort adapter, complete status notifications, governor/World View adapters, live startup, position-monitor exits, and OutcomeRecorder recovery. Worker tests use a fake ledger; real PostgreSQL tests cover only the retained Session API and reconciliation, not the unbuilt adapter's transaction/concurrency guarantees. Details and evidence: decision #173 and `TESTING.md`.
 
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 

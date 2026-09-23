@@ -1,416 +1,236 @@
-"""
-Portfolio State Engine — the single owner of position accounting,
-in-flight orders, and daily P&L (I5, EX-6, design doc §6.5). **A cache
-over the ledger, never the record (I12)** — `positions` (and, upstream
-of it, `fills`) is the actual source of truth; everything this module
-holds in memory is reconstructable from those tables at any time via
-`rebuild_from_ledger()`.
+"""Portfolio State: queue/worker, committed read cache, Session compatibility.
 
-**What this delivery builds vs. what it doesn't.** The design's full
-picture wires this to the event bus (`OrderApproved`/`OrderFilled` in,
-`PositionClosed` out) from inside the Execution Engine
-(`execution_engine/`, sibling task, decision
-execution-authorizer-and-engine). This module deliberately does NOT
-subscribe to or publish on the bus itself — `apply_fill()` is a plain,
-synchronous, DB-session-scoped function the sibling's worker loop is
-meant to call once a fill is committed (see `apply_fill`'s own
-docstring for the `PositionClosed`-publishing seam this leaves open,
-since the typed payload model and its `CRITICAL_EVENT_TYPES` entry both
-live in files outside this delivery's boundary — `schemas/events/
-execution.py`/`envelope.py`). What IS fully built and tested here: the
-position-accounting logic itself, `get_snapshot()`, and
-`rebuild_from_ledger()` — everything AC #9/#11/#12 (this delivery's
-own owned acceptance criteria) exercise.
-
-Methods are plain synchronous functions taking a `Session`, matching
-`app/trading_intelligence/performance.py:record_strategy_outcome()`'s
-own style — no `asyncio.to_thread` INSIDE this module; a caller running
-inside an async context wraps these calls itself, same as that
-existing precedent.
+Events are wake-ups, never accounting inputs: OrderFilled has no unique fill
+identity. Replay the ledger's safe prefix, commit each fill, THEN publish.
+No venue calls, exit policy, outcome writing, or live startup wiring.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-import uuid
-from dataclasses import dataclass, field
-from datetime import datetime
-
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from datetime import date, datetime
+from decimal import Decimal
+from uuid import uuid4
 
 from app.core.market_clock import MarketClock, get_market_clock
-from app.models.execution_ledger import Fill, Order, PortfolioStateCursor, Position, Trade
+from app.event_bus.bus import EventBus
+from app.event_bus.events import make_envelope
+from app.schemas.events.envelope import EventEnvelope, EventType
+from app.schemas.events.execution import OrderApproved, OrderFilled, OrderStatusChanged, PositionClosed
+from app.schemas.events.market_data import PriceUpdated
+
+from .accounting import MODES, PositionState, apply_fill, aware, decimal
+from .ports import FillApplication, InFlightOrder, LedgerState, ORDER_STATUSES, PositionLedgerError, PositionLedgerPort, RealizedFill
+from .snapshot import PortfolioSnapshot, build_snapshot
 
 logger = logging.getLogger(__name__)
+_STOP = object()
+_REFRESH = object()
 
-__all__ = [
-    "PositionState",
-    "InFlightOrder",
-    "PortfolioSnapshot",
-    "PortfolioState",
-]
-
-OPEN_POSITION_STATUSES = ("open", "closing")
-
-
-@dataclass
-class PositionState:
-    position_id: uuid.UUID
-    trade_id: uuid.UUID
-    symbol: str
-    side: str
-    qty: int
-    avg_price: float
-    opened_at: datetime
-    stop: float | None
-    target: float | None
-    status: str  # open | closing | closed
-    closed_at: datetime | None
-    realized_pnl: float | None
-    exit_attempt: int
-
-
-@dataclass
-class InFlightOrder:
-    """An approved-but-not-yet-filled order — added the moment
-    `OrderApproved` lands (design doc §6.5: "a second signal on the
-    same symbol sees it before the fill lands"). This delivery exposes
-    `add_in_flight`/`remove_in_flight` as plain methods rather than a
-    bus subscription — see this module's own docstring."""
-
-    client_order_id: str
-    symbol: str
-    side: str
-    qty: int
-    position_effect: str  # open | close
-
-
-@dataclass
-class PortfolioSnapshot:
-    """`get_snapshot()`'s answer — sync, no I/O (§6.5). Honesty
-    convention (§6.5): `unrealized_pnl`/`open_risk` are `None` — not
-    `0.0` — when at least one open position is missing a mark or a
-    stop; `None` here means UNKNOWN, and any consumer (the daily-loss
-    gate) must treat UNKNOWN as unbounded (I15), never as zero."""
-
-    positions: dict[str, PositionState] = field(default_factory=dict)  # keyed by symbol, open/closing only
-    in_flight: dict[str, InFlightOrder] = field(default_factory=dict)  # keyed by client_order_id
-    marks: dict[str, tuple[float, datetime]] = field(default_factory=dict)  # symbol -> (price, ts)
-    realized_pnl_today: float = 0.0
-    unrealized_pnl: float | None = 0.0
-    open_risk: float | None = 0.0
-    open_position_count: int = 0
-
-    @property
-    def in_flight_count(self) -> int:
-        return len(self.in_flight)
+__all__ = ["PortfolioState", "PositionState", "InFlightOrder", "PortfolioSnapshot"]
 
 
 class PortfolioState:
-    """One instance per `execution_mode` (§6.5's per-mode `trading_day`
-    bucketing) — only `"simulated"` exists to construct one for in this
-    slice (config.py's `execution_mode` validator)."""
-
-    def __init__(self, execution_mode: str, *, clock: MarketClock | None = None) -> None:
+    def __init__(
+        self, execution_mode: str, *, clock: MarketClock | None = None,
+        ledger: PositionLedgerPort | None = None, bus: EventBus | None = None,
+    ) -> None:
+        if execution_mode not in MODES:
+            raise ValueError("unknown execution mode")
         self.execution_mode = execution_mode
         self._clock = clock or get_market_clock()
-        self._snapshot = PortfolioSnapshot()
+        self._ledger = ledger
+        self._bus = bus
+        self._state: LedgerState | None = None
+        self._ready = False
+        self._marks: dict[str, tuple[Decimal, datetime]] = {}
+        self._unresolved_orders: set[str] = set()
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._subscribed = False
+        self._accepting = False
 
-    # --- sync, no-I/O reads -------------------------------------------------
+    def get_snapshot(self, symbol: str | None = None, *, trading_day: date | None = None) -> PortfolioSnapshot | None:
+        """Detached snapshot for this mode, filtered when symbol is given.
 
-    def get_snapshot(self) -> PortfolioSnapshot:
-        return self._snapshot
-
-    # --- in-flight tracking (§6.5: OrderApproved ─► in_flight added) ----
-
-    def add_in_flight(self, order: InFlightOrder) -> None:
-        self._snapshot.in_flight[order.client_order_id] = order
-
-    def remove_in_flight(self, client_order_id: str) -> None:
-        self._snapshot.in_flight.pop(client_order_id, None)
-
-    # --- marks (PriceUpdated, held symbols only; memory only, no DB write) --
-
-    def update_mark(self, symbol: str, price: float, ts: datetime) -> None:
-        if symbol not in self._snapshot.positions:
-            return  # not a held symbol — marks are memory-only for held symbols (§6.5)
-        self._snapshot.marks[symbol] = (price, ts)
-        self._recompute_derived()
-
-    # --- the ledger is the record; this is how a fill reaches it --------
-
-    def apply_fill(self, session: Session, fill: Fill) -> PositionState | None:
-        """Applies ONE already-committed `fills` row to `positions`,
-        in the caller's transaction (§6.5's "ONE TRANSACTION: upsert
-        positions row + advance cursor ... COMMIT" — the commit itself
-        is the CALLER's responsibility, matching `record_strategy_
-        outcome()`'s own commit-owned-by-caller-of-the-session shape;
-        this function only flushes so `position.position_id` etc. are
-        available to the caller before it commits).
-
-        **Publish seam.** The design has this function's caller publish
-        `PositionClosed` on the critical lane immediately after the
-        commit when `qty` reaches 0 (§6.5, EX-6). This delivery cannot
-        build that publish call — the typed payload model and its
-        `CRITICAL_EVENT_TYPES` entry both live in files outside this
-        delivery's file boundary (`schemas/events/execution.py`,
-        `schemas/events/envelope.py` — decision execution-authorizer-
-        and-engine's territory). Instead, this method's return value's
-        `status` tells the caller whether a closure just happened
-        (`"closed"`) so IT can do the publish once those pieces exist;
-        nothing here silently drops the requirement or invents a
-        payload shape unilaterally.
+        None = not restored, blocked/stale, or an unknown symbol. A restored
+        empty ledger is known flat. Daily amounts remain None if history is
+        incomplete. Read-day rollover never closes or resets a position.
         """
-        # Idempotency check FIRST, before any mutation — apply_fill can be called more than
-        # once for the same fill (e.g. a reconciliation pass re-walking fills the process
-        # already had), and every mutation below is a stateful delta (qty -=, realized_pnl +=),
-        # not an idempotent upsert. Checking after mutating would double-apply on a replay.
-        cursor = session.get(PortfolioStateCursor, self.execution_mode)
-        if cursor is None:
-            cursor = PortfolioStateCursor(execution_mode=self.execution_mode, last_applied_ledger_seq=0)
-            session.add(cursor)
-            session.flush()
-        if fill.ledger_seq <= cursor.last_applied_ledger_seq:
-            order = session.execute(
-                select(Order).where(Order.client_order_id == fill.client_order_id)
-            ).scalar_one()
-            existing = session.execute(
-                select(Position)
-                .where(Position.trade_id == order.trade_id, Position.symbol == order.symbol)
-                .order_by(Position.opened_at.desc())
-            ).scalars().first()
-            # `existing` can legitimately be None here even though this fill was already
-            # applied — e.g. it was flagged anomaly='unmatched_order' and never touched a
-            # position (see below). Absence isn't inconsistency in that case.
-            return self._to_state(existing) if existing is not None else None
-
-        order = session.execute(
-            select(Order).where(Order.client_order_id == fill.client_order_id)
-        ).scalar_one()
-
-        if order.status in ("filled", "cancelled", "rejected"):
-            # I14 (AC #13): a fill for an order the ledger already considers terminal is
-            # never dropped — it was already inserted by the caller before apply_fill ran;
-            # this method's job is to flag it and skip position mutation, not to crash or
-            # silently double-count it into the position. "Halt new entries" is an
-            # authorization-gate decision (Execution Engine, sibling task) — out of scope
-            # here beyond making the anomaly visible on the fill row and in the logs.
-            fill.anomaly = "unmatched_order"
-            logger.error(
-                "apply_fill: fill %s arrived for client_order_id=%s which is already "
-                "terminal (status=%s) — flagged anomaly='unmatched_order', not applied "
-                "to position accounting, NOT dropped from the ledger",
-                fill.venue_fill_id, order.client_order_id, order.status,
-            )
-            cursor.last_applied_ledger_seq = fill.ledger_seq
-            session.flush()
+        if not self._ready or self._state is None:
             return None
+        return build_snapshot(self._state, self._marks, trading_day or self._clock.trading_day(), symbol)
 
-        existing = session.execute(
-            select(Position).where(
-                Position.trade_id == order.trade_id,
-                Position.symbol == order.symbol,
-                Position.status.in_(OPEN_POSITION_STATUSES),
-            )
-        ).scalar_one_or_none()
+    def _install_state(self, state: LedgerState) -> None:
+        if state.execution_mode != self.execution_mode:
+            raise PositionLedgerError("checkpoint belongs to another execution mode")
+        aware(state.as_of)
+        symbols = [p.symbol for p in state.positions]
+        if len(symbols) != len(set(symbols)):
+            raise PositionLedgerError("multiple positions for one symbol in a mode are not representable")
+        if any(p.execution_mode != self.execution_mode or p.qty <= 0 or p.status == "closed" for p in state.positions):
+            raise PositionLedgerError("invalid open position checkpoint")
+        if any(o.execution_mode != self.execution_mode for o in state.orders):
+            raise PositionLedgerError("order checkpoint mixes execution modes")
+        if any(o.status not in ORDER_STATUSES or o.qty <= 0 or not 0 <= o.filled_qty <= o.qty for o in state.orders):
+            raise PositionLedgerError("invalid order checkpoint")
+        old_ids = {p.symbol: p.position_id for p in self._state.positions} if self._state else {}
+        new_ids = {p.symbol: p.position_id for p in state.positions}
+        self._state = state
+        self._marks = {s: m for s, m in self._marks.items() if old_ids.get(s) == new_ids.get(s) and s in new_ids}
+        self._ready = not state.problems and not self._unresolved_orders
 
-        if order.position_effect == "open":
-            position = self._apply_open_fill(session, order, existing, fill)
-        else:
-            if existing is None:
-                # Reduce-only guard is the Execution Engine's job (§6.3) — this should
-                # never happen if that guard ran. Still handled honestly rather than
-                # crashing the replay: flag it and skip, don't fabricate a position.
-                logger.error(
-                    "apply_fill: close fill for %s (trade_id=%s) with no open position — "
-                    "reduce-only guard should have prevented this order from ever being "
-                    "placed; ledger and venue may have diverged",
-                    order.symbol, order.trade_id,
-                )
-                raise ValueError(
-                    f"no open position for trade_id={order.trade_id} symbol={order.symbol} "
-                    f"to apply close fill {fill.venue_fill_id!r} against"
-                )
-            position = self._apply_close_fill(session, order, existing, fill)
+    def update_mark(self, symbol: str, price: float | Decimal, ts: datetime) -> None:
+        if self._state is None or not any(p.symbol == symbol for p in self._state.positions):
+            return
+        aware(ts)
+        if ts < next(p.opened_at for p in self._state.positions if p.symbol == symbol):
+            return
+        price = decimal(price)
+        if price <= 0:
+            raise ValueError("mark must be positive")
+        previous = self._marks.get(symbol)
+        if previous is None or ts > previous[1]:
+            self._marks[symbol] = price, ts
 
-        # Advance the ORDER's own status too — apply_fill is the only place that knows
-        # cumulative fill progress against order.qty; nothing else in this delivery updates
-        # it (design doc §6.3's order state machine: submitted -> partially_filled -> filled).
-        total_filled = session.execute(
-            select(func.coalesce(func.sum(Fill.qty), 0)).where(Fill.client_order_id == order.client_order_id)
-        ).scalar_one()
-        order.status = "filled" if total_filled >= order.qty else "partially_filled"
+    async def start(self) -> None:
+        if self._accepting:
+            return
+        if self._ledger is None or self._bus is None:
+            raise RuntimeError("event worker requires a PositionLedgerPort and EventBus")
+        if not self._subscribed:
+            for event_type in (EventType.ORDER_APPROVED, EventType.ORDER_FILLED,
+                               EventType.ORDER_STATUS_CHANGED, EventType.PRICE_UPDATED):
+                self._bus.subscribe(event_type, self._on_event)
+            self._subscribed = True
+        self._accepting = True
+        # Subscribe before restore so order notifications during startup queue.
+        self._queue.put_nowait(_REFRESH)
+        self._worker_task = asyncio.create_task(self._worker_loop(), name="portfolio-state")
+        await self._queue.join()
 
-        cursor.last_applied_ledger_seq = fill.ledger_seq
+    async def stop(self) -> None:
+        self._accepting = False
+        if self._worker_task is not None:
+            self._queue.put_nowait(_STOP)
+            await self._worker_task
+            self._worker_task = None
+        self._ready = False
+        self._marks.clear()
 
-        session.flush()
-        self._upsert_in_memory(position)
-        self.remove_in_flight(order.client_order_id)
-        self._recompute_derived()
-        return self._to_state(position)
+    async def refresh(self) -> None:
+        """Explicit ledger catch-up (also needed for cancellations: current
+        OrderStatusChanged only represents rejection). No polling is wired.
+        """
+        if not self._accepting:
+            raise RuntimeError("portfolio worker is not started")
+        self._ready = False
+        self._queue.put_nowait(_REFRESH)
+        await self._queue.join()
 
-    def _apply_open_fill(self, session: Session, order: Order, existing: Position | None, fill: Fill) -> Position:
-        if existing is None:
-            trade = session.get(Trade, order.trade_id)
-            thesis = (trade.thesis if trade else {}) or {}
-            position = Position(
-                trade_id=order.trade_id,
-                execution_mode=order.execution_mode,
-                execution_venue=order.execution_venue,
-                symbol=order.symbol,
-                side=order.side,
-                qty=fill.qty,
-                avg_price=float(fill.price),
-                stop=thesis.get("final_stop"),
-                target=thesis.get("final_target"),
-                opened_at=fill.venue_ts,
-                status="open",
-                exit_attempt=0,
-            )
-            session.add(position)
-        else:
-            new_qty = existing.qty + fill.qty
-            existing.avg_price = float(
-                (float(existing.avg_price) * existing.qty + float(fill.price) * fill.qty) / new_qty
-            )
-            existing.qty = new_qty
-            position = existing
-        return position
+    def _on_event(self, envelope: EventEnvelope) -> None:
+        if not self._accepting:
+            return
+        if envelope.event_type == EventType.PRICE_UPDATED and (
+            self._state is None or not any(p.symbol == envelope.symbol for p in self._state.positions)
+        ):
+            return  # bus has no symbol subscription filter
+        self._queue.put_nowait(envelope.model_copy(deep=True))
+        if envelope.event_type != EventType.PRICE_UPDATED:
+            self._ready = False  # queued accounting is not yet a current snapshot
 
-    def _apply_close_fill(self, session: Session, order: Order, existing: Position, fill: Fill) -> Position:
-        side_sign = 1 if existing.side == "BUY" else -1
-        realized_delta = (float(fill.price) - float(existing.avg_price)) * fill.qty * side_sign
-        existing.realized_pnl = float(existing.realized_pnl or 0.0) + realized_delta
-        overfilled_by = fill.qty - existing.qty  # > 0 means this fill closes more than was open
-        existing.qty -= fill.qty
-        if existing.qty <= 0:
-            if existing.qty < 0:
-                fill.anomaly = "overfill"
-                logger.warning(
-                    "apply_fill: close fill %s overfilled position %s by %s shares (I14: "
-                    "persisted and flagged anomaly='overfill', not dropped; not applied "
-                    "beyond fully closing the position)",
-                    fill.venue_fill_id, existing.position_id, overfilled_by,
-                )
-                existing.qty = 0
-            existing.status = "closed"
-            existing.closed_at = fill.venue_ts
-        else:
-            existing.status = "closing"
+    async def _worker_loop(self) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is _STOP:
+                    return
+                if item is _REFRESH:
+                    await self._synchronize()
+                elif item.event_type == EventType.PRICE_UPDATED:
+                    tick = PriceUpdated.model_validate(item.payload)
+                    self.update_mark(item.symbol, tick.price, tick.exchange_ts)
+                else:
+                    schema = {
+                        EventType.ORDER_APPROVED: OrderApproved,
+                        EventType.ORDER_FILLED: OrderFilled,
+                        EventType.ORDER_STATUS_CHANGED: OrderStatusChanged,
+                    }[item.event_type]
+                    notification = schema.model_validate(item.payload)
+                    self._unresolved_orders.add(notification.order_id)
+                    await self._synchronize()
+            except Exception:
+                self._ready = False
+                logger.exception("Portfolio State processing failed; snapshot unavailable until successful refresh")
+            finally:
+                self._queue.task_done()
 
-        if existing.status == "closed" and self._clock.trading_day(fill.venue_ts) == self._clock.trading_day():
-            self._snapshot.realized_pnl_today += realized_delta
-        return existing
-
-    # --- startup / recovery ---------------------------------------------
-
-    def rebuild_from_ledger(self, session: Session, *, full_rebuild: bool = False) -> PortfolioSnapshot:
-        """§6.5/§6.9 step 2: apply every fill with `ledger_seq >
-        cursor.last_applied_ledger_seq`, in order. `full_rebuild=True`
-        resets the cursor to 0 first — a genuine from-scratch replay
-        (used by tests and by "prove the cache matches the ledger"
-        audits), vs. the normal restart path which only catches up on
-        what a NEW process instance hasn't seen yet.
-
-        On any disagreement between what THIS instance already held in
-        memory and what the replay computes, the replay — the ledger —
-        wins (I12); the disagreement is logged, not silently ignored
-        (AC #11)."""
-        cursor = session.get(PortfolioStateCursor, self.execution_mode)
-        if cursor is None:
-            cursor = PortfolioStateCursor(execution_mode=self.execution_mode, last_applied_ledger_seq=0)
-            session.add(cursor)
-            session.flush()
-        if full_rebuild:
-            cursor.last_applied_ledger_seq = 0
-            session.flush()
-
-        before = {symbol: (p.qty, p.avg_price, p.status) for symbol, p in self._snapshot.positions.items()}
-
-        fills = session.execute(
-            select(Fill)
-            .join(Order, Order.client_order_id == Fill.client_order_id)
-            .where(Order.execution_mode == self.execution_mode, Fill.ledger_seq > cursor.last_applied_ledger_seq)
-            .order_by(Fill.ledger_seq)
-        ).scalars().all()
-
+    async def _synchronize(self) -> None:
+        assert self._ledger is not None and self._bus is not None
+        self._ready = False
+        self._install_state(await asyncio.to_thread(self._ledger.load_state, self.execution_mode))
+        self._ready = False
+        assert self._state is not None
+        if self._state.problems:
+            raise PositionLedgerError("unresolved ledger anomalies: " + ", ".join(self._state.problems))
+        fills = await asyncio.to_thread(self._ledger.pending_fills, self.execution_mode, self._state.cursor)
+        last = self._state.cursor
         for fill in fills:
-            self.apply_fill(session, fill)
-        session.commit()
-
-        self._reload_open_positions(session)
-
-        after = {symbol: (p.qty, p.avg_price, p.status) for symbol, p in self._snapshot.positions.items()}
-        if before and before != after:
-            logger.warning(
-                "rebuild_from_ledger: in-memory state disagreed with the ledger replay for "
-                "execution_mode=%s — before=%s after=%s; ledger wins (I12)",
-                self.execution_mode, before, after,
+            if fill.execution_mode != self.execution_mode or fill.ledger_seq <= last:
+                raise PositionLedgerError("pending fills are not an ordered, mode-scoped prefix")
+            last = fill.ledger_seq
+            position = next((p for p in self._state.positions if p.symbol == fill.symbol), None)
+            result = apply_fill(position, fill, new_position_id=uuid4() if position is None else None)
+            attribution = RealizedFill(
+                fill.execution_mode, fill.execution_venue, fill.venue_fill_id, fill.ledger_seq,
+                result.position.position_id, fill.symbol, self._clock.trading_day(fill.venue_ts),
+                fill.venue_ts, result.realized_delta, fill.commission,
             )
-
-        self._recompute_derived()
-        return self._snapshot
-
-    def _reload_open_positions(self, session: Session) -> None:
-        rows = session.execute(
-            select(Position).where(
-                Position.execution_mode == self.execution_mode,
-                Position.status.in_(OPEN_POSITION_STATUSES),
+            committed = await asyncio.to_thread(
+                self._ledger.commit_fill,
+                FillApplication(fill, result.position, attribution, self._state.cursor),
             )
-        ).scalars().all()
-        self._snapshot.positions = {row.symbol: self._to_state(row) for row in rows}
-        # Marks only make sense for currently-held symbols — drop any stale mark for a
-        # symbol no longer held (an honest reset, not a guess at whether it's still valid).
-        self._snapshot.marks = {
-            symbol: mark for symbol, mark in self._snapshot.marks.items() if symbol in self._snapshot.positions
-        }
+            if committed.state.cursor < fill.ledger_seq:
+                raise PositionLedgerError("commit returned a checkpoint behind its fill")
+            self._install_state(committed.state)
+            self._ready = False
+            if committed.applied and result.position.status == "closed":
+                p = result.position
+                payload = PositionClosed(
+                    position_id=str(p.position_id), exit_price=p.exit_price, realized_pnl=p.realized_pnl,
+                    r_multiple_achieved=None, r_multiple_missing_reason="immutable_risk_basis_unavailable",
+                    closed_ts=p.closed_at, trade_id=str(p.trade_id), execution_mode=p.execution_mode,
+                    execution_venue=p.execution_venue, realized_profit=p.realized_profit,
+                    realized_loss=p.realized_loss, fees=p.fees, reported_fees=p.reported_fees,
+                    unknown_fee_count=p.unknown_fee_count,
+                )
+                # No outbox: a crash/publish failure here loses this notification.
+                # Restart recovers the closure from persistence, not this bus.
+                await self._bus.publish(make_envelope(EventType.POSITION_CLOSED, payload, symbol=p.symbol))
+            if not committed.applied:
+                # A concurrent/replayed application can return a checkpoint
+                # ahead of this prefetched batch. Reload before further math.
+                self._queue.put_nowait(_REFRESH)
+                return
+        for order_id in tuple(self._unresolved_orders):
+            order = await asyncio.to_thread(self._ledger.get_order, order_id)
+            if order is not None:
+                self._unresolved_orders.remove(order_id)
+                # Other-mode notifications are harmless wake-ups: only the
+                # mode-scoped read-back above supplies accounting inputs.
+        self._ready = not self._state.problems and not self._unresolved_orders
 
-    # --- internal helpers --------------------------------------------------
+    # Existing reconciliation API. This is NOT a PositionLedgerPort adapter.
+    def apply_fill(self, session, fill) -> PositionState | None:
+        self._require_session_mode()
+        from .legacy import apply_session_fill
+        return apply_session_fill(self, session, fill)
 
-    def _upsert_in_memory(self, position: Position) -> None:
-        if position.status == "closed":
-            self._snapshot.positions.pop(position.symbol, None)
-            self._snapshot.marks.pop(position.symbol, None)
-        else:
-            self._snapshot.positions[position.symbol] = self._to_state(position)
+    def rebuild_from_ledger(self, session, *, full_rebuild: bool = False) -> PortfolioSnapshot | None:
+        self._require_session_mode()
+        from .legacy import rebuild_session
+        return rebuild_session(self, session, full_rebuild=full_rebuild)
 
-    def _recompute_derived(self) -> None:
-        snap = self._snapshot
-        snap.open_position_count = len(snap.positions)
-
-        unrealized = 0.0
-        open_risk = 0.0
-        unknown = False
-        for symbol, pos in snap.positions.items():
-            mark = snap.marks.get(symbol)
-            if mark is None:
-                unknown = True
-                continue
-            price, _ts = mark
-            side_sign = 1 if pos.side == "BUY" else -1
-            unrealized += (price - pos.avg_price) * pos.qty * side_sign
-            if pos.stop is None:
-                unknown = True
-                continue
-            open_risk += abs(pos.avg_price - pos.stop) * pos.qty
-
-        snap.unrealized_pnl = None if unknown else unrealized
-        snap.open_risk = None if unknown else open_risk
-
-    @staticmethod
-    def _to_state(position: Position) -> PositionState:
-        return PositionState(
-            position_id=position.position_id,
-            trade_id=position.trade_id,
-            symbol=position.symbol,
-            side=position.side,
-            qty=position.qty,
-            avg_price=float(position.avg_price),
-            opened_at=position.opened_at,
-            stop=float(position.stop) if position.stop is not None else None,
-            target=float(position.target) if position.target is not None else None,
-            status=position.status,
-            closed_at=position.closed_at,
-            realized_pnl=float(position.realized_pnl) if position.realized_pnl is not None else None,
-            exit_attempt=position.exit_attempt,
-        )
+    def _require_session_mode(self) -> None:
+        if self._ledger is not None:
+            raise RuntimeError("Session API and PositionLedgerPort cannot both own the same instance")

@@ -1,3 +1,60 @@
+# TESTING — decision #173: Portfolio State Engine (`portfolio-state-engine`)
+
+## Baseline and scope
+
+Fresh GitHub `main`, fetched with `git fetch origin main`: **`c341a2c2f3e2e38901fe2ce10a430b826201be11`**, branch `main`; initial `git status --short` output was empty. This is a Git checkout, not a tarball. Read `AGENTS.md`, all of the execution design, decisions #170/#171 and the already-merged #172, event/bus/clock contracts, governor/execution ports and worker, existing Portfolio State/reconciliation, ledger schema, and representative tests before editing. #172's ownership overlap was reported; Saqib explicitly approved revising that package, nullable R, and separate profit/loss/fees. He clarified support for medium- and long-term holdings as well as day trading.
+
+Immediately before assigning #173, GitHub main remained at the baseline SHA; its decision index and log both ended at #172 and archives ended at `134-160`. Existing decision bodies were preserved verbatim. The canonical design's older inventory is now explicitly historical, and its Portfolio State section describes this delivery.
+
+## Environment and command
+
+Python 3.14; repository `backend/.venv`. A newly initialized, isolated **PostgreSQL 18.6** instance on port **55436**, database **`portfolio_state_test`**, was migrated from empty through existing migration **0012** using the repository's Alembic environment. PostgreSQL 16 was not available here and is not claimed. No existing application database was used. Socket access required sandbox escalation. The existing migrations and production configuration were not changed.
+
+From `backend/`:
+
+```bash
+env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55436 POSTGRES_DB=portfolio_state_test \
+  .venv/bin/pytest \
+  tests/test_portfolio_accounting.py tests/test_portfolio_worker.py \
+  tests/test_portfolio_state.py tests/test_reconciliation.py \
+  tests/test_execution_event_schemas.py tests/test_execution_engine.py \
+  tests/test_governor_engine.py tests/test_governor_rules.py \
+  tests/test_execution_ledger.py tests/test_simulated_venue.py \
+  tests/test_event_bus.py tests/test_market_clock.py \
+  -q --tb=short --disable-warnings
+```
+
+**Result: 161 passed, no skips, in 5.20s.** Dependency deprecation warnings (pytest-asyncio/FastAPI on Python 3.14) remain; no test failures. No full-suite claim. Also ran `git diff --check` and Python compilation checks for the changed package/new test modules.
+
+**Final handoff revalidation, 2026-09-23:** restarted the same isolated PostgreSQL instance and reran the exact command above: **161 passed, no skips, in 4.85s** (6,547 dependency deprecation warnings). A separate accounting/worker check also passed all 45 cases. Fresh `git fetch origin main` confirmed both `HEAD` and `origin/main` remain `c341a2c2f3e2e38901fe2ce10a430b826201be11`. No application implementation changes were needed during handoff.
+
+## Meaningful coverage
+
+- **Pure arithmetic and fake-ledger worker: 45 cases.** Long/short gains and losses, weighted adds including adds after a reduction, partial/full closes, gross profit/loss and separate known/unknown fees, invalid/nonfinite inputs, incompatible position identity/mode, invalid side/effect, over-closes and reversal rejection. Synthetic events drive the real EventBus and queue worker; the fake stores the worker's proposed committed values and enforces its cursor/key contract.
+- **Holding period and dates.** January entries, April partial reductions, September closures retain one position ID and preserve each day's realized amount/fee. ET midnight attribution and all four capital modes are exercised separately. Changing the snapshot day never resets/closes a held position. A later reopening receives a new durable ID and no stale mark.
+- **Worker lifecycle/read honesty.** Unknown before startup, known flat after complete restore, unknown symbol, unknown realized history, detached snapshots, unknown marks after restart, stale/pre-opening/unheld tick filtering (including rejection before queueing), partial-entry remaining exposure, rejection, terminal cancellation via explicit refresh, stale approval, unresolved approval metadata, and graceful worker drain/critical-bus isolation during blocked persistence.
+- **Commit/publication boundary.** Fake commit failure publishes nothing; retry does not double-apply. Closure handlers observe a previously committed cursor. Duplicate notifications/applications publish no extra closure. Injected lost commit acknowledgement and post-commit publication failure recover accounting but deliberately demonstrate the missing-notification window; they do not prove durable delivery.
+- **Retained Session/reconciliation API: 22 real-PostgreSQL cases.** 15 portfolio tests plus 7 existing reconciliation tests. Persistence and restart retain IDs, all already-committed partial fills apply even when the order is already `filled`, daily partial realizations/fees reconstruct with cursor already advanced, full rebuild does not duplicate positions, and a visible earlier fill cannot be skipped. Pre-commit fault injection verifies no snapshot installation and real database rollback of position/cursor while the independently committed source fill survives. Known unapplied backlog keeps snapshots unavailable. Overfill rows persist with an anomaly while the stored quantity/P&L remain unchanged.
+- **Related regressions.** Governor rules and worker, Execution Engine and event schemas, ledger uniqueness/population constraints, SimulatedVenue, EventBus, and MarketClock.
+
+The initial PostgreSQL run caught five expectations tied to old behavior: close fixtures incorrectly used BUY for a long close; cache corruption used mutable returned state; overfill expectations accepted clamping and misclassified excess fills as merely terminal. Fixtures now use opposite-side closes, the corruption test explicitly corrupts internal state, and overfill checks assert preserved fill facts, unchanged stored position arithmetic, and unavailable snapshots. Assertions were strengthened rather than weakened. The code also marks a partially processed committed backlog unavailable rather than exposing incomplete state as current.
+
+## What is not verified or delivered
+
+**No real `PositionLedgerPort` adapter exists.** Fake-ledger tests do not verify PostgreSQL atomic application through that Protocol, concurrent writers, durable deduplication under races, safe committed-prefix discovery, process-kill recovery, or schema adequacy for all future risk/fee metadata. PostgreSQL Identity allocation is not commit order; the adapter must serialize ingestion or implement a safe watermark so later commits cannot appear below an advanced cursor. The retained Session path assumes serialized ingestion; tests cover one writer, not that future concurrency guarantee. Existing tables are present from #172; no new tables or migration are claimed necessary or sufficient without the adapter design.
+
+No live startup wiring, real fill publisher, cancellation/expiration publisher, venue placement, exit policy, governor/World View adapter, Position Monitor, OutcomeRecorder, or StrategyOutcome writing was added. Rejection is the only current order-status event. Persisted cancellation/expiration is discovered at startup or explicit `refresh()`, not guaranteed promptly in a running pipeline. Unknown approved-order metadata blocks usable reads until the persistence side resolves it. A future adapter must include approved reservations and handle the approval-before-order-insert race.
+
+`PositionClosed` is best-effort after commit: the in-memory critical lane is neither an outbox nor durable delivery. Already-applied closures are not re-emitted on restart. Consumers must recover committed closures from persistence independently. R is always `None` with a reason in this delivery: no numeric R or scale-in/changed-stop risk-basis policy is invented. Fees missing from any included fill remain unknown, and gross P&L does not subtract them. Splits, dividends, financing/borrow charges, and late fee corrections have no current input contracts. Mark timestamps are exposed; this task does not invent a freshness threshold. Legacy identical `(trade, symbol, opened_at)` reopening identities fail explicitly because the old schema cannot disambiguate them.
+
+## Packaging verification
+
+`portfolio-state-engine.zip` contains only the changed/new task files, with paths relative to the project root and no enclosing directory. It excludes virtualenvs, database files, caches, validation logs, and the archive itself. Shared documentation and the footprint are compared to a final fresh GitHub main; prohibited paths and existing decision bodies are checked unchanged. Packaging also verifies archive contents against the working files and overlays the archive on a clean export of the recorded main commit to compare its exact footprint. The archive's base is the SHA recorded above; later overlapping changes must be reconciled before applying it.
+
+The final archive contains **16 files: 10 modified tracked files and 6 new Python files**. Verification checks ZIP integrity, byte-for-byte equality with the working files, the exact change set after overlay onto a clean baseline export, and preservation of all pre-existing decision-log and index content. The temporary PostgreSQL validation server is stopped after verification; its data remains outside the archive.
+
+<!-- Previous delivery evidence retained below. -->
+
 # TESTING — decision #172: Execution ledger + `OrderVenue`/`SimulatedVenue` + Portfolio State built (`execution-ledger-and-venue`)
 
 ## Baseline and evidence

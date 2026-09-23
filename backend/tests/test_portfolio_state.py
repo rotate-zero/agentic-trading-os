@@ -1,21 +1,21 @@
 """
-Portfolio State Engine — decision #172, design
-doc §6.5. Real Postgres only. Every test builds its own trade/order/fill
-rows directly (no Execution Engine exists yet to produce them — same
-"prove the contract, don't fabricate the caller" posture as
-test_performance_intelligence.py).
+Portfolio State Session compatibility — decisions #172/#173, design §6.5.
+Real PostgreSQL only. Tests persist trade/order/fill rows directly; the
+Execution Engine has no fill publisher yet. Event-worker tests live in
+test_portfolio_worker.py and use the explicitly scoped fake ledger.
 """
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 
 from app.db.session import SessionLocal
-from app.models.execution_ledger import Fill, Order, Trade
+from app.models.execution_ledger import Fill, Order, Trade, Position, PortfolioStateCursor
 from app.portfolio_state.engine import PortfolioState
 
 _STRATEGY_NAME = "TEST_PORTFOLIO_STATE"
@@ -78,7 +78,7 @@ def _make_trade(session, thesis: dict | None = None) -> Trade:
 def _make_order(session, trade: Trade, *, suffix: str, position_effect: str, qty: int, status: str = "submitted") -> Order:
     order = Order(
         client_order_id=f"{trade.trade_id}:{suffix}", trade_id=trade.trade_id, execution_mode="simulated",
-        execution_venue="simulated", symbol=trade.symbol, side="BUY", position_effect=position_effect,
+        execution_venue="simulated", symbol=trade.symbol, side="BUY" if position_effect == "open" else "SELL", position_effect=position_effect,
         qty=qty, status=status,
     )
     session.add(order)
@@ -209,12 +209,8 @@ def test_rebuild_from_ledger_is_idempotent_no_duplicate_positions() -> None:
 
 
 def test_rebuild_from_ledger_recovers_a_closed_position_documenting_critical_lane_boundary(caplog) -> None:
-    """AC #12: this delivery never publishes PositionClosed at all (the
-    publish seam documented on PortfolioState.apply_fill) — so EVERY
-    closure in this test suite is, by construction, "published but
-    unhandled" in the sense AC #12 means: nothing downstream of the
-    ledger ever heard about it. This test documents that the closure
-    is still fully recovered from the ledger regardless."""
+    """The compatibility API does not publish; this verifies committed-fill
+    recovery only. The fake-port worker tests cover event publication."""
     session = SessionLocal()
     try:
         trade = _make_trade(session)
@@ -252,7 +248,7 @@ def test_rebuild_from_ledger_ledger_wins_over_corrupted_in_memory_state(caplog) 
         session.commit()
 
         # Corrupt in-memory state directly (simulating a bug/drift) — the ledger itself is untouched.
-        ps.get_snapshot().positions["AAPL"].qty = 999
+        ps._state = replace(ps._state, positions=(replace(ps._state.positions[0], qty=999),))
 
         with caplog.at_level(logging.WARNING):
             ps.rebuild_from_ledger(session, full_rebuild=True)
@@ -281,15 +277,18 @@ def test_overfill_is_persisted_and_flagged_not_dropped() -> None:
         session.refresh(overfill)
         assert overfill.anomaly == "overfill"  # persisted AND flagged, not dropped
         position = ps.get_snapshot()
-        assert "AAPL" not in position.positions  # clamped to fully closed, not left dangling negative
+        assert position is None  # anomaly blocks read-side decisions
+        stored = session.execute(select(Position).where(Position.trade_id == trade.trade_id)).scalar_one()
+        assert stored.qty == 10 and stored.status == "open"
+        assert stored.realized_pnl == 0  # no fabricated gain on the five excess shares
     finally:
         session.close()
 
 
-def test_fill_for_terminal_order_is_persisted_and_flagged_unmatched_order() -> None:
+def test_fill_exceeding_a_terminal_order_is_persisted_and_flagged_overfill() -> None:
     """AC #13: a fill for an order the ledger already considers
-    terminal (filled/cancelled/rejected) is never dropped — flagged
-    anomaly='unmatched_order' and skipped for position accounting."""
+    terminal AND already fully accounted is never dropped — flagged
+    as an overfill and not applied to position accounting."""
     session = SessionLocal()
     try:
         trade = _make_trade(session)
@@ -309,7 +308,153 @@ def test_fill_for_terminal_order_is_persisted_and_flagged_unmatched_order() -> N
 
         assert result is None  # not applied to position accounting
         session.refresh(stray)
-        assert stray.anomaly == "unmatched_order"  # persisted AND flagged, not dropped
-        assert ps.get_snapshot().positions["AAPL"].qty == 10  # unaffected by the stray fill
+        assert stray.anomaly == "overfill"  # persisted AND flagged, not dropped
+        assert ps.get_snapshot() is None
+        stored = session.execute(select(Position).where(Position.trade_id == trade.trade_id)).scalar_one()
+        assert stored.qty == 10 and stored.realized_pnl == 0
+    finally:
+        session.close()
+
+
+def test_flush_does_not_expose_uncommitted_position_and_commit_failure_installs_nothing():
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        order = _make_order(session, trade, suffix="entry", position_effect="open", qty=10)
+        fill = _make_fill(session, order, seq_hint=1, qty=10, price=100, ts=datetime.now(timezone.utc))
+        session.commit()  # the venue fill is durable before portfolio accounting
+        ps = PortfolioState("simulated")
+        ps.apply_fill(session, fill)
+        assert ps.get_snapshot() is None  # flush is NOT commit
+        def fail_commit(s):
+            raise RuntimeError("injected pre-commit failure")
+        event.listen(session, "before_commit", fail_commit)
+        with pytest.raises(RuntimeError, match="injected"):
+            session.commit()
+        session.rollback()
+        event.remove(session, "before_commit", fail_commit)
+        assert ps.get_snapshot() is None
+        assert session.execute(select(Position).where(Position.trade_id == trade.trade_id)).scalar_one_or_none() is None
+        assert session.get(PortfolioStateCursor, "simulated") is None
+        assert session.get(Fill, fill.ledger_seq) is not None  # original report survives
+        recovered = ps.rebuild_from_ledger(session)
+        assert recovered.positions["AAPL"].qty == 10
+    finally:
+        session.close()
+
+
+def test_restart_restores_partial_realizations_on_their_fill_days_and_separate_fees():
+    from datetime import date
+    from decimal import Decimal
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        entry = _make_order(session, trade, suffix="entry", position_effect="open", qty=10)
+        first = _make_fill(session, entry, seq_hint=1, qty=10, price=100,
+                           ts=datetime(2026, 1, 5, 15, tzinfo=timezone.utc))
+        first.commission = Decimal("1")
+        exit_order = _make_order(session, trade, suffix="exit", position_effect="close", qty=10)
+        partial = _make_fill(session, exit_order, seq_hint=1, qty=4, price=110,
+                             ts=datetime(2026, 4, 7, 1, tzinfo=timezone.utc))  # Apr 6 ET
+        partial.commission = Decimal("0.4")
+        session.commit()
+        ps = PortfolioState("simulated")
+        ps.rebuild_from_ledger(session)
+        identity = ps.get_snapshot().positions["AAPL"].position_id
+        assert ps.get_snapshot(trading_day=date(2026, 4, 6)).realized_profit_today == 40
+        assert ps.get_snapshot().in_flight[exit_order.client_order_id].remaining_qty == 6
+        last = _make_fill(session, exit_order, seq_hint=2, qty=6, price=95,
+                          ts=datetime(2026, 9, 22, 15, tzinfo=timezone.utc))
+        last.commission = Decimal("0.6")
+        closed = ps.apply_fill(session, last)
+        assert ps.get_snapshot() is None
+        session.commit()
+        assert closed.position_id == identity and closed.realized_pnl == 10 and closed.fees == 2
+        fresh = PortfolioState("simulated")
+        fresh.rebuild_from_ledger(session)
+        january = fresh.get_snapshot(trading_day=date(2026, 1, 5))
+        april = fresh.get_snapshot(trading_day=date(2026, 4, 6))
+        september = fresh.get_snapshot(trading_day=date(2026, 9, 22))
+        assert january.realized_pnl_today == 0 and january.fees_today == 1
+        assert april.realized_profit_today == 40 and april.fees_today == Decimal("0.4")
+        assert september.realized_loss_today == 30 and september.fees_today == Decimal("0.6")
+        assert fresh.get_snapshot().open_position_count == 0
+        assert fresh.apply_fill(session, last) is None  # duplicate closure must not signal publish
+        session.rollback()
+    finally:
+        session.close()
+
+
+def test_all_partial_fills_committed_before_replay_are_applied_in_order():
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        order = _make_order(session, trade, suffix="entry", position_effect="open", qty=10, status="filled")
+        _make_fill(session, order, seq_hint=1, qty=4, price=100, ts=datetime.now(timezone.utc))
+        _make_fill(session, order, seq_hint=2, qty=6, price=110, ts=datetime.now(timezone.utc))
+        session.commit()  # upstream status may already be filled
+        ps = PortfolioState("simulated")
+        snap = ps.rebuild_from_ledger(session)
+        assert snap.positions["AAPL"].qty == 10 and snap.positions["AAPL"].avg_price == 106
+        identity = snap.positions["AAPL"].position_id
+        assert PortfolioState("simulated").rebuild_from_ledger(session).positions["AAPL"].position_id == identity
+    finally:
+        session.close()
+
+
+def test_cursor_cannot_skip_an_earlier_fill():
+    from app.portfolio_state.ports import PositionLedgerError
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        order = _make_order(session, trade, suffix="entry", position_effect="open", qty=10)
+        _make_fill(session, order, seq_hint=1, qty=4, price=100, ts=datetime.now(timezone.utc))
+        second = _make_fill(session, order, seq_hint=2, qty=6, price=110, ts=datetime.now(timezone.utc))
+        session.commit()
+        ps = PortfolioState("simulated")
+        with pytest.raises(PositionLedgerError, match="unapplied fill"):
+            ps.apply_fill(session, second)
+        session.rollback()
+        assert ps.get_snapshot() is None
+        assert ps.rebuild_from_ledger(session).positions["AAPL"].qty == 10
+    finally:
+        session.close()
+
+
+def test_new_position_after_closure_keeps_distinct_persisted_identity():
+    from datetime import timedelta
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        entry = _make_order(session, trade, suffix="entry", position_effect="open", qty=10)
+        _make_fill(session, entry, seq_hint=1, qty=10, price=100, ts=datetime.now(timezone.utc))
+        ps = PortfolioState("simulated")
+        first_id = ps.rebuild_from_ledger(session).positions["AAPL"].position_id
+        close = _make_order(session, trade, suffix="exit", position_effect="close", qty=10)
+        _make_fill(session, close, seq_hint=1, qty=10, price=101, ts=datetime.now(timezone.utc))
+        ps.rebuild_from_ledger(session)
+        reopen = _make_order(session, trade, suffix="entry2", position_effect="open", qty=10)
+        _make_fill(session, reopen, seq_hint=1, qty=10, price=102,
+                   ts=datetime.now(timezone.utc) + timedelta(days=30))
+        second_id = ps.rebuild_from_ledger(session).positions["AAPL"].position_id
+        assert first_id != second_id
+        assert PortfolioState("simulated").rebuild_from_ledger(session).positions["AAPL"].position_id == second_id
+    finally:
+        session.close()
+
+
+def test_committing_only_first_partial_fill_leaves_snapshot_unavailable_until_catchup():
+    session = SessionLocal()
+    try:
+        trade = _make_trade(session)
+        order = _make_order(session, trade, suffix="entry", position_effect="open", qty=10)
+        first = _make_fill(session, order, seq_hint=1, qty=4, price=100, ts=datetime.now(timezone.utc))
+        _make_fill(session, order, seq_hint=2, qty=6, price=110, ts=datetime.now(timezone.utc))
+        session.commit()
+        ps = PortfolioState("simulated")
+        ps.apply_fill(session, first)
+        session.commit()
+        assert ps.get_snapshot() is None  # known backlog, not a current flat/partial account
+        assert ps.rebuild_from_ledger(session).positions["AAPL"].qty == 10
     finally:
         session.close()
