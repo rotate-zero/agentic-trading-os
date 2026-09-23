@@ -685,3 +685,124 @@ OpportunityCreated
 **Not done, stated precisely rather than left implicit.** No exit path, no reduce-only guard, no `StrategyOutcome` writing (EX-5/EX-12 still open, as this task's own §2 established). No fill processing (`on_order_update`, dedup, `OrderFilled` for entries) — a judgment call, not an oversight, see above. No real Postgres-backed ledger, no `SimulatedVenue`, no `broker_registry` `execution` role — the sibling `execution-ledger-and-venue` task's own scope; this delivery's `TESTING.md` names the exact reconciliation points. `main.py` is not wired to start either engine — outside this task's file boundary (`main.py` isn't in "may edit"); `get_authorizer_stub()`/`get_execution_engine()` both exist and are ready for that wiring once the sibling's concrete ports land.
 
 **Documentation updated in this delivery.** This entry and its `INDEX.md` row, `CHANGES.md`, `TESTING.md`. `docs/architecture/execution-engine-design.md` deliberately **not** touched (outside the file boundary — "must not touch any `docs/architecture/*.md` other than the decision entry").
+
+### 172. Execution ledger + `OrderVenue`/`SimulatedVenue` + Portfolio State built (`execution-ledger-and-venue`) — the ledger/venue half of #170's Slice A design, sibling to #171
+
+Second (and, together with #171, completing) real-code delivery for decision #170's Slice A design: the ledger tables, the `OrderVenue` port and its only implementation, the `execution` registry role, and Portfolio State — everything #171's own `execution_engine`/`governor` packages were built against narrow local `Protocol`s in anticipation of, per that task's own explicit ownership fork.
+
+**Built, per this task's own numbered scope (§4):**
+- **`OrderVenue` port** (`backend/app/broker_adapters/order_venue.py`) — the interface from design doc §6.4's table verbatim (`ExecutionMode`, `OrderInstruction`, `OrderAck`, `OrderStatusReport`, `OrderUpdate`, `VenuePosition`, the `OrderVenue` ABC). `BrokerAdapter` (`base.py`) untouched, exactly as required.
+- **`SimulatedVenue`** (`backend/app/broker_adapters/simulated_venue.py`) — the only `OrderVenue` implementation in this slice (EX-1). Market orders fill on the first qualifying tick at/after acceptance; limit orders fill on cross; fill timestamps are the tick's own `exchange_ts` (I9), never wall-clock; `venue_fill_id = "<client_order_id>:f<n>"` (deterministic); zero/`None` slippage/commission by default (I3, EX-8); session-guarded via an injectable `MarketClock`; not durable by design (a fresh instance has no memory of a prior instance's orders — this IS the intended restart behavior §6.9 depends on); injectable tick source, clock, and partial-fill planner for tests. 10 unit tests, no database needed.
+- **`execution` registry role** (`backend/app/services/broker_registry.py`) — a third, separately-typed global (`_execution_venue`) beside the existing `streaming`/`historical` `MarketDataProvider` slots, following that file's own module-level-functions-plus-globals pattern exactly (the "one finding" this task's own prompt pre-verified). `set_execution_venue()` fails closed (`UnsupportedExecutionModeError`) when the venue's `supported_modes` excludes the configured `execution_mode` (I6, AC #5). `clear_all()` now resets all three roles — already wired into `conftest.py`'s existing global `_reset_app_singletons` fixture (#171 added the call site expecting this; no `conftest.py` edit was needed from this task).
+- **Execution ledger** (`backend/app/models/execution_ledger.py`, migration `0012`) — `trades`, `orders`, `fills`, `positions`, `portfolio_state_cursor`, exactly per design doc §6.8's persistence sketch, fleshed out to concrete columns/types/constraints (see that file's own module docstring for the column-type conventions and the mode/venue pairing CHECK repeated on every table that carries both columns, not just `strategy_outcomes`). `orders.client_order_id` and `fills.(execution_venue, venue_fill_id)` are both DB-level `UNIQUE` (AC #7 ledger half, AC #8) — verified by direct `IntegrityError` tests, not merely asserted.
+- **`strategy_outcomes` EX-2/EX-7 changes**, in the same migration: `execution_mode`/`execution_venue` added `NOT NULL` (backfilled `backtest`/`simulated` for every existing `is_backtest = true` row); the four snapshot columns relaxed to nullable; new `snapshot_missing_reasons` JSONB; four new CHECK constraints (`is_backtest` ⟺ `execution_mode = 'backtest'`; the mode/venue pairing; a `backtest` row still requires all four snapshots — decision #128 preserved; **every** row's NULL snapshot must have a recorded reason). **The migration counts and aborts on any pre-existing `is_backtest = false` row** rather than guessing a label (verified: zero such rows existed, so the abort path itself is exercised only by a dedicated up/down/up round-trip during development, not by a real abort in this repository's actual data). Mirrored additively into `StrategyOutcomeRecord` (ORM) and `StrategyOutcome` (Pydantic) — `execution_mode`/`execution_venue` default from `is_backtest` when a caller doesn't set them (see J4 below), and four new `model_validator`s mirror the DB CHECKs for a friendly `ValidationError` before ever reaching Postgres.
+- **Portfolio State** (`backend/app/portfolio_state/`) — `engine.py`'s `PortfolioState`: `apply_fill()` (idempotent on `ledger_seq`; opens/adds-to/closes a `positions` row; realized P&L on close, bucketed to the exchange trading day via `MarketClock`; advances `portfolio_state_cursor` in the same flush), `rebuild_from_ledger()` (replays every fill past the cursor; ledger wins on any disagreement with what was already in memory, logged not silent — I12, AC #11), `get_snapshot()` (sync, no I/O; `unrealized_pnl`/`open_risk` are `None` — not `0.0` — when a held position lacks a mark/stop, per I15's "unknown treated as unbounded"). `reconciliation.py`'s `reconcile_with_venue()` — this task's own §4.6 explicitly places §6.9 step 3 here rather than in `execution_engine/` (sibling territory): approved-never-sent entries → cancelled (`stale_opportunity_not_resubmitted`); approved-never-sent exits → re-submitted (idempotent, for real, against a live `OrderVenue`); submitted/partially-filled orders the venue has lost → `expired` (`venue_lost_state_on_restart`); orders the venue DOES know → missing fills pulled in (deduped on `venue_fill_id`) and status advanced; open-order and position-quantity mismatches against the venue → reported as discrepancies, never silently adopted or discarded (I13).
+- **Config** — `execution_mode: str = "simulated"` appended to `core/config.py`, validated to fail closed on anything else (AC #3, #4).
+
+**Two real bugs found by testing against real Postgres, not just written and trusted:**
+1. Postgres CHECK constraints treat a NULL boolean expression as *passing*, not failing — `snapshot_missing_reasons ? 'key'` evaluates to NULL (not `false`) when `snapshot_missing_reasons` itself is NULL, silently letting an unexplained NULL snapshot through. Fixed with `COALESCE(snapshot_missing_reasons, '{}'::jsonb) ? 'key'` in the migration.
+2. SQLAlchemy's `JSONB` type binds a Python `None` as the JSON scalar `null` by default (`none_as_null=False`), **not** SQL `NULL` — which would have silently defeated EX-7's entire "nullable snapshot" mechanism and its CHECK constraints (a `None` snapshot would read back as `null`, and `IS NOT NULL` is `true` for a JSON `null`). Fixed by setting `none_as_null=True` on every nullable JSONB column in `execution_ledger.py` and the four relaxed `strategy_outcomes` columns.
+
+**Judgment calls (stated, not hidden):**
+- **J1 — `db/base.py`.** Added the one-line `from app.models import execution_ledger` import this file's own docstring requires ("every model module must be imported somewhere reachable from here … or Alembic won't see it"). Not on this task's "may edit" list; done anyway as the narrowest possible additive exception, on the same footing as #171's own two approved exceptions (`envelope.py`/`execution.py`, `conftest.py`) — flagged here for confirmation rather than silently included.
+- **J2 — `PositionClosed` publish left as a seam.** Design doc §6.5 has Portfolio State publish `PositionClosed` on the critical lane immediately after a closing commit. That event's Pydantic payload model and its `CRITICAL_EVENT_TYPES` entry live in `schemas/events/execution.py`/`envelope.py` — both outside this task's file boundary, and #171's own entry above confirms fork-1 assigns "ledger/Portfolio-State/venue-registry" to this task while payload/event work stays with `execution_engine/`. `PortfolioState.apply_fill()`'s return value signals a closure so a future caller can publish once those pieces exist; nothing here invents a payload shape unilaterally or drops the requirement silently.
+- **J3 — mode/venue pairing CHECK repeated on `trades`/`orders`/`positions`.** The design doc states this CHECK explicitly only for `strategy_outcomes`. The same population-safety reasoning (AC #18) applies anywhere `execution_mode`+`execution_venue` co-occur; repeated rather than left as a gap only `strategy_outcomes` happens to close.
+- **J4 — `execution_mode`/`execution_venue` defaults.** `record_strategy_outcome()` (`app/trading_intelligence/performance.py`) is outside this task's file boundary and constructs `StrategyOutcomeRecord` by explicit kwargs, so it does not forward `outcome.execution_mode`. A context-sensitive SQLAlchemy default (`get_current_parameters()`) derives `execution_mode` from the row's own `is_backtest` at insert time instead, so both of today's real populations (Backtest Runner's `is_backtest=True` rows, and the pre-existing population-isolation tests' synthetic `is_backtest=False` rows) land on the correct, CHECK-satisfying value with no edit to that file. Stated plainly: this is a compatibility fallback for callers that don't set the column, not a license for a future live caller to omit it.
+- **J5 — `orders.status` maintenance added to `apply_fill()`.** Nothing else in either task updates an order's own status as fills arrive; `reconcile_with_venue()`'s "unmatched_order" anomaly detection (AC #13) depends on that status being accurate, so `apply_fill()` now also advances `orders.status` (submitted → partially_filled → filled) from cumulative fill quantity — the minimal addition needed for this task's own owned ACs to be meaningfully testable, not a claim that the full order state machine (§6.3, `rejected`/`cancelled`/`expired` transitions the Execution Engine itself drives) is built here.
+
+**Compatibility with #171, verified directly, not assumed.** A re-pull of `main` partway through this task showed #171 had already merged (`backend/app/execution_engine/`, `backend/app/governor/`, additive `envelope.py`/`execution.py`/`config.py`/`conftest.py` edits — none overlapping this task's four editable files except `config.py`'s shared append point, resolved as a two-block merge exactly as both tasks' own prompts anticipated). Read `execution_engine/ports.py` directly: its local `OrderVenue` `Protocol`, `VenueOrderInstruction`/`VenueAck` dataclasses, and `default_execution_venue_provider()`'s `getattr`-based duck-typing onto `broker_registry.get_execution_venue` all match this delivery's real `SimulatedVenue`/`broker_registry` structurally — Python's duck typing means #171's already-merged code works against this delivery's concrete types with no further change on either side. Full combined suite re-run against the merged tree: **922 passed** (885 from #171 + this delivery's 37), one run surfacing the same pre-existing #119-cluster flake #171 also documented, reproduced independently by this task.
+
+**Acceptance criteria owned (§9) — verified, not asserted:** #5 (fail-closed venue/mode registration), #7 ledger half (DB-level `client_order_id` dedup), #8 (DB-level `venue_fill_id` dedup), #9 (fault-injection-then-restart recovery from the ledger alone, nothing ever published), #10 (the full restart-reconciliation ladder — cancelled/resubmitted/expired/advanced, each exercised against a real `SimulatedVenue`), #11 (ledger wins over corrupted in-memory state, logged), #12 (a closure never published in this delivery — by construction, since J2 leaves publishing unbuilt — is still fully recovered from the ledger), #13 (overfill and unmatched-order fills persisted and flagged, never dropped), #18 (population CHECKs, DB-level and Pydantic-level), venue/config half of #22 (regression baseline unchanged: 885 → 922, the only addition being this delivery's own 37 tests).
+
+**Not done, stated precisely.** No wiring of `PositionClosed`'s real event (J2). No `main.py` startup sequence calling `rebuild_from_ledger()`/`reconcile_with_venue()` (outside this task's file boundary; both are ready to be called). EX-5/EX-12 remain open, untouched, as this task's own §2 established from the start. `confirmed-decisions.md` is now over the ~100KB rollover trigger `docs/decisions/README.md` documents (both #170 and #171 already flagged approaching it without acting) — flagged again, still not acted on, per the same established precedent.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main` (post-#171): new — `backend/app/broker_adapters/{order_venue,simulated_venue}.py`, `backend/app/models/execution_ledger.py`, `backend/alembic/versions/0012_execution_ledger_and_strategy_outcomes_mode.py`, `backend/app/portfolio_state/{__init__,engine,reconciliation}.py`, 5 new test files. Edited: `backend/app/services/broker_registry.py`, `backend/app/models/trading_intelligence.py` (additive), `backend/app/schemas/performance.py` (additive), `backend/app/core/config.py` (append, two-block merge with #171's own block), `backend/app/db/base.py` (J1, one import line). Nothing under `backend/app/execution_engine/**`, `backend/app/governor/**`, `backend/app/broker_adapters/base.py`, `backend/app/broker_adapters/ibkr_adapter.py`, `backend/app/schemas/events/**`, or any `docs/architecture/*.md` touched.
+
+**Data flow — a fill reaching Portfolio State (this delivery's own components only; the Execution Engine's fill-processing loop that would normally sit between `on_order_update` and the ledger insert is #171's still-open EX-5/EX-12 gap, stood in for here by `reconciliation.py` and this delivery's own tests):**
+
+```
+PriceUpdated (event bus, normal lane)
+        │
+        ▼
+SimulatedVenue.ingest_tick(symbol, price, exchange_ts)
+        │   matches pending orders on `symbol`
+        │   market: fills on any tick · limit: fills only once price crosses
+        ▼
+SimulatedVenue._apply_fill()
+        │   venue_fill_id = "<client_order_id>:f<n>"   (deterministic ⇒ dedupe by construction)
+        ▼
+venue.on_order_update(OrderUpdate)  ───►  registered callback(s)
+        │                                  (Execution Engine's fill loop — NOT built;
+        │                                   this delivery's reconciliation.py and tests
+        │                                   drive the next step directly instead)
+        ▼
+INSERT fills row
+   UNIQUE(execution_venue, venue_fill_id)  ◄── AC #8: a replay inserts nothing
+        │
+        ▼  COMMIT                          ◄── ledger authoritative (I12); AC #9 persist-before-publish
+        │
+        ▼
+PortfolioState.apply_fill(session, fill)
+        │   SELECT orders WHERE client_order_id = fill.client_order_id
+        │   SELECT trades WHERE trade_id = order.trade_id   (thesis.final_stop/final_target)
+        │
+        ├─ position_effect == "open"  ─► new positions row, or weighted-avg add to an existing one
+        │
+        └─ position_effect == "close" ─► realized_pnl delta; qty -= fill.qty
+                                          qty <= 0 ⇒ status="closed", closed_at=fill.venue_ts
+                                          overfill (qty<0) ⇒ clamp to 0, fill.anomaly="overfill" (AC #13)
+        │
+        ├─ orders.status advanced (submitted → partially_filled → filled)         [J5]
+        ├─ portfolio_state_cursor.last_applied_ledger_seq = fill.ledger_seq   (same flush)
+        │
+        ▼
+in-memory PortfolioSnapshot updated (positions / marks / realized_pnl_today / open_risk)
+        │
+        ▼
+[SEAM, not built — J2] PositionClosed (critical lane) — once execution.py's payload model
+   and envelope.py's CRITICAL_EVENT_TYPES entry land (execution_engine/'s own future scope)
+```
+
+**Internal flow — the ledger migration's table relationships:**
+
+```
+                    trades  (trade_id UUID PK = opportunity_id)
+                    ├─ execution_mode / execution_venue        CHECK pairing (EX-2, J3)
+                    ├─ thesis JSONB  {final_stop, final_target, structural_*, confidence, evidence}
+                    ├─ decision, reasons, limits_snapshot, status
+                    ├─ entry_market_state / entry_context / entry_snapshot_missing_reasons
+                    └─ outcome_id ────────────────────────────────► strategy_outcomes.outcome_id
+                                                                     (existing table, #120 —
+                                                                      EX-2/EX-7 columns added
+                                                                      by this same migration:
+                                                                      execution_mode/_venue,
+                                                                      nullable snapshots,
+                                                                      snapshot_missing_reasons)
+                         │
+              ┌──────────┴───────────┐
+              ▼                      ▼
+          orders                 positions
+    trade_id FK ──────┐    trade_id FK ──────┐
+    UNIQUE(client_      │    CHECK pairing     │
+      order_id)         │    (EX-2, J3)        │
+    CHECK(status IN     │    CHECK(status IN   │
+      8 values, §6.3)   │    open|closing|     │
+    CHECK pairing       │    closed)           │
+      (EX-2, J3)        │                      │
+              │         │                      │
+              ▼         │                      │
+           fills        │                      │
+    client_order_id FK ─┘                      │
+      → orders.client_order_id                 │
+    ledger_seq BIGINT Identity PK               │
+      (also the monotonic unit                  │
+       portfolio_state_cursor tracks)            │
+    UNIQUE(execution_venue, venue_fill_id)        │
+    anomaly IN (overfill, unmatched_order)         │
+                                                    │
+                                       portfolio_state_cursor
+                                       execution_mode PK
+                                       last_applied_ledger_seq  ── advanced by
+                                         PortfolioState.apply_fill(), same
+                                         transaction as the positions upsert
+```

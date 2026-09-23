@@ -284,6 +284,14 @@ class BacktestRunRecord(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
 
 
+def _default_execution_mode(context) -> str:
+    """Context-sensitive default (EX-2, decision #170) — see the
+    execution_mode column's own comment on StrategyOutcomeRecord for why
+    this can't be a plain static default."""
+    is_backtest = context.get_current_parameters().get("is_backtest")
+    return "backtest" if is_backtest else "simulated"
+
+
 class StrategyOutcomeRecord(Base):
     """One row per CLOSED trade, append-only — §5 (decision #89), shape
     locked field-for-field across all five of §5's own inline groups
@@ -317,6 +325,20 @@ class StrategyOutcomeRecord(Base):
     backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("backtests.run_id"), nullable=True
     )
+    # EX-2 (decision #170, #172, migration 0012).
+    # record_strategy_outcome() (app/trading_intelligence/performance.py — out of this
+    # delivery's file boundary, decision #172 §5) constructs this ORM
+    # row by explicit kwargs and does not (yet) forward outcome.execution_mode/
+    # execution_venue, so a STATIC default here would ignore is_backtest entirely — wrong for
+    # the population-isolation tests, which construct a synthetic is_backtest=False row (see
+    # _default_execution_mode below). Context-sensitive defaults (SQLAlchemy's
+    # get_current_parameters()) read the row's OWN is_backtest value at insert time instead,
+    # so the two real callers today (Backtest Runner, always is_backtest=True; these tests,
+    # sometimes False) both land on the correct, CHECK-satisfying value without
+    # record_strategy_outcome() needing to change. This is a fallback for callers that don't
+    # set the column explicitly — NOT a license for a future live caller to skip it.
+    execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, default=_default_execution_mode)
+    execution_venue: Mapped[str] = mapped_column(String(32), nullable=False, default="simulated")
 
     # --- B. Timing ---
     trading_day: Mapped[date] = mapped_column(Date, nullable=False)
@@ -348,10 +370,18 @@ class StrategyOutcomeRecord(Base):
 
     # --- E. Evidence --- JSONB (this file's own module docstring explains why JSONB, not JSON)
     evidence: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    market_state_at_entry: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    context_at_entry: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    market_state_at_exit: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    context_at_exit: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # Nullable as of EX-7 (decision #170, migration 0012) — required only for
+    # execution_mode='backtest' (decision #128, unchanged for that population), enforced by the
+    # DB CHECK ck_strategy_outcomes_backtest_requires_all_snapshots, not by this column's
+    # nullability. See schemas/performance.py:StrategyOutcome's matching fields for the full
+    # EX-7 rationale.
+    market_state_at_entry: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    context_at_entry: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    market_state_at_exit: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    context_at_exit: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
+    # EX-7: keyed by the four snapshot column names above, present for exactly the ones that
+    # are None — see StrategyOutcome.snapshot_missing_reasons for the full contract.
+    snapshot_missing_reasons: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     # No FK: feature_snapshots doesn't exist yet anywhere in this codebase (confirmed by grep).
     feature_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 

@@ -248,7 +248,7 @@ class Settings(BaseSettings):
     # final risk settings (Saqib, 2026-09-22) — do not silently make these
     # "smarter" (no volatility scaling, no per-symbol overrides, etc.)
     # without an explicit decision to do so. `execution_mode` is a separate
-    # setting appended by the sibling `execution-ledger-and-venue` task in
+    # setting appended by decision #172 (`execution-ledger-and-venue`) in
     # its own block — deliberately not added here (AC #16: none of these
     # three appears as a literal in the authorizer; each is read from
     # Settings and recorded in `limits_snapshot` on every decision).
@@ -261,6 +261,28 @@ class Settings(BaseSettings):
     def _execution_limit_must_be_positive(cls, value: int | float, info: ValidationInfo) -> int | float:
         if value <= 0:
             raise ValueError(f"{info.field_name} must be positive, got {value!r}")
+        return value
+
+    # --- Execution: venue (decision #172) ---
+    # The capital-mode vocabulary is backtest | simulated | paper | live
+    # (EX-2, decision #170) — see app/broker_adapters/order_venue.py's
+    # `ExecutionMode` for the shared Literal both sides check against.
+    # Only "simulated" is accepted in this slice; anything else fails
+    # closed at startup (AC #3, #4) rather than silently falling back —
+    # paper/live wiring is a later decision (design doc §8), not a typo
+    # away from working.
+    execution_mode: str = "simulated"
+
+    @field_validator("execution_mode")
+    @classmethod
+    def _execution_mode_must_be_simulated(cls, value: str) -> str:
+        if value != "simulated":
+            raise ValueError(
+                f"execution_mode={value!r} is not supported in this slice — only "
+                f"'simulated' is implemented (paper/live are design doc §8, later "
+                f"decisions). Fails closed rather than silently running with an "
+                f"unsupported mode."
+            )
         return value
 
 

@@ -17,3 +17,4 @@ class Base(DeclarativeBase):
 from app.models import market_data  # noqa: E402,F401
 from app.models import trading_intelligence  # noqa: E402,F401 — level_interaction_state/events (#46); strategy_outcomes/backtests (#120)
 from app.models import scanner  # noqa: E402,F401 — scanner_universe_symbols (Scanner v1 universe management)
+from app.models import execution_ledger  # noqa: E402,F401 — trades/orders/fills/positions/portfolio_state_cursor (decision #172)

@@ -81,7 +81,7 @@ from datetime import date, datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class StrategyOutcome(BaseModel):
@@ -134,6 +134,36 @@ class StrategyOutcome(BaseModel):
             "but that pairing isn't asserted by this schema (or by record_strategy_outcome) "
             "— left to the DB's real FK constraint plus this schema's own honest optionality, "
             "not a second, redundant application-level check."
+        ),
+    )
+    execution_mode: Literal["backtest", "simulated", "paper", "live"] = Field(
+        default=None,  # type: ignore[assignment]  # always filled by _default_mode_venue_from_is_backtest below
+        validate_default=False,
+        description=(
+            "EX-2 (decision #170, #172): the capital mode, separate "
+            "from execution_venue below — venue identity and capital mode are different "
+            "concepts. When omitted, _default_mode_venue_from_is_backtest (below) fills it in "
+            "from is_backtest ('backtest' if True, else 'simulated') — a compatibility "
+            "convenience for today's two real callers (Backtest Runner, always is_backtest=True; "
+            "and the population-isolation tests, which construct a synthetic is_backtest=False "
+            "row and correctly expect it NOT to be treated as a backtest row). This default "
+            "is NOT a license for a future live caller to omit this field — pass it explicitly "
+            "once a live writer exists. The DB CHECK (is_backtest = (execution_mode = "
+            "'backtest')) and this schema's own _execution_mode_matches_is_backtest validator "
+            "both reject a mismatched pair outright rather than silently accepting a wrong label."
+        ),
+    )
+    execution_venue: str = Field(
+        default=None,  # type: ignore[assignment]  # always filled by _default_mode_venue_from_is_backtest below
+        validate_default=False,
+        description=(
+            "EX-2: which venue/broker produced the fills (simulated | ibkr | ...) — plain str, "
+            "not a Literal, since the venue list is open-ended (a future real venue is a new "
+            "value, not a schema change). Defaults to 'simulated' when omitted (see "
+            "execution_mode's note — today every real caller's venue genuinely is simulated). "
+            "The pairing invariant (execution_venue == 'simulated') == (execution_mode IN "
+            "('backtest', 'simulated')) is enforced both here and by the DB CHECK — a simulated "
+            "venue cannot be labelled paper/live and vice versa (AC #18)."
         ),
     )
 
@@ -193,18 +223,47 @@ class StrategyOutcome(BaseModel):
     evidence: dict = Field(
         description="§4's structured conditions — the strategy's own reasoning, never a dumping ground for arbitrary market data (§11)."
     )
-    market_state_at_entry: dict = Field(
+    market_state_at_entry: dict | None = Field(
+        default=None,
         description=(
             "trend_score, volatility_score, etc. (decision #91's per-symbol scores) captured at "
             "entry_filled_at, not setup_detected_at — see §5's own note on why _at_entry, not "
             "_at_signal. A dict here, not a typed model, since the dimension set is still growing. "
-            "Required per §5 — see this module's own docstring for the known, unresolved gap "
-            "between this requirement and state_snapshot.py's (#98) honest-None capture behavior (D17)."
-        )
+            "Required per §5 for backtest rows ONLY — enforced by the DB CHECK and this schema's "
+            "own _backtest_requires_all_snapshots validator below, not by this field's type. "
+            "Nullable as of EX-7 (decision #170): a live row whose snapshot was genuinely "
+            "unavailable (engine cold start, restart mid-position, a capture that raised) stores "
+            "NULL here plus a machine-readable reason in snapshot_missing_reasons — never "
+            "discarded, never a fabricated {} (I3, I14). See this module's own docstring for the "
+            "underlying D17 gap this originally tracked; EX-7 resolves it for the live path the "
+            "way decision #128 already resolved it for backtest (discard-on-None there, "
+            "nullable-plus-reason here)."
+        ),
     )
-    context_at_entry: dict = Field(description="gap day?, session type, VIX regime — see market_state_at_entry's note on required-vs-capturable (D17).")
-    market_state_at_exit: dict = Field(description="Same shape as _at_entry, captured at exit_filled_at. See market_state_at_entry's D17 note.")
-    context_at_exit: dict = Field(description="Same shape as context_at_entry, captured at exit_filled_at. See market_state_at_entry's D17 note.")
+    context_at_entry: dict | None = Field(
+        default=None,
+        description="gap day?, session type, VIX regime. Nullable as of EX-7 — see market_state_at_entry's note.",
+    )
+    market_state_at_exit: dict | None = Field(
+        default=None,
+        description="Same shape as _at_entry, captured at exit_filled_at. Nullable as of EX-7 — see market_state_at_entry's note.",
+    )
+    context_at_exit: dict | None = Field(
+        default=None,
+        description="Same shape as context_at_entry, captured at exit_filled_at. Nullable as of EX-7 — see market_state_at_entry's note.",
+    )
+    snapshot_missing_reasons: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "EX-7 (decision #170): keyed by the four snapshot field names above "
+            "('market_state_at_entry', 'context_at_entry', 'market_state_at_exit', "
+            "'context_at_exit') — present for exactly the ones that are None, each mapped to a "
+            "machine-readable reason ('engine_cold_start' | 'engine_state_lost_on_restart' | "
+            "'snapshot_capture_error' | 'recorder_unavailable', per design doc §6.7). Enforced by "
+            "the DB CHECK and this schema's own _null_snapshots_have_reasons validator: every "
+            "None snapshot field must have its key present here — never an unexplained NULL."
+        ),
+    )
     feature_snapshot_id: UUID | None = Field(
         default=None,
         description=(
@@ -215,6 +274,90 @@ class StrategyOutcome(BaseModel):
             "per §5's own text, without inventing the missing table as a side effect of this task."
         ),
     )
+
+    # --- Validators (EX-2, EX-7 — decision #170) — deliberately mirroring the DB's own
+    # CHECK constraints (migration 0012) rather than replacing them: this gives a caller a
+    # friendly ValidationError before ever reaching the database, but the DB CHECK stays the
+    # actual authority (a second writer that skipped this Pydantic layer entirely still can't
+    # violate the invariant).
+    @model_validator(mode="before")
+    @classmethod
+    def _default_mode_venue_from_is_backtest(cls, data):
+        """Fills execution_mode/execution_venue from is_backtest ONLY when the caller didn't
+        supply them — see execution_mode's Field description above for why. Runs before the
+        `after` validators below, which then enforce the pairing invariants regardless of
+        whether the values came from a caller or from this default."""
+        if isinstance(data, dict):
+            is_backtest = data.get("is_backtest")
+            if data.get("execution_mode") is None:
+                data["execution_mode"] = "backtest" if is_backtest else "simulated"
+            if data.get("execution_venue") is None:
+                data["execution_venue"] = "simulated"
+        return data
+
+    @model_validator(mode="after")
+    def _execution_mode_matches_is_backtest(self) -> "StrategyOutcome":
+        expected = self.execution_mode == "backtest"
+        if self.is_backtest != expected:
+            raise ValueError(
+                f"is_backtest={self.is_backtest!r} is inconsistent with "
+                f"execution_mode={self.execution_mode!r} (must be execution_mode == 'backtest' "
+                f"iff is_backtest is True — EX-2, decision #170)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _execution_venue_matches_mode(self) -> "StrategyOutcome":
+        simulated_venue = self.execution_venue == "simulated"
+        simulated_or_backtest_mode = self.execution_mode in ("backtest", "simulated")
+        if simulated_venue != simulated_or_backtest_mode:
+            raise ValueError(
+                f"execution_venue={self.execution_venue!r} is inconsistent with "
+                f"execution_mode={self.execution_mode!r} — a 'simulated' venue must pair with "
+                f"execution_mode IN ('backtest', 'simulated') and vice versa (EX-2, decision #170)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _backtest_requires_all_snapshots(self) -> "StrategyOutcome":
+        if self.execution_mode != "backtest":
+            return self
+        missing = [
+            name
+            for name in (
+                "market_state_at_entry",
+                "context_at_entry",
+                "market_state_at_exit",
+                "context_at_exit",
+            )
+            if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"execution_mode='backtest' requires all four snapshot fields (decision #128); "
+                f"missing: {missing}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _null_snapshots_have_reasons(self) -> "StrategyOutcome":
+        reasons = self.snapshot_missing_reasons or {}
+        missing_without_reason = [
+            name
+            for name in (
+                "market_state_at_entry",
+                "context_at_entry",
+                "market_state_at_exit",
+                "context_at_exit",
+            )
+            if getattr(self, name) is None and name not in reasons
+        ]
+        if missing_without_reason:
+            raise ValueError(
+                f"snapshot_missing_reasons must have an entry for every None snapshot field "
+                f"(EX-7, I3 — never an unexplained NULL); missing reasons for: {missing_without_reason}"
+            )
+        return self
 
 
 class BacktestRun(BaseModel):

@@ -21,15 +21,41 @@ clear_active) now that the trigger for needing more than one slot has
 actually fired: Finnhub (streaming-only) and Polygon (historical-capable,
 streaming-capable-but-delayed) both need to be connected at once, each
 doing the job it's actually good at.
+
+A third, separately-typed role was added for the Execution Engine
+(EX-3, decision #170):
+  - execution: THE OrderVenue the Execution Engine places/cancels
+    orders through (app/broker_adapters/order_venue.py). Never a
+    MarketDataProvider, never shared with the streaming/historical
+    slots above — set_execution_venue() fails closed if the venue's
+    supported_modes doesn't include the configured execution_mode
+    (core/config.py).
 """
 from __future__ import annotations
 
 from app.broker_adapters.base import MarketDataProvider
+from app.broker_adapters.order_venue import OrderVenue
+from app.core.config import get_settings
 from app.services.tick_ingest import TickIngestBridge
 
 _streaming_provider: MarketDataProvider | None = None
 _streaming_bridge: TickIngestBridge | None = None
 _historical_provider: MarketDataProvider | None = None
+
+# Third role, added for the Execution Engine (EX-3, decision #170) —
+# deliberately a THIRD, separately-typed global, not folded into
+# _streaming_provider/_historical_provider. An OrderVenue is never a
+# MarketDataProvider (order_venue.py's ABC doesn't inherit from it, and
+# vice versa), so there is no slot an IBKRAdapter connecting for market
+# data could ever fill by accident (design doc §6.4, I1).
+_execution_venue: OrderVenue | None = None
+
+
+class UnsupportedExecutionModeError(RuntimeError):
+    """Raised by set_execution_venue() when the venue's supported_modes
+    doesn't include the configured execution_mode — fail closed (I6,
+    AC #5), never register a venue that can't actually serve the
+    configured mode."""
 
 
 async def take_over_streaming(
@@ -88,6 +114,31 @@ def get_historical_provider() -> MarketDataProvider | None:
     return _historical_provider
 
 
+def set_execution_venue(venue: OrderVenue) -> None:
+    """Registers `venue` as THE execution venue. Refuses (fail closed,
+    I6, AC #5) a venue whose `supported_modes` excludes the currently
+    configured `execution_mode` — this check happens here, once, at
+    registration time, rather than being re-checked by every caller of
+    `get_execution_venue()`."""
+    global _execution_venue
+    configured_mode = get_settings().execution_mode
+    if configured_mode not in venue.supported_modes:
+        raise UnsupportedExecutionModeError(
+            f"venue {venue.venue_id!r} supports {sorted(venue.supported_modes)}, "
+            f"which does not include the configured execution_mode={configured_mode!r}"
+        )
+    _execution_venue = venue
+
+
+def clear_execution_venue() -> None:
+    global _execution_venue
+    _execution_venue = None
+
+
+def get_execution_venue() -> OrderVenue | None:
+    return _execution_venue
+
+
 def get_all_active_providers() -> list[MarketDataProvider]:
     """For lifecycle management (main.py shutdown) — every distinct
     connected provider, deduplicated by identity, since one instance can
@@ -101,6 +152,7 @@ def get_all_active_providers() -> list[MarketDataProvider]:
 
 
 def clear_all() -> None:
-    """Test-fixture convenience — resets both roles at once."""
+    """Test-fixture convenience — resets all three roles at once."""
     clear_streaming_provider()
     clear_historical_provider()
+    clear_execution_venue()
