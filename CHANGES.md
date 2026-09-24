@@ -1,31 +1,28 @@
-# CHANGES — decision #175: authorizer/order persistence
+# CHANGES — decision #174: First frontend consumer of the order-lifecycle events wired (`execution-lifecycle-frontend`)
 
-Completed the resumed authorizer/order persistence scope on 2026-09-24, preserving the pending #174 PositionLedger work on `main` at `898cde9`.
+## Current delivery
 
-- Added PostgreSQL decision and order adapters using owned durable transactions. Approved decisions atomically reserve entry exposure; rejected attempts retain honest requested-mode audit facts without inventing an accepted opportunity or execution venue.
-- Migration `0014` adds exact decision records and `trade_reservations`, keeps approved execution labels strict, and refuses downgrade that would destroy authorization history.
-- Order insertion validates the full approved entry terms and returns the durable instruction. Execution checks the committed venue identity, submits only after a new committed insert, preserves order progress, and publishes no rejection after a failed rejection write.
-- Portfolio restoration now includes approvals before an order exists, preserves exact reference price, and counts remaining exposure once across order insertion, partial fills, and terminal status.
-- Completed 58 PostgreSQL integration cases. **254 focused tests passed, no skips**; fresh migration through `0014`, migration round trips, concurrency, rollback, acknowledgement-loss, publication ordering, and venue-mismatch checks passed.
-- Updated `TESTING.md`, canonical execution architecture with component/internal diagrams, and appended decision #175 plus its index row. Previous decision bodies are preserved.
+First frontend consumer anywhere in this repo of any order-lifecycle event — closes the "Frontend" line in `execution-engine-design.md` §8's deferred-prerequisites list.
 
-No startup wiring, venue-fill ingestion, governor Portfolio-State read integration, or recovery orchestration is included. Those remain follow-ups; persisted approvals/orders with lost notifications need recovery. Application databases were not migrated, and no commit or push was made.
+**Renumbered twice.** Built and packaged as #172; renumbered to #173 when `execution-ledger-and-venue` merged first and took #172; renumbered again to **#174** when `portfolio-state-engine` merged next and took #173. Zero file overlap with either sibling, confirmed both times (`portfolio-state-engine`'s own stated boundary explicitly excludes websocket channels and frontend edits; both editable files are byte-identical, by hash, to this task's original baseline throughout).
 
-<!-- Previous delivery evidence retained below. -->
+**This round required a real code update, not just a renumber.** `portfolio-state-engine` added a real `PositionClosed` payload model to `execution.py` and a `CRITICAL_EVENT_TYPES` entry to `envelope.py`. This task's own five originally-guessed fields (chosen defensively from a docs sketch, before any real model existed) matched the real model exactly. `PositionClosedWire` in `useOrderLifecycle.ts` updated to mirror the real model's further optional fields; the panel now shows `fees` on the row (genuinely new information) — `realized_profit`/`realized_loss` are read but not separately shown (they decompose the `realizedPnl` figure already on the row); `r_multiple_missing_reason` is read but deliberately not surfaced per-row, since it's expected to be true of every closure for now and would just be noise repeated on every line.
 
-# CHANGES — decision #174: PostgreSQL PositionLedgerPort adapter
+**Still cannot arrive in a running system today** — `portfolio-state-engine`'s own words: "no production implementation of this Protocol ships here," adapter/startup wiring "not wired." `channels.py`'s routing line needed no change; only its explanatory comment did, since its prior "no payload model yet" claim is now false.
 
-Approved scope implemented on clean `main` at `898cde95f0e3e9291ba5e531adad780961a11007` (2026-09-23).
+**Verified:** `npx tsc -b && npm run build` clean, re-run a third time. `channels.py` re-verified by real import, including a new assertion (`POSITION_CLOSED in CRITICAL_EVENT_TYPES`) not meaningful before this merge. `PositionClosed` normalization re-exercised against both a full real-shape fabricated message and a minimal one — both correct. Full detail in `TESTING.md`.
 
-- Added `PostgresPositionLedger`: owned durable transactions for all four port operations, authoritative fill validation, atomic position/receipt/cursor application, durable deduplication, and restart recovery using the shared accounting implementation.
-- Added migration `0013` and `PositionFillReceipt`. Explicit fill-to-position attribution preserves reopening IDs; exact replay inputs preserve Decimal accounting beyond the existing six-place projection. Profit, loss, and fees remain separate and attributed to each fill's ET day.
-- Added a table-lock checkpoint barrier and enforced database-generated, uncached fill IDs. Readers wait out older uncommitted fills before advancing a cursor; modes remain isolated. Existing explicit IDs are preserved and the generator advances past them.
-- Incomplete reservations, anomalous/corrupt facts, and legacy applied checkpoints without receipts fail explicitly. Existing unapplied fills and empty ledgers are supported. Downgrade refuses to destroy applied receipts. Order statuses remain execution-owned.
-- Added 35 PostgreSQL adapter/migration/worker tests. Focused validation: **196 passed, no skips**. Updated `TESTING.md`, canonical execution architecture, decision log, and index.
+**Everything else** — the channel-split judgment call, the hook's overall design, the panel, the `App.tsx` wiring — unchanged from the #173 packaging.
 
-Limits: full-history replay and global table locks prioritize correctness over throughput. No automatic import of legacy applied checkpoints, startup wiring, execution persistence adapters, or durable event delivery. A useful next task is authorizer/order persistence integration, including durable approved reservations before order insertion; existing checkpoint import is needed only for a deployment with legacy applied state.
+## Boundary
 
-<!-- Previous delivery evidence retained below. -->
+Unchanged from the #173 packaging: `frontend/src/hooks/useOrderLifecycle.ts`, `frontend/src/components/execution/ExecutionLifecyclePanel.tsx` (new); `backend/app/api/websocket/channels.py` (comment-only change this round), `frontend/src/App.tsx` (unchanged this round). Confirmed by `diff -rq` against a freshly re-pulled `main` (post-#173).
+
+**Found and fixed again:** `TESTING.md`'s #171-and-earlier history, restored once already in the #173 packaging but never merged (that fix was only ever handed over as a zip), was found still missing on this pull and restored again — `portfolio-state-engine`'s own section correctly preserved #172's above it, so the gap didn't grow, but it also hadn't shrunk on its own.
+
+**Heads-up, not acted on:** `confirmed-decisions.md` is now 144,321 bytes, well past the ~100KB rollover trigger (flagged at #171, #172, #173) — still not performed; flagged a fourth time for Saqib.
+
+<!-- Previous delivery record retained below. -->
 
 # CHANGES — decision #173: Portfolio State Engine (`portfolio-state-engine`)
 

@@ -55,6 +55,36 @@ EVENT_TO_CHANNEL: dict[EventType, str] = {
     EventType.PLAN_REJECTED: "orders.status",
     EventType.ORDER_FILLED: "orders.status",
     EventType.GOVERNOR_DECISION: "orders.status",
+    # Decision #174: TRADE_PLANNED/ORDER_STATUS_CHANGED were
+    # missing purely because decision #171 landed after this table was last
+    # edited (confirmed by direct read before this change, not assumed) —
+    # not a deliberate exclusion. Both share "orders.status" with their four
+    # siblings above rather than a separate channel: TradePlanned is a
+    # pre-order "plan" (not yet an order), so a case for splitting it off
+    # exists, but this channel is already a mixed-type stream distinguished
+    # by envelope.event_type (approval vs rejection vs fill vs decision all
+    # already share it), and no frontend consumer exists yet that would
+    # benefit from planning events arriving separately from order events —
+    # this delivery's own panel wants exactly the single chronological feed
+    # a shared channel gives it for free. Splitting later costs one routing
+    # line and one channel-string change in the hook; nothing else would
+    # depend on the pairing. Judgment call, made and recorded here rather
+    # than deferred silently (see this delivery's decision log entry).
+    EventType.TRADE_PLANNED: "orders.status",
+    EventType.ORDER_STATUS_CHANGED: "orders.status",
+    # POSITION_CLOSED: forward-declared when this line was first written
+    # (decision #170's enum member existed but neither a CRITICAL_EVENT_TYPES
+    # entry nor a payload model did). Both now exist (decision #173,
+    # `portfolio-state-engine`: PositionClosed payload model added to
+    # execution.py, EventType.POSITION_CLOSED added to CRITICAL_EVENT_TYPES
+    # in envelope.py) — confirmed by direct diff against this delivery's own
+    # earlier pull, re-verified again here. Still effectively inert in a
+    # running system, per that same decision's own words: "No production
+    # implementation of this Protocol ships here" / "Production
+    # PositionLedgerPort adapter / startup / outcome recovery: not wired" —
+    # so nothing instantiates the worker that would publish it. This routing
+    # line needed no change either way; only this comment did.
+    EventType.POSITION_CLOSED: "orders.status",
     EventType.DEV_PING: "dev.ping",
 }
 

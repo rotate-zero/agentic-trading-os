@@ -9,6 +9,7 @@ import { FeatureEnginePanel } from "./components/intelligence/FeatureEnginePanel
 import { ScannerPanel } from "./components/scanner/ScannerPanel";
 import { BacktestPanel } from "./components/backtest/BacktestPanel";
 import { BacktestResultsPanel } from "./components/backtest-results/BacktestResultsPanel";
+import { ExecutionLifecyclePanel } from "./components/execution/ExecutionLifecyclePanel";
 import { DataFeedStatus } from "./components/header/DataFeedStatus";
 import { BrokerPanel } from "./components/broker/BrokerPanel";
 
@@ -55,6 +56,7 @@ function FullWorkspaceShell() {
         <ScannerPanel />
         <BacktestPanel />
         <BacktestResultsPanel />
+        <ExecutionLifecyclePanel />
         <BrokerPanel />
       </main>
     </div>
@@ -120,6 +122,7 @@ function PoppedOutWindowShell({ windowId }: { windowId: string }) {
         <ScannerPanel />
         <BacktestPanel />
         <BacktestResultsPanel />
+        <ExecutionLifecyclePanel />
         <BrokerPanel />
       </main>
     </div>
