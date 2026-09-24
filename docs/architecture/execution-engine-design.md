@@ -1,6 +1,6 @@
 # Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
 **Owner:** Saqib
-**Status:** **Approved in principle** by Saqib (2026-09-22) — the simulated-venue automatic path (Slice A) with the corrections recorded in decision #170; **this revised text is the implementation specification for that slice.** That approval revision built no application code. **As-built update:** decisions #171–#173 now implement parts of this design; §6.5 below describes the current Portfolio State slice. The original inventory in §§1–2 remains historical, not a current implementation inventory. Baseline: `main` through decision #169. Originally recorded by decision #168, which stays exactly as merged (decision content is immutable — `AGENTS.md` §6); decision #170 amends it. **Fork status (§7):** EX-1, EX-2, EX-3, EX-4, EX-6, EX-7 are **RESOLVED** by #170, and EX-10 is settled by its added ledger requirement; the remaining forks stay open with their recommendations — **EX-5 and EX-12 still need Saqib's confirmation before a build task** (§7.1). Fork labels `EX-n` are provisional and are not D-numbers.
+**Status:** **Approved in principle** by Saqib (2026-09-22) — the simulated-venue automatic path (Slice A) with the corrections recorded in decision #170; **this revised text is the implementation specification for that slice.** That approval revision built no application code. **As-built update:** decisions #171–#175 now implement parts of this design; §§6.2–6.5 describe the current persistence and Portfolio State slices. The original inventory in §§1–2 remains historical, not a current implementation inventory. Baseline: `main` through decision #169. Originally recorded by decision #168, which stays exactly as merged (decision content is immutable — `AGENTS.md` §6); decision #170 amends it. **Fork status (§7):** EX-1, EX-2, EX-3, EX-4, EX-6, EX-7 are **RESOLVED** by #170, and EX-10 is settled by its added ledger requirement; the remaining forks stay open with their recommendations — **EX-5 and EX-12 still need Saqib's confirmation before a build task** (§7.1). Fork labels `EX-n` are provisional and are not D-numbers.
 **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
 
 **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
@@ -281,7 +281,7 @@ Read the diagram as: **the middle column is the new work**; everything above the
 **Technically restricted to simulated execution — four independent layers (I6, EX-1).**
 1. **Startup refusal.** Wiring reads `execution_mode` from `Settings` (§6.10). Anything other than `simulated` — `paper`, `live`, `backtest` (a per-run label, never a live-pipeline setting), or an unrecognized value — makes the stub refuse to start: the execution pipeline is not wired, an error is logged, and the app does **not** fall back to `simulated`.
 2. **Per-decision refusal.** Every authorization re-checks the current mode; unless it is `simulated` the decision is `rejected` with reason `execution_mode_not_permitted`, before any other rule runs. (Defense in depth: v1 applies configuration changes only at restart, so this covers a mode changed at runtime or a wiring bug.)
-3. **Mode stamp and venue check.** Every event and ledger row it produces carries `execution_mode = simulated`; the Execution Engine routes an order only to a venue whose `supported_modes` includes that mode (§6.3, §6.4). The registry also refuses to register a venue that does not support the configured mode.
+3. **Mode stamp and venue check.** Every accepted decision and execution row carries `execution_mode = simulated`; rejected decision audits retain the actual requested mode (including absent/unknown) and no invented venue (#175); the Execution Engine routes an order only to a venue whose `supported_modes` includes that mode (§6.3, §6.4). The registry also refuses to register a venue that does not support the configured mode.
 4. **No other venue exists.** No `OrderVenue` other than `SimulatedVenue` is implemented in this slice, and the stub imports no broker or venue module beyond the port's types (an import-boundary test, §9). Even a mislabelled order has nowhere real to go.
 
 **Rules, in evaluation order — every rejection is committed and published with its reasons** (`trading-intelligence-architecture.md` §12):
@@ -324,11 +324,28 @@ With the initial values (§6.10) the `open_exposure_loss` term is zero at a legi
    closed)    Clock)                  (EX-7)
    └──── any check fails ─► COMMIT trade row (decision = rejected, reasons) ─► publish GovernorDecision(rejected) ─► PlanRejected
                                     all pass ─► mint opportunity_id, client_order_id = "<trade_id>:entry"
-                                             ─► COMMIT trade row (decision = approved, thesis snapshot, limits in effect, snapshots)
+                                             ─► COMMIT trade row + durable entry reservation (decision inputs, thesis, limits, qty, reference price)
                                              ─► publish TradePlanned ─► GovernorDecision(approved) ─► OrderApproved
 ```
 
 **Money and sizing.** USD, US equities. `TradePlanned` carries the intended notional and the integer `qty`; the actual filled notional is whatever the venue reports and is recorded as-is (no adjustment, I3). Entry is a market order in v1; stop and target are `structural_*` exactly as the Backtest Runner does (`final_* == structural_*`).
+
+**As built (#175): durable authorization.** `PostgresTradeLedger` implements `TradeLedgerPort` with an owned transaction. Approval commits the trade and `trade_reservations` together; exact decision inputs (including snapshot-presence flags) are detached JSON, not fill-time market/context snapshots. Matching approval retries return the existing accepted identity; conflicting terms fail. Rejections use an audit UUID without an accepted opportunity ID, reservation, or execution venue. Migration `0014` allows missing/unknown requested modes for those audits while keeping approved mode/venue labels strict. Legacy rows remain unchanged, without guessed approval terms.
+
+```
+Authorizer rule result
+    -> PostgresTradeLedger.commit_decision
+       -> fresh transaction: READ COMMITTED + synchronous commit
+       -> lock trades -> orders -> trade_reservations
+       -> validate decision inputs and accepted identity
+       -> identical approval? return existing identity after transaction
+       -> insert trade + reservation (approval) OR trade only (rejection)
+       -> durable COMMIT
+    -> existing authorizer event publication
+
+Committed reservation -> PostgresPositionLedger -> Portfolio State restore
+                    \-> PostgresOrderLedger -> committed order -> venue
+```
 
 ### 6.3 Execution Engine (`execution_engine/`)
 
@@ -374,6 +391,22 @@ With the initial values (§6.10) the `open_exposure_loss` term is zero at a legi
                                                                           7. publish OrderFilled (critical) — only after COMMIT (I8)
 
   startup ─► recovery (§6.9) completes BEFORE this worker consumes its first OrderApproved (I13)
+```
+
+**As built (#175): entry persistence.** `PostgresOrderLedger` implements both `OrderLedgerPort` and `DecisionAuthorizationPort`. Before insert it rechecks the approved trade and reservation under the same transaction/lock prefix as the decision writer. Identity, symbol, direction, quantity, mode/venue, market order type, and open effect must match. It returns the committed instruction; Execution routes that instruction and checks both venue support and the approved venue ID. Only `inserted=True` can submit. Rejection writes retain the original execution venue, and a failed rejection commit publishes nothing. Status updates cannot regress partial/terminal/unknown states. Fill ingestion and reconciliation are still unimplemented; the complete design diagram above is not a claim that those paths are wired.
+
+```
+OrderApproved -> committed-decision read -> insert_order
+    -> lock trades -> orders -> reservations
+    -> recheck durable approved terms
+    -> existing identical order? return stored row; no venue call
+    -> insert approved order -> COMMIT -> return durable instruction
+    -> verify venue mode support + venue identity -> place_order
+    -> commit submitted/rejected status -> publish rejection if applicable
+
+Failed/uncertain insert commit -> no venue call, no event
+Lost acknowledgement after commit -> order retained; duplicate sends nothing
+                                     (recovery must reconcile later)
 ```
 
 **Order state machine** (persisted `status`):
@@ -429,7 +462,7 @@ With the initial values (§6.10) the `open_exposure_loss` term is zero at a legi
 
 ### 6.5 Portfolio State Engine (`portfolio_state/`)
 
-**Built in decisions #172 and #173; integration remains partial.** Portfolio State owns position accounting, in-flight exposure, marks, and daily realized amounts. It is a cache over the ledger, never the record (I5/I12). Decision #173 revises #172's package with Saqib's approval; the same database-free arithmetic now serves both the event worker and the retained Session/reconciliation API.
+**Built in decisions #172–#174; integration remains partial.** Portfolio State owns position accounting, in-flight exposure, marks, and daily realized amounts. It is a cache over the ledger, never the record (I5/I12). Decision #173 revises #172's package with Saqib's approval; the same database-free arithmetic now serves both the event worker and the retained Session/reconciliation API.
 
 **Holding period is unrestricted by this component.** Day trading is the primary use, but positions may remain open across days, months, and restarts. No daily position reset, forced EOD exit, or maximum holding period exists here. Exit policy belongs to Position Monitor. A position's UUID is persisted at opening, survives adds/reductions/restarts, and is retired at full closure. A later opening in the same symbol receives a new UUID.
 
@@ -454,15 +487,47 @@ Session/reconciliation API -> same arithmetic -> caller COMMIT -> cache
 get_snapshot() <- committed cache + memory-only marks (no I/O)
 ```
 
-**Verified event limitations.** `OrderFilled` has no fill ID/sequence, mode, or position effect and still has no application publisher. Approval/fill/status events therefore trigger authoritative ledger catch-up; payload amounts are not used for arithmetic. Mode/effect/trade/symbol/side come from the persisted order; the fill supplies sequence and `(execution_venue, venue_fill_id)`. An unresolved approval is unknown exposure, never an empty account. The eventual adapter must read durable approved reservations even before their order insert. `OrderStatusChanged` currently represents rejection only. Read-back handles cancelled/expired/filled states, but prompt live cancellation tracking needs a future status publisher or explicit refresh trigger; this slice provides `refresh()` and restart catch-up, not polling. The bus has no symbol-filtered subscriptions: unheld ticks are dropped before queueing and checked again during processing.
+**Verified event limitations.** `OrderFilled` has no fill ID/sequence, mode, or position effect and still has no application publisher. Approval/fill/status events therefore trigger authoritative ledger catch-up; payload amounts are not used for arithmetic. Mode/effect/trade/symbol/side come from the persisted order; the fill supplies sequence and `(execution_venue, venue_fill_id)`. An unresolved approval is unknown exposure, never an empty account. The PostgreSQL adapter includes approved order rows and durable pre-order reservations (#175). Approval restoration now works before order insertion, using the persisted quantity and exact reference price. After insertion, the order status and applied fill quantity determine remaining exposure; the retained reservation is counted only through that order. Legacy approved trades lacking both an entry order and reservation still block restoration explicitly. `OrderStatusChanged` currently represents rejection only. Read-back handles cancelled/expired/filled states, but prompt live cancellation tracking needs a future status publisher or explicit refresh trigger; this slice provides `refresh()` and restart catch-up, not polling. The bus has no symbol-filtered subscriptions: unheld ticks are dropped before queueing and checked again during processing.
 
 **Accounting.** `accounting.py` uses immutable values and Decimal arithmetic for opens, same-side adds, average entry cost, opposite-side reductions, and full closes. Invalid quantities/prices, unintended reversals, and incompatible trade/mode/symbol inputs raise before changing state. Exposure includes filled positions and only the remaining entry-order quantity; exit orders do not duplicate exposure. Missing marks/stops remain unknown. Marks have exchange timestamps; older/pre-opening ticks are ignored, and marks are cleared at closure/reopening and restart. Cash/buying power is unavailable (`None`).
 
 **Profit, loss, and fees are separate.** Each reducing fill contributes positive gross P&L to profit or a positive loss magnitude to loss on `MarketClock.trading_day(fill.venue_ts)` (ET calendar date). Gross P&L = profit − loss. Each fill's reported commission is tracked separately on that fill's day, including entries. Unknown commission stays unknown; `reported_fees` and an unknown-fee count distinguish known charges from a complete total. Closing a position later never moves its earlier partial realizations to closure day. Position lifetime totals and daily totals are different views. Stock splits, dividends, financing/borrow costs, and late fee corrections have no input contracts here.
 
-**Persistence Protocol, not a production adapter.** `ports.py:PositionLedgerPort` provides `load_state`, `pending_fills`, `get_order`, and `commit_fill`. Startup read-back must recover durable IDs and lifetime totals, open positions, non-terminal orders/reservations, cursor, and per-symbol/day amounts derived from individual fill attributions. Unknown history is explicit. A fill commit atomically deduplicates its stable venue key, compares the expected cursor, persists position plus realized-fill attribution (or immutable replay inputs sufficient to reproduce it), and advances the cursor. Exact duplicates publish nothing; conflicting keys/cursors raise.
+**Persistence Protocol and PostgreSQL adapter (#174).** `ports.py:PositionLedgerPort` provides `load_state`, `pending_fills`, `get_order`, and `commit_fill`. Startup read-back must recover durable IDs and lifetime totals, open positions, non-terminal orders/reservations, cursor, and per-symbol/day amounts derived from individual fill attributions. Unknown history is explicit. A fill commit atomically deduplicates its stable venue key, compares the expected cursor, persists position plus realized-fill attribution (or immutable replay inputs sufficient to reproduce it), and advances the cursor. Exact duplicates publish nothing; conflicting keys/cursors raise.
 
-`pending_fills` must expose a complete safe committed prefix. PostgreSQL Identity allocation is not commit order: an adapter must serialize ingestion or establish a safe watermark so a lower-sequence transaction cannot commit behind the cursor. This delivery supplies no production implementation of that Protocol. The retained Session path rejects skipping an earlier visible fill, shares the arithmetic, stages cache installation until `after_commit`, and rebuilds daily totals from full fill history; it still assumes serialized ledger writers. Session and Protocol ownership cannot be mixed on one instance. `full_rebuild` audits without resetting IDs/cursor. Flagged invalid fills remain persisted and block usable snapshots; reconciliation reports unavailable accounting as a discrepancy.
+`pending_fills` must expose a complete safe committed prefix. PostgreSQL Identity allocation is not commit order: an adapter must serialize ingestion or establish a safe watermark so a lower-sequence transaction cannot commit behind the cursor. `postgres.py:PostgresPositionLedger` now implements that Protocol with an owned transaction per call and the barrier described below. The retained Session path rejects skipping an earlier visible fill, shares the arithmetic, stages cache installation until `after_commit`, and rebuilds daily totals from full fill history; it still assumes serialized ledger writers. Session and Protocol ownership cannot be mixed on one instance. `full_rebuild` audits without resetting IDs/cursor. Flagged invalid fills remain persisted and block usable snapshots; reconciliation reports unavailable accounting as a discrepancy.
+
+**PostgreSQL checkpoint barrier.** Each adapter call uses a fresh Session, READ COMMITTED, synchronous commit, and a `SHARE ROW EXCLUSIVE` lock on trades, orders, trade reservations, fills, positions, cursor, and receipt tables, acquired in that order. The locks exclude ordinary INSERT/UPDATE/DELETE and competing adapters. Reads occur only after all locks are granted, so previously uncommitted lower fill IDs are visible or aborted before any prefix is returned. Migration `0013` sets the fill Identity to `GENERATED ALWAYS`, `CACHE 1`, and advances its generator past any existing explicit IDs without rewinding it. The adapter verifies that policy on every transaction. Administrative sequence reseeding, identity override, and disabling integrity constraints are outside the ingestion contract. This conservative barrier serializes all modes and blocks ledger writers while history is read; throughput optimization is deferred until measured.
+
+**Durable fill receipts.** `position_fill_receipts` stores the source fill FK, unique venue fill key, mode, explicit position FK, exact replay inputs (Decimal strings in JSONB), ET trading day, and unscaled numeric gross delta. Each new application revalidates the first pending source fill, expected cursor, pure arithmetic result, and attribution, then writes position + receipt + cursor in one transaction. An identical previously applied fill returns `applied=False` and current state even if another consumer generated a different provisional position UUID; conflicting source identity raises. The position projection retains its existing six-place columns; receipt replay preserves the exact average and lifetime totals. Restore checks the projection against that history and reads current stop/target/exit-attempt metadata. Orders and their statuses remain execution-owned; filled quantities come from applied receipts.
+
+```text
+Portfolio State worker -- PositionLedgerPort --> PostgresPositionLedger
+                                                       |
+                                          owned transaction / table barrier
+                                                       |
+                       +-------------------------------+-------------------+
+                       | authoritative reads                               |
+                       v                                                   v
+              trades -> orders -> fills                positions + receipts + cursor
+                       |                                                   ^
+                       +--> shared accounting --> validate application ----+
+                                                       |
+                                                  durable COMMIT
+                                                       |
+                                    worker cache -> optional PositionClosed
+```
+
+```text
+begin READ COMMITTED -> wait for all table locks -> verify sequence policy
+       -> reconstruct/audit committed checkpoint
+       -> existing receipt? identical fill: return applied=False after commit
+       -> compare cursor -> require first pending fill -> recompute and compare
+       -> write position -> append receipt -> advance cursor -> audit -> COMMIT
+failure/uncertain acknowledgement -> raise PositionLedgerError -> reload on retry
+```
+
+**Cutover and incomplete history.** Empty ledgers and existing unapplied fills are supported. A pre-0013 applied cursor/position without complete receipts raises; no automatic legacy backfill or zero reset is performed. The old Session/reconciliation API remains available, but the two persistence paths must not own the same mode concurrently. Missing reservation metadata, flagged fills, overfills, inconsistent mode/venue/symbol facts, incomplete receipts, and corrupt projections also fail closed. Receipt history is replayed on each checkpoint, so this is correctness-first persistence, not a bounded-cost snapshot implementation. Downgrade refuses to drop nonempty receipt history.
 
 **Read contract.** `get_snapshot(symbol=None, *, trading_day=None)` is synchronous and I/O-free. One instance serves one explicit capital mode. No symbol means the entire mode; a symbol filters positions, orders, marks, exposures, and daily totals. Unknown symbol, unrestored state, accounting backlog/failure, or unresolved order metadata yields `None`. A closed symbol with known history has a flat snapshot; a restored empty ledger is known flat. Incomplete history yields unknown daily amounts, never invented zeros. Default day comes from MarketClock; an explicit day supports historical reads. Returned dictionaries are detached and their position/order values immutable. Fields map to governor's PortfolioSnapshot/OpenExposure concepts without importing that package; consumer adaptation and honest handling of unknown state remain integration work.
 
@@ -490,7 +555,7 @@ fill -> validate ledger identity/mode/effect and safe cursor order
 
 Only a successful newly applied closure commit can publish `PositionClosed`, on the critical lane. There is **no outbox and no exactly-once or at-least-once delivery guarantee**: commit success followed by crash, lost acknowledgement, publication failure, or an unhandled bus notification can lose the event. Committed state remains recoverable; already-applied closures are not re-published at startup. Consumers need independent ledger recovery. The Session compatibility API does not publish events.
 
-**Not wired:** production PositionLedgerPort adapter, complete status notifications, governor/World View adapters, live startup, position-monitor exits, and OutcomeRecorder recovery. Worker tests use a fake ledger; real PostgreSQL tests cover only the retained Session API and reconciliation, not the unbuilt adapter's transaction/concurrency guarantees. Details and evidence: decision #173 and `TESTING.md`.
+**Not wired:** complete status notifications, authorizer/order/fill persistence integration, governor/World View adapters, live startup, position-monitor exits, and OutcomeRecorder recovery. Adapter tests now exercise real PostgreSQL transactions, concurrent writers/consumers, restart accounting, migration safety, and the real event worker. They do not prove durable event delivery or end-to-end venue ingestion. Details: decisions #173–#174 and `TESTING.md`.
 
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 
@@ -534,17 +599,19 @@ Only a successful newly applied closure commit can publish `PositionClosed`, on 
 4. **Backtests are unchanged:** decision #128's discard-on-`None` stays for `execution_mode = backtest` rows, and the schema keeps those four columns `NOT NULL` for them (§6.8).
 5. **Capture timing is visible.** Snapshots are read at fill-handling time, not as of `fill_ts`; the market-state dict carries its `candle_ts` and the trade row stores `captured_at`, so late capture is measurable rather than hidden.
 
-### 6.8 Persistence sketch (proposal — no migration is created by this design)
+### 6.8 Persistence sketch (implemented incrementally by #172, #174, and #175)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**
 
 | Table | Purpose | Key columns / constraints |
 |---|---|---|
-| `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= `opportunity_id`), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
+| `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= accepted `opportunity_id` for approvals; audit identity for rejections), `decision_record` (#175 exact authorization inputs), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
+| `trade_reservations` (#175) | Durable approval terms before order insertion, retained after handoff | `trade_id` PK/FK, deterministic `client_order_id` UNIQUE, positive `qty`, finite positive exact `reference_price`, `created_at`; migration downgrade refuses to discard reservations or decision records |
 | `orders` | The order ledger and state machine | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
 | `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills` | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
+| `position_fill_receipts` (#174) | Durable fill application and exact replay inputs | `ledger_seq` PK/FK, unique `(execution_venue, venue_fill_id)`, `execution_mode`, `position_id` FK, `fill_data` JSONB, `trading_day`, `gross_pnl` |
 
 **`strategy_outcomes` changes (EX-2, EX-7; the build task owns the migration):**
 - Add **`execution_mode`** (`backtest | simulated | paper | live`) and **`execution_venue`** (`simulated | ibkr | …`); both set on every new row, both part of the `StrategyOutcome` contract. For `backtest` rows the venue is `simulated` (the `fill_simulator` replay model); for `simulated` rows it is `SimulatedVenue`; the *mode* says which.

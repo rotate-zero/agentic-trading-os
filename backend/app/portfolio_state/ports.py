@@ -1,6 +1,6 @@
 """Persistence seam for decision #173 (portfolio-state-engine). No ORM or sibling imports.
 
-There is deliberately no production implementation of PositionLedgerPort.
+postgres.py implements PositionLedgerPort with owned PostgreSQL transactions.
 The old Session API is retained separately for reconciliation compatibility.
 """
 from __future__ import annotations

@@ -1,3 +1,32 @@
+# CHANGES — decision #175: authorizer/order persistence
+
+Completed the resumed authorizer/order persistence scope on 2026-09-24, preserving the pending #174 PositionLedger work on `main` at `898cde9`.
+
+- Added PostgreSQL decision and order adapters using owned durable transactions. Approved decisions atomically reserve entry exposure; rejected attempts retain honest requested-mode audit facts without inventing an accepted opportunity or execution venue.
+- Migration `0014` adds exact decision records and `trade_reservations`, keeps approved execution labels strict, and refuses downgrade that would destroy authorization history.
+- Order insertion validates the full approved entry terms and returns the durable instruction. Execution checks the committed venue identity, submits only after a new committed insert, preserves order progress, and publishes no rejection after a failed rejection write.
+- Portfolio restoration now includes approvals before an order exists, preserves exact reference price, and counts remaining exposure once across order insertion, partial fills, and terminal status.
+- Completed 58 PostgreSQL integration cases. **254 focused tests passed, no skips**; fresh migration through `0014`, migration round trips, concurrency, rollback, acknowledgement-loss, publication ordering, and venue-mismatch checks passed.
+- Updated `TESTING.md`, canonical execution architecture with component/internal diagrams, and appended decision #175 plus its index row. Previous decision bodies are preserved.
+
+No startup wiring, venue-fill ingestion, governor Portfolio-State read integration, or recovery orchestration is included. Those remain follow-ups; persisted approvals/orders with lost notifications need recovery. Application databases were not migrated, and no commit or push was made.
+
+<!-- Previous delivery evidence retained below. -->
+
+# CHANGES — decision #174: PostgreSQL PositionLedgerPort adapter
+
+Approved scope implemented on clean `main` at `898cde95f0e3e9291ba5e531adad780961a11007` (2026-09-23).
+
+- Added `PostgresPositionLedger`: owned durable transactions for all four port operations, authoritative fill validation, atomic position/receipt/cursor application, durable deduplication, and restart recovery using the shared accounting implementation.
+- Added migration `0013` and `PositionFillReceipt`. Explicit fill-to-position attribution preserves reopening IDs; exact replay inputs preserve Decimal accounting beyond the existing six-place projection. Profit, loss, and fees remain separate and attributed to each fill's ET day.
+- Added a table-lock checkpoint barrier and enforced database-generated, uncached fill IDs. Readers wait out older uncommitted fills before advancing a cursor; modes remain isolated. Existing explicit IDs are preserved and the generator advances past them.
+- Incomplete reservations, anomalous/corrupt facts, and legacy applied checkpoints without receipts fail explicitly. Existing unapplied fills and empty ledgers are supported. Downgrade refuses to destroy applied receipts. Order statuses remain execution-owned.
+- Added 35 PostgreSQL adapter/migration/worker tests. Focused validation: **196 passed, no skips**. Updated `TESTING.md`, canonical execution architecture, decision log, and index.
+
+Limits: full-history replay and global table locks prioritize correctness over throughput. No automatic import of legacy applied checkpoints, startup wiring, execution persistence adapters, or durable event delivery. A useful next task is authorizer/order persistence integration, including durable approved reservations before order insertion; existing checkpoint import is needed only for a deployment with legacy applied state.
+
+<!-- Previous delivery evidence retained below. -->
+
 # CHANGES — decision #173: Portfolio State Engine (`portfolio-state-engine`)
 
 ## Current delivery

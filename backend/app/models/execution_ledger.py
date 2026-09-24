@@ -42,11 +42,13 @@ column list for it), since a fill's mode is derivable via its
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     ForeignKey,
     Identity,
     Integer,
@@ -90,8 +92,10 @@ class Trade(Base):
     __tablename__ = "trades"
 
     trade_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    execution_mode: Mapped[str] = mapped_column(String(16), nullable=False)
-    execution_venue: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Rejected attempts retain even an unknown requested mode, with no
+    # invented venue. Approved rows are constrained to complete valid labels.
+    execution_mode: Mapped[str | None] = mapped_column(String(), nullable=True)
+    execution_venue: Mapped[str | None] = mapped_column(String(32), nullable=True)
     origin: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")  # auto | manual (EX-13: auto only, v1)
     strategy_name: Mapped[str] = mapped_column(String(64), nullable=False)
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -107,6 +111,7 @@ class Trade(Base):
     decision: Mapped[str] = mapped_column(String(16), nullable=False)  # approved | rejected
     reasons: Mapped[list | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     limits_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    decision_record: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
 
     # open|closing|closed for an approved trade; NULL for a rejected one.
     status: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -131,6 +136,34 @@ class Trade(Base):
             "status IS NULL OR status IN ('open', 'closing', 'closed')", name="ck_trades_status"
         ),
         CheckConstraint(_MODE_VENUE_PAIRING, name="ck_trades_mode_venue_pairing"),
+        CheckConstraint(
+            "decision = 'rejected' OR (execution_mode IS NOT NULL AND execution_venue IS NOT NULL "
+            "AND execution_mode IN ('backtest', 'simulated', 'paper', 'live'))",
+            name="ck_trades_approved_execution_labels",
+        ),
+    )
+
+
+class TradeReservation(Base):
+    """Durable approved entry exposure before Execution inserts its order.
+
+    Retained as immutable approval terms after order insertion; the order's
+    status and applied fills then determine the remaining exposure.
+    """
+
+    __tablename__ = "trade_reservations"
+
+    trade_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("trades.trade_id"), primary_key=True)
+    client_order_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    reference_price: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("qty > 0", name="ck_trade_reservations_qty"),
+        CheckConstraint("reference_price > 0 AND reference_price NOT IN ('NaN', 'Infinity', '-Infinity')",
+                        name="ck_trade_reservations_price"),
+        CheckConstraint("client_order_id = trade_id::text || chr(58) || 'entry'", name="ck_trade_reservations_client_id"),
     )
 
 
@@ -180,7 +213,7 @@ class Fill(Base):
 
     __tablename__ = "fills"
 
-    ledger_seq: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    ledger_seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True, cache=1), primary_key=True)
     client_order_id: Mapped[str] = mapped_column(
         String(128), ForeignKey("orders.client_order_id"), nullable=False
     )
@@ -248,3 +281,27 @@ class PortfolioStateCursor(Base):
     execution_mode: Mapped[str] = mapped_column(String(16), primary_key=True)
     last_applied_ledger_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PositionFillReceipt(Base):
+    """Immutable replay inputs and explicit fill-to-position attribution.
+
+    Decimal inputs in the JSON object are strings, preserving accounting
+    precision independently of the six-place position projection.
+    """
+
+    __tablename__ = "position_fill_receipts"
+
+    ledger_seq: Mapped[int] = mapped_column(BigInteger, ForeignKey("fills.ledger_seq"), primary_key=True)
+    execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    execution_venue: Mapped[str] = mapped_column(String(32), nullable=False)
+    venue_fill_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    position_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("positions.position_id"), nullable=False)
+    fill_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    trading_day: Mapped[date] = mapped_column(Date, nullable=False)
+    gross_pnl: Mapped[Decimal] = mapped_column(Numeric(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("execution_venue", "venue_fill_id", name="uq_position_receipts_fill_key"),
+        CheckConstraint(_MODE_VENUE_PAIRING, name="ck_position_receipts_mode_venue"),
+    )

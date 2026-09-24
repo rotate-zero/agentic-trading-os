@@ -1,3 +1,104 @@
+# TESTING — decision #175: authorizer/order persistence
+
+## Scope and environment
+
+2026-09-24: resumed on `main` at `898cde95f0e3e9291ba5e531adad780961a11007`, preserving the existing #174 adapter and unfinished authorizer/order changes. Fetched GitHub `main` immediately before assigning #175: same HEAD; remote index/log through #173, local index/log through pending #174, archives through `134-160`. Existing decision bodies were not rewritten.
+
+Python 3.14 in `backend/.venv`; PostgreSQL **18.6**. Started the existing isolated validation cluster on port 55436, created the new database `authorization_resume_test`, and migrated it from empty through `0014`. No application database was used. The sandbox blocked the initial Alembic connection; reran with approved local database access. These tests delete their fixture records and reset accounting cursors, so use only an isolated database.
+
+## Reproducible command
+
+From `backend/`, with the isolated PostgreSQL server running:
+
+```bash
+env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55436 POSTGRES_DB=authorization_resume_test \
+  .venv/bin/alembic upgrade head
+
+env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55436 POSTGRES_DB=authorization_resume_test \
+  .venv/bin/pytest \
+  tests/test_authorization_ledger_postgres.py tests/test_position_ledger_postgres.py \
+  tests/test_portfolio_accounting.py tests/test_portfolio_worker.py \
+  tests/test_portfolio_state.py tests/test_reconciliation.py \
+  tests/test_execution_event_schemas.py tests/test_execution_engine.py \
+  tests/test_governor_engine.py tests/test_governor_rules.py \
+  tests/test_execution_ledger.py tests/test_simulated_venue.py \
+  tests/test_event_bus.py tests/test_market_clock.py \
+  -q --tb=short --disable-warnings
+```
+
+**Result: 254 passed, no skips, 7.95s** (9,010 dependency deprecation warnings): 58 authorizer/order integration cases plus 196 focused adapter/accounting/execution regressions. The initial resumed suite passed 250 cases; four additional failure-path cases brought the final total to 254. No test assertions were weakened.
+
+Also passed `git diff --check` and Python AST parsing of all 11 changed/new Python files. Byte comparisons confirm committed decision-log/index content is unchanged; appended numbers are ordered and index/log agree through #175. Final repository inspection found the same intended file set and unchanged local/remote HEAD. The isolated validation server was stopped after testing.
+
+## Verified behavior
+
+- Decision and reservation commit atomically; rollback leaves neither. Lost commit acknowledgement leaves one recoverable reservation, and a retry does not duplicate it. Concurrent identical approvals converge; changed terms fail.
+- Missing/unknown/paper/live/backtest requested modes remain rejection audit facts, with no reservation or invented venue. Approved database rows still require complete, valid mode/venue labels. Actual authorizer event handling sees already durable approval/rejection records.
+- Portfolio lookup/restart works before order insertion and preserves exact reference price. The order handoff counts exposure once; applied partial fills reduce the remainder; terminal order reads release it.
+- Order insert rejects changed identity, symbol, direction, quantity, effect, type, mode, venue, and initial status. Concurrent duplicates return one inserted result. Actual Execution sees a committed order before its venue call and never resubmits a duplicate.
+- Injected failure before order commit rolls back the order; lost acknowledgement after commit retains it. Both paths make no venue call or event publication and preserve one reservation on restart. Subsequent insertion distinguishes missing versus already committed orders.
+- A venue claiming simulated support but using a different ID receives no order. Durable rejection retains the authorized venue. Failed rejection commit emits nothing and retains approved exposure. Stale acknowledgement/status writes cannot regress partial, terminal, or unknown states.
+- Fresh upgrade through `0014`; combined `0014 -> 0012 -> head` round trip preserves legacy source rows. Downgrade refuses to discard reservations, approved decision records, rejection-only audit records, or applied fill receipts. Existing PositionLedger tests now clean reservation fixtures and expect migration head `0014`.
+
+## Limits
+
+No full-backend-suite, PostgreSQL 16, load, server-crash, or power-loss claim. Commit acknowledgement loss uses SQLAlchemy hooks; persistence is real PostgreSQL. Engine composition uses the real EventBus/adapters and controlled venue/market/portfolio inputs, not a fully wired application.
+
+Startup, governor Portfolio-State snapshot adaptation/cache synchronization, venue-fill persistence/publication, exits, outcomes, and recovery orchestration remain out of scope. Persisted pre-order approvals can survive lost publication; committed orders can survive lost acknowledgements without submission. Future recovery must reconcile those facts rather than blindly retry venue calls. Table locks serialize writes but do not make separate authorizers' risk decisions atomic. Legacy approvals without orders/reservations and legacy applied checkpoints without receipts still require explicitly reviewed recovery. Migration `0014` was applied only to the isolated test database; no commit or push is included.
+
+<!-- Previous delivery evidence retained below. -->
+
+# TESTING — decision #174: PostgreSQL PositionLedgerPort adapter
+
+## Baseline and environment
+
+2026-09-23: clean `main`, HEAD and freshly fetched GitHub main both `898cde95f0e3e9291ba5e531adad780961a11007`. Rechecked main before assigning #174: index/log end at #173, archives through `134-160`. Existing decision bodies preserved; no changes from another session were present.
+
+Used Python 3.14, `backend/.venv`, and PostgreSQL **18.6**. Started the existing isolated validation cluster on port 55436 and created a **new database `position_ledger_adapter_test`**, migrated from empty through `0013`. No application database was used. PostgreSQL socket access required sandbox escalation; an accidental sandbox-only suite attempt produced connection errors and was stopped, then rerun with the required access. PostgreSQL 16 and a full backend-suite run are not claimed.
+
+## Reproducible focused command
+
+Run against an isolated database; these database tests create/delete their fixtures and reset accounting cursors. From `backend/`:
+
+```bash
+env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55436 POSTGRES_DB=position_ledger_adapter_test \
+  .venv/bin/alembic upgrade head
+
+env POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55436 POSTGRES_DB=position_ledger_adapter_test \
+  .venv/bin/pytest \
+  tests/test_position_ledger_postgres.py \
+  tests/test_portfolio_accounting.py tests/test_portfolio_worker.py \
+  tests/test_portfolio_state.py tests/test_reconciliation.py \
+  tests/test_execution_event_schemas.py tests/test_execution_engine.py \
+  tests/test_governor_engine.py tests/test_governor_rules.py \
+  tests/test_execution_ledger.py tests/test_simulated_venue.py \
+  tests/test_event_bus.py tests/test_market_clock.py \
+  -q --tb=short --disable-warnings
+```
+
+**Result: 196 passed, no skips, 6.95s** (7,759 dependency deprecation warnings). This comprises **35 new real-PostgreSQL adapter tests** plus the previous 161 focused regression cases. The first 29-case adapter run also passed. An intermediate combined run had one existing log-capture assertion failure: in-process Alembic tests used fileConfig and disabled existing loggers. Switching those tests to programmatic Alembic Config without global logging configuration resolved the failure; production logging and the existing assertion were not changed.
+
+Also passed Python compilation and `git diff --check`; byte comparisons confirm all pre-existing decision-log and index content is unchanged. Final repository inspection found only the ten intended task files. The isolated validation server was stopped after testing.
+
+## New coverage
+
+- **Committed-prefix safety:** two actual database transactions allocate fills in sequence order and commit the higher one first. A concurrent adapter read is observed waiting in `pg_locks`, not merely assumed blocked by a timing sleep. Committing, rolling back, or disconnecting the lower writer yields exactly the safe prefix. Other-mode sequence gaps are preserved.
+- **Atomicity and concurrency:** simultaneous consumers return one applied result and one durable duplicate; stale cursor, skipped source fill, changed fill facts, incorrect resulting position, and incorrect attribution fail without partial accounting writes. A before-commit exception rolls back position/receipt/cursor while retaining independently committed fills. An after-commit acknowledgement exception leaves recoverable accounting and an idempotent retry.
+- **Restoration and arithmetic:** all four execution modes; exact weighted Decimal averages (including a six-place rounding tie); multi-month long/short reductions; per-day profit/loss/entry and exit fees; unknown commission and rebates; ET midnight; explicit reopening IDs even with repeated timestamps; historical stop inputs survive thesis edits.
+- **Orders and incomplete state:** approved orders, partial remaining quantities, persisted cancellation/terminal reads, absent order lookup, and unchanged execution-owned statuses. Missing approved reservation quantities, anomalous fills, overfills, mode/symbol inconsistency, changed source facts, damaged position projections, missing receipts/cursors, and legacy applied state fail closed.
+- **Migration:** fresh upgrade; 0013 → 0012 → 0013 with existing source fills; legacy explicitly supplied IDs survive and the next generated ID is greater; ordinary explicit-ID inserts rejected; unsafe sequence-cache policy detected; downgrade with receipts refused without deleting history or changing revision.
+- **Actual worker composition:** real PostgreSQL adapter + EventBus + PortfolioState; a closure callback sees an already committed final cursor/closed state, and a fresh worker restores without re-publishing the closure.
+
+## Limits and follow-ups
+
+The adapter serializes all modes through table locks and replays full receipt history on each checkpoint; no load/throughput claim. Administrative identity override/reseeding and integrity-constraint disabling are outside the supported ingestion contract. Connection close covers rollback/released locks, but no operating-system process kill, server crash, replica/failover, or power-loss test was performed. Commit acknowledgement loss is injected through SQLAlchemy's after-commit hook.
+
+Existing unapplied fills and empty ledgers work. **Already-applied legacy checkpoints have no receipt history and require a separately reviewed import/recovery task**; the adapter reports that condition, and the unchanged Session path remains available. Do not use both paths as writers for the same mode. The current trades schema cannot restore the quantity of an approved reservation before its order exists; the adapter raises until that information is persisted. Authorizer/order persistence integration must resolve that gap.
+
+Startup, execution fill ingestion/publication, full status notifications, governor/World View integration, exits, OutcomeRecorder, outbox delivery, and numeric R remain outside this delivery. The migration was applied only to the isolated test database. No archive or commit is produced by this task.
+
+<!-- Previous delivery evidence retained below. -->
+
 # TESTING — decision #173: Portfolio State Engine (`portfolio-state-engine`)
 
 ## Baseline and scope

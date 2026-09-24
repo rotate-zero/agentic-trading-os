@@ -188,6 +188,11 @@ class ExecutionEngine:
             logger.info("OrderApproved %s already in the ledger — duplicate delivery, no venue call", client_order_id)
             return
 
+        # Route the committed instruction. Concrete adapters verify incoming
+        # terms against the durable authorization before returning it.
+        record = insert_result.order
+        execution_mode = record.execution_mode
+
         # Mode/venue check (§6.3 step 3; AC #5 venue-refusal half) —
         # never routed to a venue that doesn't support this execution_mode.
         venue = self._venue_provider.get_execution_venue()
@@ -201,15 +206,20 @@ class ExecutionEngine:
                 client_order_id, "mode_not_supported", execution_venue=venue.venue_id, symbol=order_approved.symbol
             )
             return
+        if record.execution_venue is not None and venue.venue_id != record.execution_venue:
+            await self._reject_after_insert(
+                client_order_id, "execution_venue_mismatch", execution_venue=venue.venue_id, symbol=record.symbol
+            )
+            return
 
         instruction = VenueOrderInstruction(
             client_order_id=client_order_id,
-            symbol=order_approved.symbol,
-            side=order_approved.side,
-            qty=order_approved.qty,
-            order_type=order_approved.order_type,
-            limit_price=order_approved.limit_price,
-            position_effect=order_approved.position_effect,
+            symbol=record.symbol,
+            side=record.side,
+            qty=record.qty,
+            order_type=record.order_type,
+            limit_price=record.limit_price,
+            position_effect=record.position_effect,
         )
         ack = await venue.place_order(instruction)
 
@@ -254,9 +264,10 @@ class ExecutionEngine:
             )
         except OrderLedgerError:
             logger.exception(
-                "ExecutionEngine: update_order_status(rejected) failed for %s — publishing OrderStatusChanged anyway",
+                "ExecutionEngine: update_order_status(rejected) failed for %s — no event published",
                 client_order_id,
             )
+            return
         await self._publish_rejected(client_order_id, reason, execution_venue=execution_venue, symbol=symbol)
 
     async def _publish_rejected(
