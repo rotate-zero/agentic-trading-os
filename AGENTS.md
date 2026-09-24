@@ -21,8 +21,9 @@
   * the likely files/modules involved;
   * what completion should look like.
 * Prefer one well-scoped next task over a large collection of future tasks.
-* Wait for Saqib's approval before modifying code or documentation.
-* Approval such as `approved`, `proceed`, or an explicit instruction to implement the proposed task authorizes only that scope.
+* Wait for Saqib's approval before modifying code or documentation for a newly proposed task. A direct instruction to implement a named task, or `approved`/`proceed` in response to its proposal, is approval for that task.
+* Once a task is approved, carry it through implementation, relevant tests, database verification, documentation, and packaging without asking for permission at each step. Ask again only for a genuinely unresolved product/architecture choice or a material expansion beyond the approved outcome.
+* A task that is partly implemented on the current branch remains approved. Verify and reuse the existing work, then finish the remaining accepted scope; do not restart the approval cycle solely because the baseline advanced.
 
 ## 3. Scope control
 
@@ -55,7 +56,8 @@
   * relevant documentation/decision-log state.
 * Before finalizing the task, check repository state again.
 * Never overwrite, revert, discard, or "clean up" changes that were not created as part of the approved task.
-* If unexpected existing changes overlap files needed by this task, stop implementation and report the collision to Saqib.
+* Distinguish committed changes on the current base from uncommitted or concurrent changes. Committed code is the current baseline: inspect, test, and reuse it even if a prior task description is stale. A documentation gap by itself does not require renewed approval; correct it within the approved delivery and describe the provenance accurately. Never claim a pre-existing component was created by this task.
+* If unexpected uncommitted or concurrently changing work overlaps files needed by this task, preserve it and report the collision. Continue independent parts when safe; ask Saqib only when the overlap cannot be reconciled from the repository and approved scope. Do not overwrite another session's changes.
 * Never use destructive commands such as `git reset --hard`, `git clean`, or broad file restoration to resolve another session's work unless Saqib explicitly instructs it.
 
 ## 6. Documentation must move with the code
@@ -65,14 +67,16 @@
 - Keep documentation consistent with the actual implementation.
 - Every delivery must update `CHANGES.md` and `TESTING.md`.
 - When a decision or architecture changes, also update `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, and the relevant architecture document in the same delivery.
+- If implemented code is missing from documentation, verify its behavior and document the as-built state in the current delivery. Do not silently treat undocumented code as a new design decision or duplicate its implementation.
 
 ### Decision-log integrity
 
-- Immediately before assigning or writing a decision number, re-check the latest GitHub `main`.
+- Use the delivery slug as a temporary identifier during parallel work. Immediately before packaging/applying the delivery, re-check the latest GitHub `main` and assign a final number only if a new decision is needed.
 - Confirm that `docs/decisions/INDEX.md`, the tail of `confirmed-decisions.md`, and the decision archive filenames agree on the latest number.
 - Append each new decision at the true end of `confirmed-decisions.md`, in numerical order, using the heading format `### N. Title`.
 - Existing decision content is immutable. Correct a decision by adding a new entry that references the original; never rewrite its substance.
 - Formatting or physical-order repairs must preserve the existing decision body exactly and must be documented by a new correction entry.
+- A reference to a decision number absent from the canonical log is an inconsistency, not proof the decision exists. Check the current base and concurrent work, then correct the reference or add the properly numbered decision at packaging. Never invent a historical decision or renumber an existing one.
 
 ### Architecture diagrams
 
@@ -99,6 +103,12 @@
 * Add or update tests appropriate to the changed behavior.
 * Run the relevant tests/checks after implementation.
 * Do not hide failing tests or weaken assertions merely to make the suite pass.
+
+### Standing authorization for tests and development databases
+
+* Saqib authorizes Codex to run any relevant `pytest` command, including the full suite, without per-command approval. This covers setup, fixtures, reruns, and test-created records.
+* Saqib authorizes database connections, reads, inserts, updates, deletes, schema inspection, migrations, and test setup/teardown needed to implement and verify an approved task in the project's local development and test databases. Use the project's configured database conventions and isolate test data where appropriate. No per-query or per-test approval is needed.
+* This authorization does not extend the task's functional scope or authorize changing live trading/broker accounts, external production databases, or deleting unrelated persistent data. Report the target database and any material effect when those boundaries are unclear.
 
 ## 9. When something outside scope is discovered
 
