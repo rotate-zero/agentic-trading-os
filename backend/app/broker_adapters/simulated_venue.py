@@ -149,11 +149,11 @@ class SimulatedVenue(OrderVenue):
         self._connected = True
 
     async def disconnect(self) -> None:
-        # Subscriptions on EventBus have no unsubscribe today (grep
-        # confirms) — disconnect() simply stops treating this instance
-        # as live; a stray late callback while unsubscribed is
-        # harmless since it only touches this instance's own dict.
         self._connected = False
+        if self._event_bus is not None and self._subscribed:
+            self._event_bus.unsubscribe(EventType.PRICE_UPDATED, self._on_price_updated_envelope)
+            self._subscribed = False
+        self._callbacks.clear()
 
     def is_connected(self) -> bool:
         return self._connected
@@ -291,6 +291,8 @@ class SimulatedVenue(OrderVenue):
             self._apply_fill(order, price, exchange_ts)
 
     def _on_price_updated_envelope(self, envelope: EventEnvelope) -> None:
+        if not self._connected:
+            return
         if envelope.symbol is None:
             logger.warning("PriceUpdated envelope with no symbol — ignored by SimulatedVenue")
             return

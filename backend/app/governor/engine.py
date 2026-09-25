@@ -93,8 +93,10 @@ class AuthorizerStub:
 
         self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._accepting = False
 
     def start(self) -> None:
+        self._accepting = True
         self._bus.subscribe(EventType.OPPORTUNITY_CREATED, self._on_opportunity_created)
         self._reference_price.start(self._bus)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="authorizer-stub")
@@ -107,6 +109,7 @@ class AuthorizerStub:
         in-flight inside asyncio.to_thread, and this engine's own commit
         writes to the same kind of shared ledger state that motivated
         that fix originally."""
+        self._bus.unsubscribe(EventType.OPPORTUNITY_CREATED, self._on_opportunity_created)
         if self._worker_task is not None and not self._worker_task.done():
             await self._queue.put(_STOP_SENTINEL)
             try:
@@ -114,11 +117,21 @@ class AuthorizerStub:
             except asyncio.CancelledError:
                 pass
         self._worker_task = None
+        self._accepting = False
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
         self._reference_price.stop()
+
+    def deactivate(self) -> None:
+        """Close the entry gate before rollback awaits any worker drain."""
+        self._accepting = False
 
     # --- Event Bus subscriber (must stay fast) ------------------------------
 
     def _on_opportunity_created(self, envelope: EventEnvelope) -> None:
+        if not self._accepting:
+            return
         if envelope.symbol is None:
             logger.warning("OpportunityCreated received with no envelope.symbol — dropped")
             return
@@ -134,7 +147,8 @@ class AuthorizerStub:
                     self._queue.task_done()
                     break
                 try:
-                    await self._process_one(item)  # type: ignore[arg-type]
+                    if self._accepting:
+                        await self._process_one(item)  # type: ignore[arg-type]
                 except Exception:  # noqa: BLE001 — one bad Opportunity must not stall the rest
                     logger.exception(
                         "AuthorizerStub failed to process OpportunityCreated for %s",

@@ -734,6 +734,44 @@ The bus is in-memory and forgets (F6); recovery runs from the ledger, **before**
 
 Position closures and outcomes are recovered the same way: a `PositionClosed` published but never handled left its committed closure in the ledger, and step 4 finds it.
 
+**Running app startup and rollback (as built, `main.py`).** The diagram above
+states the broader recovery design; OutcomeRecorder and exit placement remain
+unwired. The actual entry startup keeps the bus and unrelated market-data /
+intelligence engines running when reconciliation or execution startup fails.
+
+```
+Event Bus + market-data / intelligence subscribers start
+        │
+        ▼
+SimulatedVenue.connect() ──► Session-mode PortfolioState rebuild ──► reconcile ledger / venue
+        │                                                         │
+        │                                      discrepancy ────────┴──► disconnect venue
+        │                                                             entry pipeline unavailable
+        └─ clean ──► register execution venue ──► PortfolioState.start() (restore)
+                         ──► AuthorizerStub.start() ──► ExecutionEngine.start()
+                         ──► PositionMonitor.start()
+                         ──► publish app World View reader + monitor references
+                         ──► serve requests with entry pipeline active
+
+Exception at any startup step ──► rollback below ──► serve unrelated routes
+```
+
+```
+Exception handler, before lifespan yields:
+  clear execution venue registry role + app read references
+       ──► deactivate authorizer and execution callbacks together
+       ──► stop authorizer ──► stop execution engine ──► stop monitor
+       ──► stop Portfolio State ──► disconnect venue
+       ──► clear local lifecycle references
+
+Event Bus unsubscribe removes each stopped pipeline handler from future dispatch.
+A handler already copied by a bus dispatch checks its stopped flag; authorizer
+and execution workers discard queued items during rollback and finish before
+requests are served. The bus keeps serving market-data and intelligence routes.
+Normal shutdown still stops the bus first, then drains the execution pipeline
+in its existing producer-to-consumer order.
+```
+
 ### 6.10 Configuration (EX-4) — three limits, configurable, not hardcoded
 
 All values live in `core/config.py`'s `Settings` (the repository's single source of configuration — nothing else reads the environment), overridable by environment/`.env`, validated at startup (each must be positive), and **recorded on every authorization** as `limits_snapshot` so a decision's basis is auditable after the limits change. Changes take effect at restart in v1.

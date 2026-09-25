@@ -111,6 +111,11 @@ class PortfolioState:
 
     async def stop(self) -> None:
         self._accepting = False
+        if self._subscribed and self._bus is not None:
+            for event_type in (EventType.ORDER_APPROVED, EventType.ORDER_FILLED,
+                               EventType.ORDER_STATUS_CHANGED, EventType.PRICE_UPDATED):
+                self._bus.unsubscribe(event_type, self._on_event)
+            self._subscribed = False
         if self._worker_task is not None:
             self._queue.put_nowait(_STOP)
             await self._worker_task

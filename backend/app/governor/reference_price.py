@@ -27,19 +27,22 @@ logger = logging.getLogger(__name__)
 class ReferencePriceTracker:
     def __init__(self) -> None:
         self._last_price: dict[str, float] = {}
+        self._bus: EventBus | None = None
 
     def start(self, bus: EventBus) -> None:
+        self._bus = bus
         bus.subscribe(EventType.PRICE_UPDATED, self._on_price_updated)
         logger.info("ReferencePriceTracker started — subscribed to PriceUpdated")
 
     def stop(self) -> None:
-        """No background task, no queue — genuinely a no-op, present for
-        interface consistency with every other component's start()/stop()
-        pair (same reasoning OpportunityCache.stop() documents)."""
+        if self._bus is not None:
+            self._bus.unsubscribe(EventType.PRICE_UPDATED, self._on_price_updated)
+            self._bus = None
+        self._last_price.clear()
         logger.info("ReferencePriceTracker stopped")
 
     def _on_price_updated(self, envelope: EventEnvelope) -> None:
-        if envelope.symbol is None:
+        if self._bus is None or envelope.symbol is None:
             return
         price = envelope.payload.get("price")
         if price is None:

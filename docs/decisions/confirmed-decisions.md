@@ -1203,3 +1203,28 @@ The narrow typed response contains execution mode, snapshot time, open positions
 After clean execution-ledger/venue reconciliation, restoration of the running Portfolio State, and successful entry-pipeline startup, `main.py` starts one `PositionMonitor` with the existing `PortfolioStatePositionReader` over that same Portfolio State instance. A blocked or failed pipeline exposes no monitor. Shutdown clears the app-owned reference and stops the monitor before Portfolio State stops. This adopts the already-built monitor and adapter (#175 and `position-monitor-portfolio-reader`); neither trigger policy nor accounting changes.
 
 `GET /intelligence/exit-intents` is a read-only, observed-only point-in-time diagnostic of `PositionMonitor.get_exit_intents(symbol)`. The response distinguishes a running monitor with an empty list from an unavailable monitor, sorts by symbol, trigger timestamp, and position ID, and exposes the existing intent's position ID, symbol, side, quantity, reason, trigger price, and trigger timestamp. It is not an order, fill, or closed position. The observer reacts only to received `PriceUpdated`/`CandleClosed` events and keeps one intent per position in memory; it neither protects nor flattens a position. No exit-order placement, new event publication, Governor authorization change, frontend control, or EX-5/EX-12 resolution is included. Cross-component and internal-flow diagrams are in `docs/architecture/execution-engine-design.md` §6.6.
+
+### 179. Partial execution startup rolls back before serving (`execution-startup-fail-closed`)
+
+This corrects the implementation of #176's soft-failure, fail-closed startup
+contract. An exception after the authorizer or execution engine started used to
+log that entry acceptance stayed off while leaving their bus subscriptions and
+worker tasks active until lifespan shutdown. The failed attempt now revokes the
+execution venue registry role and both app read references, deactivates entry
+callbacks, stops the authorizer, execution engine, Position Monitor, and
+Portfolio State, then disconnects the venue before lifespan yields. A
+reconciliation discrepancy also disconnects the venue it already connected.
+Unrelated market-data and intelligence routes still start, and successful
+startup and normal shutdown retain their order.
+
+Event Bus subscription removal prevents future dispatch to stopped pipeline
+components. Callback guards handle a dispatch that copied a handler just before
+removal, and deactivated authorizer/execution workers discard queued work while
+their poison-pill stop completes; their queues do not collect unprocessed work
+after the workers stop. The simulated venue removes its price subscription and
+update callbacks when disconnected. A real-lifespan test injects an exception
+after all entry workers and the monitor start, then verifies `/health`, cleared
+registry/read surfaces, stopped tasks, and no approved trade or order after a
+valid `OpportunityCreated`. The as-built success and rollback diagrams are in
+`docs/architecture/execution-engine-design.md` §6.9. No entry rule, exit order,
+status UI, or EX-5/EX-12 decision changes.

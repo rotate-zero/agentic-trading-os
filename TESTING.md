@@ -1,3 +1,43 @@
+# TESTING — decision #179: `execution-startup-fail-closed`
+
+Initial local `main` and GitHub `main`: `fd3657157c2e840963f4916fe7d9dc53d2fef387`;
+working tree clean. The isolated PostgreSQL 18.6 cluster was initialized in
+`/tmp/execution-startup-fail-closed-pg`, listening only on local port 55438.
+The new `execution_startup_fail_closed_test` database was migrated through
+`0014`. No existing development database, broker account, or external service
+was changed.
+
+- Real-lifespan injection: `PositionMonitor.start()` completes after the
+  authorizer and execution engine have started, queues an `OpportunityCreated`,
+  then raises. `/health` returns 200 while the execution venue registry role,
+  World View reader, and monitor read reference are unavailable; every started
+  pipeline worker has stopped. A subsequent price and opportunity are valid for
+  approval if the gate were live, but write no approved trade or order. Stale
+  copied callbacks leave worker queues empty. The normal-start regression still
+  exposes a venue, restored Portfolio State, and running entry workers.
+- Initial focused command: `pytest -q tests/test_main_execution_pipeline.py
+  tests/test_entry_lifecycle_wiring.py tests/test_governor_engine.py
+  tests/test_execution_engine.py tests/test_event_bus.py
+  tests/test_position_monitor_engine.py tests/test_portfolio_worker.py
+  --tb=short --disable-warnings` — **62 passed**.
+- Expanded focused/regression command adds `test_simulated_venue.py`,
+  `test_exit_intents_route.py`, `test_world_view_portfolio.py`, and
+  `test_intelligence_routes.py` — **88 passed**.
+- Strengthened real-lifespan test rerun: `pytest -q
+  tests/test_main_execution_pipeline.py --tb=short --disable-warnings` —
+  **6 passed**.
+- Final focused and adjacent regression command added `test_portfolio_state.py`,
+  `test_reconciliation.py`, and `test_position_monitor_portfolio_reader.py`
+  after the strengthened fault assertion — **115 passed**.
+
+Before numbering, GitHub `main` still matched local `fd36571`; the canonical
+index and log both ended at #178, and the newest archive was `134-160.md`.
+Decision #179 was appended at the true end of the log and indexed. `git diff
+--check` passed. Package: `execution-startup-fail-closed.zip` contains only
+the changed repository-relative files.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `observed-exit-intents-ui`
 
 GitHub `main` and local `HEAD` both resolved to `222f36507cdec15245a33c292196a9785f47ed6d` before editing and at the pre-packaging recheck. The initial working tree was clean. The canonical decision log and index end at #178; this consumer of the existing read contract needs no new decision.

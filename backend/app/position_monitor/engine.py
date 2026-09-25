@@ -188,6 +188,7 @@ class PositionMonitor:
         self._clock = clock or get_market_clock()
         self._queue: asyncio.Queue[EventEnvelope | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._accepting = False
         # Idempotency latch (§4 item 4): a position_id in this dict has
         # already had its one ExitIntent produced — "moved to closing"
         # in this module's own in-process sense only (see engine's own
@@ -197,11 +198,15 @@ class PositionMonitor:
         self._exit_intents: dict[UUID, ExitIntent] = {}
 
     def start(self) -> None:
+        self._accepting = True
         self._bus.subscribe(EventType.PRICE_UPDATED, self._on_market_event)
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_market_event)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="position-monitor")
 
     async def stop(self) -> None:
+        self._accepting = False
+        self._bus.unsubscribe(EventType.PRICE_UPDATED, self._on_market_event)
+        self._bus.unsubscribe(EventType.CANDLE_CLOSED, self._on_market_event)
         if self._worker_task is not None and not self._worker_task.done():
             await self._queue.put(_STOP_SENTINEL)
             try:
@@ -223,7 +228,7 @@ class PositionMonitor:
     # --- EventBus subscriber (must stay cheap — no awaiting here) ---------
 
     def _on_market_event(self, envelope: EventEnvelope) -> None:
-        if envelope.symbol is None:
+        if not self._accepting or envelope.symbol is None:
             return
         held_symbols = {p.symbol for p in self._position_reader.get_open_positions()}
         if envelope.symbol not in held_symbols:

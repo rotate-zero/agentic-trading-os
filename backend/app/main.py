@@ -234,6 +234,8 @@ async def lifespan(app: FastAPI):
                 len(reconciliation_report.discrepancies),
                 reconciliation_report.discrepancies,
             )
+            await execution_venue.disconnect()
+            execution_venue = None
         else:
             broker_registry.set_execution_venue(execution_venue)
 
@@ -282,7 +284,29 @@ async def lifespan(app: FastAPI):
         # rest of the app (market data, Feature Engine, Context Engine, ... all run without it) —
         # a DB outage or a reconciliation failure here must not crash the whole process, same
         # soft-fail posture as the optional Finnhub/Polygon auto-connects just above.
-        logger.exception("Execution pipeline failed to start — entry acceptance stays OFF")
+        logger.exception("Execution pipeline failed to start — rolling back entry pipeline")
+        # Revoke the placer before awaiting any worker drain. deactivate() closes
+        # both entry callbacks before their queued work can run; the bus
+        # itself stays live for unrelated routes and subscribers.
+        broker_registry.clear_execution_venue()
+        app.state.world_view_portfolio_reader = None
+        app.state.position_monitor = None
+        if authorizer_stub is not None:
+            authorizer_stub.deactivate()
+        if execution_engine is not None:
+            execution_engine.deactivate()
+        if authorizer_stub is not None:
+            await authorizer_stub.stop()
+        if execution_engine is not None:
+            await execution_engine.stop()
+        if position_monitor is not None:
+            await position_monitor.stop()
+        if portfolio_state is not None:
+            await portfolio_state.stop()
+        if execution_venue is not None:
+            await execution_venue.disconnect()
+        authorizer_stub = execution_engine = portfolio_state = position_monitor = execution_venue = None
+        logger.error("Execution pipeline rollback complete — entry acceptance stays OFF")
 
     logger.info("%s started (debug=%s)", settings.app_name, settings.debug)
     try:

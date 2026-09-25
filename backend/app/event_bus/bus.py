@@ -42,6 +42,15 @@ class EventBus:
     def subscribe(self, event_type: EventType, handler: Handler) -> None:
         self._subscribers[event_type].append(handler)
 
+    def unsubscribe(self, event_type: EventType, handler: Handler) -> None:
+        """Remove one subscription; a dispatch already snapshotted may still call it."""
+        subscribers = self._subscribers.get(event_type)
+        if subscribers is not None:
+            try:
+                subscribers.remove(handler)
+            except ValueError:
+                pass
+
     def subscribe_all(self, handler: Handler) -> None:
         """Subscribe to every event type, regardless of lane. See WILDCARD."""
         self._subscribers[WILDCARD].append(handler)

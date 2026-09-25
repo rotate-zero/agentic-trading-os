@@ -1,3 +1,27 @@
+# CHANGES — decision #179: `execution-startup-fail-closed`
+
+## Current delivery
+
+An exception after partial execution-pipeline startup now rolls back before
+FastAPI serves requests. `main.py` clears the execution venue role and the
+World View / Position Monitor app references, closes the authorizer and
+execution callbacks, then stops the started workers and disconnects the venue.
+A reconciliation discrepancy also disconnects its already-connected venue.
+Market-data and intelligence routes retain their soft-start behavior; successful
+startup and the existing normal shutdown order remain intact.
+
+The bus can remove these lifecycle subscriptions. A callback already copied for
+dispatch sees a stopped component and cannot enqueue new work; authorizer and
+execution workers discard pending items during rollback. The simulated venue
+also drops its update callbacks on disconnect. A real-lifespan fault test raises
+after the authorizer, execution engine, and monitor start, then verifies health,
+no approved trade or order, cleared readers/registry role, and stopped workers.
+The canonical execution architecture record now diagrams successful startup and
+rollback. Decision #179 records this correction to #176's startup contract.
+No trading rule, exit placement, status UI, or EX-5/EX-12 change.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `observed-exit-intents-ui`
 
 ## Current delivery

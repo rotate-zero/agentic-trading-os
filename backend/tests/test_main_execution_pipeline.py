@@ -198,6 +198,9 @@ def test_world_view_reader_is_exposed_only_during_restored_pipeline_lifespan():
         reader = fastapi_app.state.world_view_portfolio_reader
         assert isinstance(reader, PortfolioState)
         assert reader.get_snapshot() is not None
+        assert broker_registry.get_execution_venue() is not None
+        assert governor_engine_module._authorizer_stub._worker_task is not None
+        assert execution_engine_module._execution_engine._worker_task is not None
         response = client.get("/intelligence/world-view")
         assert response.status_code == 200
         assert response.json()["portfolio"]["positions"] == []
@@ -205,10 +208,95 @@ def test_world_view_reader_is_exposed_only_during_restored_pipeline_lifespan():
     assert fastapi_app.state.world_view_portfolio_reader is None
 
 
+def test_partial_startup_rolls_back_before_serving_requests(monkeypatch):
+    from app.position_monitor.engine import PositionMonitor
+
+    monkeypatch.setattr(MarketClock, "is_regular_session", lambda self, ts=None: True)
+    monkeypatch.setattr(
+        governor_engine_module, "capture_strategy_outcome_snapshots",
+        lambda symbol: StrategyOutcomeSnapshots(market_state={"trend_score": 1.0}, context={"news": []}),
+    )
+
+    started_monitors = []
+    started_venues = []
+    started_tasks = []
+    original_start = PositionMonitor.start
+
+    def fail_after_start(self):
+        original_start(self)
+        started_monitors.append(self)
+        started_venues.append(broker_registry.get_execution_venue())
+        started_tasks.extend((
+            governor_engine_module._authorizer_stub._worker_task,
+            execution_engine_module._execution_engine._worker_task,
+            self._position_reader._portfolio_state._worker_task,
+            self._worker_task,
+        ))
+        # Already queued on the normal bus lane when startup fails. The
+        # authorizer must reject it even if dispatch resumes during rollback.
+        self._bus._normal_queue.put_nowait(_opportunity_envelope())
+        raise RuntimeError("injected after authorizer and execution engine start")
+
+    monkeypatch.setattr(PositionMonitor, "start", fail_after_start)
+
+    with TestClient(fastapi_app) as client:
+        assert client.get("/health").status_code == 200
+        bus = get_event_bus()
+        authorizer = governor_engine_module._authorizer_stub
+        engine = execution_engine_module._execution_engine
+        monitor = started_monitors[0]
+        portfolio_state = monitor._position_reader._portfolio_state
+        venue = started_venues[0]
+
+        assert authorizer is not None and engine is not None
+        assert fastapi_app.state.world_view_portfolio_reader is None
+        assert fastapi_app.state.position_monitor is None
+        assert client.get("/intelligence/world-view").json()["portfolio"] is None
+        assert client.get("/intelligence/exit-intents").json()["monitor_status"] == "unavailable"
+        assert broker_registry.get_execution_venue() is None
+        assert authorizer._worker_task is None
+        assert engine._worker_task is None
+        assert monitor._worker_task is None
+        assert portfolio_state._worker_task is None
+        assert all(task is not None and task.done() for task in started_tasks)
+        assert venue is not None and not venue.is_connected()
+        assert authorizer._queue.empty() and engine._queue.empty() and monitor._queue.empty()
+        assert authorizer._queue._unfinished_tasks == 0
+        assert engine._queue._unfinished_tasks == 0
+        assert monitor._queue._unfinished_tasks == 0
+        assert authorizer._on_opportunity_created not in bus._subscribers[EventType.OPPORTUNITY_CREATED]
+        assert authorizer._reference_price._on_price_updated not in bus._subscribers[EventType.PRICE_UPDATED]
+        assert engine._on_order_approved not in bus._subscribers[EventType.ORDER_APPROVED]
+        assert monitor._on_market_event not in bus._subscribers[EventType.PRICE_UPDATED]
+        assert portfolio_state._on_event not in bus._subscribers[EventType.ORDER_FILLED]
+        assert venue._on_price_updated_envelope not in bus._subscribers[EventType.PRICE_UPDATED]
+
+        client.portal.call(bus.publish, _price_envelope())
+        client.portal.call(bus.publish, _opportunity_envelope())
+        client.portal.call(asyncio.sleep, 0.2)
+        # A dispatch that snapshotted a handler before unsubscribe is also
+        # harmless; stopped callbacks must leave their queues empty.
+        client.portal.call(authorizer._on_opportunity_created, _opportunity_envelope())
+        client.portal.call(engine._on_order_approved, EventEnvelope(
+            event_type=EventType.ORDER_APPROVED, symbol=SYMBOL, payload={},
+        ))
+        client.portal.call(monitor._on_market_event, _price_envelope())
+        client.portal.call(portfolio_state._on_event, _price_envelope())
+        client.portal.call(venue._on_price_updated_envelope, _price_envelope())
+        assert authorizer._queue.empty() and engine._queue.empty()
+        assert monitor._queue.empty() and portfolio_state._queue.empty()
+        with SessionLocal() as s:
+            assert s.scalar(select(Trade).where(Trade.strategy_name == NAME)) is None
+            assert s.scalar(select(Order).where(Order.symbol == SYMBOL)) is None
+
+
 def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries(monkeypatch):
     from app.portfolio_state.reconciliation import ReconciliationReport
 
-    async def discrepant_reconciliation(*args):
+    reconciled_venues = []
+
+    async def discrepant_reconciliation(_session, venue, _portfolio_state):
+        reconciled_venues.append(venue)
         return ReconciliationReport(discrepancies=["test mismatch"])
 
     monkeypatch.setattr(
@@ -216,6 +304,8 @@ def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries
     )
     with TestClient(fastapi_app) as client:
         assert fastapi_app.state.world_view_portfolio_reader is None
+        assert broker_registry.get_execution_venue() is None
+        assert reconciled_venues and not reconciled_venues[0].is_connected()
         response = client.get("/intelligence/world-view")
         assert response.status_code == 200
         assert response.json()["portfolio"] is None

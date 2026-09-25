@@ -91,8 +91,10 @@ class ExecutionEngine:
 
         self._queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._accepting = False
 
     def start(self) -> None:
+        self._accepting = True
         self._bus.subscribe(EventType.ORDER_APPROVED, self._on_order_approved)
         if self._fill_ledger is not None:
             # §6.3 step 6: registered once, at start — main.py's startup
@@ -112,6 +114,7 @@ class ExecutionEngine:
         """Poison-pill drain — same shape as LevelInteractionEngine.stop()
         (decision #84) / AuthorizerStub.stop(): a plain task.cancel() can
         return while a venue call or ledger commit is still in-flight."""
+        self._bus.unsubscribe(EventType.ORDER_APPROVED, self._on_order_approved)
         if self._worker_task is not None and not self._worker_task.done():
             await self._queue.put(_STOP_SENTINEL)
             try:
@@ -119,10 +122,20 @@ class ExecutionEngine:
             except asyncio.CancelledError:
                 pass
         self._worker_task = None
+        self._accepting = False
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+
+    def deactivate(self) -> None:
+        """Reject callbacks and queued work before rollback awaits anything."""
+        self._accepting = False
 
     # --- Event Bus subscriber (must stay fast — I7) -------------------------
 
     def _on_order_approved(self, envelope: EventEnvelope) -> None:
+        if not self._accepting:
+            return
         self._queue.put_nowait(dict(envelope.payload))
 
     def _on_venue_update(self, update: Any) -> None:
@@ -138,7 +151,8 @@ class ExecutionEngine:
         is what guarantees a fill for an order can never be processed
         before that same order's own `_process_one()` (which placed it
         at the venue in the first place) has already committed."""
-        self._queue.put_nowait(("venue_update", update))
+        if self._accepting:
+            self._queue.put_nowait(("venue_update", update))
 
     # --- background worker -----------------------------------------------------
 
@@ -150,7 +164,9 @@ class ExecutionEngine:
                     self._queue.task_done()
                     break
                 try:
-                    if isinstance(item, tuple) and len(item) == 2 and item[0] == "venue_update":
+                    if not self._accepting:
+                        pass
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] == "venue_update":
                         await self._process_venue_update(item[1])
                     else:
                         await self._process_one(item)  # type: ignore[arg-type]
