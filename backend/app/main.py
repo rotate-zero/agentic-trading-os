@@ -197,6 +197,7 @@ async def lifespan(app: FastAPI):
     execution_engine = None
     portfolio_state = None
     execution_venue = None
+    app.state.world_view_portfolio_reader = None
     try:
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
@@ -251,6 +252,11 @@ async def lifespan(app: FastAPI):
             execution_engine = get_execution_engine(bus, order_ledger, order_ledger, fill_ledger)
             execution_engine.start()
 
+            # Publish this read dependency only after reconciliation, restore,
+            # and the entry pipeline have all succeeded. World View never
+            # owns or starts a second Portfolio State instance.
+            app.state.world_view_portfolio_reader = portfolio_state
+
             logger.info(
                 "Execution pipeline started (mode=%s, venue=%s) — reconciliation: %d advanced, "
                 "%d expired, %d cancelled stale entries, %d resubmitted exits",
@@ -271,6 +277,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        app.state.world_view_portfolio_reader = None
         # try/finally added deliberately (confirmed decision #47) — found
         # via a real, reproducible bug, not by inspection. Without it, an
         # exception raised anywhere inside the `async with

@@ -1,3 +1,17 @@
+# CHANGES — decision #177: `world-view-portfolio-read`
+
+## Current delivery
+
+World View now reads the running, restored Portfolio State instance through an explicit lifespan dependency. The reader is exposed only after clean reconciliation and successful execution-pipeline startup, then cleared on shutdown. A missing or stale snapshot remains `portfolio: null`; a restored flat snapshot has an empty positions list.
+
+The typed portfolio response contains execution mode, snapshot time, open position ID/symbol/side/remaining quantity/average entry/stop/target, and in-flight order count. Prices are decimal strings. The World View symbol still scopes only Market State and Context. The existing World View panel retains both performance columns and now displays the position count and compact position rows, with manual Refresh.
+
+Updated `docs/architecture/trading-intelligence-architecture.md` with cross-component and internal read-flow diagrams, and corrected the World View follow-up in `docs/architecture/execution-engine-design.md`. Added focused backend response, serialization, scope, startup, and shutdown coverage. No exit path, order control, accounting change, Position Monitor wiring, or EX-5/EX-12 decision is included.
+
+Appended decision #177 at the true end of `docs/decisions/confirmed-decisions.md` and indexed it in `docs/decisions/INDEX.md` after the final GitHub main/log recheck.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `position-monitor-portfolio-reader`
 
 ## Current delivery

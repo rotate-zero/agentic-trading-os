@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape } from "../services/api-client";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape, type WorldViewPortfolioWireShape } from "../services/api-client";
 
 /**
  * Backend read side for the World View composite facade — GET
@@ -20,8 +20,8 @@ import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape } from "..
  * UI never renders, would be dead code. Only `performance` (the one
  * field with genuinely new shape — both live and backtest populations,
  * always, side by side, all-time; nothing else in this codebase shows
- * both populations at once) and `portfolio` (World View's only honest
- * demonstration that Portfolio State doesn't exist yet) are exposed.
+ * both populations at once) and `portfolio` (the restored execution
+ * snapshot when available) are exposed.
  *
  * Always calls `fetchWorldView()` with no `symbol` — `performance`/
  * `portfolio` are system-wide/unscoped regardless of `symbol` (only
@@ -38,16 +38,13 @@ import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape } from "..
  * query functions (`get_win_rate_by_hour()`/
  * `get_expectancy_by_session_type()`, composite.py's own
  * `_read_performance()`): no event is published when a `strategy_outcomes`
- * row is written (no live Execution Engine exists yet to write one), and
+ * row is written, and
  * World View has no event subscription, cache, or WebSocket channel of
  * its own by design — confirmed directly against decision #150's own
  * text and `composite.py`'s module docstring ("No persistence, cache,
  * scheduler, or WebSocket channel added"). There is consequently nothing
  * that would ever change on its own for this hook to poll or subscribe
- * to; `refetch()` is exposed as the manual trigger instead, same as
- * usePerformanceAnalytics's own — and, matching useStrategyOutcomes.ts's
- * own precedent for the identical situation, no new manual-refresh
- * button is added in the UI (no established equivalent nearby to match).
+ * to; `refetch()` is exposed as the manual trigger.
  *
  * Distinguishes a caller-visible `error` from genuinely empty data, the
  * same deliberate deviation usePerformanceAnalytics.ts already
@@ -60,7 +57,7 @@ import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape } from "..
  */
 export interface UseWorldViewResult {
   performance: WorldViewPerformanceWireShape | null;
-  portfolio: Record<string, unknown> | null;
+  portfolio: WorldViewPortfolioWireShape | null;
   loading: boolean;
   error: string | null;
   refetch: () => void;
@@ -68,24 +65,25 @@ export interface UseWorldViewResult {
 
 export function useWorldView(): UseWorldViewResult {
   const [performance, setPerformance] = useState<WorldViewPerformanceWireShape | null>(null);
-  const [portfolio, setPortfolio] = useState<Record<string, unknown> | null>(null);
+  const [portfolio, setPortfolio] = useState<WorldViewPortfolioWireShape | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const requestId = useRef(0);
 
   const load = useCallback(() => {
-    let cancelled = false;
+    const currentRequest = ++requestId.current;
     setLoading(true);
     setError(null);
 
     fetchWorldView()
       .then((snapshot) => {
-        if (cancelled) return;
+        if (currentRequest !== requestId.current) return;
         setPerformance(snapshot.performance);
         setPortfolio(snapshot.portfolio);
         setLoading(false);
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (currentRequest !== requestId.current) return;
         const detail = err instanceof ApiError ? err.message : String(err);
         console.error(`useWorldView: fetch failed — ${detail}`);
         // Cleared rather than left stale — same reasoning
@@ -98,9 +96,7 @@ export function useWorldView(): UseWorldViewResult {
         setLoading(false);
       });
 
-    return () => {
-      cancelled = true;
-    };
+    return () => { requestId.current++; };
   }, []);
 
   useEffect(() => load(), [load]);

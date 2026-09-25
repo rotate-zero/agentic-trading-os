@@ -1,3 +1,17 @@
+# TESTING — decision #177: `world-view-portfolio-read`
+
+At task start and at the final pre-numbering recheck, local `main` and freshly fetched GitHub `origin/main` were both `05d0cbc07c4903e0dda0232a84536ce6248a6e5f`; the initial working tree was clean. `docs/decisions/INDEX.md` and the canonical log both ended at #176, with archive filenames ending at `134-160.md`. The new cross-component lifecycle read decision was assigned #177 only after that recheck, appended at the true end of the log, and indexed to `confirmed-decisions.md`.
+
+The default local development database had an older schema (`strategy_outcomes.execution_mode` and `position_fill_receipts` absent), so the initial backend attempt was not a valid regression run. Created an isolated PostgreSQL 18 cluster in `/tmp/world-view-portfolio-read.N8y53w`, database `world_view_portfolio_read_test` on port 55437, and applied Alembic migrations through `0014`. No existing development database was migrated or cleaned. The first new serialization test also exposed an assertion expecting `Z` where FastAPI emits `+00:00`; the expected string was corrected without changing response behavior.
+
+- Backend: `pytest tests/test_world_view_portfolio.py tests/test_world_view.py tests/test_main_execution_pipeline.py tests/test_entry_lifecycle_wiring.py tests/test_portfolio_state.py -q --tb=short --disable-warnings` against the isolated database: **28 passed**. Coverage includes unavailable reader/snapshot, restored empty portfolio, an open `PositionState` with exact Decimal price strings and an in-flight order, system-wide portfolio under symbol-scoped reads, unchanged World View fields, clean startup exposure, reconciliation failure, and shutdown cleanup.
+- Frontend: `npm run build` (includes `tsc -b`): **passed**.
+- `git diff --check`: **passed**.
+
+Package: `world-view-portfolio-read.zip` contains the 14 changed files with repository-relative paths (three backend application files, two backend test files, two frontend application files plus the API client, four documentation files, `CHANGES.md`, and `TESTING.md`). The generated `frontend/tsconfig.tsbuildinfo` was restored after the build and is not packaged. No production database or external account was touched.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `position-monitor-portfolio-reader`
 
 GitHub `main` and local `main` both resolved to `51ba48a9eebe1ad36d7eb77bd9060fc4d4edc460` before editing and at the final packaging recheck; the initial working tree was clean. The decision index, canonical log, and archive inventory ended at #176. No new decision was required for this adapter.

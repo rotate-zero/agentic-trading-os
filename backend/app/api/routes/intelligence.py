@@ -60,7 +60,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.context_engine.engine import get_context_engine
 from app.core.config import get_settings
@@ -813,13 +813,12 @@ async def get_backtest_runs(
 
 
 @router.get("/world-view")
-async def get_world_view(symbol: str | None = Query(None)):
-    """Read-only composite over Market State, Context, and Performance.
+async def get_world_view(request: Request, symbol: str | None = Query(None)):
+    """Read-only composite over Market State, Context, Performance, and Portfolio.
 
     World View owns the source assembly contract; this route only forwards
-    the optional symbol and returns its snapshot.  Portfolio State is not
-    implemented, so v1 serializes that reserved slot as JSON ``null``.
+    the optional symbol and the lifespan's restored Portfolio State reader.
     """
     from app.world_view import WorldView
 
-    return await WorldView().snapshot(symbol)
+    return await WorldView(getattr(request.app.state, "world_view_portfolio_reader", None)).snapshot(symbol)

@@ -1451,10 +1451,8 @@ export async function fetchMarketStateSnapshot(symbol?: string): Promise<MarketS
 // rows fetchWinRateByHour/fetchExpectancyBySessionType already expose,
 // just called once per population (`is_backtest=False`/`True`) and
 // nested under "live"/"backtest" instead of returned as two separate
-// route responses. `portfolio` is `dict[str, Any] | None` on the
-// backend and always `None`/JSON `null` in v1 — Portfolio State has no
-// application implementation yet (composite.py's own module docstring);
-// this is "source unavailable," never a fabricated empty portfolio.
+// route responses. Portfolio prices are decimal strings from the restored
+// Portfolio State; null means its read snapshot is unavailable.
 export interface WorldViewPerformancePopulationWireShape {
   hourly_win_rates: HourlyWinRateWireShape[];
   session_expectancy: SessionTypeExpectancyWireShape[];
@@ -1465,12 +1463,29 @@ export interface WorldViewPerformanceWireShape {
   backtest: WorldViewPerformancePopulationWireShape;
 }
 
+export interface WorldViewPositionWireShape {
+  position_id: string;
+  symbol: string;
+  side: string;
+  remaining_quantity: number;
+  average_entry: string;
+  stop: string | null;
+  target: string | null;
+}
+
+export interface WorldViewPortfolioWireShape {
+  execution_mode: string;
+  snapshot_time: string;
+  positions: WorldViewPositionWireShape[];
+  in_flight_order_count: number;
+}
+
 export interface WorldViewSnapshotWireShape {
   symbol: string | null;
   market_state: MarketStateSnapshotWireShape;
   context: ContextSnapshotWireShape;
   performance: WorldViewPerformanceWireShape;
-  portfolio: Record<string, unknown> | null;
+  portfolio: WorldViewPortfolioWireShape | null;
 }
 
 /**

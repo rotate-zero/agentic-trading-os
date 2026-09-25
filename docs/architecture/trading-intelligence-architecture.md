@@ -470,7 +470,7 @@ Fridays?
 
 Feeds back into two places: **Strategy Engine** (reweight or retire underperforming strategies) and **Trade Planning Engine** (recalibrate sizing/stop logic based on realized outcomes, not assumptions). This is the seed of an eventual optimization engine, though building that optimization loop itself is out of scope for now.
 
-**Schema built (decision #120):** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — a real migration, real ORM (`StrategyOutcomeRecord`), real write path (`record_strategy_outcome()`). This line previously read "Schema direction-locked, not yet built," true when originally written, stale since decision #120 landed; corrected here. `strategy_outcomes` has real backtest-derived rows since decision #128, but zero live-trading rows — no Execution Engine/Position Monitor exists yet to call the write path for a real trade. "Rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5, itself now built, see `backtest-runner-design.md` §7), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5 / `backtest-runner-design.md` §7 (decisions #87, #89, #120).
+**Schema built (decision #120):** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — a real migration, real ORM (`StrategyOutcomeRecord`), real write path (`record_strategy_outcome()`). This line previously read "Schema direction-locked, not yet built," true when originally written, stale since decision #120 landed; corrected here. `strategy_outcomes` has real backtest-derived rows since decision #128; the running entry pipeline does not yet write live closed-trade outcomes because exit execution and OutcomeRecorder remain unwired. "Rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5, itself now built, see `backtest-runner-design.md` §7), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5 / `backtest-runner-design.md` §7 (decisions #87, #89, #120).
 
 ---
 
@@ -488,7 +488,9 @@ class WorldView:
 
 **World View v1 is built at `backend/app/world_view/composite.py`** (decision #150). `WorldViewSnapshot` contains `symbol`, the complete unmodified `market_state` and `context` public envelopes, a `performance` envelope, and the reserved `portfolio` slot. The optional symbol is passed unchanged to `MarketStateEngine.get_snapshot(symbol)` and `ContextEngine.get_snapshot(symbol)`; consequently their honest not-yet-computed behavior remains their own: an unknown symbol is absent from `symbols`, while valid broad-market/global portions remain present.
 
-Portfolio State still has no application implementation. Saqib confirmed the widened-schema/implemented-narrowly option established by decision #6: v1 includes `portfolio: dict[str, Any] | None` and always returns `None`/JSON `null`. That means **the source is unavailable**, not an empty account, empty positions list, or zero buying power. No placeholder Portfolio engine or fabricated account data exists.
+The reserved portfolio slot now reads the running Portfolio State event-worker instance through an explicit lifecycle dependency. `main.py` publishes that reader to `app.state.world_view_portfolio_reader` only after clean venue reconciliation, Portfolio State restoration, and successful entry-pipeline startup; it clears the reader at shutdown before stopping the worker. No second Portfolio State instance is created for World View. An unavailable pipeline or stale/unrestored `get_snapshot()` returns `portfolio: null`; a restored flat portfolio returns a non-null object with `positions: []`.
+
+The typed portfolio projection contains `execution_mode`, `snapshot_time`, `positions` (position ID, symbol, side, remaining quantity, average entry, stop, target), and `in_flight_order_count`. Decimal prices become decimal strings to preserve source precision. It does not present a mark, buying power, or P&L. The World View `symbol` argument continues to scope only Market State and Context: the Portfolio State read calls `get_snapshot()` without a symbol filter.
 
 Performance uses only `get_win_rate_by_hour()` and `get_expectancy_by_session_type()`. Each is called once with `is_backtest=False` and once with `is_backtest=True`, preserving the query layer's hard population boundary. These synchronous SQLAlchemy reads run via `asyncio.to_thread`, outside the async route's event loop. Their existing dataclass rows are converted without new metric definitions into this exact envelope:
 
@@ -518,8 +520,10 @@ GET /intelligence/world-view?symbol=...                 external flow
                   ▼
        WorldView.snapshot(symbol)                      composite facade
           │          │             │             │
-          │          │             │             └──▶ portfolio = null
-          │          │             │                  (source unavailable)
+          │          │             │             └──▶ app.state.world_view_portfolio_reader
+          │          │             │                        │
+          │          │             │                        └──▶ PortfolioState.get_snapshot()
+          │          │             │                             (system-wide; null if unavailable)
           │          │             │
           │          │             └──▶ asyncio.to_thread(_read_performance)
           │          │                       │
@@ -537,9 +541,29 @@ Context, and Performance Intelligence retain their own contracts and writers;
 World View stores and publishes nothing.
 ```
 
-**As-built: frontend surfacing (decision #154).** `GET /intelligence/world-view` had zero frontend representation until this delivery, confirmed by grep across `frontend/src/` before starting. Scoped deliberately narrow rather than as a full re-rendering of the payload: `market_state`/`context` are NOT re-rendered here at all — both already have their own complete, live-updating UI (`MarketSessionSummary`/`MarketStateSummary`, decisions #125/#126/#147/#151) that a mechanical re-display would only duplicate. The two things actually new about World View — `performance`'s all-time, both-populations-at-once shape (distinct in kind from `StrategyPerformanceSummary`'s own live/backtest *toggle*, decisions #127/#137/#138, which shows exactly one population at a time, filtered by hour/session) and Portfolio State's honest, explicit absence — are the only two fields this surfacing renders.
+```text
+Internal portfolio read flow in WorldView.snapshot(symbol):
 
-New fetch-based `frontend/src/hooks/useWorldView.ts` (one-shot on mount, `refetch()` exposed, no poll and no WebSocket subscription) — World View has no event subscription, cache, or WebSocket channel of its own by design (`composite.py`'s own module docstring), and `performance` is composed from `strategy_outcomes` via the same two query functions `usePerformanceAnalytics.ts` already established have no live writer/event to react to; that hook's exact "one-shot + caller-visible `error`" reasoning carries over directly. New `fetchWorldView()` + wire types in `api-client.ts` (additive only), reusing `MarketStateSnapshotWireShape`/`ContextSnapshotWireShape`/`HourlyWinRateWireShape`/`SessionTypeExpectancyWireShape` rather than re-declaring the same shapes under new names — `WorldView.snapshot()` returns those engines'/queries' own envelopes unmodified. New `WorldViewSummary` section in `InfoTab.tsx`'s `GeneralContent`, directly below `StrategyPerformanceSummary` (added alongside, that component's own internals untouched) — a compact, honest side-by-side Live/Backtest summary (trades, win rate, expectancy — arithmetic aggregation of already-real per-row backend numbers, not an invented composite score, same discipline decisions #125/#127 already established) plus an explicit Portfolio row.
+lifespan restored PortfolioState ──▶ route injects reader ──▶ _read_portfolio(reader)
+                                                              │
+                           reader absent ─────────────────────┼──▶ null
+                           snapshot absent ───────────────────┤
+                                                              ▼
+                                                  snapshot.positions.values()
+                                                              │
+                                                 position ID/side/qty and
+                                                 Decimal price strings
+                                                              │
+                                                              ▼
+                                     WorldViewPortfolio(mode, snapshot time,
+                                        position rows, in-flight order count)
+
+No writer, mutation, SQL query, or symbol filter is introduced by this path.
+```
+
+**As-built: frontend surfacing (decision #154), now populated for Portfolio State.** The existing `WorldViewSummary` remains below `StrategyPerformanceSummary` and retains its Live/Backtest performance columns. It shows the count of open positions and compact rows of the position details when a snapshot is available, an explicit unavailable state when it is null, and a manual Refresh control. The hook still performs one fetch on mount and does not poll or subscribe to a new channel.
+
+The existing `frontend/src/hooks/useWorldView.ts` remains one-shot on mount with a caller-visible error and `refetch()`; there is no World View poll or WebSocket subscription. `fetchWorldView()` keeps the existing Market State, Context, and Performance wire envelopes and adds a typed portfolio shape. `WorldViewSummary` retains its side-by-side Live/Backtest trades, win rate, and expectancy display. Its Portfolio section now uses the typed read shape, and the Refresh button calls `refetch()` to show a subsequent fill without a page reload.
 
 ```text
 GET /intelligence/world-view                          frontend data flow
@@ -575,8 +599,10 @@ Internal flow inside WorldViewSummary:
                   ▼
      one compact column per population, Live | Backtest side by side
 
-  portfolio === null  ──▶  "Not available (Portfolio State not yet built)"
-                           (v1 always null — composite.py never returns otherwise)
+  portfolio === null  ──▶  "Unavailable (execution pipeline or snapshot)"
+  portfolio present   ──▶  count + one compact row per open position
+                           (zero positions is a valid restored snapshot)
+  Refresh button      ──▶  useWorldView.refetch() ──▶ GET /intelligence/world-view
 ```
 
 ---

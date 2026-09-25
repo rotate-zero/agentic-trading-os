@@ -831,7 +831,7 @@ These are recorded so they are not rediscovered; none is recommended for now.
 - **A real Governor rule engine, Decision Engine (D1), and Opportunity Engine (D4)** — the stub is designed so these replace it without changing Execution.
 - **Position Monitor proper** — thesis-validity checks, stop management, partials, reversal, manual-position handling (`future-ideas.md` #14).
 - **Frontend** — Positions / Trade Management / order-status widgets, and any consumer of `orders.status`.
-- **World View `portfolio` slot** — filled by a separate task once Portfolio State exists.
+- **World View `portfolio` slot** — now reads the running restored Portfolio State through `main.py`'s lifecycle dependency; see `trading-intelligence-architecture.md` §15. This read path does not wire Position Monitor or exits.
 - **Retiring `is_backtest`** — kept only for compatibility; its removal is a later decision.
 
 ---

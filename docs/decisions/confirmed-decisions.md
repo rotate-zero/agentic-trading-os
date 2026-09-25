@@ -1191,3 +1191,9 @@ with SessionLocal() as recon_session:
                      ▼
               execution pipeline live — accepts OrderApproved / fills from here on
 ```
+
+### 177. World View reads the restored running Portfolio State (`world-view-portfolio-read`)
+
+This delivery fills the read-only portfolio slot reserved by #7/#150 now that #176 wires a running Portfolio State. `main.py` supplies that same event-worker instance to World View through a lifecycle-owned read dependency after successful reconciliation, restoration, and entry-pipeline startup; shutdown clears the dependency before the worker stops. A blocked pipeline, missing reader, or unavailable snapshot returns JSON `null`. A restored flat account returns a non-null portfolio with an empty positions list. No World View writer or second Portfolio State instance is added.
+
+The narrow typed response contains execution mode, snapshot time, open positions (ID, symbol, side, remaining quantity, average entry, stop, target), and in-flight order count. Decimal prices serialize as strings without inferred precision. World View's optional `symbol` continues to filter only Market State and Context; Portfolio and Performance remain system-wide. The existing frontend performance columns remain, while the Portfolio section shows the open-position count and rows and offers manual refresh. No marks, buying power, P&L, order controls, Position Monitor wiring, exits, or EX-5/EX-12 resolution are introduced. Cross-component and internal read-flow diagrams are in `docs/architecture/trading-intelligence-architecture.md` §15.

@@ -509,12 +509,15 @@ function aggregateExpectancy(rows: SessionTypeExpectancyWireShape[]): {
 }
 
 function WorldViewSummary() {
-  const { performance, portfolio, loading, error } = useWorldView();
+  const { performance, portfolio, loading, error, refetch } = useWorldView();
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="text-[11px] uppercase tracking-wide text-text-muted">
-        World View <span className="text-text-primary">— All-Time</span>
+      <div className="flex items-center justify-between text-[11px] uppercase tracking-wide text-text-muted">
+        <span>World View <span className="text-text-primary">— All-Time</span></span>
+        <button type="button" onClick={refetch} disabled={loading} className="text-text-primary disabled:opacity-50">
+          Refresh
+        </button>
       </div>
       <div className="text-[10px] text-text-muted">
         Live and backtest together, all matching history — distinct from the hour/session toggle above.
@@ -540,7 +543,7 @@ function WorldViewSummary() {
                   {isEmpty ? (
                     <div className="text-text-muted">
                       {population === "live"
-                        ? "No live trades yet — no Execution Engine exists to write them."
+                        ? "No live trades yet."
                         : "No backtest trades yet."}
                     </div>
                   ) : (
@@ -571,20 +574,28 @@ function WorldViewSummary() {
               );
             })}
           </div>
-          {/* Portfolio State has no application implementation (decision
-              #150) — rendered honestly as "not available," never hidden
-              and never implied to be an empty-but-valid portfolio. v1
-              only ever returns null; the non-null branch is stated
-              plainly rather than left silently unhandled, without
-              building any actual Portfolio UI ahead of that engine
-              existing. */}
-          <div className="mt-1 flex items-center justify-between rounded border border-base-border px-2 py-1 font-mono text-[11px]">
-            <span className="text-text-muted">Portfolio</span>
-            <span className="text-text-muted">
-              {portfolio === null
-                ? "Not available (Portfolio State not yet built)"
-                : "Available — no Portfolio State UI exists yet to render it"}
-            </span>
+          <div className="mt-1 rounded border border-base-border px-2 py-1 font-mono text-[11px]">
+            <div className="flex items-center justify-between">
+              <span className="text-text-muted">Portfolio</span>
+              <span className="text-text-muted">
+                {portfolio === null ? "Unavailable (execution pipeline or snapshot)" : `${portfolio.positions.length} open positions`}
+              </span>
+            </div>
+            {portfolio !== null && (
+              <div className="mt-1 flex flex-col gap-1">
+                <div className="text-[10px] text-text-muted">
+                  {portfolio.execution_mode} · {portfolio.in_flight_order_count} in-flight orders · Snapshot {portfolio.snapshot_time}
+                </div>
+                {portfolio.positions.map((position) => (
+                  <div key={position.position_id} title={`Position ${position.position_id}`} className="flex flex-wrap gap-x-2 border-t border-base-border pt-1">
+                    <span className="text-text-primary">{position.symbol} {position.side} × {position.remaining_quantity}</span>
+                    <span>Avg {position.average_entry}</span>
+                    <span>Stop {position.stop ?? "—"}</span>
+                    <span>Target {position.target ?? "—"}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </>
       )}

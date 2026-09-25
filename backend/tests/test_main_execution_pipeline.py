@@ -189,3 +189,35 @@ def test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes(mon
         assert EventType.ORDER_APPROVED in types, f"execution pipeline did not resume after restart: {types}"
 
     _reset_singletons()
+
+
+def test_world_view_reader_is_exposed_only_during_restored_pipeline_lifespan():
+    from app.portfolio_state.engine import PortfolioState
+
+    with TestClient(fastapi_app) as client:
+        reader = fastapi_app.state.world_view_portfolio_reader
+        assert isinstance(reader, PortfolioState)
+        assert reader.get_snapshot() is not None
+        response = client.get("/intelligence/world-view")
+        assert response.status_code == 200
+        assert response.json()["portfolio"]["positions"] == []
+
+    assert fastapi_app.state.world_view_portfolio_reader is None
+
+
+def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries(monkeypatch):
+    from app.portfolio_state.reconciliation import ReconciliationReport
+
+    async def discrepant_reconciliation(*args):
+        return ReconciliationReport(discrepancies=["test mismatch"])
+
+    monkeypatch.setattr(
+        "app.portfolio_state.reconciliation.reconcile_with_venue", discrepant_reconciliation
+    )
+    with TestClient(fastapi_app) as client:
+        assert fastapi_app.state.world_view_portfolio_reader is None
+        response = client.get("/intelligence/world-view")
+        assert response.status_code == 200
+        assert response.json()["portfolio"] is None
+
+    assert fastapi_app.state.world_view_portfolio_reader is None
