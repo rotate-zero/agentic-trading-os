@@ -1,3 +1,34 @@
+# CHANGES — decision #176: Entry-order lifecycle wired to real Postgres (`entry-lifecycle-wiring`)
+
+## Current delivery
+
+Closes the gap #171 and #172 both left explicitly open: the full entry pipeline (authorizer, Execution Engine, ledger, `SimulatedVenue`, Portfolio State) was fully built and fully tested as of #172 — **against fakes only**. Nothing persisted to a real database in a running process, and `main.py` started none of it. This delivery wires the real thing together for the entry side of the lifecycle (exits, Position Monitor's own exit-order placement, `StrategyOutcome` writing — EX-5/EX-12 — remain untouched, exactly as scoped from the start).
+
+**Renumbered once.** Reserved #175 via this task's own three-source re-check; a re-pull immediately before packaging found a file-disjoint sibling, `position-monitor-lite`, had landed first and correctly taken #175 — that task's own entry explicitly anticipated this exact collision and pre-committed to deferring, which it did. This delivery is **#176**.
+
+**Found two-and-a-half of three scoped adapters already on `main`, undocumented, when this task began.** `backend/app/execution_engine/postgres.py` (`PostgresOrderLedger`, implementing both `OrderLedgerPort` and `DecisionAuthorizationPort`) and `backend/app/governor/postgres.py` (`PostgresTradeLedger`, implementing `TradeLedgerPort`) were real, tested code (`test_authorization_ledger_postgres.py`) with **zero** decision-log entry anywhere — a genuine process gap, not a design fork, reported to Saqib before writing any code. `docs/architecture/execution-engine-design.md` had already been edited to describe this as "As built (#175)," a decision number that never existed in `INDEX.md`/`confirmed-decisions.md`. Directed by Saqib to verify and adopt rather than rebuild: 153/153 pre-existing tests passing against a real, freshly migrated Postgres 16 before this task changed a single line; neither file is edited by this delivery. A third such file, `backend/app/portfolio_state/postgres.py` (`PostgresPositionLedger`), was found and adopted the same way.
+
+**Built.**
+- `FillLedgerPort` + `PostgresFillLedger` (new file, `execution_engine/fill_ledger.py`) — fill-ingestion persistence (design doc §6.3 step 6), kept as a new, separate port rather than widening `OrderLedgerPort`/`PostgresOrderLedger` per Saqib's explicit reuse-not-rebuild direction.
+- Fill processing wired into `ExecutionEngine` (additive) — registers `OrderVenue.on_order_update()` once at `start()` when a `FillLedgerPort` is supplied (optional, `None`-default — no existing caller/test affected); shares the engine's existing single-worker queue with `OrderApproved` processing, which is what guarantees ordering against the very order a fill belongs to.
+- `PortfolioStateAdapter` (new file, `governor/portfolio_state_reader.py`) — the third and last concrete `PortfolioStateReader`, a thin translation over the live `PortfolioState` event-worker instance `main.py` now wires. Implements I14's "halt new entries on an unresolved fill anomaly" by raising, which `AuthorizerStub`'s existing fail-closed handling already turns into exactly that halt — no new table or flag.
+- `main.py`'s real startup wiring — the §6.9 sequence (rebuild → connect → reconcile → resume), called from a running process for the first time; a reconciliation discrepancy leaves the execution pipeline entirely unwired (logged `CRITICAL`) rather than proceeding; the rest of the app still boots. Symmetric, `None`-guarded shutdown.
+- Two stale docstrings fixed (`get_execution_engine()`/`get_authorizer_stub()` both previously said "main.py is NOT wired to call this").
+
+**Documentation gap corrected, per Saqib's explicit direction (the one approved exception to this task's own "don't touch other architecture docs" boundary).** Every phantom "#175" citation in `execution-engine-design.md` (the banner, two "As built" callouts, and four smaller inline citations a first pass missed) rewritten to name this task's own slug instead of a decision that never existed. A second, differently-shaped error found the same way: `position_fill_receipts` was attributed to **#174**, which is frontend-only and built no table — corrected, with the mistake stated inline.
+
+**Testing.** Real Postgres 16, no mocks, throughout. 15 new tests: 7 for `PostgresFillLedger` (dedup, overfill, unknown-order, monotonic status advance), 4 for `PortfolioStateAdapter` (mode mismatch, not-ready, I14 halt, snapshot translation), 3 end-to-end `OpportunityCreated → real open Position` integration tests, 1 restart-recovery test through `main.py`'s **real** `lifespan()` (submit an order, exit the process, re-enter with a fresh, non-durable `SimulatedVenue`, confirm it's marked `expired`/`venue_lost_state_on_restart` and the pipeline resumes). **1066 → 1081** passing on this task's own branch; **1091** combined with `position-monitor-lite` (confirmed file-disjoint, re-run together). Zero regressions. Repeated 3x for timing flakiness (a four-engine async queue-hop chain) — stable every time.
+
+**Not done, stated precisely.** EX-5/EX-12 untouched. No cancel/expire path beyond restart reconciliation. The "a durable venue reports a fill the dead process never persisted" branch of restart recovery is covered at the function level by #172's own `test_reconciliation.py`; it cannot be reproduced at the process level against `SimulatedVenue`, which is not durable across a restart by design.
+
+**Heads-up, not acted on.** `confirmed-decisions.md` is now well past the ~100KB rollover trigger (flagged at #171, #172, #173, #174) — flagged again.
+
+## Boundary
+
+New: `backend/app/execution_engine/fill_ledger.py`, `backend/app/governor/portfolio_state_reader.py`, four new test files. Edited, additive only: `backend/app/execution_engine/engine.py`, `backend/app/governor/engine.py` (docstring only), `backend/app/main.py`, `docs/architecture/execution-engine-design.md` (Saqib's explicit exception). Untouched: `backend/app/broker_adapters/**`, `backend/app/models/execution_ledger.py`, `backend/app/portfolio_state/**`, `backend/app/services/broker_registry.py` (called, not edited), any migration, `backend/tests/conftest.py` (no new module-level singleton is introduced by this task — `PortfolioState`, both new adapters, and the reconciliation-mode instance are all local to `main.py`'s own `lifespan()`), `backend/app/execution_engine/postgres.py`, `backend/app/governor/postgres.py` (both found pre-built, reused unmodified). Confirmed by `diff -rq` against a freshly re-pulled `main`, done twice (once before, once after discovering the `position-monitor-lite` collision).
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #175: Position Monitor-lite built (`position-monitor-lite`)
 
 ## Current delivery

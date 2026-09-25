@@ -1,3 +1,46 @@
+# TESTING — decision #176: Entry-order lifecycle wired to real Postgres (`entry-lifecycle-wiring`)
+
+## Baseline and evidence
+
+Fresh pull via `curl -sL https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main | tar -xzf - --strip-components=1` (tarball, no `git status`). PostgreSQL 16 installed and started locally (`apt-get install postgresql`), role/database created matching `core/config.py`'s conventions, `alembic upgrade head` applied cleanly including the two migrations this task found already on `main` (`0013_position_ledger_receipts.py`, `0014_authorization_reservations.py`).
+
+**Collision, resolved twice.** First re-check (task start): `INDEX.md`/`confirmed-decisions.md` tail both at #174 — reserved #175 as temp expectation, used the slug `entry-lifecycle-wiring` throughout instead. Final re-check (immediately before packaging): a file-disjoint sibling, `position-monitor-lite` (`backend/app/position_monitor/**` + one test file, confirmed zero overlap with this task's own edited/created files by `diff -rq` in both directions), had landed and correctly taken #175 — its own decision entry explicitly anticipated this exact collision by name and pre-committed to deferring to whichever session landed first. This delivery renumbers to **#176**.
+
+**Found already on `main`, undocumented, at task start** (both re-checks): `backend/app/execution_engine/postgres.py`, `backend/app/governor/postgres.py`, `backend/app/portfolio_state/postgres.py`, `backend/app/db/ledger_transaction.py`, migrations `0013`/`0014` — real, tested, zero decision-log entry. Verified before writing any new code: `alembic upgrade head` clean; `python3 -m pytest tests/test_authorization_ledger_postgres.py tests/test_position_ledger_postgres.py tests/test_execution_engine.py tests/test_governor_engine.py tests/test_governor_rules.py tests/test_governor_config.py -q` → **153 passed**. Full baseline suite on the untouched pull: **1066 passed**, zero failures (a live local Postgres was available this session, unlike `position-monitor-lite`'s own sandbox — its 48 failed/93 errors on an untouched pull were exactly this gap, confirmed by that task's own TESTING.md).
+
+## Environment setup
+
+```
+apt-get install -y postgresql postgresql-contrib
+service postgresql start
+su postgres -c "psql -c \"CREATE USER trading WITH PASSWORD 'trading' CREATEDB SUPERUSER;\""
+su postgres -c "psql -c \"CREATE DATABASE trading_workspace OWNER trading;\""
+cd backend && pip install -r requirements.txt --break-system-packages
+export POSTGRES_HOST=localhost POSTGRES_PORT=5432 POSTGRES_DB=trading_workspace POSTGRES_USER=trading POSTGRES_PASSWORD=trading
+python3 -m alembic upgrade head
+python3 -m pytest -q
+```
+
+## What changed
+
+See `CHANGES.md`'s matching entry for the full description. In test terms: two new adapters (`FillLedgerPort`/`PostgresFillLedger`, `PortfolioStateAdapter`), fill processing added to `ExecutionEngine` (additive, `None`-guarded — every pre-existing test path unaffected), a new `main.py` startup/shutdown block, two corrected docstrings, and the design doc's premature-citation cleanup (no test surface — doc-only).
+
+## Checks and results
+
+- **Unit, `PostgresFillLedger`** (`test_fill_ledger_postgres.py`, 7 tests): fill persists and advances order status to `partially_filled`; full-quantity fill advances to `filled`; duplicate delivery is a no-op, not an error (exactly one row survives — a second insert would have hit the `UNIQUE` constraint); overfill is persisted and flagged, not rejected; a fill for an unknown `client_order_id` raises `FillLedgerError` rather than attempting an FK-violating insert; a stale/out-of-order status update does not regress the order but the fill is still persisted; `execution_venue` is read from the order row, never the caller.
+- **Unit, `PortfolioStateAdapter`** (`test_governor_portfolio_state_reader.py`, 4 tests): a mode mismatch is refused, not silently answered from the wrong instance; a never-started `PortfolioState` raises "not ready" rather than a default; an unresolved anomalous fill raises (I14's halt, proven directly — not merely that the mechanism exists); a real open position translates correctly into governor's own `PortfolioSnapshot`/`OpenExposure` shape, Decimal→float included.
+- **Integration, direct component wiring** (`test_entry_lifecycle_wiring.py`, 3 tests): `OpportunityCreated` → real `trades`/`trade_reservations`/`orders` rows → a real `SimulatedVenue` tick fill → real `fills` row + `orders.status` advance → `OrderFilled` published → the real `PortfolioState` event worker → a real, open `positions` row, read back correctly through the same `PortfolioStateAdapter` the next authorization would consult; a rejected opportunity never reaches the ledger at all; a second opportunity for a now-busy symbol is rejected by rule 4, proving the read side actually feeds real rejections, not just that it returns *some* snapshot.
+- **Restart recovery, through `main.py`'s real lifespan** (`test_main_execution_pipeline.py`, 1 test): boot the real FastAPI app (`TestClient`), submit an order via a real `PriceUpdated`+`OpportunityCreated` pair (via `client.portal.call`, the established pattern `test_websocket_channels.py` already uses for this exact cross-loop problem), exit the process before any fill, re-enter with a fresh (non-durable-by-design) `SimulatedVenue` — confirms the orphaned order is marked `expired`/`venue_lost_state_on_restart` and that a fresh opportunity for the same, now-free symbol is approved normally afterward. Module-level singletons (`EventBus`, `AuthorizerStub`, `ExecutionEngine`, `broker_registry`, ...) reset mid-test, mirroring `conftest.py`'s own autouse fixture exactly — needed here specifically because this one test spans two separate `TestClient` enters/exits, each with its own torn-down-and-rebuilt anyio portal/event loop.
+- **Full regression**, this task's own branch: **1066 → 1081** (+15), zero regressions.
+- **Combined with `position-monitor-lite`** (fully reconciled tree, both deliveries applied): **1091 passed**, zero regressions, zero failures, zero errors.
+- **Flakiness check:** the four new test files re-run 3x in immediate succession (async queue-hop chain across four cooperating engines is the main timing risk) — stable every time, no `asyncio.sleep` tuning needed beyond the values already used elsewhere in this codebase's own async tests (0.15–0.3s).
+
+## Not covered by this delivery's own tests, stated precisely
+
+The restart-recovery branch where a **durable** venue (a real broker, not `SimulatedVenue`) reports a fill the dead process never got to persist (`reconcile_with_venue`'s own `_reconcile_known_to_venue` missing-fills-pulled-in path) is covered at the function level by #172's own `test_reconciliation.py`; it is not, and structurally cannot be, reproduced at the process level against `SimulatedVenue`, which has no memory across a restart by design (see the decision entry's J5). No cancel/expire path beyond what restart reconciliation already provides — EX-5/EX-12 remain untouched. No load/concurrency testing of the fill-processing path beyond what the existing single-worker-queue design already guarantees by construction.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #175: Position Monitor-lite built (`position-monitor-lite`)
 
 ## Baseline, pulled fresh

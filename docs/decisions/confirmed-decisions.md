@@ -1054,3 +1054,140 @@ PriceUpdated / CandleClosed (ALL symbols, normal lane -- already published, no n
 **Not built, restated for visibility, not left to be rediscovered later.** Publishing any event; calling `execution_engine`/`governor` or placing any order; any `schemas/events/execution.py` change (no `exit_reason` field added there); any edit to `backend/app/{portfolio_state,execution_engine,governor}/*.py`, `db/**`, `alembic/**`, `main.py` (no wiring — no module-level singleton getter ships here either, since there is no concrete `PositionReader` yet to default-construct one against); manual-position handling and emergency actions (§6.6 excludes both explicitly); broker-side protective orders (EX-11's own option (b), a hard prerequisite for any real venue, not this one, per §8); §6.9 step 5's ledger-backed re-arm-after-restart (informed this task's in-memory-latch shape but is not itself built).
 
 **Boundary.** Created only `backend/app/position_monitor/**` (new) and `backend/tests/test_position_monitor_engine.py` (new). Nothing else in the tree touched — confirmed by `diff -rq` above. `docs/architecture/execution-engine-design.md` and every other architecture doc were read, not edited — this task's own file boundary permits only this decision entry, `INDEX.md`, `CHANGES.md`, and `TESTING.md`.
+
+### 176. Entry-order lifecycle wired to real Postgres (`entry-lifecycle-wiring`) — fill ingestion, `main.py` restart-recovery startup sequence, and governor's `PortfolioStateReader`; two of the three concrete adapters this task was scoped to build were already on `main`, undocumented
+
+**Renumbered once, collision anticipated by both sides.** This task's own three-source re-check (`INDEX.md`/`confirmed-decisions.md` tail/archive list) reserved **#175** before packaging. A re-pull immediately before committing found a parallel, entirely file-disjoint sibling (`position-monitor-lite`, `backend/app/position_monitor/**` + one new test file — confirmed zero overlap with this task's own footprint by `diff -rq` in both directions) had landed first and correctly taken #175; that task's own decision entry explicitly named this sibling by slug and pre-committed to deferring on exactly this collision (its own words: "If that sibling lands first, this delivery renumbers to whatever is next"). Since it landed first, this delivery is **#176**, reconciled against a second, fresh three-source re-check.
+
+Closes the gap #171 and #172 both left explicitly open: as of #172, the full entry pipeline (authorizer, Execution Engine, ledger, `SimulatedVenue`, Portfolio State) was fully built and fully tested — **against fakes**. Nothing in it persisted to a real database in a running process, and `main.py` started none of it. This task wires the real thing together for the entry side of the lifecycle only (exits, Position Monitor, `StrategyOutcome` writing — EX-5/EX-12 — remain untouched, exactly as #171/#172 both scoped from the start; Position Monitor now has its own in-process lite build, decision #175, still stopping short of placing any exit order for the same EX-5 reason).
+
+**Found already on `main`, undocumented, when this task began — inspected, tested, and adopted rather than rebuilt (Saqib's explicit direction).** A fresh pull at task start showed `backend/app/execution_engine/postgres.py` (`PostgresOrderLedger`, implementing both `OrderLedgerPort` and `DecisionAuthorizationPort`) and `backend/app/governor/postgres.py` (`PostgresTradeLedger`, implementing `TradeLedgerPort`) — real, tested code (`test_authorization_ledger_postgres.py`, 453 lines) satisfying two-and-a-half of this task's own three originally-scoped concrete-adapter items. `docs/architecture/execution-engine-design.md`'s own banner and §§6.2/6.3 had been edited to describe this as "**As built (#175)**" — but no decision #175 existed anywhere in `INDEX.md`, `confirmed-decisions.md`, `CHANGES.md`, or `TESTING.md` (confirmed twice, by two independent fresh pulls, days apart). A genuine, confirmed process gap — code merged to `main` with no decision-log entry at all — not a design fork. Reported to Saqib before writing any code; directed to treat it as baseline after verification. Verified: migrations `0013`/`0014` (already on `main`) apply cleanly; `test_authorization_ledger_postgres.py` + `test_position_ledger_postgres.py` + `test_execution_engine.py` + `test_governor_engine.py` + `test_governor_rules.py` + `test_governor_config.py` — **153/153 passing** against a real, freshly migrated Postgres 16, before this task changed a single line. Not rebuilt: neither file is edited by this delivery. This decision entry is their first canonical documentation.
+
+A third undocumented-but-real file was found the same way, not named in Saqib's two-adapter list but adopted on the same basis: `backend/app/portfolio_state/postgres.py` (`PostgresPositionLedger`, implementing decision #173's own `PositionLedgerPort` — #173's own words: "No production Protocol adapter is included," "not tested because it is not built," now contradicted by its presence). Also inspected, also reused unmodified — `test_position_ledger_postgres.py`'s existing coverage coincidentally already exercises it fully.
+
+**Built, per this task's own remaining scope:**
+- **`FillLedgerPort` + `PostgresFillLedger`** (new file, `execution_engine/fill_ledger.py`) — the fill-ingestion persistence seam design doc §6.3 step 6 calls for. Deliberately a **new, separate Protocol**, not a widened `OrderLedgerPort`/`PostgresOrderLedger` — that port's own docstring scopes itself to steps 2 and 5 only, and Saqib's direction was reuse, not rebuild. Idempotent on `(execution_venue, venue_fill_id)` (lock-then-check under `LOCK TABLE orders, fills IN SHARE ROW EXCLUSIVE MODE`, the same idiom `PostgresOrderLedger`/`PostgresPositionLedger` already use, not an `IntegrityError`-driven retry); `execution_venue` is read from the fill's own `orders` row, never caller-supplied (`VenueOrderUpdate`/`OrderUpdate` carries no venue identity at all); status advances monotonically from the venue's own reported status, matching `reconcile_with_venue()`'s own convention; overfill persists and is flagged (I14), a genuinely unmatched-order fill raises instead (**J1** below) rather than attempting a schema-impossible write.
+- **Fill processing wired into `ExecutionEngine`** (`execution_engine/engine.py`, additive) — `on_order_update()` registered once at `start()` when a `FillLedgerPort` is supplied (optional constructor kwarg, `None` by default — every pre-existing caller/test is unaffected); the venue callback `put_nowait`s onto the **same** queue `OrderApproved` payloads already use, tagged so `_worker_loop` can tell them apart, which is what guarantees a fill can never be processed before the very `_process_one()` call that placed its order has already committed (single worker task, FIFO queue — no new locking needed for this ordering guarantee). A duplicate delivery publishes nothing further (I11); a genuine new fill publishes `OrderFilled` (critical lane, already built by #171 — no schema edit needed here).
+- **`PortfolioStateAdapter`** (new file, `governor/portfolio_state_reader.py`) — the third concrete adapter, governor's own `PortfolioStateReader`. A thin translation over the **same** live `portfolio_state.engine.PortfolioState` event-worker instance `main.py` wires for real accounting (decision #173) — reshapes its `get_snapshot()` into governor's own narrower `PortfolioSnapshot`/`OpenExposure` shape. Mode-checked (refuses any `execution_mode` other than the one live instance it wraps) and not-ready-checked (raises rather than inventing a default) — `AuthorizerStub._process_one()` (unmodified) already treats any exception from this call as fatal-for-this-Opportunity-only: logged, no decision committed, worker continues. I14's "halt NEW entries" for an unresolved fill anomaly is implemented **here** (**J2** below), not as a new table/flag.
+- **`main.py` restart-recovery startup wiring** (additive, entirely new block in `lifespan()`) — the §6.9 sequence, for real, for the first time: construct a Session-mode `PortfolioState`, `rebuild_from_ledger()`, connect `SimulatedVenue`, `reconcile_with_venue()` (both functions already built by #172, never previously called from anywhere but tests); on any discrepancy, log `CRITICAL` and leave the execution pipeline entirely unwired (I13 — no separate halt flag needed, the pipeline just never starts); otherwise register the venue, construct the real event-worker `PortfolioState` + `PostgresPositionLedger`, `start()` it, construct `PostgresOrderLedger`/`PostgresTradeLedger`/`PostgresFillLedger`/`PortfolioStateAdapter`, and start `AuthorizerStub`/`ExecutionEngine` via their existing `get_*()` singleton factories (both extended additively — `get_execution_engine()` gained an optional `fill_ledger` kwarg; `get_authorizer_stub()`'s signature was already correct, only its stale docstring needed fixing). Whole block wrapped in one `try/except`, soft-failing (logged, `CRITICAL` or `exception`) exactly like the pre-existing Finnhub/Polygon auto-connects just above it — a DB outage must not crash market data / Feature Engine / everything else that doesn't need it. Symmetric shutdown: `authorizer_stub` → `execution_engine` → `portfolio_state` → venue disconnect, each `None`-guarded (the block above is best-effort; any of them may never have started).
+- **`get_execution_engine()`/`get_authorizer_stub()` docstrings corrected** — both previously said "main.py is NOT wired to call this" (true when #171 wrote them, false as of this delivery).
+- **Design doc corrected** (`execution-engine-design.md`, Saqib's own explicit direction, the one approved exception to this task's original "don't touch other architecture docs" boundary) — every phantom "#175" attribution found (banner, §6.2/§6.3's two "As built" callouts, and four smaller inline citations at §6.3/§6.7/§6.8 this task's first editing pass missed and a second full-file grep caught) rewritten to the `entry-lifecycle-wiring` slug instead of a decision number that never existed, with the discovery stated plainly; §6.3's stale "fill ingestion and reconciliation are still unimplemented" tail corrected (both are implemented, the first by this delivery, the second by #172 and now actually called). A second, differently-shaped citation error found the same way: §6.8's `position_fill_receipts` row was attributed to **#174** — but #174 is frontend-only ("no backend logic changed" per its own entry) and never built any table; corrected to name this delivery instead, with the mistake stated inline rather than silently swapped.
+
+**Judgment calls (stated, not hidden):**
+- **J1 — a fill for a `client_order_id` with no `orders` row raises, rather than persisting anomaly-flagged per I14's literal text.** `fills.client_order_id` has a database `FOREIGN KEY` onto `orders.client_order_id` (`models/execution_ledger.py`, outside this task's file boundary) — there is no `anomaly` value that makes an FK violation insertable; I14's "still persist" is schema-impossible for this specific sub-case. Not reachable via `SimulatedVenue` in this slice: it only ever calls a registered callback for a `client_order_id` it was itself asked to `place_order()`, and `ExecutionEngine` always completes its own idempotent `insert_order()` (step 2) before ever calling `place_order()` (step 4) — so by the time any fill can exist for an id, that id's `orders` row is already committed. `FillLedgerError`, logged, no publish — the overfill sub-case (order row exists, cumulative quantity exceeds it) has no such conflict and is handled exactly per I14.
+- **J2 — I14's "halt NEW entries" implemented as `PortfolioStateAdapter.get_snapshot()` raising on an unresolved anomalous fill, not a new halt flag/table.** Adding one would touch `models/execution_ledger.py` and a migration, both outside this task's file boundary. `AuthorizerStub`'s existing fail-closed handling of any `get_snapshot()` exception (unmodified — already built by #171) already gives exactly "no decision committed, logged, worker continues." No new machinery; this adapter's own raise **is** the halt.
+- **J3 — `FillLedgerPort` is a new, separate Protocol/file, not an extension of `OrderLedgerPort`/`PostgresOrderLedger`.** Saqib's direction was explicit: do not rebuild `PostgresOrderLedger`. `update_order_status()`'s own implementation already hard-rejects any status other than `submitted`/`rejected` — fill-driven status advancement is a distinct concern the original Protocol's own docstring never claimed to cover (it scopes itself to steps 2 and 5; fill ingestion is step 6). Zero edits to either pre-existing, reviewed file.
+- **J4 — no `conftest.py` change.** This task deliberately introduces no new module-level singleton — `PortfolioState`, `PostgresPositionLedger`, `PostgresFillLedger`, `PortfolioStateAdapter`, and the reconciliation-mode `PortfolioState` are all local variables inside `main.py`'s own `lifespan()`, never cached at module scope. `get_execution_engine()`/`get_authorizer_stub()` are the only singletons involved, and both already have working `conftest.py` reset lines from #171. Item 7 of this task's original scope ("add whatever reset lines the new singletons require") resolves to zero lines needed, not skipped.
+- **J5 — the reconciliation-mode `PortfolioState` and the event-worker `PortfolioState` are two separate objects, deliberately.** `PortfolioState` itself refuses to let one instance own both the Session-based reconciliation API and the ledger/bus-based event-worker API (`_require_session_mode()`, #173's own code, unmodified) — `main.py` constructs a throwaway Session-mode instance for `rebuild_from_ledger()`/`reconcile_with_venue()` at startup, then a separate, real event-worker instance for everything after. Both read/write the same underlying tables; state is DB-driven, not held in either Python object, so running the first to completion (committed) before starting the second is sufficient — verified directly (`test_main_execution_pipeline.py`), not assumed.
+
+**Verified, not assumed.** `execution_engine/ports.py`'s local `VenueOrderInstruction`/`VenueOrderUpdate` dataclasses were checked for real structural compatibility with `broker_adapters/order_venue.py`'s actual `OrderInstruction`/`OrderUpdate` pydantic models by direct interactive use against a real `SimulatedVenue` (not merely re-asserted from #172's own claim) — confirmed working, including the session-hours guard, before writing any pipeline code against it.
+
+**Testing.** Real Postgres 16 throughout, no mocks. **Full regression suite: 1066 → 1081 passing, zero regressions** (15 new tests: 7 for `PostgresFillLedger` — dedup, overfill, unknown-order, monotonic status advance, venue-identity-from-order-row; 4 for `PortfolioStateAdapter` — mode mismatch, not-ready, I14 anomaly halt, correct snapshot translation; 3 end-to-end `OpportunityCreated → real Position` integration tests wiring the actual production classes directly, including a rejection path and a read-side `symbol_busy` proof; 1 restart-recovery test driven through `main.py`'s **real** `lifespan()` via `TestClient` — not `reconcile_with_venue()` called directly, which #172's own `test_reconciliation.py` already covers, but the wiring sequence itself: submit an order, exit the process, re-enter with a fresh `SimulatedVenue` — never durable across a restart by construction, so any leftover non-terminal order already **is** the "process died mid-flight" case — confirm it's marked `expired`/`venue_lost_state_on_restart` and that the pipeline resumes normally afterward). Repeated 3x for timing flakiness (async queue-hop chain across four engines); stable every time.
+
+**Not done, stated precisely.** EX-5/EX-12 (exits, Position Monitor, `StrategyOutcome` writing) remain untouched, as both #171 and #172 scoped from the start and this task's own prompt restated. No cancel/expire path beyond what restart reconciliation already provides. The "a real, durable venue reports a fill the dead process never got to persist" branch of restart recovery (`_reconcile_known_to_venue`'s missing-fills-pulled-in path) is exercised by #172's own `test_reconciliation.py` at the function level; it is not, and cannot be, reproduced against `SimulatedVenue` at the process level (not durable across a restart by design — see J5's reasoning), so this delivery's own process-level restart test only exercises the `venue_lost_state_on_restart` branch.
+
+**Heads-up, not acted on.** `confirmed-decisions.md` is now well past the ~100KB rollover trigger (flagged at #171, #172, #173, #174, all deferred) — flagged a fifth time.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main` immediately before packaging: new — `backend/app/execution_engine/fill_ledger.py`, `backend/app/governor/portfolio_state_reader.py`, `backend/tests/{test_fill_ledger_postgres,test_governor_portfolio_state_reader,test_entry_lifecycle_wiring,test_main_execution_pipeline}.py`. Edited, additive only — `backend/app/execution_engine/engine.py` (fill processing + docstrings), `backend/app/governor/engine.py` (docstring only), `backend/app/main.py` (new `lifespan()` block, both halves), `docs/architecture/execution-engine-design.md` (the phantom-#175 correction, Saqib's explicit exception). Untouched, exactly as scoped: `backend/app/broker_adapters/**`, `backend/app/models/execution_ledger.py`, `backend/app/portfolio_state/**`, `backend/app/services/broker_registry.py` (called, not edited), any Alembic migration, `backend/tests/conftest.py` (J4), `backend/app/execution_engine/postgres.py`, `backend/app/governor/postgres.py` (both found pre-built, reused unmodified).
+
+**Data flow — `OrderApproved` through a fill to `PositionClosed` (this delivery's own new pieces marked; everything else is #171/#172/#173, called, not rebuilt):**
+
+```
+OrderApproved (critical lane, published by AuthorizerStub — #171, unmodified)
+        │
+        ▼
+ExecutionEngine._process_one()                                    #171, unmodified
+        │   PostgresOrderLedger.insert_order()  ──► INSERT orders  (found pre-built, this delivery's own
+        │   (idempotent, client_order_id UNIQUE)                    first canonical documentation — J-none)
+        │
+        ▼
+venue.place_order(instruction)  ──►  SimulatedVenue                #172, unmodified
+        │   PostgresOrderLedger.update_order_status("submitted")
+        │
+        ▼
+   [ ... later: a PriceUpdated tick reaches SimulatedVenue.ingest_tick() ... ]
+        │
+        ▼
+SimulatedVenue._apply_fill()  ──►  venue.on_order_update(OrderUpdate)      #172, unmodified
+        │
+        ▼
+ExecutionEngine._on_venue_update()  ── put_nowait(("venue_update", update))  ◄── NEW, this delivery
+        │   same queue as OrderApproved — strict FIFO, single worker task,
+        │   so this can never run before ITS OWN order's insert_order()/
+        │   update_order_status() above has already committed
+        ▼
+ExecutionEngine._process_venue_update()                                     ◄── NEW, this delivery
+        │   PostgresFillLedger.record_fill()  ──► INSERT fills               ◄── NEW file, this delivery
+        │        UNIQUE(execution_venue, venue_fill_id)  — duplicate ⇒ no-op (I11)
+        │        unknown order ⇒ FillLedgerError, no insert (J1)
+        │        overfill ⇒ persisted, anomaly="overfill" (I14)
+        │        order.status advanced monotonically from update.status
+        │   COMMIT fill + order.status together (one transaction)
+        │
+        ▼  (only after COMMIT)
+publish OrderFilled (critical lane — already built by #171; here, a wake-up signal only)
+        │
+        ▼
+PortfolioState._on_event() → _synchronize()                        #173, unmodified — the actual
+        │   PostgresPositionLedger.pending_fills() / commit_fill()  accounting worker, found
+        │   position opened/added-to/closed; realized P&L on close  pre-built this delivery too
+        │
+        └─ closure ⇒ COMMIT position first, THEN publish PositionClosed (critical lane, #173's own
+                                                                          commit-before-publish rule)
+        │
+        ▼
+governor.PortfolioStateAdapter.get_snapshot()                                ◄── NEW file, this delivery
+        │   reads the SAME live PortfolioState instance above, translated
+        │   into governor's own PortfolioSnapshot/OpenExposure shape;
+        │   raises first on any unresolved fill anomaly (J2 — I14's halt)
+        ▼
+the NEXT OpportunityCreated's rule 4 (symbol_busy / max_concurrent_positions)  #171 rules.py, unmodified
+   now sees this position — proven directly, not assumed
+   (test_second_opportunity_for_a_busy_symbol_is_rejected_by_the_read_side)
+```
+
+**Internal flow — `main.py`'s new startup sequence (§6.9, called for the first time from anywhere but a test):**
+
+```
+lifespan() startup, after market-data auto-connect
+        │
+        ▼
+SimulatedVenue(event_bus=bus)  ──►  await venue.connect()                    fresh instance every boot —
+        │                                                                    NOT durable across a restart
+        ▼
+recon_portfolio_state = PortfolioState(execution_mode)      Session-mode (no ledger/bus) — §6.9 step 2
+        │
+        ▼
+with SessionLocal() as recon_session:
+    recon_portfolio_state.rebuild_from_ledger(recon_session)         #172's own Session API, unmodified
+    report = await reconcile_with_venue(recon_session, venue,        #172's own function, unmodified —
+                                         recon_portfolio_state)       called from main.py for the first time
+        │
+        ├─ report.has_discrepancy ──► logger.critical(...)                          I13
+        │                              execution pipeline NEVER wired below —
+        │                              rest of the app (market data, Feature
+        │                              Engine, ...) still boots normally
+        │
+        └─ clean ──►
+              broker_registry.set_execution_venue(venue)
+                     │
+                     ▼
+              portfolio_state = PortfolioState(mode, ledger=PostgresPositionLedger, bus)   event-worker
+                     │                                                                     instance —
+              await portfolio_state.start()          ◄── own internal _synchronize()       SEPARATE object
+                     │                                     (§6.9 step 2, again, for the     from the one
+                     │                                     event-worker's own cache)        above (J5)
+                     ▼
+              order_ledger    = PostgresOrderLedger(SessionLocal)        found pre-built, adopted
+              trade_ledger    = PostgresTradeLedger(SessionLocal)        found pre-built, adopted
+              fill_ledger     = PostgresFillLedger(SessionLocal)         NEW, this delivery
+              portfolio_reader = PortfolioStateAdapter(portfolio_state)  NEW, this delivery
+                     │
+                     ▼
+              get_authorizer_stub(bus, trade_ledger, portfolio_reader).start()    #171 singleton,
+              get_execution_engine(bus, order_ledger, order_ledger,               unmodified factory
+                                    fill_ledger=fill_ledger).start()              signature (+kwarg)
+                     │
+                     ▼
+              execution pipeline live — accepts OrderApproved / fills from here on
+```

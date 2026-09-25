@@ -3,8 +3,14 @@ ExecutionEngine — consumes OrderApproved (critical lane), mints/verifies
 the deterministic client-order ID, performs an idempotent ledger insert,
 checks the configured venue supports the order's execution mode, and
 calls OrderVenue.place_order(). See package docstring
-(execution_engine/__init__.py) for this delivery's exact scope boundary
-(entry orders only, fill processing NOT built here).
+(execution_engine/__init__.py) for the original delivery's scope
+boundary (entry orders only). Fill processing (§6.3 step 6) was added
+by entry-lifecycle-wiring: when a FillLedgerPort is supplied, this
+engine also registers OrderVenue.on_order_update(), persists each fill,
+advances the order's ledger status, and publishes OrderFilled — see
+_process_venue_update() below. Still entry-only: a non-"open"
+position_effect is still dropped (see _process_one()), and exits
+remain EX-5/EX-12 territory.
 
 Own queue + worker (I7): OrderApproved is only ever enqueued by the Event
 Bus subscriber callback (`_on_order_approved`, must stay fast); the actual
@@ -23,6 +29,7 @@ from typing import Any, Callable
 from app.core.config import Settings, get_settings
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
+from app.execution_engine.fill_ledger import FillLedgerError, FillLedgerPort, FillRecord
 from app.execution_engine.ports import (
     DecisionAuthorizationPort,
     ExecutionVenueProvider,
@@ -33,7 +40,7 @@ from app.execution_engine.ports import (
     default_execution_venue_provider,
 )
 from app.schemas.events.envelope import EventEnvelope, EventType
-from app.schemas.events.execution import OrderApproved, OrderStatusChanged
+from app.schemas.events.execution import OrderApproved, OrderFilled, OrderStatusChanged
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,7 @@ class ExecutionEngine:
         order_ledger: OrderLedgerPort,
         decision_authorization: DecisionAuthorizationPort,
         *,
+        fill_ledger: FillLedgerPort | None = None,
         venue_provider: ExecutionVenueProvider | None = None,
         execution_mode_provider: Callable[[], str | None] | None = None,
         settings: Settings | None = None,
@@ -66,6 +74,12 @@ class ExecutionEngine:
         self._bus = bus
         self._order_ledger = order_ledger
         self._decision_authorization = decision_authorization
+        # Optional (entry-lifecycle-wiring): fill processing (on_order_update
+        # registration, §6.3 step 6) is only wired when a FillLedgerPort is
+        # supplied — None preserves this engine's pre-existing entry-only
+        # behavior exactly (every caller/test that predates this delivery
+        # keeps working unmodified).
+        self._fill_ledger = fill_ledger
         self._venue_provider = venue_provider or _NoVenueProvider()
         # Same defensive getattr as governor/engine.py — execution_mode is
         # the sibling `execution-ledger-and-venue` task's own config.py
@@ -80,6 +94,17 @@ class ExecutionEngine:
 
     def start(self) -> None:
         self._bus.subscribe(EventType.ORDER_APPROVED, self._on_order_approved)
+        if self._fill_ledger is not None:
+            # §6.3 step 6: registered once, at start — main.py's startup
+            # sequence connects/registers the venue BEFORE calling this
+            # engine's own start() (§6.9: rebuild -> connect -> reconcile ->
+            # resume), so the venue is already available here whenever fill
+            # processing is actually wired. No venue configured yet is not
+            # fatal — same "no venue" posture _process_one() already takes
+            # for the order path (AC #5 venue-refusal half).
+            venue = self._venue_provider.get_execution_venue()
+            if venue is not None:
+                venue.on_order_update(self._on_venue_update)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="execution-engine")
         logger.info("ExecutionEngine started — subscribed to OrderApproved")
 
@@ -100,6 +125,21 @@ class ExecutionEngine:
     def _on_order_approved(self, envelope: EventEnvelope) -> None:
         self._queue.put_nowait(dict(envelope.payload))
 
+    def _on_venue_update(self, update: Any) -> None:
+        """Venue callback (must stay fast, same I7 reasoning as
+        `_on_order_approved` above) — called SYNCHRONOUSLY from inside
+        `SimulatedVenue._dispatch()`, itself reachable from a
+        PriceUpdated bus-subscriber callback (`_on_price_updated_
+        envelope`) that must also stay fast. `put_nowait` onto this
+        engine's OWN queue, tagged so `_worker_loop` can tell it apart
+        from an `OrderApproved` payload dict — processed strictly
+        in-order by the SAME single worker task (design doc §6.1's
+        diagram puts fill ingestion in the same execution queue), which
+        is what guarantees a fill for an order can never be processed
+        before that same order's own `_process_one()` (which placed it
+        at the venue in the first place) has already committed."""
+        self._queue.put_nowait(("venue_update", update))
+
     # --- background worker -----------------------------------------------------
 
     async def _worker_loop(self) -> None:
@@ -110,9 +150,12 @@ class ExecutionEngine:
                     self._queue.task_done()
                     break
                 try:
-                    await self._process_one(item)  # type: ignore[arg-type]
-                except Exception:  # noqa: BLE001 — one bad order must not stall the rest
-                    logger.exception("ExecutionEngine failed to process OrderApproved: %r", item)
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] == "venue_update":
+                        await self._process_venue_update(item[1])
+                    else:
+                        await self._process_one(item)  # type: ignore[arg-type]
+                except Exception:  # noqa: BLE001 — one bad order/update must not stall the rest
+                    logger.exception("ExecutionEngine failed to process queued item: %r", item)
                 finally:
                     self._queue.task_done()
         except asyncio.CancelledError:
@@ -247,9 +290,70 @@ class ExecutionEngine:
             )
             return
 
-        # Fill processing (on_order_update, dedup, OrderFilled) is a
-        # deliberately NOT-built extension point — see package docstring.
         logger.info("OrderApproved %s submitted to venue %s", client_order_id, venue.venue_id)
+
+    # --- fill processing (§6.3 step 6, entry-lifecycle-wiring) --------------
+
+    async def _process_venue_update(self, update: Any) -> None:
+        if update.venue_fill_id is None:
+            # A pure status update (a cancel ack, a plain rejection notice
+            # with no fill attached) — not built in this delivery. The
+            # entry path never cancels; a real cancel/exit path is EX-5/
+            # EX-12 territory, out of this task's scope exactly like the
+            # position_effect != "open" branch in _process_one() above.
+            logger.info(
+                "Venue order update for %s carries no fill (status=%s) — not processed in this delivery",
+                update.client_order_id, update.status,
+            )
+            return
+        if self._fill_ledger is None:
+            # Unreachable in practice — _on_venue_update is only ever
+            # registered when self._fill_ledger is not None (start()) —
+            # kept as a defensive guard, not a silent drop.
+            logger.error("Fill %s for %s received with no FillLedgerPort configured — dropped",
+                         update.venue_fill_id, update.client_order_id)
+            return
+
+        fill = FillRecord(
+            client_order_id=update.client_order_id,
+            venue_fill_id=update.venue_fill_id,
+            qty=update.fill_qty,
+            price=update.fill_price,
+            venue_ts=update.venue_ts,
+            status=update.status,
+            commission=update.commission,
+        )
+        try:
+            result = await asyncio.to_thread(self._fill_ledger.record_fill, fill)
+        except FillLedgerError:
+            logger.exception(
+                "ExecutionEngine: record_fill failed for %s (fill %s) — no event published",
+                update.client_order_id, update.venue_fill_id,
+            )
+            return
+
+        if not result.inserted:
+            # Duplicate delivery of the same fill (I11) — the stored row
+            # already exists, log, publish nothing further.
+            logger.info(
+                "Fill %s for %s already in the ledger — duplicate delivery, no publish",
+                update.venue_fill_id, update.client_order_id,
+            )
+            return
+
+        order_filled = OrderFilled(
+            order_id=update.client_order_id,
+            side=result.side,
+            qty=update.fill_qty,
+            fill_price=update.fill_price,
+            fill_ts=update.venue_ts,
+        )
+        await self._bus.publish(make_envelope(EventType.ORDER_FILLED, order_filled, symbol=result.symbol))
+        logger.info(
+            "Fill %s for %s committed (order_status=%s%s) — OrderFilled published",
+            update.venue_fill_id, update.client_order_id, result.order_status,
+            f", anomaly={result.anomaly}" if result.anomaly else "",
+        )
 
     async def _reject_after_insert(
         self, client_order_id: str, reason: str, *, execution_venue: str | None, symbol: str
@@ -286,20 +390,23 @@ def get_execution_engine(
     bus: EventBus | None = None,
     order_ledger: OrderLedgerPort | None = None,
     decision_authorization: DecisionAuthorizationPort | None = None,
+    fill_ledger: FillLedgerPort | None = None,
 ) -> ExecutionEngine:
     """Lazy singleton, same pattern as get_authorizer_stub()/
     get_level_interaction_engine(). `order_ledger`/`decision_authorization`
-    MUST be supplied on first construction in this delivery — no default
-    concrete implementation exists (fork 1: the real `orders` ledger
-    belongs to the sibling `execution-ledger-and-venue` task). main.py is
-    NOT wired to call this in this delivery (outside this task's file
-    boundary) — see TESTING.md."""
+    MUST be supplied on first construction — no default concrete
+    implementation exists to fall back to. `fill_ledger` is optional
+    (entry-lifecycle-wiring): omit it to get exactly this delivery's
+    predecessor behavior (entry orders only, no fill processing wired);
+    main.py's lifespan() supplies it for the real running app."""
     global _execution_engine
     if _execution_engine is None:
         if order_ledger is None or decision_authorization is None:
             raise RuntimeError(
                 "get_execution_engine() requires order_ledger and decision_authorization on first call "
-                "(no default OrderLedgerPort/DecisionAuthorizationPort exists yet in this delivery)"
+                "(no default OrderLedgerPort/DecisionAuthorizationPort exists)"
             )
-        _execution_engine = ExecutionEngine(bus or get_event_bus(), order_ledger, decision_authorization)
+        _execution_engine = ExecutionEngine(
+            bus or get_event_bus(), order_ledger, decision_authorization, fill_ledger=fill_ledger
+        )
     return _execution_engine

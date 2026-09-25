@@ -290,12 +290,10 @@ def get_authorizer_stub(
 ) -> AuthorizerStub:
     """Lazy singleton, same pattern as get_level_interaction_engine()/
     get_market_state_engine()/get_opportunity_cache(). `trade_ledger`/
-    `portfolio_state` MUST be supplied on first construction in this
-    delivery — no default concrete implementation exists to fall back to
-    (fork 1: the real ledger and Portfolio State belong to modules this
-    task doesn't own/build). main.py is NOT wired to call this in this
-    delivery (outside this task's file boundary) — see TESTING.md for the
-    follow-up wiring still needed once the sibling ledger/venue land."""
+    `portfolio_state` MUST be supplied on first construction — no default
+    concrete implementation exists to fall back to. main.py's lifespan()
+    supplies both (PostgresTradeLedger, governor.portfolio_state_reader.
+    PortfolioStateAdapter) for the real running app — entry-lifecycle-wiring."""
     global _authorizer_stub
     if _authorizer_stub is None:
         if trade_ledger is None or portfolio_state is None:

@@ -170,6 +170,103 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("POLYGON_API_KEY not set — skipping Polygon auto-connect")
 
+    # Execution pipeline (entry-lifecycle-wiring) — wires decisions #171
+    # (AuthorizerStub, ExecutionEngine: entry orders, built against fakes)
+    # and #172 (execution ledger, SimulatedVenue, Portfolio State: also
+    # built against fakes) together against real Postgres-backed adapters,
+    # per design doc §6.9's restart-recovery sequence: rebuild -> connect
+    # -> reconcile -> resume. settings.execution_mode is validated to
+    # "simulated" at Settings construction (core/config.py's own
+    # field_validator) — nothing else is reachable past that point, so no
+    # separate startup-mode-refusal check is needed here (§6.2 "layer 1").
+    # Local imports, kept together — same self-contained-block convention
+    # OpportunityCache above already uses.
+    from app.broker_adapters.simulated_venue import SimulatedVenue
+    from app.db.session import SessionLocal
+    from app.execution_engine.engine import get_execution_engine
+    from app.execution_engine.fill_ledger import PostgresFillLedger
+    from app.execution_engine.postgres import PostgresOrderLedger
+    from app.governor.engine import get_authorizer_stub
+    from app.governor.portfolio_state_reader import PortfolioStateAdapter
+    from app.governor.postgres import PostgresTradeLedger
+    from app.portfolio_state.engine import PortfolioState
+    from app.portfolio_state.postgres import PostgresPositionLedger
+    from app.portfolio_state.reconciliation import reconcile_with_venue
+
+    authorizer_stub = None
+    execution_engine = None
+    portfolio_state = None
+    execution_venue = None
+    try:
+        execution_venue = SimulatedVenue(event_bus=bus)
+        await execution_venue.connect()
+
+        # §6.9 step 2 (rebuild) + step 3 (reconcile) — a throwaway,
+        # Session-mode PortfolioState (no ledger/bus): the OLD Session-
+        # based reconciliation API decision #172 built (engine.py's own
+        # "Existing reconciliation API" section), deliberately separate
+        # from the event-worker instance below — PortfolioState itself
+        # refuses to let one object own both APIs (_require_session_mode).
+        recon_portfolio_state = PortfolioState(execution_mode=settings.execution_mode)
+        with SessionLocal() as recon_session:
+            recon_portfolio_state.rebuild_from_ledger(recon_session)
+            reconciliation_report = await reconcile_with_venue(
+                recon_session, execution_venue, recon_portfolio_state
+            )
+
+        if reconciliation_report.has_discrepancy:
+            # I13: never silently proceed on a discrepancy. This task's own
+            # resolution of reconciliation.py's own open question ("what
+            # 'halt new entries' means operationally belongs to whoever
+            # owns the pipeline's entry point"): log CRITICAL with the
+            # full list, and simply never wire AuthorizerStub/
+            # ExecutionEngine/Portfolio State below — no OrderApproved can
+            # be produced or accepted, while the rest of the app (market
+            # data, Feature Engine, ...) still boots normally.
+            logger.critical(
+                "Execution ledger/venue reconciliation found %d discrepancy(ies) on startup — "
+                "entry acceptance stays OFF: %s",
+                len(reconciliation_report.discrepancies),
+                reconciliation_report.discrepancies,
+            )
+        else:
+            broker_registry.set_execution_venue(execution_venue)
+
+            position_ledger = PostgresPositionLedger(SessionLocal)
+            portfolio_state = PortfolioState(
+                execution_mode=settings.execution_mode, ledger=position_ledger, bus=bus
+            )
+            await portfolio_state.start()
+
+            order_ledger = PostgresOrderLedger(SessionLocal)
+            trade_ledger = PostgresTradeLedger(SessionLocal)
+            fill_ledger = PostgresFillLedger(SessionLocal)
+            portfolio_state_reader = PortfolioStateAdapter(portfolio_state, SessionLocal)
+
+            authorizer_stub = get_authorizer_stub(bus, trade_ledger, portfolio_state_reader)
+            authorizer_stub.start()
+
+            # order_ledger doubles as decision_authorization — PostgresOrderLedger
+            # implements both OrderLedgerPort and DecisionAuthorizationPort.
+            execution_engine = get_execution_engine(bus, order_ledger, order_ledger, fill_ledger)
+            execution_engine.start()
+
+            logger.info(
+                "Execution pipeline started (mode=%s, venue=%s) — reconciliation: %d advanced, "
+                "%d expired, %d cancelled stale entries, %d resubmitted exits",
+                settings.execution_mode,
+                execution_venue.venue_id,
+                len(reconciliation_report.advanced_orders),
+                len(reconciliation_report.expired_orders),
+                len(reconciliation_report.cancelled_stale_entries),
+                len(reconciliation_report.resubmitted_exits),
+            )
+    except Exception:  # noqa: BLE001 — the execution pipeline is not (yet) load-bearing for the
+        # rest of the app (market data, Feature Engine, Context Engine, ... all run without it) —
+        # a DB outage or a reconciliation failure here must not crash the whole process, same
+        # soft-fail posture as the optional Finnhub/Polygon auto-connects just above.
+        logger.exception("Execution pipeline failed to start — entry acceptance stays OFF")
+
     logger.info("%s started (debug=%s)", settings.app_name, settings.debug)
     try:
         yield
@@ -230,6 +327,26 @@ async def lifespan(app: FastAPI):
         # trivial in practice (opportunity_cache.py's own docstring: no
         # queue, nothing to drain).
         await opportunity_cache.stop()
+
+        # Execution pipeline (entry-lifecycle-wiring) — same "stops after
+        # the bus" posture as everything else in this block: each engine's
+        # own stop() then only has to drain a fixed, already-queued
+        # backlog. Producer-to-consumer order (authorizer -> execution
+        # engine -> Portfolio State) so each stage stops enqueueing new
+        # work for the next before that next stage itself stops. None-
+        # guarded: the whole block above is best-effort (soft-fails on a
+        # DB outage or a reconciliation discrepancy), so any of these may
+        # never have started.
+        if authorizer_stub is not None:
+            await authorizer_stub.stop()
+        if execution_engine is not None:
+            await execution_engine.stop()
+        if portfolio_state is not None:
+            await portfolio_state.stop()
+        if execution_venue is not None:
+            await execution_venue.disconnect()
+            broker_registry.clear_execution_venue()
+
         logger.info("%s stopped", settings.app_name)
 
 
