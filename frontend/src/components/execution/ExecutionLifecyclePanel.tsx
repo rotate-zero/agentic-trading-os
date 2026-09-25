@@ -1,5 +1,6 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
+import { fetchExitIntents, type ExitIntentsWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx/BacktestResultsPanel.tsx already reuse verbatim — same
@@ -11,10 +12,8 @@ const DEFAULT_WIDTH = 300;
 
 // Deliberately local component state (collapsed/widthPx), not threaded
 // through WorkspaceContext.tsx — same reasoning BacktestResultsPanel.tsx's
-// own header comment gives for itself: this panel's contents are a live
-// feed with no server-side "current value" to sync across tabs and no
-// reason to survive a reload, so there's nothing here WorkspaceContext's
-// shared state would actually buy.
+// own header comment gives for itself. The event list is transient; the
+// separate exit-intent snapshot is fetched again when this panel opens.
 
 // Time-only, like InfoTab.tsx's formatExitTime/AIAnalysisPanel.tsx's
 // formatDetectedAt (a "recent activity, today" feed, same posture) — but
@@ -26,6 +25,11 @@ function formatTime(iso: string): string {
   return Number.isNaN(d.getTime())
     ? "—"
     : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatTriggerTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
 
 function formatNum(n: number | null, digits = 2): string {
@@ -139,6 +143,66 @@ function ExecutionLifecycleBody() {
   );
 }
 
+type ExitIntentLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExitIntentsWireShape };
+
+const EXIT_REASON_LABEL = { stop: "Stop", target: "Target", eod_flatten: "EOD" } as const;
+
+function ObservedExitTriggers() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<ExitIntentLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExitIntents()
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return (
+    <section className="border-b border-base-border" aria-label="Observed exit triggers">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Observed exit triggers</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          disabled={load.kind === "loading"}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+        >
+          Refresh
+        </button>
+      </div>
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+        Observed trigger only — no exit order has been placed and the position has not been closed.
+      </p>
+      {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading exit triggers…</p>}
+      {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch exit triggers: {load.message}</p>}
+      {load.kind === "ready" && load.data.monitor_status === "unavailable" && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Position Monitor unavailable.</p>
+      )}
+      {load.kind === "ready" && load.data.monitor_status === "running" && load.data.exit_intents.length === 0 && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Position Monitor running — no observed exit triggers.</p>
+      )}
+      {load.kind === "ready" && load.data.monitor_status === "running" && load.data.exit_intents.map((intent) => (
+        <div key={intent.position_id} className="border-t border-base-border px-2 py-1.5 font-mono text-[10px]">
+          <div className="flex flex-wrap items-center justify-between gap-1">
+            <span className="text-text-primary">{intent.symbol} · {EXIT_REASON_LABEL[intent.exit_reason]}</span>
+            <time className="text-text-muted" dateTime={intent.trigger_ts}>{formatTriggerTime(intent.trigger_ts)}</time>
+          </div>
+          <div className="text-text-muted">{intent.side} {intent.qty} · trigger {formatNum(intent.trigger_price)}</div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 export function ExecutionLifecyclePanel() {
   const [collapsed, setCollapsed] = useState(true); // starts collapsed, same reasoning every other sibling panel here already uses
   const [widthPx, setWidthPx] = useState(DEFAULT_WIDTH);
@@ -184,6 +248,7 @@ export function ExecutionLifecyclePanel() {
           {!collapsed && <span className="font-mono text-xs font-semibold text-text-primary">Execution</span>}
         </div>
 
+        {!collapsed && <ObservedExitTriggers />}
         {!collapsed && <ExecutionLifecycleBody />}
       </div>
     </div>

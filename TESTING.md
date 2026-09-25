@@ -1,3 +1,15 @@
+# TESTING — `observed-exit-intents-ui`
+
+GitHub `main` and local `HEAD` both resolved to `222f36507cdec15245a33c292196a9785f47ed6d` before editing and at the pre-packaging recheck. The initial working tree was clean. The canonical decision log and index end at #178; this consumer of the existing read contract needs no new decision.
+
+- `cd frontend && npx tsc -b` — passed.
+- `cd frontend && npm run build` — passed (TypeScript build and Vite production bundle).
+- `git diff --check` — passed.
+
+No backend or database behavior changed. Package: `observed-exit-intents-ui.zip` contains the frontend consumer and required documentation with repository-relative paths. The build-generated `frontend/tsconfig.tsbuildinfo` is excluded.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #178: `position-monitor-observer-wiring`
 
 Initial and pre-numbering GitHub `origin/main` checks both resolved to `5b43d55038c0b5af3aefd1477e66dbc5267510e0`, matching local `HEAD`. The initial working tree was clean. `docs/decisions/INDEX.md` and the canonical log ended at #177; the latest archive remained `134-160.md`. Decision #178 was appended in numerical order after that recheck.

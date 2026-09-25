@@ -1,3 +1,13 @@
+# CHANGES — `observed-exit-intents-ui`
+
+## Current delivery
+
+The Execution panel now reads decision #178's existing `GET /intelligence/exit-intents` response when expanded and on manual Refresh. A separate “Observed exit triggers” section distinguishes unavailable monitor, running monitor with no intents, fetch error, and observed intents. Intent rows show symbol, stop/target/EOD reason, side, quantity, trigger price, and trigger time. The section states that observation has not placed an exit order or closed the position; the order-lifecycle event list remains separate.
+
+Added the exact backend response types to the frontend API client and corrected stale entry-pipeline comments. Updated `docs/architecture/execution-engine-design.md` §6.6 to show the new read-only UI connection. No backend, Position Monitor, execution, WebSocket, EX-5/EX-12, or new architectural decision change.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #178: `position-monitor-observer-wiring`
 
 ## Current delivery

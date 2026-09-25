@@ -229,7 +229,7 @@ export async function fetchFeatureSeries(
 // actually got built. Real, load-bearing differences: no `symbol` field
 // on the payload itself (it's the outer dict's key — see
 // OpportunityWireShape's own comment below); no `suggested_entry`
-// anywhere (Trade Planning Engine, which would compute one, isn't built);
+// anywhere (the running Trade Planning Engine computes the entry later);
 // `suggested_stop`/`suggested_target` are `structural_invalidation`/
 // `structural_target` — the price at which the strategy's own thesis is
 // falsified, not a refined trade-ready number (strategy-engine-design.md
@@ -299,6 +299,32 @@ export async function fetchOpportunities(symbol?: string): Promise<Opportunities
     throw new ApiError(await parseErrorDetail(res), res.status);
   }
   return (await res.json()) as OpportunitiesSnapshotWireShape;
+}
+
+// GET /intelligence/exit-intents (decision #178). These are in-memory
+// observations from Position Monitor, not orders, fills, or closures.
+export interface ExitIntentWireShape {
+  position_id: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  qty: number;
+  exit_reason: "stop" | "target" | "eod_flatten";
+  trigger_price: number;
+  trigger_ts: string;
+}
+
+export interface ExitIntentsWireShape {
+  monitor_status: "unavailable" | "running";
+  intent_status: "observed_only";
+  exit_intents: ExitIntentWireShape[];
+}
+
+export async function fetchExitIntents(): Promise<ExitIntentsWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/exit-intents`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExitIntentsWireShape;
 }
 
 // Matches GET /intelligence/strategy-outcomes's response shape (decision

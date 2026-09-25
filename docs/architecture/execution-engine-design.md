@@ -579,6 +579,10 @@ PriceUpdated / CandleClosed ──► Event Bus ───────┤
                                                 ▼
                               GET /intelligence/exit-intents
                                   observed_only diagnostic
+                                                │ read on panel expansion / Refresh
+                                                ▼
+                              ExecutionLifecyclePanel: Observed exit triggers
+                              (separate from order-lifecycle WebSocket events)
 ```
 
 ```
@@ -615,6 +619,10 @@ GET /intelligence/exit-intents?symbol=... ──► monitor.get_exit_intents(sym
        └─ sort by symbol, trigger_ts, position_id ──► observed_only list
           (running + empty is distinct from unavailable + empty)
 
+ExecutionLifecyclePanel expands / Refresh ──► typed GET /intelligence/exit-intents
+       └─ unavailable / running-empty / fetch error / observed rows
+          (no order or position-closure event is inferred)
+
 lifespan shutdown ──► clear app reference ──► stop bus/monitor ──► stop Portfolio State
 ```
 
@@ -622,7 +630,10 @@ The diagnostic exposes position ID, symbol, side, quantity, reason, trigger pric
 and trigger timestamp. It is a point-in-time read of received events, not an order,
 fill, or closed position. Intents are lost at process shutdown and are not rebuilt
 from the ledger. No price/candle event means no observation, and this observer does
-not protect or flatten a position. Exit placement, durable re-arm, EX-5, and EX-12
+not protect or flatten a position. The frontend reads this snapshot when the
+Execution panel expands and on manual refresh, in a section separate from its
+existing order-lifecycle event list; it does not poll or subscribe to another
+WebSocket channel. Exit placement, durable re-arm, EX-5, and EX-12
 remain open; the output bullet below describes the broader design target, not this
 observer's current behavior.
 
