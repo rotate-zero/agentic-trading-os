@@ -1,3 +1,19 @@
+# TESTING — decision #178: `position-monitor-observer-wiring`
+
+Initial and pre-numbering GitHub `origin/main` checks both resolved to `5b43d55038c0b5af3aefd1477e66dbc5267510e0`, matching local `HEAD`. The initial working tree was clean. `docs/decisions/INDEX.md` and the canonical log ended at #177; the latest archive remained `134-160.md`. Decision #178 was appended in numerical order after that recheck.
+
+Used the existing local PostgreSQL 18 test cluster on port 55437 and created a separate `position_monitor_observer_test` database. Alembic `upgrade head` applied migrations through `0014`. No production database or broker account was touched.
+
+- Focused: `pytest -q tests/test_exit_intents_route.py tests/test_main_execution_pipeline.py tests/test_position_monitor_engine.py tests/test_position_monitor_portfolio_reader.py --tb=short --disable-warnings` — **21 passed**. The new real-FastAPI-lifespan test opens a simulated position through `OpportunityCreated`, fills it through `SimulatedVenue`, sends a stop-crossing `PriceUpdated`, checks one observed-only intent and its fields, sends a second crossing, and checks there is still one intent, one entry order/fill, and an open position. It also checks unavailable startup and shutdown cleanup. A separate route test checks multi-intent sorting and symbol-filter delegation.
+- Adjacent regressions: `pytest -q tests/test_entry_lifecycle_wiring.py tests/test_portfolio_state.py tests/test_intelligence_routes.py tests/test_world_view_portfolio.py tests/test_world_view.py --tb=short --disable-warnings` — **37 passed**.
+- `git diff --check` — passed after code, test, decision, and architecture edits.
+
+The first focused run found only a test expectation mismatch: FastAPI emits a UTC `Z` suffix while Python's `datetime.isoformat()` returns `+00:00`. The expected timestamp was corrected; the repeated focused run passed without changing response behavior.
+
+Package: `position-monitor-observer-wiring.zip` contains the 12 changed files with repository-relative paths, including the new route test and the decision/doc updates.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #177: `world-view-portfolio-read`
 
 At task start and at the final pre-numbering recheck, local `main` and freshly fetched GitHub `origin/main` were both `05d0cbc07c4903e0dda0232a84536ce6248a6e5f`; the initial working tree was clean. `docs/decisions/INDEX.md` and the canonical log both ended at #176, with archive filenames ending at `134-160.md`. The new cross-component lifecycle read decision was assigned #177 only after that recheck, appended at the true end of the log, and indexed to `confirmed-decisions.md`.

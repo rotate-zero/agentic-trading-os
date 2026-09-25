@@ -192,12 +192,16 @@ async def lifespan(app: FastAPI):
     from app.portfolio_state.engine import PortfolioState
     from app.portfolio_state.postgres import PostgresPositionLedger
     from app.portfolio_state.reconciliation import reconcile_with_venue
+    from app.position_monitor.engine import PositionMonitor
+    from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
 
     authorizer_stub = None
     execution_engine = None
     portfolio_state = None
+    position_monitor = None
     execution_venue = None
     app.state.world_view_portfolio_reader = None
+    app.state.position_monitor = None
     try:
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
@@ -252,6 +256,13 @@ async def lifespan(app: FastAPI):
             execution_engine = get_execution_engine(bus, order_ledger, order_ledger, fill_ledger)
             execution_engine.start()
 
+            # Observe received market events against the same restored
+            # Portfolio State instance. The monitor only retains in-memory
+            # ExitIntents; it cannot place an exit order or close a position.
+            position_monitor = PositionMonitor(bus, PortfolioStatePositionReader(portfolio_state))
+            position_monitor.start()
+            app.state.position_monitor = position_monitor
+
             # Publish this read dependency only after reconciliation, restore,
             # and the entry pipeline have all succeeded. World View never
             # owns or starts a second Portfolio State instance.
@@ -278,6 +289,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         app.state.world_view_portfolio_reader = None
+        app.state.position_monitor = None
         # try/finally added deliberately (confirmed decision #47) — found
         # via a real, reproducible bug, not by inspection. Without it, an
         # exception raised anywhere inside the `async with
@@ -348,6 +360,8 @@ async def lifespan(app: FastAPI):
             await authorizer_stub.stop()
         if execution_engine is not None:
             await execution_engine.stop()
+        if position_monitor is not None:
+            await position_monitor.stop()
         if portfolio_state is not None:
             await portfolio_state.stop()
         if execution_venue is not None:

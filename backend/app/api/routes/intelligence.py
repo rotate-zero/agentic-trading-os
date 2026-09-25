@@ -822,3 +822,26 @@ async def get_world_view(request: Request, symbol: str | None = Query(None)):
     from app.world_view import WorldView
 
     return await WorldView(getattr(request.app.state, "world_view_portfolio_reader", None)).snapshot(symbol)
+
+
+@router.get("/exit-intents")
+async def get_exit_intents_view(request: Request, symbol: str | None = Query(None)) -> dict[str, Any]:
+    """Read only the running monitor's observed, in-memory trigger intents."""
+    monitor = getattr(request.app.state, "position_monitor", None)
+    intents = () if monitor is None else monitor.get_exit_intents(symbol=symbol)
+    return {
+        "monitor_status": "unavailable" if monitor is None else "running",
+        "intent_status": "observed_only",
+        "exit_intents": [
+            {
+                "position_id": intent.position_id,
+                "symbol": intent.symbol,
+                "side": intent.side,
+                "qty": intent.qty,
+                "exit_reason": intent.exit_reason,
+                "trigger_price": intent.trigger_price,
+                "trigger_ts": intent.trigger_ts,
+            }
+            for intent in sorted(intents, key=lambda item: (item.symbol, item.trigger_ts, str(item.position_id)))
+        ],
+    }

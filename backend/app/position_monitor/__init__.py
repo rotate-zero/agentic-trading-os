@@ -30,6 +30,6 @@ worker shape every engine in this codebase uses (decision #84's
 pattern). Subscribes to `PriceUpdated`/`CandleClosed` (both already
 published, normal lane, no new event/schema). No module-level singleton
 getter ships here (unlike governor's `get_authorizer_stub()` or
-execution_engine's `get_execution_engine()`); `main.py` wiring remains
-outside the adapter task.
+execution_engine's `get_execution_engine()`); `main.py` now owns one
+instance during a reconciled, restored execution-pipeline lifespan.
 """

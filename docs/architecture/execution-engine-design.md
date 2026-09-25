@@ -559,19 +559,26 @@ Only a successful newly applied closure commit can publish `PositionClosed`, on 
 
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 
-**As built (`position-monitor-portfolio-reader`).** `PortfolioStatePositionReader` implements
+**As built (`position-monitor-portfolio-reader`, then `position-monitor-observer-wiring`).** `PortfolioStatePositionReader` implements
 Position Monitor's existing `PositionReader` port using the synchronous, detached
 `PortfolioState.get_snapshot()` of one supplied Portfolio State instance. The
-adapter has no database or bus work and is not wired into `main.py`.
+adapter has no database or bus work. `main.py` starts one monitor against the running,
+restored Portfolio State instance only after clean venue reconciliation and successful
+entry-pipeline startup. A blocked or failed pipeline leaves the monitor unavailable.
 
 ```
 Postgres position ledger ──restore/fill commits──► Portfolio State
-                                               │ get_snapshot() (detached)
-                                               ▼
-                                PortfolioStatePositionReader
-                                               │ tuple[PositionView, ...]
-                                               ▼
-                                Position Monitor (not wired in main.py)
+                                                │ get_snapshot() (detached)
+                                                ▼
+                                 PortfolioStatePositionReader
+                                                │ tuple[PositionView, ...]
+PriceUpdated / CandleClosed ──► Event Bus ───────┤
+                                                ▼
+                                       Position Monitor
+                                                │ in-memory ExitIntent latch
+                                                ▼
+                              GET /intelligence/exit-intents
+                                  observed_only diagnostic
 ```
 
 ```
@@ -590,10 +597,39 @@ copy id, symbol, side, qty, opened_at; Decimal stop/target → float or None
 tuple[PositionView, ...] (empty when restored and flat)
 ```
 
+**Internal observer flow (as built):**
+
+```
+lifespan startup: reconcile venue + ledger
+       ├─ discrepancy/failure ──► app.state.position_monitor = None
+       └─ clean ──► await PortfolioState.start() (restore snapshot)
+                          └─ start entry pipeline
+                                └─ PositionMonitor(bus, PortfolioStatePositionReader(portfolio_state)).start()
+                                      └─ app.state.position_monitor = monitor
+
+received PriceUpdated/CandleClosed ──► held-symbol filter ──► monitor queue/worker
+       └─ fresh PositionView read ──► stop, target, EOD precedence
+              └─ first trigger per position ──► in-memory ExitIntent
+
+GET /intelligence/exit-intents?symbol=... ──► monitor.get_exit_intents(symbol)
+       └─ sort by symbol, trigger_ts, position_id ──► observed_only list
+          (running + empty is distinct from unavailable + empty)
+
+lifespan shutdown ──► clear app reference ──► stop bus/monitor ──► stop Portfolio State
+```
+
+The diagnostic exposes position ID, symbol, side, quantity, reason, trigger price,
+and trigger timestamp. It is a point-in-time read of received events, not an order,
+fill, or closed position. Intents are lost at process shutdown and are not rebuilt
+from the ledger. No price/candle event means no observation, and this observer does
+not protect or flatten a position. Exit placement, durable re-arm, EX-5, and EX-12
+remain open; the output bullet below describes the broader design target, not this
+observer's current behavior.
+
 **What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
-- **Inputs:** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).
-- **Output:** one reduce-only exit intent per position (idempotent: the position moves to `closing` first), carrying `exit_reason ∈ {stop, target, eod_flatten}` and its own client-order ID `"<trade_id>:exit:<n>"`; after a restart it is re-armed from the ledger (§6.9).
+- **Inputs (as built):** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).
+- **Output (design target, not yet built):** one reduce-only exit intent per position (idempotent: the position moves to `closing` first), carrying `exit_reason ∈ {stop, target, eod_flatten}` and its own client-order ID `"<trade_id>:exit:<n>"`; after a restart it is re-armed from the ledger (§6.9). The current `ExitIntent` is in-process only, has no client-order ID, and does not change the persisted position status.
 - **Stop/target enforcement is in-process** — acceptable for a simulated venue with no broker, **not** for a real one (a crash would leave a position without a stop): broker-side protective orders are a hard prerequisite before any real venue (§8, EX-11).
 
 ### 6.7 `OutcomeRecorder` and D17's live half (`trading_intelligence/`)
@@ -831,7 +867,7 @@ These are recorded so they are not rediscovered; none is recommended for now.
 - **A real Governor rule engine, Decision Engine (D1), and Opportunity Engine (D4)** — the stub is designed so these replace it without changing Execution.
 - **Position Monitor proper** — thesis-validity checks, stop management, partials, reversal, manual-position handling (`future-ideas.md` #14).
 - **Frontend** — Positions / Trade Management / order-status widgets, and any consumer of `orders.status`.
-- **World View `portfolio` slot** — now reads the running restored Portfolio State through `main.py`'s lifecycle dependency; see `trading-intelligence-architecture.md` §15. This read path does not wire Position Monitor or exits.
+- **World View `portfolio` slot** — reads the running restored Portfolio State through `main.py`'s separate lifecycle dependency; see `trading-intelligence-architecture.md` §15. Position Monitor is now wired separately as an observed-only diagnostic; neither path places an exit.
 - **Retiring `is_backtest`** — kept only for compatibility; its removal is a later decision.
 
 ---

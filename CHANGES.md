@@ -1,3 +1,15 @@
+# CHANGES — decision #178: `position-monitor-observer-wiring`
+
+## Current delivery
+
+`main.py` now starts the existing Position Monitor with the existing `PortfolioStatePositionReader` after clean execution reconciliation, restored Portfolio State, and successful entry-pipeline startup. It stops the monitor during lifespan shutdown and clears the app-owned reference. A blocked pipeline leaves it unavailable.
+
+Added read-only `GET /intelligence/exit-intents`. Its `monitor_status` distinguishes `unavailable` from `running`, `intent_status` labels every response `observed_only`, and `exit_intents` lists existing intent fields (position ID, symbol, side, quantity, reason, trigger price, timestamp). It delegates the optional symbol filter to `get_exit_intents()` and sorts results deterministically. A real-lifespan simulated-entry test confirms one stop intent, continued one-intent latching after another crossing, and no exit order, fill, or position closure.
+
+Updated `docs/architecture/execution-engine-design.md` §6.6 with cross-component and internal-flow diagrams, `docs/architecture/trading-intelligence-architecture.md` §13 with the as-built boundary, and the Position Monitor package/port descriptions. Appended and indexed decision #178 after the final GitHub main/log recheck. This observer only reacts to received price/candle events and keeps intents in memory; it does not protect or flatten a position. EX-5/EX-12 remain open.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #177: `world-view-portfolio-read`
 
 ## Current delivery

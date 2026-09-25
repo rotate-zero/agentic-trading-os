@@ -436,6 +436,21 @@ class GovernorDecision(BaseModel):
 
 ## 13. Position Monitor
 
+**As built (`position-monitor-observer-wiring`).** The current lite monitor reads
+open positions from the same restored Portfolio State instance used by the entry
+pipeline, via `PortfolioStatePositionReader`. `main.py` starts it only after clean
+reconciliation, restoration, and entry-pipeline startup, and stops it during
+shutdown. It receives `PriceUpdated`/`CandleClosed` events and latches one
+in-memory stop, target, or end-of-day `ExitIntent` per position. The read-only
+`GET /intelligence/exit-intents` route exposes these as `observed_only`, with a
+symbol filter and deterministic ordering; it distinguishes unavailable startup
+from a running monitor with no intents. It does not publish an exit event, place
+an order, produce a fill, close a position, protect it between events, or restore
+intents after restart. The broader management behavior and cadence described
+below remain design direction, not the behavior of this lite observer. See
+`execution-engine-design.md` §6.6 for its cross-component and internal-flow
+diagrams.
+
 Underweighted in early drafts of this system — deliberately elevated here. Not a passive "position is open" tracker. It continuously asks, against live Market State and Features:
 
 ```

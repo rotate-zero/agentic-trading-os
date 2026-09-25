@@ -221,3 +221,98 @@ def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries
         assert response.json()["portfolio"] is None
 
     assert fastapi_app.state.world_view_portfolio_reader is None
+
+
+def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch):
+    from app.position_monitor.engine import PositionMonitor
+
+    monkeypatch.setattr(MarketClock, "is_regular_session", lambda self, ts=None: True)
+    monkeypatch.setattr(
+        governor_engine_module, "capture_strategy_outcome_snapshots",
+        lambda symbol: StrategyOutcomeSnapshots(market_state={"trend_score": 1.0}, context={"news": []}),
+    )
+
+    with TestClient(fastapi_app) as client:
+        monitor = fastapi_app.state.position_monitor
+        assert isinstance(monitor, PositionMonitor)
+        assert fastapi_app.state.world_view_portfolio_reader.get_snapshot() is not None
+        assert client.get("/intelligence/exit-intents").json() == {
+            "monitor_status": "running", "intent_status": "observed_only", "exit_intents": [],
+        }
+
+        bus = get_event_bus()
+        published: list[EventEnvelope] = []
+        bus.subscribe_all(lambda env: published.append(env))
+        client.portal.call(bus.publish, _price_envelope())
+        client.portal.call(bus.publish, _opportunity_envelope())
+        client.portal.call(asyncio.sleep, 0.3)
+
+        with SessionLocal() as s:
+            trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
+            assert trade is not None and trade.decision == "approved"
+            order = s.scalar(select(Order).where(Order.trade_id == trade.trade_id))
+            assert order is not None and order.status == "submitted"
+
+        venue = broker_registry.get_execution_venue()
+        assert venue is not None
+        client.portal.call(venue.ingest_tick, SYMBOL, 100.0, NOW)
+        client.portal.call(asyncio.sleep, 0.3)
+
+        with SessionLocal() as s:
+            position = s.scalar(select(Position).where(Position.trade_id == trade.trade_id))
+            assert position is not None and position.status == "open"
+            assert position.stop == 90
+            assert len(s.scalars(select(Fill).where(Fill.client_order_id == order.client_order_id)).all()) == 1
+
+        def send_stop(price: float) -> None:
+            envelope = EventEnvelope(
+                event_type=EventType.PRICE_UPDATED, symbol=SYMBOL,
+                payload=PriceUpdated(price=price, size=100, exchange_ts=NOW).model_dump(mode="json"),
+            )
+            client.portal.call(bus.publish, envelope)
+            client.portal.call(asyncio.sleep, 0.1)
+
+        send_stop(89.0)
+        response = client.get("/intelligence/exit-intents")
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {
+            "monitor_status": "running", "intent_status": "observed_only",
+            "exit_intents": [{
+                "position_id": str(position.position_id), "symbol": SYMBOL,
+                "side": "BUY", "qty": position.qty, "exit_reason": "stop",
+                "trigger_price": 90.0, "trigger_ts": NOW.isoformat().replace("+00:00", "Z"),
+            }],
+        }
+        assert client.get("/intelligence/exit-intents?symbol=OTHER").json() == {
+            "monitor_status": "running", "intent_status": "observed_only", "exit_intents": [],
+        }
+        assert client.get(f"/intelligence/exit-intents?symbol={SYMBOL}").json() == body
+
+        send_stop(85.0)
+        assert client.get("/intelligence/exit-intents").json() == body
+        assert EventType.POSITION_CLOSED not in [event.event_type for event in published]
+
+        with SessionLocal() as s:
+            assert len(s.scalars(select(Order).where(Order.trade_id == trade.trade_id)).all()) == 1
+            assert len(s.scalars(select(Fill).where(Fill.client_order_id == order.client_order_id)).all()) == 1
+            position_after = s.scalar(select(Position).where(Position.trade_id == trade.trade_id))
+            assert position_after.status == "open" and position_after.qty == position.qty
+
+    assert fastapi_app.state.position_monitor is None
+    assert monitor._worker_task is None
+
+
+def test_position_monitor_unavailable_when_reconciliation_blocks_pipeline(monkeypatch):
+    from app.portfolio_state.reconciliation import ReconciliationReport
+
+    async def discrepant_reconciliation(*args):
+        return ReconciliationReport(discrepancies=["test mismatch"])
+
+    monkeypatch.setattr("app.portfolio_state.reconciliation.reconcile_with_venue", discrepant_reconciliation)
+    with TestClient(fastapi_app) as client:
+        assert fastapi_app.state.position_monitor is None
+        assert client.get("/intelligence/exit-intents").json() == {
+            "monitor_status": "unavailable", "intent_status": "observed_only", "exit_intents": [],
+        }
+    assert fastapi_app.state.position_monitor is None

@@ -26,8 +26,8 @@ dependency):
     mirroring its *classes*.
 
 `portfolio_state_reader.py` supplies the concrete read-only adapter over
-the real Portfolio State snapshot. Wiring it into `main.py` remains a
-separate integration task.
+the real Portfolio State snapshot. `main.py` now wires it to the monitor
+after successful pipeline reconciliation and Portfolio State restoration.
 
 Type choice, stated plainly: `stop`/`target` are typed `float | None`
 here, not `Decimal | None` as `accounting.PositionState` stores them.
