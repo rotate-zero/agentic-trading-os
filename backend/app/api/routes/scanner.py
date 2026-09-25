@@ -10,9 +10,22 @@ from the SAME table by default now (DbUniverseProvider), so adding or
 removing a symbol here changes what the next scan actually scores.
 `?symbols=` on GET /scanner/state still overrides it ad hoc without
 touching the persisted universe, same as before.
+
+Every app/scanner/universe.py call below is synchronous SQLAlchemy (the
+DB engine is sync by design, per db/session.py) and is wrapped in
+asyncio.to_thread at this route boundary — same convention
+candle_store.py/market.py's GET /market/candles already establish for
+this codebase's async routes. Each wrapped function already opens and
+closes its own Session internally (session_factory in, closed in a
+`finally`), so nothing about that shape changes here — only where it
+runs. run_scan()/FeatureEngine.get_snapshot() are NOT wrapped: the
+latter is documented as a pure in-memory dict read with no I/O
+(feature_engine/engine.py's own get_snapshot docstring), so there is
+nothing blocking to move.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -47,7 +60,8 @@ async def get_scanner_state(
     if symbols:
         universe = [s.strip().upper() for s in symbols.split(",")]
     else:
-        universe = DbUniverseProvider(SessionLocal).get_core_universe()
+        provider = DbUniverseProvider(SessionLocal)
+        universe = await asyncio.to_thread(provider.get_core_universe)
         if not universe:
             # Empty persisted universe (migration not yet run, or every
             # symbol removed) — fall back rather than silently return
@@ -76,13 +90,14 @@ async def get_scanner_state(
 
 @router.get("/universe")
 async def get_scanner_universe() -> dict[str, Any]:
-    return {"symbols": list_universe_symbols(SessionLocal)}
+    symbols = await asyncio.to_thread(list_universe_symbols, SessionLocal)
+    return {"symbols": symbols}
 
 
 @router.post("/universe")
 async def add_scanner_universe_symbol(payload: AddSymbolRequest) -> dict[str, Any]:
     try:
-        added = add_symbol_to_universe(SessionLocal, payload.symbol)
+        added = await asyncio.to_thread(add_symbol_to_universe, SessionLocal, payload.symbol)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"symbol": added, "added": True}
@@ -90,5 +105,5 @@ async def add_scanner_universe_symbol(payload: AddSymbolRequest) -> dict[str, An
 
 @router.delete("/universe/{symbol}")
 async def remove_scanner_universe_symbol(symbol: str) -> dict[str, Any]:
-    removed = remove_symbol_from_universe(SessionLocal, symbol)
+    removed = await asyncio.to_thread(remove_symbol_from_universe, SessionLocal, symbol)
     return {"symbol": symbol.strip().upper(), "removed": removed}

@@ -1,3 +1,34 @@
+# CHANGES — `scanner-route-db-offload`
+
+## Current delivery
+
+The Scanner's four synchronous database calls — `GET /scanner/state`'s
+default-universe read and `GET`/`POST`/`DELETE /scanner/universe` — now run
+via `asyncio.to_thread` instead of directly on the event loop, so a slow
+database read or write no longer holds up every other request this process is
+serving for its duration. Each wrapped `app/scanner/universe.py` function
+already opened and closed its own `Session`; only where it runs changed.
+`run_scan()` and `FeatureEngine.get_snapshot()` stay on the event loop —
+inspection confirmed the latter's own docstring is accurate: a pure in-memory
+dict read with no I/O, nothing blocking to move.
+
+Validation, the `TEST_UNIVERSE` fallback, response shapes, and the POST
+route's `ValueError`→400 mapping are all unchanged. New
+`backend/tests/test_scanner_route_concurrency.py` proves a blocked universe
+call no longer blocks `GET /health`, using a `threading.Event`-controlled fake
+rather than a sleep for deterministic timing; the test was verified to
+genuinely catch the regression by temporarily reverting the fix and watching
+it fail (time out) first. Updated `docs/architecture/scanner-design.md` §13
+with before/after data-flow and internal-flow diagrams. Full backend suite:
+1109 → 1111 passed (exactly +2, the new tests), zero regressions. No new
+architectural decision — universe semantics, validation, scoring, and the API
+contract are all unchanged; this is an operational fix at the route boundary.
+Execution, `main.py`, frontend API files, and the continuous
+`MarketActivityScanner`/promotion/cadence path remain untouched, exactly as
+scoped.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #180: `execution-startup-status`
 
 ## Current delivery

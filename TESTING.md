@@ -1,3 +1,68 @@
+# TESTING — `scanner-route-db-offload`
+
+GitHub `main` was `fc1b674427b4a0062ebb1b55f11a4369099ea22b` (`execution-startup-fail-closed`)
+when this task was assigned and first pulled. Re-pulled after being told "git
+is updated": `c1e347cab8e03ac73513142fd67eee9c648ea157` (`position-monitor-lite`)
+— `diff -rq` against the prior pull confirmed zero overlap with Scanner scope
+(only `backend/app/main.py`, `backend/app/api/routes/health.py`,
+`backend/tests/test_execution_startup_status_route.py`,
+`docs/architecture/execution-engine-design.md`, and the decision log/
+`CHANGES.md`/`TESTING.md` changed — none touched by this delivery). Re-checked
+again immediately before packaging: GitHub `main` still `c1e347c...`,
+unchanged. The canonical index and log both end at #180; per standing
+instruction, a pure event-loop offload with no behavior change needs no new
+decision number.
+
+No PostgreSQL was preinstalled in this environment — installed PostgreSQL
+16.15 locally, started it, created the `trading`/`trading_workspace` role and
+database per this project's own documented convention, and ran `alembic
+upgrade head` (through `0014`). No pre-existing development database, broker
+account, or external service was touched.
+
+- Full backend suite baseline, before any code change: `pytest -q` —
+  **1109 passed, 0 failed**.
+- Scanner-focused baseline: `pytest -q tests/test_scanner.py
+  tests/test_scanner_runner.py tests/test_scanner_universe.py` —
+  **17 passed**.
+- After the `asyncio.to_thread` change: same three files, unchanged —
+  **17 passed**. Confirms response shapes, scoring, and validation are
+  untouched, as expected from a boundary-only change.
+- New focused file: `pytest -q tests/test_scanner_route_concurrency.py` —
+  **2 passed**. One test proves `GET /health` still responds while a
+  `GET /scanner/universe` request is deliberately blocked (a
+  `threading.Event`-controlled fake `list_universe_symbols`) in its worker
+  thread; the other proves two concurrently blocked `GET /scanner/universe`
+  requests both complete rather than one starving the other. Both use
+  explicit `threading.Event`s to synchronize — no sleeps.
+- Verified the concurrency test is a genuine regression guard, not a false
+  positive: temporarily reverted `GET /scanner/universe` to call
+  `list_universe_symbols` directly (no `asyncio.to_thread`) and re-ran the
+  same file — **both tests failed** (timed out waiting for the blocked call
+  to release, since it was now running on the same event loop the test
+  itself needed to send its second request). Re-applied the fix and
+  confirmed **2 passed** again before proceeding.
+- All four Scanner test files together: `pytest -q tests/test_scanner.py
+  tests/test_scanner_runner.py tests/test_scanner_universe.py
+  tests/test_scanner_route_concurrency.py` — **19 passed**.
+- Full backend suite with the delivery applied: `pytest -q` —
+  **1111 passed, 0 failed** (exactly +2 versus the 1109 baseline — the two
+  new concurrency tests; zero regressions elsewhere, no flaky-intermittent
+  failure observed on this run).
+- Frontend: not touched by this delivery (backend-only, exclusive scope); no
+  frontend check run.
+- `git diff --check` — passed.
+
+Package: `scanner-route-db-offload.zip` contains only the changed
+repository-relative files — `backend/app/api/routes/scanner.py` (edited),
+`backend/tests/test_scanner_route_concurrency.py` (new),
+`docs/architecture/scanner-design.md` (edited, new §13), `CHANGES.md` and
+`TESTING.md` (both edited, this delivery's entry prepended). Untouched,
+exactly as scoped: `app/scanner/universe.py`, `app/scanner/runner.py`,
+`app/scanner/scorer.py`, `main.py`, every execution and frontend file, and
+the continuous `MarketActivityScanner`/promotion/cadence path.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #180: `execution-startup-status`
 
 Initial local `main` and GitHub `main` both `fc1b674427b4a0062ebb1b55f11a4369099ea22b`

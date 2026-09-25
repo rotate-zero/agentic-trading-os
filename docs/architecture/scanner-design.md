@@ -230,3 +230,82 @@ Verification before this was sent: `tsc -b` (only the known, pre-existing `GridP
 **Built — the Scanner panel collapses/resizes now**, matching `FeatureEnginePanel`'s exact pattern: `scannerCollapsed`/`scannerWidthPx` added to `MainWindowState` (`types/workspace.ts`) and `WorkspaceContext.tsx`, same drag-resize handle, same persistence (and the same pre-existing `normalizeMainWindow` gap `featureEngineCollapsed` already has — old saved sessions predating this field get `undefined` rather than a backfilled default; not something introduced by this change, just inherited from following the identical existing pattern).
 
 **Verification:** this round was checked against **real infrastructure**, not mocks — PostgreSQL 16 installed fresh, all four migrations (0001-0004) run against it, every universe CRUD function exercised directly against real rows, then the actual FastAPI app booted and every route hit over real HTTP (`GET /scanner/universe`, `POST` both a valid and a format-invalid symbol, `GET /scanner/state` with and without overrides, `DELETE`). 14 backend tests passing (6 scorer + 3 runner + 5 new universe tests, the last of these run against the same real Postgres instance). One real bug was caught and fixed during this process: the first draft of the universe test used a `test_feature_engine.py`-style double-underscore test ticker, which correctly failed the new format validation it was supposed to be testing around — fixed by using a format-valid placeholder ticker instead, not by weakening the validation. `tsc -b` and `vite build` both clean (only the standing `GridPresetPicker` errors, decision #35).
+
+---
+
+## 13. Fifth update — universe DB calls moved off the event loop (`scanner-route-db-offload`)
+
+**Problem.** `GET /scanner/state`'s default-universe path and `GET`/`POST`/`DELETE /scanner/universe` called `app/scanner/universe.py`'s synchronous SQLAlchemy functions directly from their `async` route handlers. Each of those functions already opens and closes its own `Session` (§3/§12 above), but running that call directly ON the event loop meant a slow read/write — a lock wait, a slow query, a stalled connection — held up every other request this process was serving for its duration, not just the Scanner one.
+
+**Fix — `asyncio.to_thread` at the route boundary, nothing changed below it.** Every call site in `app/api/routes/scanner.py` now `await`s `asyncio.to_thread(...)` around the same function call that was there before — same convention `app/services/candle_store.py`/`app/api/routes/market.py` already established elsewhere in this codebase (see that module's own docstring). Nothing inside `app/scanner/universe.py` changed: each function still creates its own `Session`, uses it, and closes it in a `finally`, now just running inside a worker thread instead of on the event loop. Validation, the `TEST_UNIVERSE` fallback, response shapes, and the POST route's `ValueError`→400 mapping are byte-identical to before.
+
+**Deliberately NOT touched:** `run_scan()` and `FeatureEngine.get_snapshot()` (§5, `runner.py`). `get_snapshot()`'s own docstring already states it is a "pure in-memory dict read — no I/O, safe to call directly from an async route handler without `asyncio.to_thread`"; inspection confirmed this is accurate (a plain dict walk over `self._latest`, no DB, no network), so wrapping it would add thread-hop overhead for zero blocking-risk benefit. `scorer.py`'s scoring math is likewise pure computation.
+
+**Diagram 1 — data flow, this process, before vs. after:**
+
+```
+BEFORE
+  Frontend (ScannerPanel / useScannerUniverse)
+        │  HTTP
+        ▼
+  GET/POST/DELETE /scanner/universe , GET /scanner/state    [async route, event loop]
+        │
+        ▼
+  app/scanner/universe.py   (sync SQLAlchemy, runs ON the event loop)
+        │
+        ▼
+  PostgreSQL (symbols / scanner_universe_symbols)
+
+  A slow call here blocks every other request this process is
+  serving for its duration — Feature Engine writes, other routes,
+  everything sharing this one event loop.
+
+AFTER
+  Frontend (ScannerPanel / useScannerUniverse)
+        │  HTTP
+        ▼
+  GET/POST/DELETE /scanner/universe , GET /scanner/state    [async route, event loop]
+        │
+        │  await asyncio.to_thread(fn, ...)
+        ▼
+  worker thread (default executor)
+        │                                     event loop is free here —
+        │  app/scanner/universe.py            other requests (e.g. GET
+        │  (same sync SQLAlchemy code,        /health, GET /intelligence/
+        │   own Session, own commit/close)    state) still get served
+        ▼
+  PostgreSQL (symbols / scanner_universe_symbols)
+        │
+        ▼
+  result returned to the awaiting route handler, back on the event loop
+```
+
+**Diagram 2 — internal flow within `app/api/routes/scanner.py` (what moved, what didn't):**
+
+```
+GET /scanner/state
+  ?symbols= given?  ──yes──►  parse comma list in-process (no DB, unchanged)
+        │ no
+        ▼
+  await asyncio.to_thread(DbUniverseProvider(SessionLocal).get_core_universe)   ← NEW: off-loop
+        │  empty? → fall back to TEST_UNIVERSE (in-process, unchanged)
+        ▼
+  run_scan(universe, ...)                           ← UNCHANGED: stays on the event loop
+        │
+        ├─► get_feature_engine().get_snapshot()      pure in-memory read, no I/O (own docstring)
+        └─► score_symbol() per symbol                 pure computation, no I/O
+        ▼
+  JSON response (same shape as before)
+
+GET /scanner/universe     → await asyncio.to_thread(list_universe_symbols, SessionLocal)         ← NEW
+POST /scanner/universe    → await asyncio.to_thread(add_symbol_to_universe, SessionLocal, sym)   ← NEW
+                              (ValueError still caught → HTTPException 400, unchanged)
+DELETE /scanner/universe/{symbol}
+                           → await asyncio.to_thread(remove_symbol_from_universe, SessionLocal, symbol)  ← NEW
+```
+
+**Testing.** New `backend/tests/test_scanner_route_concurrency.py` — two focused tests, real ASGI transport, no sleeps: a `threading.Event`-controlled fake `list_universe_symbols` blocks until released; one proves `GET /health` still answers while a blocked `GET /scanner/universe` request is stuck in its worker thread, the other proves two concurrent blocked Scanner requests both complete rather than one starving the other. Verified the test is a genuine regression guard, not a false positive, by temporarily reverting the `asyncio.to_thread` wrapping and confirming it then fails (times out) before re-applying the fix. Full backend suite: 1109 passed/0 failed on the untouched baseline (fresh `main` pull, real Postgres 16), 1111 passed/0 failed with this delivery (exactly +2, the new concurrency tests) — zero regressions. The existing scoring/response-shape assertions in `test_scanner.py`/`test_scanner_runner.py`/`test_scanner_universe.py` (17/17) still pass unchanged.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main`: edited — `backend/app/api/routes/scanner.py` (`asyncio.to_thread` wrapping only, no behavior change). New — `backend/tests/test_scanner_route_concurrency.py`. Untouched, exactly as scoped: `app/scanner/universe.py`, `app/scanner/runner.py`, `app/scanner/scorer.py`, `main.py`, every execution/frontend file, and the continuous `MarketActivityScanner`/`ScanCadenceSchedule`/promotion path (§4/§5 above — still not built).
+
+**No decision number assigned** for this delivery, per standing instruction: moving already-synchronous, already-correct DB work off the event loop is an operational fix at the route boundary, not a new architectural decision — nothing about universe semantics, validation, scoring, or the API contract changed.
