@@ -1,3 +1,61 @@
+# TESTING — decision #175: Position Monitor-lite built (`position-monitor-lite`)
+
+## Baseline, pulled fresh
+
+`curl -sL https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main | tar -xzf - --strip-components=1` (a tarball, not a clone — `git status` recorded as absent, per this task's own §1.1). `pip install -r requirements.txt --break-system-packages` (Python 3.12.3, pytest 8.4.2, pytest-asyncio 0.24.0).
+
+Full suite run on the untouched pull, before any edit, per `ways-of-working.md`'s "confirm pre-existing flakiness before attributing any failure to new work":
+
+```
+48 failed, 606 passed, 319 skipped, 15 warnings, 93 errors in 58.86s
+```
+
+Every failure/error inspected is the same root cause: `sqlalchemy.exc.OperationalError: (psycopg2.OperationalError) connection to server at "localhost" (127.0.0.1), port 5432 failed: Connection refused` — this sandbox has no live Postgres. Files affected: `test_daily_levels.py`, `test_feature_engine.py`, `test_market_routes.py`, `test_scanner_universe.py`, `test_strategy_outcomes_and_opportunity_conflicts_routes.py`, `test_vwap_ext.py`, `test_websocket_channels.py` (the 48 failures), plus `test_authorization_ledger_postgres.py`/`test_position_ledger_postgres.py` (all 93 errors — the `entry-lifecycle-wiring` sibling's own still-undocumented Postgres-backed ledger adapters and their tests, confirmed present on this pull by direct `ls`: `backend/app/{portfolio_state,execution_engine,governor}/postgres.py`, `backend/app/db/ledger_transaction.py`, migrations `0013_position_ledger_receipts.py`/`0014_authorization_reservations.py`). None of this relates to `position-monitor-lite`, which touches no database at all — confirmed true in practice, not just asserted: `position_monitor/` imports nothing from `app.db`, `sqlalchemy`, or `psycopg2`.
+
+## Command
+
+From `backend/`: `python3 -m pytest -q` (whole suite) and `python3 -m pytest -q tests/test_position_monitor_engine.py -v` (this task's own file, in isolation).
+
+## Result
+
+This task's own 10 tests, isolated: **10 passed in 1.82s.**
+
+Whole suite after adding `backend/app/position_monitor/**` and `backend/tests/test_position_monitor_engine.py`:
+
+```
+48 failed, 616 passed, 319 skipped, 15 warnings, 93 errors in 59.29s
+```
+
+Exactly **+10** over the untouched baseline (606 → 616) — the new tests, nothing else. Same 48 failed / 93 errored, same root cause, same files — zero regressions, zero incidental fixes, zero incidental breakage.
+
+## What's tested and how
+
+Real `pytest`/`pytest-asyncio` (`asyncio_mode = auto`), no live Postgres needed (this task's own §1.2, confirmed correct) — real `EventBus`, a fake `PositionReader` (dataclass wrapping a plain list, no concrete adapter exists to test against yet — same fork-1 precedent `test_execution_engine.py`/`test_governor_engine.py` both already set for their own narrow ports), and a real `MarketClock` (not mocked — `is_half_day()`/`trading_day()` run their genuine logic against a fixed, injected instant, never wall-clock):
+
+- Long-position stop touched by a single tick (`_on_market_event` → queue → `_process_event` → `_evaluate` → `ExitIntent(exit_reason="stop")`).
+- Short-position target touched by a single tick.
+- One candle whose high crosses target AND whose low crosses stop in the same bar — asserts `exit_reason == "stop"` (EX-8's stop-wins-tie, checked-first ordering).
+- EOD-flatten: a tick one minute before the real `regular_session_close_utc` instant produces nothing; a tick exactly at that instant produces `exit_reason="eod_flatten"` with `trigger_price` equal to the bar's own price (not a fabricated value) and `trigger_ts` equal to the triggering tick's own timestamp.
+- Idempotency: after the first `ExitIntent`, two further ticks — one that would independently re-trigger the stop, one that would independently re-trigger the target — both produce nothing; `get_exit_intents()` is byte-identical before and after.
+- An unheld symbol's tick (a position exists for `AAPL`; a tick arrives for `MSFT`) produces nothing.
+- `get_exit_intents(symbol=...)` filters correctly against two symbols with independently-triggered intents.
+- Two positions on the same symbol with different stops — only the one actually crossed produces an intent; the other stays untouched.
+- Two pure `_evaluate()`-level tests, no asyncio/EventBus at all: the stop case directly, and the "no stop/target configured" honest-absence case (`stop=None, target=None` — price alone can never produce an intent; only `eod_flatten` remains reachable).
+
+## Verification against an untouched clone
+
+A second, independent fresh tarball pull (`/home/claude/atos_clean`), `diff -rq` against the working tree: the only non-cache differences are `backend/app/position_monitor/` (new directory, 3 files) and `backend/tests/test_position_monitor_engine.py` (new file). Nothing else in the tree was touched — no existing file's content changed, confirmed by the same `diff -rq` convention every prior packaging in this project's history has used.
+
+## Decision-number reconciliation
+
+Immediately before packaging, re-pulled fresh a second time (`/home/claude/atos_verify`) and diffed it against a fresh `/home/claude/atos_clean` pull taken minutes apart — byte-identical, confirming nothing landed on `main` mid-session. `INDEX.md`'s last row: #174. `confirmed-decisions.md`'s last heading: `### 174.`. Archive file list: unchanged, ends `134-160.md`. No `PENDING` marker, no `### 175.` heading, anywhere in either canonical log. Assigned **#175**. See the decision entry itself for the citation-drift heads-up (`execution-engine-design.md` §6.8 already informally references "#174"/"#175" for the `entry-lifecycle-wiring` sibling's own, still-undocumented migrations) — a likely future collision, not treated as a reservation.
+
+## Not verified / not applicable to this task
+
+No live Postgres involved (this task's own module touches no database). No frontend change (`frontend/` untouched — confirmed by the `diff -rq` above). No end-to-end run against a live EventBus/`main.py` process — `main.py` wiring is explicitly out of this task's scope, so there is no running system yet for this module to be exercised inside of; every test here drives `PositionMonitor` directly against a real, standalone `EventBus`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #174: First frontend consumer of the order-lifecycle events wired (`execution-lifecycle-frontend`)
 
 ## Baseline and evidence — two collisions, both resolved

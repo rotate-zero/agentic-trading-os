@@ -962,3 +962,95 @@ invalid arithmetic / unresolved data ----------------------------------+
 **Found and fixed, not just flagged — again.** As of this delivery's own second pull, `TESTING.md`'s dropped #171-and-earlier history (found and restored once already, in the #173 packaging) was still missing from `main` — that fix was never merged, since this delivery had only been handed to Saqib as a zip, not applied. `portfolio-state-engine`'s own `TESTING.md` section correctly preserved #172's section above it (unlike #172's own section, which had dropped everything below it), so the gap has not grown, but it also hasn't shrunk. Restored again here, the same way: #171-and-earlier's history, byte-for-byte from this session's own original pre-#172 pull, preserved beneath #173's and #172's own sections, both left unchanged.
 
 **Heads-up, not acted on.** `confirmed-decisions.md` is now well past the ~100KB rollover trigger (flagged at #171, #172, and #173, deliberately deferred every time) — still not performed as part of this delivery; flagged a fourth time for Saqib.
+
+### 175. Position Monitor-lite built (`position-monitor-lite`) — the in-process exit-intent decision layer EX-11's recommendation calls for; decision #171's own marked extension point, named directly there
+
+**What was built.** One new package, `backend/app/position_monitor/` (`__init__.py`, `ports.py`, `engine.py`), plus one new test file, `backend/tests/test_position_monitor_engine.py` — nothing else. This is Position Monitor-lite's own increment, named directly by decision #171 ("that consumer is a clearly separate, later increment (Position Monitor-lite's own task)") and specified by §6.6 of the canonical execution design.
+
+**The EX-5/EX-11 scoping call, restated plainly, not buried.** EX-11 (exit enforcement) carries a recommendation — (a) in-process monitoring — and §7.1's own closing line puts it on the "proceeds on its recommendation unless Saqib objects" list; this task proceeds on it. EX-5 (does a protective exit need a fresh Governor-class decision, or just a reduce-only guard?) is explicitly NOT on that list — §7.1 states plainly it "still needs Saqib" before a full build. This task does not wait for EX-5 and does not resolve it either: it stays inside the half of the problem EX-5 doesn't touch — deciding WHEN and WHY a held position should exit — and deliberately stops at a typed, in-process `ExitIntent`. No event is published, no order is placed, `schemas/events/execution.py` is untouched, `execution_engine`/`governor` are never called. Placing the exit order — minting `"<trade_id>:exit:<n>"` (§6.6's own output spec), choosing reduce-only-guard vs. a fresh Governor round-trip — is exactly where EX-5's answer matters, so it is left for a later task, once EX-5 is actually confirmed by Saqib.
+
+**Precedence and idempotency, exactly matching `fill_simulator`'s convention (EX-8).** Stop checked before target — a single bar (tick or candle) crossing both resolves to `"stop"` without a separate tie branch, same as `fill_simulator.simulate_exit()`'s own ordering. EOD-flatten is keyed to the position's own entry day (`clock.trading_day(position.opened_at)`, mirroring `entry_fill.entry_ts` there), via a local `_regular_session_close_utc()` that duplicates — deliberately, not by omission — `fill_simulator.regular_session_close_utc()`'s exact ET/half-day formula rather than importing it (EX-8 recommendation (a): "reuse conventions only… write a new incremental model"; extracting a shared helper is EX-8's un-taken option (b), which the design doc itself flags as expanding the build's footprint into `backtest_runner/` — not this task's call to make). Once a position has produced an `ExitIntent`, its `position_id` is latched in an in-memory dict; every subsequent tick/candle for that position is a no-op, checked directly with prices that would have independently re-triggered stop AND target after the first intent. This is an in-process-only latch — §6.9 step 5's ledger-backed "re-arm after restart" is explicitly not built here (read per this task's own reading list, informing this shape, not its scope); a restart today loses every position's latch along with everything else the in-memory worker held, the same honest gap the rest of this slice already lives with (Execution Engine's own restart recovery is also unbuilt — decision #171).
+
+**Own `PositionReader` Protocol, not governor's.** `governor.ports.PortfolioStateReader`/`OpenExposure` were read as a pattern reference only, not reused: that Protocol has no `target` field (the daily-loss gate never needed one) and deliberately mixes already-open positions with in-flight ENTRY orders (both count as "exposure" for governor's own purpose) — the wrong shape for a module that must only ever see genuinely filled, open positions. `position_monitor.ports.PositionReader.get_open_positions() -> tuple[PositionView, ...]` is this module's own narrow Protocol; `PositionView` carries exactly the seven fields `_evaluate()` reads (`position_id`, `symbol`, `side`, `qty`, `stop`, `target`, `opened_at` — no `avg_price`, no P&L), satisfiable by adapting `portfolio_state.snapshot.PortfolioSnapshot`/`accounting.PositionState` (read-only reference) without this module importing `portfolio_state` directly. `stop`/`target` are typed `float | None` here, not `Decimal | None` as `accounting.PositionState` stores them — a deliberate, stated choice (`ports.py`'s own docstring): this module only ever compares against tick/candle prices, which arrive as `float` on `PriceUpdated`/`CandleClosed`, matching `fill_simulator`'s own float-based convention; the `Decimal → float` conversion is the future adapter's own visible job, not hidden inside a comparison here. No concrete implementation of `PositionReader` ships in this delivery — same "ports, no adapter" precedent `governor/ports.py`/`execution_engine/ports.py` both already set (decision #171's fork 1).
+
+**Held-symbol filtering.** Mirrors decision #173's own Portfolio State worker precisely ("EventBus has no symbol-filtered subscriptions, so unheld price events are dropped before queueing and checked again at processing"): `_on_market_event()` (the EventBus subscriber, which must stay cheap — I7) reads `get_open_positions()` once to drop an event for a symbol nobody's holding before it's even enqueued; `_process_event()` (the worker) reads it again, fresh, before evaluating — so a position closed (or newly opened) between enqueue and processing is never acted on with stale membership.
+
+**Component flow, this task's own internal engine:**
+
+```text
+PriceUpdated / CandleClosed (ALL symbols, normal lane -- already published, no new event)
+              |
+              v
+   _on_market_event()  [EventBus subscriber -- must stay cheap, no awaiting -- I7]
+   reads get_open_positions() once -- envelope.symbol not held? -> drop, never enqueued
+              | held
+              v
+      position_monitor queue  -- asyncio.Queue, this module's own, decision #84's pattern
+              |
+              v
+      single worker: _process_event()
+              |  re-reads get_open_positions() fresh, filters to this symbol
+              v
+   for each open position on this symbol:
+       position_id already in self._exit_intents?  --yes-->  skip -- latched, no second intent ever
+              | no
+              v
+       _evaluate(position, bar, clock):
+           stop_touched(bar)?      --yes-->  ExitIntent(exit_reason="stop",   trigger_price=position.stop)
+              | no
+           target_touched(bar)?    --yes-->  ExitIntent(exit_reason="target", trigger_price=position.target)
+              | no
+           bar.ts >= regular_session_close_utc(clock.trading_day(position.opened_at))?
+              | yes                --yes-->  ExitIntent(exit_reason="eod_flatten", trigger_price=bar.close)
+              | no
+              v
+           None -- nothing this tick; position stays eligible for re-evaluation on the next one
+              |
+              v (if an intent was produced)
+       self._exit_intents[position.position_id] = intent   [the idempotency latch itself]
+              |
+              v
+   get_exit_intents(symbol=None) -> tuple[ExitIntent, ...]   [sync, point-in-time read]
+
+   === STOPS HERE (this task's own boundary) ===  no event published, no order placed,
+   no execution_engine/governor call, no schemas/events/execution.py touched.
+```
+
+**Where this sits in §6.1's own bigger data-flow diagram** (trimmed to the fan-out after `OrderFilled`; `***` marks this task's own new work — everything else on this fan-out is exactly as `main` already has it, untouched):
+
+```text
+                                                                   OrderFilled (critical lane)
+                              +-----------------------------------------+----------------------------------------+
+                              v                                         v                                        v
+                    Portfolio State [#172/#173]              *** Position Monitor-lite ***            OutcomeRecorder [not built]
+                    applies fills, COMMIT position            (this task -- #175)                      (unaffected, either way)
+                    exposes get_snapshot() -- unmodified       reads open positions via its OWN
+                              |                                ports.PositionReader -- no import
+                              |                                of portfolio_state/*.py at all
+                              |                                          |
+                              |                                subscribes INDEPENDENTLY to
+                              |                                PriceUpdated/CandleClosed (normal
+                              |                                lane, §6.6's own Inputs list) --
+                              |                                NOT the OrderFilled edge drawn
+                              |                                above, which is a DEPENDENCY
+                              |                                (a position must exist to monitor),
+                              |                                not an EventBus subscription
+                              |                                          |
+                              |                                stop/target/EOD precedence + the
+                              |                                idempotency latch -> ExitIntent
+                              |                                          |
+                              |                                          X  in-process only (see above)
+                              v
+                    PositionClosed (critical) -> OutcomeRecorder -> strategy_outcomes -> World View
+                    [none of this row touched by this task -- unchanged from #171-#174]
+```
+
+**Test coverage.** 10 new tests in `test_position_monitor_engine.py`: a long-position stop touched by a tick; a short-position target touched by a tick; a single candle touching both stop and target in one bar (stop wins — EX-8); EOD-flatten firing exactly at the real `regular_session_close_utc` instant and not one minute before; idempotency (two further ticks after the first intent, deliberately priced to independently re-trigger stop and target, produce no second intent); an unheld symbol's tick producing nothing; `get_exit_intents(symbol=...)` filtering; two positions on the same symbol with different stops evaluated independently (only the one actually crossed produces an intent); plus two pure `_evaluate()`-level tests (no asyncio/EventBus) covering the stop case directly and the "no stop/target configured" honest-absence case (a position with neither set can never produce a `"stop"`/`"target"` intent — only `eod_flatten` stays reachable for it).
+
+**Validation.** Fresh tarball pull, `git status` recorded as absent (a tarball, not a clone). `pip install -r requirements.txt --break-system-packages` (Python 3.12.3). Baseline established on the untouched pull first, per `ways-of-working.md`'s "confirm pre-existing flakiness before attributing any failure to new work": **48 failed, 606 passed, 319 skipped, 93 errors.** Every single failure/error is `psycopg2.OperationalError: connection to server at "localhost"... Connection refused` (`test_daily_levels.py`, `test_position_ledger_postgres.py`, `test_authorization_ledger_postgres.py`, and others needing a live Postgres this sandbox doesn't have — the `entry-lifecycle-wiring` sibling's own new Postgres-backed adapters/tests, confirmed by direct inspection, not assumed), zero relation to this task, which needs no live Postgres (confirmed correct in practice: nothing in `position_monitor/` touches the DB). After adding this delivery: **48 failed, 616 passed, 319 skipped, 93 errors** — exactly +10, the new tests, zero regressions. `diff -rq` against a second, independently freshly-pulled, untouched clone confirms the only non-cache differences are `backend/app/position_monitor/` (new directory) and `backend/tests/test_position_monitor_engine.py` (new file) — nothing else in the tree was touched.
+
+**Decision-number reconciliation, three-source, immediately before packaging.** `INDEX.md`'s last row: #174. `confirmed-decisions.md`'s tail: `### 174.`. Archive file list unchanged, ends at `134-160.md`. No `PENDING` marker or forward reference to #175 exists in either canonical log. Assigned **#175** on that basis. **Flagged, not silently followed:** `docs/architecture/execution-engine-design.md` §6.8's persistence-sketch table (read, not edited — outside this task's file boundary) already cites `"trade_reservations (#175)"` and `"position_fill_receipts (#174)"` for two tables that match the still-undocumented `entry-lifecycle-wiring` sibling's own migrations (`0013_position_ledger_receipts.py`, `0014_authorization_reservations.py`, `backend/app/{portfolio_state,execution_engine,governor}/postgres.py`, `backend/app/db/ledger_transaction.py` — all present on this pull, all still absent from any confirmed decision entry). Those inline citations are forward-guesses written into the design doc ahead of that sibling's own actual packaging, not entries in either canonical log — the same kind of citation drift decisions #161/#163 each found and corrected elsewhere in this repository — and this task's own number is assigned strictly from the two canonical sources (`INDEX.md`/`confirmed-decisions.md`), not from prose inside an architecture doc. This makes a **collision with `entry-lifecycle-wiring`'s own eventual packaging likely** (its author may also expect #174/#175) — the same "expect at least one collision" pattern this task's own brief anticipated. If that sibling lands first, this delivery renumbers to whatever is next, exactly as #173/#174 each already did in this session.
+
+**Not built, restated for visibility, not left to be rediscovered later.** Publishing any event; calling `execution_engine`/`governor` or placing any order; any `schemas/events/execution.py` change (no `exit_reason` field added there); any edit to `backend/app/{portfolio_state,execution_engine,governor}/*.py`, `db/**`, `alembic/**`, `main.py` (no wiring — no module-level singleton getter ships here either, since there is no concrete `PositionReader` yet to default-construct one against); manual-position handling and emergency actions (§6.6 excludes both explicitly); broker-side protective orders (EX-11's own option (b), a hard prerequisite for any real venue, not this one, per §8); §6.9 step 5's ledger-backed re-arm-after-restart (informed this task's in-memory-latch shape but is not itself built).
+
+**Boundary.** Created only `backend/app/position_monitor/**` (new) and `backend/tests/test_position_monitor_engine.py` (new). Nothing else in the tree touched — confirmed by `diff -rq` above. `docs/architecture/execution-engine-design.md` and every other architecture doc were read, not edited — this task's own file boundary permits only this decision entry, `INDEX.md`, `CHANGES.md`, and `TESTING.md`.

@@ -1,3 +1,26 @@
+# CHANGES — decision #175: Position Monitor-lite built (`position-monitor-lite`)
+
+## Current delivery
+
+New package `backend/app/position_monitor/` — the in-process exit-intent decision layer EX-11's recommendation calls for, and decision #171's own marked extension point ("Position Monitor-lite's own task"), named directly.
+
+- `ports.py`: this module's own narrow, frozen-dataclass `PositionReader` Protocol (`get_open_positions() -> tuple[PositionView, ...]`) and `PositionView` (`position_id`, `symbol`, `side`, `qty`, `stop`, `target`, `opened_at` — no `avg_price`, no P&L). Deliberately its own shape, not governor's `PortfolioStateReader`/`OpenExposure` (no `target` field there; mixes open positions with in-flight entries) — read as a pattern reference only. No concrete adapter ships here, same "ports, no adapter" precedent `governor/ports.py`/`execution_engine/ports.py` already set.
+- `engine.py`: `PositionMonitor` — same subscribe→own-queue→worker shape every engine in this codebase uses (decision #84's pattern). Subscribes to `PriceUpdated`/`CandleClosed` (held symbols only — filtered before enqueue, rechecked at processing, mirroring decision #173's own Portfolio State worker). Precedence exactly matches `fill_simulator`'s convention (EX-8): stop checked before target (same-bar tie → stop wins); EOD-flatten keyed to the position's own entry trading day via a local, deliberate duplicate of `fill_simulator.regular_session_close_utc()`'s ET/half-day formula (not an import — EX-8's un-taken option (b) would've expanded the footprint into `backtest_runner/`). One `ExitIntent` per position, ever — an in-memory idempotency latch, no ledger-backed re-arm-after-restart yet (§6.9 step 5, out of this task's scope).
+- **Deliberately stops at the `ExitIntent`.** No event published, no order placed, `schemas/events/execution.py`/`execution_engine`/`governor` all untouched. EX-5 (protective-exit authorization — still open, explicitly NOT on the "proceeds on recommendation" list, unlike EX-11) is left for a later task, once Saqib confirms it — this task stays inside the half of the problem EX-5 doesn't touch (deciding *when/why* to exit, not *how* to place the exit).
+- No `main.py` wiring, no module-level singleton getter (there's no concrete `PositionReader` yet to default-construct one against) — a later wiring task adds both together.
+
+**Verified:** 10 new tests, all passing in isolation (1.82s) and as part of the full suite (616/616 passing overall — was 606 on the untouched baseline; same 48 failed/93 errored pre-existing Postgres-connection tests either side, all from the `entry-lifecycle-wiring` sibling's own unwired adapters, zero relation to this task). `diff -rq` against a fresh, independently-pulled, untouched clone confirms only `backend/app/position_monitor/**` (new) and `backend/tests/test_position_monitor_engine.py` (new) changed — nothing else in the tree touched. Full detail in `TESTING.md`.
+
+## Boundary
+
+Created only: `backend/app/position_monitor/__init__.py`, `backend/app/position_monitor/ports.py`, `backend/app/position_monitor/engine.py`, `backend/tests/test_position_monitor_engine.py`. Everything else — `backend/app/{portfolio_state,execution_engine,governor}/*.py`, `backend/app/db/**`, `backend/alembic/**`, `backend/app/main.py`, `backend/app/schemas/events/*.py`, `backend/app/api/**`, `frontend/**`, every architecture doc, every existing decision entry — untouched, confirmed by `diff -rq`.
+
+**Heads-up, not acted on (flagged a fifth time).** `confirmed-decisions.md` remains well past the ~100KB rollover trigger (flagged at #171, #172, #173, #174) — archive rollover stays outside this task's own append-only decision-entry boundary, not performed here either.
+
+**Heads-up, new this round.** `docs/architecture/execution-engine-design.md` §6.8's persistence-sketch table already informally cites `"#174"`/`"#175"` for two tables belonging to the still-undocumented `entry-lifecycle-wiring` sibling's own migrations — read, not edited (outside this task's file boundary), and not treated as a real reservation: this delivery's own `#175` is assigned strictly from `INDEX.md`/`confirmed-decisions.md`'s own tails. A collision with that sibling's own eventual packaging (it may also expect #174/#175) is likely and would mean renumbering this delivery, the same way #172→#173→#174 each already renumbered earlier in this session.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #174: First frontend consumer of the order-lifecycle events wired (`execution-lifecycle-frontend`)
 
 ## Current delivery
