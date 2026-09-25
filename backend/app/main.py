@@ -28,6 +28,28 @@ from app.trading_intelligence.level_interaction_engine import get_level_interact
 logger = logging.getLogger(__name__)
 
 
+# Read-only startup status for GET /health/execution-startup
+# (execution-startup-status). Tracks the same three real outcomes the
+# execution-pipeline try/except below already produces (decision #179's
+# fail-closed contract) — "ready", "reconciliation_blocked", or
+# "startup_failed" — never a fourth "in progress" value, since routes are
+# only served after this lifespan's startup section has already finished
+# one way or another. "unavailable" is not built here: it's whatever a
+# route sees when app.state.execution_startup_status is still its
+# pre-lifespan default (None) or has been reset by the `finally` block
+# below (shutdown, or partway through rollback) — the same "no active
+# lifespan" posture app.state.world_view_portfolio_reader/position_monitor
+# already use. Deliberately narrow fields: reason_code is one of a fixed
+# set of safe, non-identifying codes (never str(exc)), and
+# discrepancy_count is only ever a plain count, never the discrepancy
+# list itself — no exception text, database credentials, or raw
+# reconciliation contents ever reach this dict.
+def _execution_startup_status(
+    status: str, *, reason_code: str | None = None, discrepancy_count: int | None = None
+) -> dict:
+    return {"status": status, "reason_code": reason_code, "discrepancy_count": discrepancy_count}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -202,6 +224,7 @@ async def lifespan(app: FastAPI):
     execution_venue = None
     app.state.world_view_portfolio_reader = None
     app.state.position_monitor = None
+    app.state.execution_startup_status = None
     try:
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
@@ -236,6 +259,11 @@ async def lifespan(app: FastAPI):
             )
             await execution_venue.disconnect()
             execution_venue = None
+            app.state.execution_startup_status = _execution_startup_status(
+                "reconciliation_blocked",
+                reason_code="reconciliation_discrepancy",
+                discrepancy_count=len(reconciliation_report.discrepancies),
+            )
         else:
             broker_registry.set_execution_venue(execution_venue)
 
@@ -270,6 +298,11 @@ async def lifespan(app: FastAPI):
             # owns or starts a second Portfolio State instance.
             app.state.world_view_portfolio_reader = portfolio_state
 
+            # Last line of the success path, deliberately — "ready" means the
+            # whole block above (venue connect, reconcile, restore, all three
+            # workers) already completed without raising.
+            app.state.execution_startup_status = _execution_startup_status("ready")
+
             logger.info(
                 "Execution pipeline started (mode=%s, venue=%s) — reconciliation: %d advanced, "
                 "%d expired, %d cancelled stale entries, %d resubmitted exits",
@@ -285,6 +318,15 @@ async def lifespan(app: FastAPI):
         # a DB outage or a reconciliation failure here must not crash the whole process, same
         # soft-fail posture as the optional Finnhub/Polygon auto-connects just above.
         logger.exception("Execution pipeline failed to start — rolling back entry pipeline")
+        # Set before rollback, not after: a route hit while rollback is still
+        # draining workers below must already see "startup_failed", not
+        # "unavailable" (only the `finally` block's later reset means that).
+        # reason_code is a fixed safe constant, never the caught exception's
+        # own str() — that text can carry stack detail, DSNs, or other
+        # internals this route must never surface.
+        app.state.execution_startup_status = _execution_startup_status(
+            "startup_failed", reason_code="startup_exception"
+        )
         # Revoke the placer before awaiting any worker drain. deactivate() closes
         # both entry callbacks before their queued work can run; the bus
         # itself stays live for unrelated routes and subscribers.
@@ -314,6 +356,11 @@ async def lifespan(app: FastAPI):
     finally:
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
+        # Same "no active lifespan" reset as the two lines above — a route
+        # hit after shutdown must report "unavailable", not a stale "ready"/
+        # "reconciliation_blocked"/"startup_failed" from before this process
+        # started stopping.
+        app.state.execution_startup_status = None
         # try/finally added deliberately (confirmed decision #47) — found
         # via a real, reproducible bug, not by inspection. Without it, an
         # exception raised anywhere inside the `async with

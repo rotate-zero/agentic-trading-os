@@ -772,6 +772,80 @@ Normal shutdown still stops the bus first, then drains the execution pipeline
 in its existing producer-to-consumer order.
 ```
 
+**Startup status surface (as built, `execution-startup-status`).** Decision #179
+made partial startup fail closed but gave the running UI no way to tell *which*
+of the three real outcomes above (§6.9) actually happened — a route caller could
+only infer "not ready" from `/intelligence/world-view`'s `portfolio: null` or
+`/intelligence/exit-intents`' `monitor_status: "unavailable"`, neither of which
+distinguishes a clean-but-blocked reconciliation from an exception mid-startup.
+`main.py` now tracks an explicit `app.state.execution_startup_status` through
+the same try/reconcile/else/except/finally structure §6.9 already diagrams —
+one of `"ready"`, `"reconciliation_blocked"`, or `"startup_failed"`, set at the
+same point in the existing sequence that already determines the outcome, never
+a fourth "in progress" value (routes are only served after this section has
+already finished, one way or another). The `finally` block resets it to unset
+on shutdown, the same reset `world_view_portfolio_reader`/`position_monitor`
+already get — so a route hit with no active lifespan, before startup finishes,
+or after shutdown, reports `"unavailable"`.
+
+```
+main.py lifespan, execution-pipeline section (§6.9 above, unmodified control flow)
+        │
+        ├─ app.state.execution_startup_status = None            (init, same line as the other two resets)
+        │
+        ▼
+venue.connect() ──► reconcile ledger / venue
+        │
+        ├─ discrepancy ──► app.state.execution_startup_status =
+        │                     {"status": "reconciliation_blocked",
+        │                      "reason_code": "reconciliation_discrepancy",
+        │                      "discrepancy_count": len(discrepancies)}      ◄── plain count only;
+        │                                                                       the discrepancy list
+        │                                                                       itself never leaves main.py
+        │
+        ├─ clean ──► restore Portfolio State ──► start authorizer/engine/monitor
+        │               └─ app.state.execution_startup_status = {"status": "ready", ...}
+        │
+        └─ any exception ──► rollback (§6.9 above, unmodified)
+                        └─ app.state.execution_startup_status =
+                              {"status": "startup_failed",
+                               "reason_code": "startup_exception", ...}       ◄── fixed constant;
+                                                                                  never str(exc) —
+                                                                                  no stack detail, no DSN
+        │
+        ▼
+GET /health/execution-startup ──► getattr(app.state, "execution_startup_status", None)
+        │
+        ├─ None (no active lifespan / pre-startup / post-shutdown) ──► {"status": "unavailable", ...}
+        └─ set ──► that dict, unchanged
+
+lifespan shutdown (`finally`, §6.9 above) ──► app.state.execution_startup_status = None
+        (same line as the world_view_portfolio_reader / position_monitor resets)
+```
+
+```
+ExecutionLifecyclePanel (frontend, new "Startup status" section, above
+"Observed exit triggers")
+        │
+        ▼ on panel expand / manual Refresh
+fetchExecutionStartupStatus() ──► GET /health/execution-startup
+        │
+        ├─ fetch error ──► "Could not fetch startup status: ..."
+        └─ 200 ──► label by status (Started / Blocked — reconciliation /
+                    Startup failed / Unavailable) + discrepancy count
+                    when reconciliation_blocked
+        (no WebSocket subscription — same manual-refresh-only posture
+        "Observed exit triggers" already established for this panel)
+```
+
+This is a startup diagnostic, not a live trading-readiness check: `"ready"`
+means the pipeline finished startup successfully, not that any particular
+opportunity will clear Governor's rules (§6.2), that Portfolio State will stay
+ready, or that an open position's exit is protected (§6.6's `PositionMonitor`
+is an observer, not a guarantee) — the route's own docstring and the panel's
+own copy both say so. No new event, no polling, no change to §6.9's actual
+control flow or to any entry rule, exit placement, or EX-5/EX-12 decision.
+
 ### 6.10 Configuration (EX-4) — three limits, configurable, not hardcoded
 
 All values live in `core/config.py`'s `Settings` (the repository's single source of configuration — nothing else reads the environment), overridable by environment/`.env`, validated at startup (each must be positive), and **recorded on every authorization** as `limits_snapshot` so a decision's basis is auditable after the limits change. Changes take effect at restart in v1.

@@ -1228,3 +1228,70 @@ registry/read surfaces, stopped tasks, and no approved trade or order after a
 valid `OpportunityCreated`. The as-built success and rollback diagrams are in
 `docs/architecture/execution-engine-design.md` §6.9. No entry rule, exit order,
 status UI, or EX-5/EX-12 decision changes.
+
+### 180. Read-only execution startup status surface (`execution-startup-status`)
+
+Decision #179 made partial execution startup fail closed but left the running
+UI unable to tell whether the pipeline started successfully, reconciliation
+blocked it, or startup failed and rolled back — only indirect signals existed
+(`/intelligence/world-view`'s `portfolio: null`, `/intelligence/exit-intents`'
+`monitor_status: "unavailable"`), neither of which distinguishes the three
+outcomes. `main.py` now tracks an explicit `app.state.execution_startup_status`
+through the same try/reconcile/else/except/finally sequence §179 already built,
+set at the same points that already determine the outcome: `"ready"` after a
+clean startup with the entry pipeline live, `"reconciliation_blocked"` when
+venue/ledger reconciliation finds a discrepancy (entry acceptance stays off,
+per #179), or `"startup_failed"` after an exception triggers #179's own
+rollback. The `finally` block resets it to unset on shutdown — the same line
+that already resets `world_view_portfolio_reader`/`position_monitor` — so a
+route hit with no active lifespan, before startup finishes, or after shutdown
+reports `"unavailable"`, never a stale prior value.
+
+Added read-only `GET /health/execution-startup`, reading
+`getattr(request.app.state, "execution_startup_status", None)` and returning
+the unavailable shape when unset. Deliberately narrow response fields:
+`reason_code` is one of two fixed constants (`reconciliation_discrepancy`,
+`startup_exception`) — never the caught exception's own `str()`, which could
+carry stack detail or connection internals — and `discrepancy_count` is a
+plain integer, never the discrepancy list itself. The route's own docstring
+states plainly that `"ready"` is a startup fact, not a live trading-readiness
+guarantee: not proof a given opportunity will pass Governor's rules (`governor/`),
+that Portfolio State will stay ready, or that an open position's exit is
+protected (`position_monitor/` remains an observer, per decision #178).
+`/health` itself and all entry behavior are unchanged.
+
+The Execution panel (`ExecutionLifecyclePanel.tsx`) gains a compact "Startup
+status" section above "Observed exit triggers" — same manual-Refresh-only,
+loading/error/unavailable shape that section already established for this
+panel (no polling, no new WebSocket channel). It shows the status label and,
+when blocked, the discrepancy count, plus the same readiness-vs-guarantee
+disclaimer as the route's own docstring.
+
+**Testing.** New `test_execution_startup_status_route.py` (4 tests, real
+Postgres): a route call with no active lifespan (direct ASGI transport call
+against the unstarted app) reporting `unavailable`; a real-lifespan clean
+startup reporting `ready`, then `unavailable` again after that same lifespan's
+shutdown; an injected reconciliation discrepancy (3 synthetic mismatches)
+reporting `reconciliation_blocked` with `discrepancy_count: 3` and asserting
+the raw discrepancy text never reaches the response; and an injected
+`PositionMonitor.start()` failure after the authorizer/execution engine have
+already started (the same fault-injection shape decision #179's own test
+uses), reporting `startup_failed` after rollback completes, asserting the
+caught exception's own text never reaches the response either. Full backend
+suite: 1105 passed/0 failed on the untouched baseline, 1109 passed/0 failed
+with this delivery (exactly +4, the new tests) — one intermittent failure seen
+on an initial full run (`test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events`)
+was isolated and reproduced independently of this delivery's own changes (2/2
+fail-or-pass against the changed tree, 4/4 pass against the untouched baseline,
+then 6/6 pass against the changed tree again), confirming genuine pre-existing
+intermittency unrelated to any file this delivery touches, not a regression.
+Frontend `npx tsc -b`/`npm run build` clean.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main`:
+edited, additive only — `backend/app/main.py`, `backend/app/api/routes/health.py`,
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`. New —
+`backend/tests/test_execution_startup_status_route.py`. Untouched, exactly as
+scoped: every scanner file, trading rule, exit-placement file, and EX-5/EX-12.
+Cross-component and internal status-flow diagrams are in
+`docs/architecture/execution-engine-design.md` §6.9.

@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
-import { fetchExitIntents, type ExitIntentsWireShape } from "../../services/api-client";
+import {
+  fetchExecutionStartupStatus,
+  fetchExitIntents,
+  type ExecutionStartupStatusWireShape,
+  type ExitIntentsWireShape,
+} from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx/BacktestResultsPanel.tsx already reuse verbatim — same
@@ -143,6 +148,88 @@ function ExecutionLifecycleBody() {
   );
 }
 
+type StartupStatusLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExecutionStartupStatusWireShape };
+
+const STARTUP_STATUS_LABEL: Record<ExecutionStartupStatusWireShape["status"], string> = {
+  ready: "Started",
+  reconciliation_blocked: "Blocked — reconciliation",
+  startup_failed: "Startup failed",
+  unavailable: "Unavailable",
+};
+
+const STARTUP_STATUS_TONE: Record<ExecutionStartupStatusWireShape["status"], Tone> = {
+  ready: "bull",
+  reconciliation_blocked: "bear",
+  startup_failed: "bear",
+  unavailable: "muted",
+};
+
+// One compact line, deliberately — this is a startup diagnostic, not a
+// second event feed, so it gets the same manual-Refresh/loading/error/
+// unavailable shape ObservedExitTriggers below already established for
+// this panel rather than its own list-style section.
+function StartupStatusLine() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<StartupStatusLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExecutionStartupStatus()
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return (
+    <section className="border-b border-base-border" aria-label="Execution pipeline startup status">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Startup status</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          disabled={load.kind === "loading"}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+        >
+          Refresh
+        </button>
+      </div>
+      {/* Startup status only — not proof a given opportunity will clear
+          Governor's rules, that Portfolio State will stay ready, or that
+          open positions' exits are protected (see "Observed exit triggers"
+          below for that separate, also-observational surface). */}
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+        Startup status only — not confirmation an opportunity will pass Governor rules, Portfolio State stays ready, or exits are protected.
+      </p>
+      {load.kind === "loading" && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Checking startup status…</p>
+      )}
+      {load.kind === "error" && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch startup status: {load.message}</p>
+      )}
+      {load.kind === "ready" && (
+        <p className="px-2 pb-2 font-mono text-[10px]">
+          <span className={TONE_CLASS[STARTUP_STATUS_TONE[load.data.status]]}>
+            {STARTUP_STATUS_LABEL[load.data.status]}
+          </span>
+          {load.data.status === "reconciliation_blocked" && load.data.discrepancy_count !== null && (
+            <span className="text-text-muted">
+              {" "}
+              · {load.data.discrepancy_count} discrepanc{load.data.discrepancy_count === 1 ? "y" : "ies"}
+            </span>
+          )}
+        </p>
+      )}
+    </section>
+  );
+}
+
 type ExitIntentLoad =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -248,6 +335,7 @@ export function ExecutionLifecyclePanel() {
           {!collapsed && <span className="font-mono text-xs font-semibold text-text-primary">Execution</span>}
         </div>
 
+        {!collapsed && <StartupStatusLine />}
         {!collapsed && <ObservedExitTriggers />}
         {!collapsed && <ExecutionLifecycleBody />}
       </div>

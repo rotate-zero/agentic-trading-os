@@ -1,3 +1,40 @@
+# CHANGES — decision #180: `execution-startup-status`
+
+## Current delivery
+
+The running UI can now tell which of decision #179's three real startup
+outcomes actually happened, instead of only inferring "not ready" from
+`/intelligence/world-view`'s `portfolio: null` or `/intelligence/exit-intents`'
+`monitor_status: "unavailable"`. `main.py` tracks an explicit
+`app.state.execution_startup_status` through the existing execution-pipeline
+try/reconcile/else/except/finally sequence — `"ready"`, `"reconciliation_blocked"`
+(with a plain discrepancy count), or `"startup_failed"` (a fixed reason code,
+never the caught exception's own text) — set at the same points that already
+determine the outcome. The `finally` block resets it on shutdown, the same
+reset `world_view_portfolio_reader`/`position_monitor` already get, so a route
+hit with no active lifespan, before startup finishes, or after shutdown reports
+`"unavailable"`.
+
+Added read-only `GET /health/execution-startup`, returning that status (or the
+unavailable shape when unset). Its docstring states plainly that this is a
+startup diagnostic, not a live trading-readiness check: `"ready"` is not proof
+a given opportunity will pass Governor's rules, that Portfolio State will stay
+ready, or that an open position's exit is protected. `/health` itself and all
+entry behavior are unchanged.
+
+The Execution panel gains a compact "Startup status" line above "Observed exit
+triggers," fetched on expand and manual Refresh only (no polling, no new
+WebSocket subscription) — same loading/error/unavailable shape that section
+already established. It shows the status label and, when blocked, the
+discrepancy count, plus the same "not a readiness guarantee" disclaimer as the
+route's own docstring.
+
+Updated `docs/architecture/execution-engine-design.md` §6.9 with cross-component
+and internal status-flow diagrams. No entry rule, exit placement, scanner file,
+or EX-5/EX-12 change; no new architectural decision beyond this one.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #179: `execution-startup-fail-closed`
 
 ## Current delivery

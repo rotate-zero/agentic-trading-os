@@ -1,3 +1,66 @@
+# TESTING — decision #180: `execution-startup-status`
+
+Initial local `main` and GitHub `main` both `fc1b674427b4a0062ebb1b55f11a4369099ea22b`
+(`execution-startup-fail-closed`, decision #179); working tree clean. No
+PostgreSQL cluster was preinstalled in this environment — installed PostgreSQL
+16.15 locally, started it, and created `trading`/`trading_workspace` per this
+project's own documented convention plus an isolated `execution_startup_status_test`
+database, migrated through `0014`. No pre-existing development database, broker
+account, or external service was touched.
+
+- New focused file: `pytest -q tests/test_execution_startup_status_route.py
+  --tb=short --disable-warnings` — **4 passed**. Covers a route call with no
+  active lifespan (direct ASGI call against the unstarted app, no `with
+  TestClient`) reporting `unavailable`; a real-lifespan clean startup reporting
+  `ready`, then `unavailable` again after that lifespan's own shutdown; an
+  injected reconciliation discrepancy (3 synthetic mismatches) reporting
+  `reconciliation_blocked` with `discrepancy_count: 3` and asserting the raw
+  discrepancy text never reaches the response body; and an injected
+  `PositionMonitor.start()` failure after the authorizer/execution engine have
+  already started, reporting `startup_failed` after the existing #179 rollback
+  completes, asserting the caught exception's own text never reaches the
+  response body either.
+- Adjacent regression command: `pytest -q tests/test_execution_startup_status_route.py
+  tests/test_main_execution_pipeline.py tests/test_exit_intents_route.py
+  tests/test_world_view_portfolio.py tests/test_world_view.py
+  tests/test_entry_lifecycle_wiring.py tests/test_governor_engine.py
+  tests/test_execution_engine.py tests/test_event_bus.py
+  tests/test_position_monitor_engine.py tests/test_portfolio_worker.py
+  tests/test_portfolio_state.py tests/test_reconciliation.py
+  tests/test_position_monitor_portfolio_reader.py tests/test_simulated_venue.py
+  tests/test_intelligence_routes.py --tb=short --disable-warnings` —
+  **123 passed**.
+- Full backend suite baseline, changes stashed (`git stash -u`) on the
+  untouched `fc1b674` tree: **1105 passed, 0 failed**.
+- Full backend suite with the delivery restored: **1108 passed, 1 failed**
+  first run (`test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events`,
+  a VWAP-state-equality assertion unrelated to any file this delivery
+  touches), then **1109 passed, 0 failed** on an immediate re-run with no
+  code change. Confirmed pre-existing and unrelated, not attributed to this
+  work without evidence: isolated the single test and ran it 2x against the
+  changed tree (1 fail / 1 pass) and 4x against the untouched `fc1b674`
+  baseline (4/4 passed there), then 6x more against the changed tree (6/6
+  passed) — consistent with genuine intermittency in that unrelated test, not
+  a regression this delivery introduced. Net delta from the 1105 baseline is
+  exactly +4 (this delivery's own new tests); zero other regressions.
+- Frontend: `npx tsc -b` — clean (only the pre-existing #166-excluded
+  `GridPresetPicker.tsx` sketch stays out of the active program, as before).
+  `npm run build` — clean (`tsc -b && vite build`, same bundle-size-only
+  warning this project already has). The build-generated
+  `frontend/tsconfig.tsbuildinfo` was restored (`git checkout --`) after the
+  build and is not packaged.
+- `git diff --check` — passed.
+
+Immediately before numbering, GitHub `main` was re-checked and still matched
+local `fc1b674`; the canonical index and log both ended at #179, and the
+newest archive was `134-160.md`. Decision #180 was appended at the true end
+of `confirmed-decisions.md` and indexed in `INDEX.md` only after that recheck.
+
+Package: `execution-startup-status.zip` contains only the changed
+repository-relative files.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #179: `execution-startup-fail-closed`
 
 Initial local `main` and GitHub `main`: `fd3657157c2e840963f4916fe7d9dc53d2fef387`;

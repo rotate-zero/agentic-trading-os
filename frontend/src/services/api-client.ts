@@ -327,6 +327,31 @@ export async function fetchExitIntents(): Promise<ExitIntentsWireShape> {
   return (await res.json()) as ExitIntentsWireShape;
 }
 
+// GET /health/execution-startup (execution-startup-status). Reports what
+// main.py's own execution-pipeline lifespan startup sequence last produced
+// — NOT a live trading-readiness check. "ready" is not confirmation any
+// particular opportunity will pass Governor rules, that Portfolio State
+// will stay ready, or that open positions' exits are protected (see
+// ExitIntentsWireShape above for that separate, also-observational
+// surface). "unavailable" covers both "no lifespan is currently active"
+// and "this route was hit before startup finished or after shutdown".
+// reason_code/discrepancy_count are deliberately narrow — a fixed safe
+// code and a plain count, never exception text or raw reconciliation
+// contents (see health.py's own route docstring).
+export interface ExecutionStartupStatusWireShape {
+  status: "ready" | "reconciliation_blocked" | "startup_failed" | "unavailable";
+  reason_code: "reconciliation_discrepancy" | "startup_exception" | null;
+  discrepancy_count: number | null;
+}
+
+export async function fetchExecutionStartupStatus(): Promise<ExecutionStartupStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/health/execution-startup`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionStartupStatusWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's current contents) —
