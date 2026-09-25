@@ -22,19 +22,14 @@ once EX-5 is actually confirmed by Saqib.
 (`PositionReader.get_open_positions()`), deliberately not importing or
 reusing `portfolio_state.snapshot.PortfolioSnapshot` or
 `governor.ports.PortfolioStateReader` directly (see that module's own
-docstring for the full reasoning). No concrete implementation ships here
-— same "ports, no adapter" pattern `governor/ports.py` and
-`execution_engine/ports.py` already establish; a thin adapter from the
-real Portfolio State is integration work for whoever eventually wires
-this module up.
+docstring for the full reasoning). `portfolio_state_reader.py` is the
+concrete read-only adapter over the real Portfolio State snapshot.
 
 `engine.py` — `PositionMonitor`, the same subscribe -> own queue ->
 worker shape every engine in this codebase uses (decision #84's
 pattern). Subscribes to `PriceUpdated`/`CandleClosed` (both already
 published, normal lane, no new event/schema). No module-level singleton
 getter ships here (unlike governor's `get_authorizer_stub()` or
-execution_engine's `get_execution_engine()`) — there is deliberately no
-concrete `PositionReader` to default-construct one against yet, and
-`main.py` wiring is explicitly out of this task's scope; a later wiring
-task adds both together.
+execution_engine's `get_execution_engine()`); `main.py` wiring remains
+outside the adapter task.
 """

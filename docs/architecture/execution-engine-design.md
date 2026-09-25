@@ -559,6 +559,37 @@ Only a successful newly applied closure commit can publish `PositionClosed`, on 
 
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 
+**As built (`position-monitor-portfolio-reader`).** `PortfolioStatePositionReader` implements
+Position Monitor's existing `PositionReader` port using the synchronous, detached
+`PortfolioState.get_snapshot()` of one supplied Portfolio State instance. The
+adapter has no database or bus work and is not wired into `main.py`.
+
+```
+Postgres position ledger ──restore/fill commits──► Portfolio State
+                                               │ get_snapshot() (detached)
+                                               ▼
+                                PortfolioStatePositionReader
+                                               │ tuple[PositionView, ...]
+                                               ▼
+                                Position Monitor (not wired in main.py)
+```
+
+```
+get_open_positions()
+       │
+       ▼
+PortfolioState.get_snapshot() ── None ──► PositionSnapshotUnavailable
+       │ restored snapshot
+       ▼
+snapshot.positions.values() ──► keep qty > 0 (open or closing)
+       │                         ignore snapshot.in_flight / exposures
+       ▼
+copy id, symbol, side, qty, opened_at; Decimal stop/target → float or None
+       │
+       ▼
+tuple[PositionView, ...] (empty when restored and flat)
+```
+
 **What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
 - **Inputs:** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).

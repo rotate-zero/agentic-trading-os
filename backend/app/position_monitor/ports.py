@@ -22,16 +22,12 @@ dependency):
     "exposure" for governor's own purpose) — this module must only ever
     see genuinely open, filled positions, never an order still working
     its way to a fill. Mirroring governor's *pattern* (a narrow, frozen,
-    read-only Protocol; no concrete adapter ships with it) does not mean
+    read-only Protocol) does not mean
     mirroring its *classes*.
 
-No concrete implementation of `PositionReader` ships in this delivery —
-matching the "ports, no adapter" precedent `governor/ports.py` and
-`execution_engine/ports.py` both already set. A thin adapter satisfying
-this Protocol from the real Portfolio State (`portfolio_state.snapshot`)
-is integration work for whoever eventually wires `PositionMonitor` into
-`main.py` — out of scope here, same footing as every other module's own
-unbuilt adapter.
+`portfolio_state_reader.py` supplies the concrete read-only adapter over
+the real Portfolio State snapshot. Wiring it into `main.py` remains a
+separate integration task.
 
 Type choice, stated plainly: `stop`/`target` are typed `float | None`
 here, not `Decimal | None` as `accounting.PositionState` stores them.

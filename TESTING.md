@@ -1,3 +1,13 @@
+# TESTING — `position-monitor-portfolio-reader`
+
+GitHub `main` and local `main` both resolved to `51ba48a9eebe1ad36d7eb77bd9060fc4d4edc460` before editing and at the final packaging recheck; the initial working tree was clean. The decision index, canonical log, and archive inventory ended at #176. No new decision was required for this adapter.
+
+Focused checks: `backend/.venv/bin/pytest -q backend/tests/test_position_monitor_portfolio_reader.py backend/tests/test_position_monitor_engine.py backend/tests/test_portfolio_accounting.py` → **40 passed**. The five new tests cover restored empty, open position, `closing` position after a partial reduction, in-flight entry without a position, and unavailable (unrestored or blocked) snapshots. The tests use real `PortfolioState.get_snapshot()` and accounting `apply_fill()`; they install a ledger state directly without database I/O.
+
+`git diff --check` passed. A broader command that also included `test_portfolio_worker.py` passed its first 40 tests and then stalled in that worker test module; it was interrupted after no further output. A separate 20-second run confirmed the stall at its first test, `test_unknown_then_known_flat_snapshot_is_detached_and_io_free`. The focused adapter and adjacent monitor/accounting checks were rerun separately and passed. No production startup wiring or database mutation was part of this delivery.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #176: Entry-order lifecycle wired to real Postgres (`entry-lifecycle-wiring`)
 
 ## Baseline and evidence

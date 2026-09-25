@@ -1,3 +1,24 @@
+# CHANGES — `position-monitor-portfolio-reader`
+
+## Current delivery
+
+Added `position_monitor/portfolio_state_reader.py`, a synchronous `PositionReader`
+adapter over the real Portfolio State instance. It reads only the detached
+snapshot's positions with remaining quantity, including accounting status
+`closing` after a partial reduction. It excludes in-flight entry orders and
+converts Decimal stop/target prices to float for `PositionView`. An unrestored,
+stale, or blocked snapshot raises `PositionSnapshotUnavailable`; a restored
+empty portfolio returns `()`.
+
+Updated the existing Position Monitor package and port descriptions and
+`docs/architecture/execution-engine-design.md` §6.6 with as-built data-flow
+and internal adapter-flow diagrams. Added focused adapter tests. No new
+architecture decision was needed: this implements the read seam already
+reserved by decision #175. Position Monitor remains unwired in `main.py`;
+no exit orders or new events are produced, and EX-5/EX-12 remain open.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #176: Entry-order lifecycle wired to real Postgres (`entry-lifecycle-wiring`)
 
 ## Current delivery
