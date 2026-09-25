@@ -1,11 +1,12 @@
 """
 run_scan unit tests — a fake FeatureEngine (no DB, no real snapshot
 machinery), verifying the orchestration logic on top of the already-
-tested score_symbol (test_scanner.py). GET /scanner/state's own
-correctness is downstream of this — not re-tested separately here, since
-the route is a thin pass-through (query param parsing + this call +
-JSON shaping), nothing route-specific to get wrong beyond what manual
-verification already checked.
+tested score_symbol (test_scanner.py). GET /scanner/state's ranking/
+scoring/JSON-shaping behavior is downstream of this — not re-tested
+separately here. Its `?symbols=` override DOES now have real,
+route-specific validation/normalization logic of its own (trim/upper,
+format check, dedup, empty-input 400s) — that's covered by
+test_scanner_state_route.py, not this file.
 """
 from __future__ import annotations
 

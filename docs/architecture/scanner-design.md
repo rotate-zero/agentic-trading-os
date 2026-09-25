@@ -309,3 +309,102 @@ DELETE /scanner/universe/{symbol}
 **Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main`: edited — `backend/app/api/routes/scanner.py` (`asyncio.to_thread` wrapping only, no behavior change). New — `backend/tests/test_scanner_route_concurrency.py`. Untouched, exactly as scoped: `app/scanner/universe.py`, `app/scanner/runner.py`, `app/scanner/scorer.py`, `main.py`, every execution/frontend file, and the continuous `MarketActivityScanner`/`ScanCadenceSchedule`/promotion path (§4/§5 above — still not built).
 
 **No decision number assigned** for this delivery, per standing instruction: moving already-synchronous, already-correct DB work off the event loop is an operational fix at the route boundary, not a new architectural decision — nothing about universe semantics, validation, scoring, or the API contract changed.
+
+---
+
+## 14. Sixth update — `?symbols=` override now validated with the same ticker-format rule as the persisted universe (`scanner-override-ticker-validation`)
+
+**Problem.** §12's persisted universe (`POST /scanner/universe`) enforces `is_valid_ticker_format` (1-5 letters, optional share-class suffix like `BRK.B`) before a symbol can ever be added. `GET /scanner/state`'s ad hoc `?symbols=` override (§0/§5, predates §12) never got the same treatment — it only `strip()`/`upper()`'d each comma-separated entry, so `?symbols=AAPL,,TSLA` (a stray comma) or `?symbols=AAPL,123` (a malformed ticker) were silently accepted as literal universe entries. Each invalid entry then reached `run_scan()`, which can't distinguish "genuinely malformed input" from "a real ticker that just hasn't streamed yet" — both come back in `skipped`, so the caller had no way to tell a typo from a cold start. The override and the persisted universe were, in effect, enforcing two different contracts for what counts as a valid symbol.
+
+**Fix — reuse `is_valid_ticker_format` at the override boundary, fail fast instead of degrading silently.** `app/api/routes/scanner.py` gains one new private helper, `_parse_symbols_override()`, called only when `symbols is not None` (an explicit override, whether or not it's empty) — genuinely omitting the query parameter still takes the untouched `DbUniverseProvider`/`TEST_UNIVERSE` fallback path (§12/§13), unchanged. The helper: strips and uppercases each comma-separated entry; rejects the whole override with HTTP 400 if it's empty/whitespace-only; rejects any individual empty entry (a stray or trailing comma) with 400; rejects any entry that fails `is_valid_ticker_format` with 400 (same message convention `add_symbol_to_universe`'s own `ValueError` already uses); and deduplicates valid entries, keeping first-seen order rather than sorting or silently dropping order information. Nothing below the parse changes — `run_scan`, scoring, ranking, `top_n` slicing, and every universe CRUD route are byte-identical to before. No new size limit is introduced on the override (an unusually long but format-valid list is not rejected here, same posture the persisted universe itself takes — see §3's own "not resolved here" note on the real Core-100 count).
+
+**Diagram 1 — request flow through `GET /scanner/state`, before vs. after:**
+
+```
+BEFORE
+  ?symbols= given?
+        │
+       yes ──► [s.strip().upper() for s in symbols.split(",")]   (no validation at all)
+        │            │
+        │            ▼
+        │      universe = [...]  (may contain "", "123", duplicates, in
+        │                         whatever order split() produced them)
+        │
+       no  ──► DbUniverseProvider(...).get_core_universe()  (§13: off-loop)
+                    │  empty? → TEST_UNIVERSE fallback
+                    ▼
+              universe = [...]
+        │
+        ▼
+  run_scan(universe, ...)   ← malformed entries silently land in `skipped`,
+                              indistinguishable from a real cold-start symbol
+        ▼
+  200 JSON response (or a confusing all-skipped result)
+
+AFTER
+  symbols is not None?  (explicit override, empty string included —
+  distinct from the parameter being absent entirely)
+        │
+       yes ──► _parse_symbols_override(symbols)          ← NEW
+        │            │
+        │            ├─ whole string empty/whitespace?  ──► HTTP 400
+        │            ├─ any entry empty after strip?     ──► HTTP 400
+        │            ├─ any entry fails                  ──► HTTP 400
+        │            │  is_valid_ticker_format?
+        │            └─ else: dedup, first-seen order kept
+        │            ▼
+        │      universe = [...]  (every entry format-valid, unique,
+        │                         in the order first seen)
+        │
+       no  ──► DbUniverseProvider(...).get_core_universe()  (§13: UNCHANGED)
+                    │  empty? → TEST_UNIVERSE fallback   (UNCHANGED)
+                    ▼
+              universe = [...]
+        │
+        ▼
+  run_scan(universe, ...)   ← UNCHANGED: every symbol reaching this line is
+                              now guaranteed format-valid; `skipped` means
+                              only "no FeatureSet yet," never "was malformed"
+        ▼
+  200 JSON response, or 400 with a specific detail message before
+  run_scan() (or any DB call) ever runs
+```
+
+**Diagram 2 — internal flow of `_parse_symbols_override()`:**
+
+```
+_parse_symbols_override(symbols: str) -> list[str]
+        │
+        ▼
+  symbols.strip() == ""?  ──yes──►  raise HTTPException(400, "must not be empty")
+        │ no
+        ▼
+  for raw in symbols.split(","):
+        │
+        ▼
+  item = raw.strip().upper()
+        │
+        ├─ item == ""?  ──yes──►  raise HTTPException(400, "empty entry ...")
+        │
+        ├─ not is_valid_ticker_format(item)?  ──yes──►  raise HTTPException(
+        │                                                 400, "'<item>' doesn't
+        │                                                 look like a valid ticker ...")
+        │                                                 (same wording
+        │                                                 add_symbol_to_universe's
+        │                                                 own ValueError uses)
+        │
+        └─ item not in seen?  ──yes──►  seen.add(item); normalized.append(item)
+                                (else: silently drop — duplicate, first
+                                 occurrence already kept)
+        │
+        ▼  (loop over every comma-separated entry)
+  return normalized
+```
+
+**Testing.** New `backend/tests/test_scanner_state_route.py` — 11 focused HTTP-route tests, direct ASGI transport against the real (unstarted) app, no lifespan needed: valid multi-symbol normalization (trim/uppercase, verified by round-tripping through `run_scan`'s own honest `skipped` list rather than trusting the echoed `universe` field alone), duplicate-entry dedup preserving first-seen order, a `BRK.B`-style share-class suffix accepted, a lowercase-only input NOT rejected for case (the other direction of the rule, so this isn't just testing "everything 400s"), an invalid-format ticker (400, message names the bad entry), a too-long ticker (400), an empty entry from a stray internal comma (400), a trailing comma (400), an explicitly empty `?symbols=` (400), a whitespace-only override (400), and the omitted-parameter path (no `symbols` key in the query string at all) asserting a non-empty `universe` list and never a 400 — the one test in this file that reads the real persisted `scanner_universe_symbols` table via the untouched `DbUniverseProvider`/`TEST_UNIVERSE` path. Verified these are a genuine regression guard, not false positives: temporarily reverted `app/api/routes/scanner.py` to its pre-fix form and re-ran the file — 7 of 11 tests failed (every 400 case returned 200 instead) — then restored the fix and confirmed 11/11 passed again. Also corrected a now-stale claim in `test_scanner_runner.py`'s own module docstring, which said `GET /scanner/state` had "nothing route-specific to get wrong beyond what manual verification already checked" — no longer accurate once the override gained real, route-specific validation logic of its own; corrected to point at this new file instead of removing the claim silently.
+
+No PostgreSQL was preinstalled in this environment for this delivery either — installed PostgreSQL 16.15 locally, created the `trading`/`trading_workspace` role and database per this project's own documented convention, and ran `alembic upgrade head` (through `0014`) before running anything. Full backend suite baseline, freshly re-pulled `main` before any change: **1111 passed, 0 failed**. With this delivery applied: **1122 passed, 0 failed** (exactly +11, the new route tests; zero regressions elsewhere). The existing scoring/orchestration/universe-CRUD assertions in `test_scanner.py`/`test_scanner_runner.py`/`test_scanner_universe.py`/`test_scanner_route_concurrency.py` (19/19) still pass unchanged.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main` immediately before packaging (identical to the `main` this task started from — no concurrent changes to reconcile): edited — `backend/app/api/routes/scanner.py` (new `_parse_symbols_override()` helper plus the `symbols is not None` branch condition; every other line unchanged), `backend/tests/test_scanner_runner.py` (docstring correction only, no test logic changed). New — `backend/tests/test_scanner_state_route.py`. Untouched, exactly as scoped: `app/scanner/universe.py` (only *called*, not edited — `is_valid_ticker_format` is reused as-is), `app/scanner/runner.py`, `app/scanner/scorer.py`, `main.py`, every execution/frontend file, universe CRUD behavior, scoring, ranking, `top_n`, and the continuous `MarketActivityScanner`/`ScanCadenceSchedule`/promotion path (§4/§5 — still not built).
+
+**No decision number assigned** for this delivery, for the same reason §13 gives none: this reuses an existing, already-decided validation rule (`is_valid_ticker_format`, format-only, deliberately not a liveness/tradability check — see that function's own docstring) to close a consistency gap at a second call site, rather than deciding anything new about what a valid ticker is, how universe membership works, how scoring/ranking behaves, or the shape of the API contract's success path. The only contract change is that malformed input now fails fast with a specific 400 instead of silently degrading into an all-skipped scan — an operational/correctness fix at the route boundary, not a product or architecture decision.

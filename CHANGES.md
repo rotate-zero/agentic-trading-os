@@ -1,3 +1,47 @@
+# CHANGES — `scanner-override-ticker-validation`
+
+## Current delivery
+
+`GET /scanner/state`'s ad hoc `?symbols=` override now enforces the exact
+same ticker-format rule `POST /scanner/universe` already enforces
+(`is_valid_ticker_format` — 1-5 letters, optional share-class suffix like
+`BRK.B`), instead of only stripping/uppercasing each comma-separated entry.
+A new `_parse_symbols_override()` helper in `app/api/routes/scanner.py`
+trims and uppercases each entry, returns HTTP 400 for a whole-empty
+override, an empty entry from a stray comma, or a format-invalid ticker,
+and deduplicates valid entries preserving first-seen order. The omitted-
+parameter path (`symbols` key absent from the query string entirely) is
+untouched — it still reads the persisted universe via `DbUniverseProvider`
+with the same `TEST_UNIVERSE` fallback, exactly as before. Scoring,
+ranking, `top_n`, and every universe CRUD route are unchanged; no new
+size limit is introduced on the override.
+
+New `backend/tests/test_scanner_state_route.py` (11 focused HTTP-route
+tests, direct ASGI transport, no lifespan needed for 10 of the 11 — the
+omitted-parameter test is the one that reads real Postgres). Verified as
+a genuine regression guard by temporarily reverting the fix and confirming
+7 of 11 tests failed, then restoring it and confirming 11/11 passed.
+Corrected a now-stale claim in `test_scanner_runner.py`'s own docstring
+that said the route had "nothing route-specific to get wrong." Updated
+`docs/architecture/scanner-design.md` with new §14 (before/after
+request-flow and internal-parser-flow diagrams). Full backend suite:
+1111 → 1122 passed (exactly +11, the new tests), zero regressions. No new
+architectural decision — this reuses an existing, already-decided
+validation rule at a second call site to close a consistency gap; universe
+semantics, scoring, ranking, and the success-path API contract are
+unchanged. Universe CRUD, `run_scan`, `main.py`, and every frontend/
+execution file remain untouched, exactly as scoped.
+
+## Boundary
+
+Exactly four files change: `backend/app/api/routes/scanner.py` (edited),
+`backend/tests/test_scanner_runner.py` (docstring correction only),
+`backend/tests/test_scanner_state_route.py` (new), and
+`docs/architecture/scanner-design.md` (edited, new §14) — plus this file
+and `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `scanner-route-db-offload`
 
 ## Current delivery

@@ -1,3 +1,72 @@
+# TESTING — `scanner-override-ticker-validation`
+
+GitHub `main` was pulled fresh at task start; re-pulled and `diff -rq`'d
+against the working tree immediately before packaging — identical except
+for this delivery's own three changed/new files (`backend/app/api/routes/scanner.py`,
+`backend/tests/test_scanner_runner.py`, `backend/tests/test_scanner_state_route.py`).
+No concurrent changes to reconcile; the sibling `scanner-route-db-offload`
+delivery (immediately below) had already landed on `main` before this task
+pulled it, confirmed by its `asyncio.to_thread` wrapping and
+`test_scanner_route_concurrency.py` both already present in the fresh pull.
+The canonical index and log both end at #180; per the same standing
+instruction that delivery's own entry states, reusing an existing,
+already-decided validation rule at a second call site needs no new
+decision number.
+
+No PostgreSQL was preinstalled in this environment — installed PostgreSQL
+16.15 locally, started it, created the `trading`/`trading_workspace` role
+and database per this project's own documented convention, and ran
+`alembic upgrade head` (through `0014`). No pre-existing development
+database, broker account, or external service was touched.
+
+- Full backend suite baseline, before any code change: `pytest -q` —
+  **1111 passed, 0 failed**.
+- New focused file: `pytest -q tests/test_scanner_state_route.py -v` —
+  **11 passed**. Covers valid multi-symbol normalization (trim/uppercase,
+  cross-checked against `run_scan`'s own honest `skipped` list, not just
+  the echoed `universe` field), duplicate-entry dedup preserving
+  first-seen order, a `BRK.B`-style share-class suffix accepted, a
+  lowercase-only input NOT rejected for case (the other direction of the
+  rule), an invalid-format ticker (400, message names the bad entry), a
+  too-long ticker (400), an empty entry from a stray internal comma (400),
+  a trailing comma (400), an explicitly empty `?symbols=` (400), a
+  whitespace-only override (400), and the omitted-parameter path (no
+  `symbols` key in the query string at all) asserting a non-empty
+  `universe` list and never a 400.
+- Verified the new tests are a genuine regression guard, not false
+  positives: temporarily reverted `app/api/routes/scanner.py` to its
+  pre-fix form (`git show HEAD:...` from the pre-edit baseline commit) and
+  re-ran the same file — **7 of 11 failed** (every 400-expecting case
+  returned 200 instead, since the old code only stripped/uppercased with
+  no validation at all). Restored the fix and re-ran — **11 passed**
+  again before proceeding.
+- All four Scanner test files together: `pytest -q tests/test_scanner.py
+  tests/test_scanner_runner.py tests/test_scanner_universe.py
+  tests/test_scanner_route_concurrency.py tests/test_scanner_state_route.py`
+  — **30 passed** (the pre-existing 19 unchanged, plus the 11 new).
+- Full backend suite with the delivery applied: `pytest -q` —
+  **1122 passed, 0 failed** (exactly +11 versus the 1111 baseline — the
+  new route tests; zero regressions elsewhere, no flaky-intermittent
+  failure observed on this run).
+- Frontend: not touched by this delivery (backend-only, exclusive scope
+  per the approved task); no frontend check run.
+- `git diff --check` — passed.
+
+Package: `scanner-override-ticker-validation.zip` contains only the
+changed repository-relative files — `backend/app/api/routes/scanner.py`
+(edited), `backend/tests/test_scanner_runner.py` (docstring correction
+only), `backend/tests/test_scanner_state_route.py` (new),
+`docs/architecture/scanner-design.md` (edited, new §14), `CHANGES.md` and
+`TESTING.md` (both edited, this delivery's entry prepended, the sibling
+`scanner-route-db-offload` entry preserved intact below it). Untouched,
+exactly as scoped: `app/scanner/universe.py` (called, not edited),
+`app/scanner/runner.py`, `app/scanner/scorer.py`, `main.py`, every
+execution/frontend file, universe CRUD behavior, scoring, ranking,
+`top_n`, and the continuous `MarketActivityScanner`/`ScanCadenceSchedule`/
+promotion path.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `scanner-route-db-offload`
 
 GitHub `main` was `fc1b674427b4a0062ebb1b55f11a4369099ea22b` (`execution-startup-fail-closed`)
