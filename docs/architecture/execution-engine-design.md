@@ -433,6 +433,50 @@ Lost acknowledgement after commit -> order retained; duplicate sends nothing
 - `OrderFilled` already carries `order_id` (= the client-order ID); it gains `venue_fill_id`, `cumulative_qty`, `leaves_qty`, `execution_venue`, and an optional `commission` (`None` unless the venue supplies it).
 - New models: `TradePlanned`, `PositionClosed` (§6.5), and reserved `OpportunitySelected`, `PositionAdjusted`; `PositionClosed` joins `CRITICAL_EVENT_TYPES` (EX-6); a venue-level rejection/cancel needs a representation distinct from plan-level `PlanRejected{symbol, reasons}` (EX-9).
 
+**As built (decision #181, `execution-orders-route`).** `GET /intelligence/execution-orders` is the first reader of the `orders` ledger anywhere in this codebase (confirmed by grep before writing it: `governor/`, `execution_engine/`, and `portfolio_state/` all import `Order` to WRITE it; nothing reads it back). Hard-scoped to `execution_mode == "simulated"` — not a query parameter, since `simulated` is the only mode the authorizer stub can produce today (EX-1) and the only mode any row can honestly carry until a real venue exists (§8). Optional exact `symbol` match; `limit` bounded `[1, 100]`, default 50; ordered by `orders.id` (the ledger's own monotonic primary key) descending. Curated fields only — order identity (`id`, `client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`, `qty`, `status`, `execution_venue`, `exit_reason`, `reject_reason`, `created_at`, `updated_at` — not a full-row dump (`order_type`, `limit_price`, `venue_order_id` stay out). Same honest-empty convention as every route in this file: an empty table, or a `symbol` with no matches, is `{"orders": []}`, never an error. The synchronous SQLAlchemy read runs through `asyncio.to_thread` (`api/routes/scanner.py`'s established convention, decision `scanner-route-db-offload`) rather than blocking the event loop the way this file's own older `GET /strategy-outcomes` and `GET /backtest-runs` routes still do. Observation only: no order placement, no ledger write, no frontend consumer yet (that gap is unchanged from §8's own "Frontend" line — `orders.status` still has no UI widget; this route is a diagnostic/ops surface, not that prerequisite).
+
+```
+governor/ AuthorizerStub ──INSERT trades──┐
+execution_engine/ ExecutionEngine ──INSERT/UPDATE orders, fills──┤
+                                                                  ▼
+                                                    orders  [ledger — authoritative, I12]
+                                                                  │
+                                                                  │ SELECT ... WHERE execution_mode = 'simulated'
+                                                                  │   [AND symbol = :symbol]
+                                                                  │   ORDER BY id DESC LIMIT :limit
+                                                                  │   (asyncio.to_thread — worker thread, not the event loop)
+                                                                  ▼
+                                        GET /intelligence/execution-orders
+                                            curated fields; observation only — no write path, no frontend consumer
+                                                                  │ read on demand
+                                                                  ▼
+                                              caller (ops diagnostic / curl / future frontend — none built yet)
+```
+
+**Internal flow (as built):**
+
+```
+GET /intelligence/execution-orders?symbol=...&limit=...
+       │
+       ▼
+FastAPI query validation ── limit outside [1, 100] ──► 422  (rejected before any DB touch)
+       │ limit valid (default 50), symbol optional
+       ▼
+await asyncio.to_thread(_fetch_execution_orders, symbol, limit)   ── event loop free while this runs
+       │
+       ▼
+_fetch_execution_orders()  [worker thread — opens AND closes its own Session]
+       SessionLocal() ──► filters = [execution_mode == 'simulated'] (+ symbol == :symbol if given)
+                     ──► SELECT * FROM orders WHERE <filters> ORDER BY id DESC LIMIT :limit
+                     ──► build curated dicts (id, client_order_id, trade_id, symbol, side,
+                         position_effect, qty, status, execution_venue, exit_reason,
+                         reject_reason, created_at, updated_at)
+                     ──► session.close()  (finally — always, even on a query error)
+       │
+       ▼  list[dict] crosses back to the event loop
+{"orders": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
+```
+
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
 
 **A new narrow interface; `BrokerAdapter` is not enlarged.** `BrokerAdapter` keeps its job — market-data connectivity (it extends `MarketDataProvider`). Its dormant `place_order`/`cancel_order`/`get_positions` declarations stay exactly as they are: unwired, not extended, not implemented (their eventual removal is a later decision — §10, R8). The Execution Engine depends only on `OrderVenue`.
@@ -685,7 +729,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 |---|---|---|
 | `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= accepted `opportunity_id` for approvals; audit identity for rejections), `decision_record` (entry-lifecycle-wiring exact authorization inputs), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
 | `trade_reservations` (entry-lifecycle-wiring) | Durable approval terms before order insertion, retained after handoff | `trade_id` PK/FK, deterministic `client_order_id` UNIQUE, positive `qty`, finite positive exact `reference_price`, `created_at`; migration downgrade refuses to discard reservations or decision records |
-| `orders` | The order ledger and state machine | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
+| `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
 | `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills` | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |

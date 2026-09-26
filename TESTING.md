@@ -1,3 +1,103 @@
+# TESTING — decision #181: `execution-orders-route`
+
+GitHub `main` was `0546492f30c66d8434acf36f7806523655d14ee8`
+(`scanner-route-db-offload`) when this task was assigned and first pulled.
+Mid-task, a fresh baseline pull surfaced a new commit,
+`bbac618786595faf6978458d559a4c69b351bc43` (`scanner-override-ticker-validation`)
+— `diff -rq` against a freshly re-pulled `main` confirmed it touched only
+`backend/app/api/routes/scanner.py`, `backend/tests/test_scanner_runner.py`,
+`backend/tests/test_scanner_state_route.py`, and
+`docs/architecture/scanner-design.md` — zero overlap with this task's own
+exclusive file, `backend/app/api/routes/intelligence.py`. This delivery's
+two already-written files (`intelligence.py`, the new test file) were copied
+onto that fresh `bbac618` clone rather than merged by hand, migrations
+re-run (already at head — no new migration), and the full suite re-run clean
+before continuing. Re-checked immediately before packaging: `git ls-remote`
+against the same URL still returned `bbac618786595faf6978458d559a4c69b351bc43`
+— nothing further landed. The canonical index and log both ended at #180;
+next number #181 assigned and written to both `confirmed-decisions.md` and
+`INDEX.md` in this same change, per protocol.
+
+No PostgreSQL was preinstalled in this environment — installed PostgreSQL
+16 locally, started it, created the `trading`/`trading_workspace` role and
+database per this project's own documented convention, and ran
+`alembic upgrade head` (through `0014` — no new migration exists for this
+delivery, which adds no schema). No pre-existing development database,
+broker account, or external service was touched.
+
+- Full backend suite baseline, before any code change (at `0546492`):
+  `pytest -q` — **1111 passed, 0 failed**.
+- Baseline re-confirmed after rebasing onto `bbac618`
+  (`scanner-override-ticker-validation` applied, this delivery's files not
+  yet copied over): **1122 passed, 0 failed** — matches that delivery's own
+  `CHANGES.md` entry exactly.
+- New focused file: `pytest -q tests/test_execution_orders_route.py -v` —
+  **13 passed**. Covers descending-`orders.id` ordering (three hand-inserted
+  rows, asserted in reverse insertion order); exact-`symbol` filtering,
+  including that a lowercase (`zzxo4`) and a substring (`ZZX`) query each
+  return `[]` rather than matching; hard exclusion of an `execution_mode ==
+  "backtest"` row (same `execution_venue == "simulated"`, passing the DB's
+  own mode/venue CHECK) from the `simulated`-only route with no parameter
+  able to request it; `limit` capping to the most recent N rows; rejection of
+  `limit=0` and `limit=101` with 422; acceptance at both bound edges (1 and
+  100); the default-limit path requiring no `limit` param; an honest
+  `{"orders": []}` for a symbol with zero matching rows; response-shape
+  verification — `id`/`client_order_id`/`symbol`/`side`/`position_effect`/
+  `qty`/`status`/`execution_venue`/`exit_reason`/`reject_reason` field values
+  asserted directly, `trade_id` asserted equal to `str(uuid)` (not a raw
+  UUID object), `created_at`/`updated_at` round-tripped through
+  `datetime.fromisoformat()` confirming real ISO-8601 with timezone info,
+  and `order_type`/`limit_price`/`venue_order_id`/`execution_mode` asserted
+  absent from the response (curated fields only, not a full-row dump); a
+  nullable `reject_reason` populated on a `status="rejected"` row; and a
+  concurrency regression (`test_blocked_execution_orders_read_does_not_block_
+  an_unrelated_route`) using the same deterministic `threading.Event`
+  start/release technique as `test_scanner_route_concurrency.py` — monkeypatches
+  the module-level `_fetch_execution_orders` to block until released, confirms
+  it is actually running in a worker thread (`started.wait`), then confirms a
+  concurrent `GET /health` still completes in under 2 seconds before
+  releasing the block and confirming the original request completes too.
+- Verified the new tests are a genuine regression guard, not false
+  positives: temporarily replaced `app/api/routes/intelligence.py` with its
+  pre-delivery form (copied from a fresh, untouched clone) and re-ran the
+  same file — **12 of 13 failed, 1 errored** (every route-hitting assertion
+  got a 404 instead of 200/422, since the route did not exist; the
+  concurrency test errored outright since `_fetch_execution_orders` did not
+  exist to monkeypatch). Restored the real implementation and re-ran —
+  **13 passed** again before proceeding.
+- Full backend suite with the delivery applied: `pytest -q` —
+  **1135 passed, 0 failed** (exactly +13 versus the 1122 post-rebase
+  baseline — the new route tests; zero regressions elsewhere, no flaky-
+  intermittent failure observed on this run).
+- `diff -rq` against a final, independently fresh clone of `main`
+  (confirmed still at `bbac618`) immediately before packaging: exactly six
+  files differ — `backend/app/api/routes/intelligence.py` (edited),
+  `backend/tests/test_execution_orders_route.py` (new),
+  `docs/architecture/execution-engine-design.md` (edited),
+  `docs/decisions/confirmed-decisions.md` (edited),
+  `docs/decisions/INDEX.md` (edited), and this pair (`CHANGES.md`/
+  `TESTING.md`, both edited, this delivery's entry prepended, the sibling
+  `scanner-override-ticker-validation` entry preserved intact below it).
+- Frontend: not touched by this delivery (backend-only observation
+  endpoint, exclusive scope per the approved task); no frontend check run.
+- `git diff --check` — passed (no whitespace errors).
+
+Package: `execution-orders-route.zip` contains only the changed
+repository-relative files — `backend/app/api/routes/intelligence.py`
+(edited), `backend/tests/test_execution_orders_route.py` (new),
+`docs/architecture/execution-engine-design.md` (edited, §6.3 as-built note
+plus two new diagrams, §6.8 table annotation), `docs/decisions/
+confirmed-decisions.md` (edited, new #181 entry appended), `docs/decisions/
+INDEX.md` (edited, new #181 row appended), `CHANGES.md` and `TESTING.md`
+(both edited, this delivery's entry prepended, the
+`scanner-override-ticker-validation` entry preserved intact below it).
+Untouched, exactly as scoped: `models/execution_ledger.py` (imported, not
+edited), every `governor/`, `execution_engine/`, `portfolio_state/`, and
+scanner file, `main.py`, every frontend file, any Alembic migration, and
+EX-5/EX-12.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `scanner-override-ticker-validation`
 
 GitHub `main` was pulled fresh at task start; re-pulled and `diff -rq`'d

@@ -1,3 +1,70 @@
+# CHANGES — decision #181: `execution-orders-route`
+
+## Current delivery
+
+Added `GET /intelligence/execution-orders`, a bounded, read-only endpoint over
+the `orders` ledger (decision #172) — the first reader of that table anywhere
+in this codebase; every existing import of `Order` (`governor/`,
+`execution_engine/`, `portfolio_state/`) is a write. Returns the most recent
+rows for `execution_mode == "simulated"` (hard-scoped, not a query parameter —
+the only mode any row can honestly carry until a real venue exists), ordered
+by `orders.id` (the ledger's own monotonic primary key) descending, with an
+optional exact `symbol` match and `limit` bounded `[1, 100]` (default 50).
+Response fields are curated, not a full-row dump: order identity (`id`,
+`client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`, `qty`,
+`status`, `execution_venue`, `exit_reason`, `reject_reason`, `created_at`,
+`updated_at`. An empty table, or a `symbol` with no matches, returns
+`{"orders": []}`, never an error — the same honest-empty convention every
+route in this file already follows.
+
+The synchronous SQLAlchemy read runs through a new module-level
+`_fetch_execution_orders()` helper, wrapped in `asyncio.to_thread` at the
+route boundary — `scanner-route-db-offload`'s established convention for
+keeping a blocking DB read off the event loop, rather than the inline,
+loop-blocking pattern this file's own older `GET /strategy-outcomes` and
+`GET /backtest-runs` routes still use (flagged, not silently repeated).
+`_fetch_execution_orders` opens and closes its own `Session` entirely inside
+the worker thread.
+
+New `backend/tests/test_execution_orders_route.py` (13 focused tests, real
+Postgres, hand-inserted `trades`/`orders` rows): descending-ledger-id
+ordering; exact-symbol filtering (including that a lowercase or substring
+query does not match); hard exclusion of `backtest`-mode rows even though the
+DB's own mode/venue CHECK allows them to exist; `limit` bounds (422 below/
+above, both edges accepted, default confirmed); an honest empty collection
+for an unmatched symbol; curated-field response shape with UUID/timestamp
+serialization verified by parsing them back, and confirmation that
+`order_type`/`limit_price`/`venue_order_id`/`execution_mode` are absent from
+the response; a nullable `reject_reason` populated on a rejected row; and a
+concurrency regression (mirroring `test_scanner_route_concurrency.py`'s own
+deterministic `threading.Event` technique) proving a blocked read does not
+block a concurrent `/health` request. Updated
+`docs/architecture/execution-engine-design.md` §6.3 with an as-built note
+plus a data-flow diagram and an internal-flow diagram, and annotated §6.8's
+`orders` row as now read.
+
+A file-disjoint sibling, `scanner-override-ticker-validation`, merged to
+`main` first, mid-task; this delivery was rebased onto that `main` with zero
+file overlap confirmed directly. Full backend suite on that baseline: 1122
+passed; with this delivery: 1135 passed (exactly +13, the new tests), zero
+regressions. Observation only, exactly as scoped: no order placement, no
+ledger write, no schema migration, and no frontend consumer — `orders.status`
+still has no UI widget, unchanged from the design doc's own deferred
+"Frontend" prerequisite.
+
+## Boundary
+
+Exactly two application files change: `backend/app/api/routes/intelligence.py`
+(edited, additive only — one new route, one new module-level helper) and
+`docs/architecture/execution-engine-design.md` (edited — §6.3 as-built note
+plus two new diagrams, §6.8 table annotation). New —
+`backend/tests/test_execution_orders_route.py` — plus this file, `TESTING.md`,
+`confirmed-decisions.md`, and `INDEX.md`. Untouched: every `governor/`,
+`execution_engine/`, `portfolio_state/`, scanner, and frontend file;
+`models/execution_ledger.py`; any migration; EX-5/EX-12.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `scanner-override-ticker-validation`
 
 ## Current delivery

@@ -845,3 +845,151 @@ async def get_exit_intents_view(request: Request, symbol: str | None = Query(Non
             for intent in sorted(intents, key=lambda item: (item.symbol, item.trigger_ts, str(item.position_id)))
         ],
     }
+
+
+def _fetch_execution_orders(symbol: str | None, limit: int) -> list[dict[str, Any]]:
+    """Synchronous read of the `orders` ledger (`models/execution_ledger.py`,
+    decision #172) — opens and closes its own `Session` entirely inside
+    whatever thread runs it. Module-level, not nested inside the route
+    function below: matches this file's own `_parse_level_key`/
+    `_parse_slope_key` precedent for a route-local helper, and is what
+    makes it a patchable target for a concurrency regression test the
+    same way `api/routes/scanner.py`'s own `list_universe_symbols` already
+    is (decision `scanner-route-db-offload`).
+
+    Hard-scoped to `execution_mode == "simulated"` — see
+    `get_execution_orders`'s own docstring for why this is fixed, not a
+    query parameter. `symbol`, when given, is an exact `==` match, no
+    case-folding. Ordered by `orders.id` (the ledger's own monotonic
+    `BigInteger Identity()` primary key) descending, capped by `limit`.
+
+    Returns plain dicts with the ORM row's own Python types
+    (`uuid.UUID` for `trade_id`, `datetime` for the two timestamps) rather
+    than pre-stringifying anything — same posture `get_exit_intents_view`
+    above already takes for `ExitIntent.position_id`/`trigger_ts`: FastAPI's
+    default `jsonable_encoder` serializes both safely (confirmed by that
+    route's own existing test asserting `str(uuid)` and an ISO timestamp
+    round-trip through JSON), so a second, redundant manual conversion
+    here would just duplicate encoding this process already does
+    correctly.
+    """
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.execution_ledger import Order
+
+    session = SessionLocal()
+    try:
+        filters = [Order.execution_mode == "simulated"]
+        if symbol is not None:
+            filters.append(Order.symbol == symbol)
+        rows = session.execute(
+            select(Order).where(*filters).order_by(Order.id.desc()).limit(limit)
+        ).scalars().all()
+        return [
+            {
+                "id": row.id,
+                "client_order_id": row.client_order_id,
+                "trade_id": row.trade_id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "position_effect": row.position_effect,
+                "qty": row.qty,
+                "status": row.status,
+                "execution_venue": row.execution_venue,
+                "exit_reason": row.exit_reason,
+                "reject_reason": row.reject_reason,
+                "created_at": row.created_at,
+                "updated_at": row.updated_at,
+            }
+            for row in rows
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/execution-orders")
+async def get_execution_orders(
+    limit: int = Query(50, ge=1, le=100, description="Most-recent-first cap on returned rows, 1-100."),
+    symbol: str | None = Query(None, description="Exact match on orders.symbol. Omit to return every symbol."),
+) -> dict[str, Any]:
+    """
+    Raw recent-rows observability into the `orders` ledger
+    (`models/execution_ledger.py`, decision #172) — the FIRST reader of
+    that table anywhere in this codebase. Confirmed by grep before writing
+    this: `governor/`, `execution_engine/`, and `portfolio_state/` all
+    import `Order` to WRITE it (authorization, placement, fill
+    application); no route, script, or test has ever read it back. Same
+    "make a built-but-unwired capability visible outside of tests" purpose
+    GET /strategy-outcomes (#122) already served for `strategy_outcomes`
+    and GET /backtest-runs (#136) served for `backtests` — this is that
+    same precedent applied to the one remaining unread ledger table with
+    real, persisted rows (the authorizer stub has been placing simulated
+    entry orders since decision #171).
+
+    **`execution_mode` is hard-scoped to `"simulated"`, not a query
+    parameter.** `simulated` is the only mode the authorizer stub is
+    technically permitted to run today (EX-1, decision #170: "technically
+    restricted to simulated execution... failing closed for paper/live")
+    and the only mode any `orders` row can honestly carry until a real
+    venue exists (`execution-engine-design.md` §8's "A real venue" deferred
+    prerequisite — still unbuilt). Exposing a mode filter today would let a
+    caller ask for `paper`/`live` rows that can never exist yet and get a
+    silently-empty result indistinguishable from "not built" — the same
+    population-safety reasoning (I4) GET /strategy-outcomes' own
+    `is_backtest`/`execution_mode` discussion already gives. Widening this
+    once a second venue/mode is real is a later, explicit decision, not an
+    oversight here.
+
+    **`symbol` is an exact match**, no case-folding or partial match — the
+    approved scope for this route. **`limit` is bounded `[1, 100]`**
+    (`Query(..., ge=1, le=100)`) — tighter than GET /strategy-outcomes'/GET
+    /backtest-runs' own `le=500`, matching `GET /scanner/state`'s own
+    `top_n` bound shape: this is a diagnostic tail over a comparatively
+    low-volume, single-authorizer-stub ledger (one concurrent position
+    today, per EX-4), not a paged export.
+
+    **Ordered by `orders.id` descending** — the ledger's own strictly-
+    monotonic `BigInteger Identity()` primary key (the task's own "ledger
+    ID"), not `created_at`: `id` is guaranteed insertion order, where
+    `created_at` is only a `server_default=func.now()` timestamp that could
+    tie within one statement. Mirrors `fills.ledger_seq`'s own "ledger
+    order" role on the neighboring table in the same schema.
+
+    **Curated fields, not a full-row dump** — deliberately narrower than
+    GET /strategy-outcomes' whole-schema `model_validate` precedent, per
+    this route's own approved scope: order identity (`id`,
+    `client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`,
+    `qty`, `status`, `execution_venue`, `exit_reason`, `reject_reason`,
+    `created_at`, `updated_at`. `execution_mode` itself is left off the row
+    shape since every row is `"simulated"` by construction of the filter
+    above; `order_type`, `limit_price`, and `venue_order_id` are real
+    columns on this table that this route's own approved field list
+    doesn't ask for, so they stay out — a later, explicitly-approved
+    widening, not an omission to fix quietly.
+
+    **Off the event loop, on purpose.** Unlike GET /strategy-outcomes and
+    GET /backtest-runs above (both call `session.execute(...)` directly
+    inside their own `async def`, blocking the loop for the query's
+    duration — a pre-existing gap in this file this task's own approved
+    scope does not ask this route to fix for them), this route's read runs
+    through `_fetch_execution_orders` via `asyncio.to_thread`, the same
+    convention `api/routes/scanner.py` established (decision
+    `scanner-route-db-offload`) for exactly this "sync SQLAlchemy call at
+    an async route boundary" shape: the helper opens and closes its own
+    `Session` entirely inside the worker thread, so a slow or blocked read
+    here cannot hold up an unrelated concurrent request this process is
+    serving.
+
+    An empty `orders` table, or a `symbol` with no matching rows, returns
+    `{"orders": []}`, 200 — the same honest-empty convention every route in
+    this file already follows, never an error.
+
+    Import is local to `_fetch_execution_orders` itself, not hoisted to
+    this file's top-of-file import block — same collision-avoidance
+    reasoning every other route below GET /opportunities already gives
+    (decision #114 onward): this route is this delivery's only touch to
+    this file.
+    """
+    orders = await asyncio.to_thread(_fetch_execution_orders, symbol, limit)
+    return {"orders": orders}

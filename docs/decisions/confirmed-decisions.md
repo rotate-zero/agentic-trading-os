@@ -1295,3 +1295,103 @@ edited, additive only — `backend/app/main.py`, `backend/app/api/routes/health.
 scoped: every scanner file, trading rule, exit-placement file, and EX-5/EX-12.
 Cross-component and internal status-flow diagrams are in
 `docs/architecture/execution-engine-design.md` §6.9.
+
+### 181. Read-only `orders` ledger observability (`execution-orders-route`)
+
+The `orders` ledger (decision #172) has had two real writers — `governor/`
+approves and `execution_engine/` places, updates, and fills — since decision
+#171/#172, but no reader anywhere in this codebase (confirmed by grep before
+writing this: every import of `Order` from `models/execution_ledger.py` is a
+write, in `governor/`, `execution_engine/`, or `portfolio_state/`). Same
+"make a built-but-unwired capability visible outside of tests" gap this
+project has repeatedly closed for other tables — `GET /strategy-outcomes`
+(#122) for `strategy_outcomes`, `GET /backtest-runs` (#136) for `backtests`,
+`GET /intelligence/exit-intents` (#178) for Position Monitor's in-memory
+state — applied here to the one remaining unread ledger table with real,
+persisted rows.
+
+Added `GET /intelligence/execution-orders` to
+`backend/app/api/routes/intelligence.py`. Hard-scoped to
+`execution_mode == "simulated"` — deliberately not a query parameter:
+`simulated` is the only mode the authorizer stub is technically permitted to
+run today (EX-1, decision #170) and the only mode any `orders` row can
+honestly carry until a real venue exists (§8's still-deferred "A real venue"
+prerequisite); exposing a mode filter now would let a caller ask for
+`paper`/`live` rows that can never exist and get a silently-empty result
+indistinguishable from "not built yet" (the same population-safety reasoning
+decision #130/#172 already established for `strategy_outcomes`). `symbol`,
+when given, is an exact match — no case-folding, no partial match. `limit`
+is bounded `[1, 100]` (default 50) — tighter than `GET /strategy-outcomes`'/
+`GET /backtest-runs`' own `le=500`, sized for a diagnostic tail over a
+comparatively low-volume, single-authorizer-stub ledger (one concurrent
+position today, per EX-4), not a paged export. Rows are ordered by
+`orders.id` — the ledger's own strictly-monotonic `BigInteger Identity()`
+primary key — descending, not `created_at`, which could tie within one
+statement. The response is curated, not a full-row dump: order identity
+(`id`, `client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`,
+`qty`, `status`, `execution_venue`, `exit_reason`, `reject_reason`,
+`created_at`, `updated_at` — `execution_mode` (constant by construction of
+the filter), `order_type`, `limit_price`, and `venue_order_id` stay out, a
+scoped omission rather than an oversight. An empty table, or a `symbol` with
+no matching rows, returns `{"orders": []}`, 200 — the same honest-empty
+convention every route in this file already follows.
+
+The synchronous SQLAlchemy read runs through a new module-level
+`_fetch_execution_orders()` helper, wrapped in `asyncio.to_thread` at the
+route boundary — `api/routes/scanner.py`'s established convention (the
+decision-number-free `scanner-route-db-offload` delivery) for exactly this
+"sync DB call at an async route boundary" shape, rather than repeating this
+file's own older gap a third time: `GET /strategy-outcomes` and
+`GET /backtest-runs` above both still call `session.execute(...)` directly
+inside their own `async def`, blocking the event loop for the query's
+duration — a pre-existing issue in this file this task's own scope did not
+ask this route to fix for them, flagged here rather than silently repeated.
+The helper opens and closes its own `Session` entirely inside the worker
+thread, matching `app/scanner/universe.py`'s own shape.
+
+**Testing.** New `backend/tests/test_execution_orders_route.py` (13 tests,
+real Postgres, hand-inserted `trades`/`orders` rows via the real ORM models —
+no live authorizer-stub/Execution Engine run needed, matching
+`test_backtest_runs_route.py`'s own hand-inserted-row precedent for rows it
+doesn't need a live write path to produce): descending-ledger-id ordering;
+exact-symbol filtering, including that a lowercase or substring query does
+NOT match; that a `backtest`-mode row (same `simulated` venue, passing the
+DB's own mode/venue CHECK) is excluded from the `simulated`-only route with
+no parameter able to ask for it; `limit` capping to the most recent rows,
+rejecting `0` and `101` with 422, and accepting both bound edges; the
+default-limit path; an honest empty collection for an unmatched symbol;
+curated-field response shape with UUID (`trade_id`) and timestamp
+(`created_at`/`updated_at`) serialization asserted by parsing them back, and
+that `order_type`/`limit_price`/`venue_order_id`/`execution_mode` are absent
+from the response; nullable `reject_reason` populated on a rejected row; and
+a concurrency regression (same deterministic `threading.Event`
+start/release technique as `test_scanner_route_concurrency.py`) proving a
+blocked `_fetch_execution_orders` call does not block a concurrent `/health`
+request, confirming the `asyncio.to_thread` offload actually keeps the
+event loop free rather than merely returning the right JSON.
+
+A file-disjoint sibling, `scanner-override-ticker-validation`
+(decision-number-free, `backend/app/api/routes/scanner.py` +
+`test_scanner_runner.py`/`test_scanner_state_route.py` +
+`scanner-design.md`), merged to `main` first, mid-task; this delivery was
+rebased onto that `main` and zero file overlap confirmed directly (its own
+footprint never touches `intelligence.py`, `execution_ledger.py`, or
+`execution-engine-design.md`). Full backend suite on the untouched
+post-`scanner-override-ticker-validation` baseline: 1122 passed/0 failed;
+with this delivery: 1135 passed/0 failed (exactly +13, the new tests), zero
+regressions.
+
+Observation only, exactly as scoped: no order placement, no ledger write, no
+schema migration, no frontend consumer, and no change to any execution
+decision. §8's "Frontend — ... any consumer of `orders.status`" deferred
+prerequisite is unchanged by this delivery — this route is a diagnostic/ops
+read, not that prerequisite.
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main`:
+edited, additive only — `backend/app/api/routes/intelligence.py`,
+`docs/architecture/execution-engine-design.md` (§6.3 as-built note plus a
+data-flow and an internal-flow diagram; §6.8's `orders` row annotated as now
+read). New — `backend/tests/test_execution_orders_route.py`. Untouched,
+exactly as scoped: every `governor/`, `execution_engine/`, `portfolio_state/`,
+scanner, and frontend file; `models/execution_ledger.py`; every prior
+decision entry; EX-5/EX-12.
