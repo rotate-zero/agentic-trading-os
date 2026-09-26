@@ -487,6 +487,34 @@ Feeds back into two places: **Strategy Engine** (reweight or retire underperform
 
 **Schema built (decision #120):** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — a real migration, real ORM (`StrategyOutcomeRecord`), real write path (`record_strategy_outcome()`). This line previously read "Schema direction-locked, not yet built," true when originally written, stale since decision #120 landed; corrected here. `strategy_outcomes` has real backtest-derived rows since decision #128; the running entry pipeline does not yet write live closed-trade outcomes because exit execution and OutcomeRecorder remain unwired. "Rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5, itself now built, see `backtest-runner-design.md` §7), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5 / `backtest-runner-design.md` §7 (decisions #87, #89, #120).
 
+**As-built analytics route read flow.** The two decision #127 routes expose the decision #122 query functions. Each async route offloads its synchronous SQLAlchemy read with `asyncio.to_thread`, following the established read-route pattern; the query SQL and population selector stay in `performance_queries.py`.
+
+```text
+Frontend usePerformanceAnalytics / API caller
+                  │ GET /intelligence/win-rate-by-hour or
+                  │ GET /intelligence/expectancy-by-session-type
+                  ▼
+app/api/routes/intelligence.py (async route, event loop)
+                  │ await asyncio.to_thread(query function, filters)
+                  ▼
+app/trading_intelligence/performance_queries.py (worker thread)
+                  │ synchronous SQLAlchemy session + GROUP BY query
+                  ▼
+          strategy_outcomes (PostgreSQL)
+```
+
+```text
+Route receives strategy_name, strategy_version, is_backtest
+    │
+    ▼
+await asyncio.to_thread(the matching query function, all three filters)
+    ├─ query validates version/name and applies strict is_backtest selection
+    ├─ ValueError ─► HTTP 400 with the existing detail
+    └─ dataclass rows ─► asdict per row ─► existing response envelope
+         win-rate-by-hour: {"hourly_win_rates": [...]}
+         expectancy-by-session-type: {"session_expectancy": [...]}
+```
+
 ---
 
 ## 15. World View — Read-Only Composite Snapshot

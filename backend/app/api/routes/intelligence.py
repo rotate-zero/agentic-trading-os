@@ -624,7 +624,8 @@ async def get_win_rate_by_hour_view(
     from app.trading_intelligence.performance_queries import get_win_rate_by_hour
 
     try:
-        rows = get_win_rate_by_hour(
+        rows = await asyncio.to_thread(
+            get_win_rate_by_hour,
             strategy_name=strategy_name,
             strategy_version=strategy_version,
             is_backtest=is_backtest,
@@ -664,7 +665,8 @@ async def get_expectancy_by_session_type_view(
     from app.trading_intelligence.performance_queries import get_expectancy_by_session_type
 
     try:
-        rows = get_expectancy_by_session_type(
+        rows = await asyncio.to_thread(
+            get_expectancy_by_session_type,
             strategy_name=strategy_name,
             strategy_version=strategy_version,
             is_backtest=is_backtest,

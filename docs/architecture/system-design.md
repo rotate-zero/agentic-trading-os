@@ -410,6 +410,30 @@ Two config shapes cover this, split by what they draw: `SubWindowConfig.priceInd
 
 **Feature Engine panel state in older sessions.** `WorkspaceContext.tsx` stores `featureEngineCollapsed`, `featureEngineWidthPx`, and `featureEnginePanelSymbol` per Main Window. `makeMainWindow()` starts them at `true`, `300`, and `DEFAULT_SYMBOL`. On session load, `normalizeMainWindow()` now backfills each missing value independently with those same defaults, using the established Scanner `??` pattern. An explicitly saved `false`, custom width, or selected symbol passes through. This repairs restoration of older `trading-workspace:session` data; the panel's controls and saved field contract are unchanged.
 
+**Info panel state in older sessions.** `makeMainWindow()` starts `infoCollapsed` at `false` and `infoWidthPx` at `300`. `normalizeMainWindow()` backfills each missing field with that existing default. An explicitly saved `true` or `false`, and any saved width, pass through; `InfoTab.tsx` continues to consume the normalized values without changing its interactions.
+
+Info panel restoration data flow:
+
+```text
+Browser localStorage["trading-workspace:session"]
+    -> loadSession() parses mainWindows[]
+    -> normalizeMainWindow() backfills missing Info fields per Main Window
+    -> WorkspaceProvider exposes the normalized active window
+    -> useWorkspace() supplies infoCollapsed and infoWidthPx
+    -> InfoTab renders the saved/default collapse state and width
+```
+
+Info field flow inside `normalizeMainWindow()`:
+
+```text
+saved MainWindowState w
+    -> copy existing fields and normalize subWindows
+    -> infoCollapsed = w.infoCollapsed ?? false
+    -> infoWidthPx   = w.infoWidthPx   ?? 300
+    -> continue existing Feature Engine and Scanner backfills
+    -> return normalized MainWindowState
+```
+
 Data flow during session restoration:
 
 ```text

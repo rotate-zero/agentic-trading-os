@@ -1,3 +1,48 @@
+# CHANGES — `info-panel-session-restore`
+
+## Current delivery
+
+Older workspace sessions now receive `makeMainWindow()`'s existing Info
+panel defaults in `normalizeMainWindow()`: `infoCollapsed: false` and
+`infoWidthPx: 300`. Each missing field is backfilled independently with
+`??`, preserving explicitly saved collapsed and expanded states and custom
+widths. The Info panel's interactions and other saved fields are unchanged.
+
+Updated `docs/architecture/system-design.md` §4.11 with Info restoration
+data-flow and internal-flow diagrams. Verification is recorded in
+`TESTING.md`. This follows the established Scanner and Feature Engine
+restoration pattern; no new product decision or decision number was needed.
+
+## Boundary
+
+The only application code change is in `frontend/src/state/WorkspaceContext.tsx`.
+The earlier uncommitted analytics delivery in this workspace remains intact.
+
+<!-- Previous delivery record retained below. -->
+
+# CHANGES — `performance-analytics-route-read-offload`
+
+## Current delivery
+
+Moved the synchronous query calls in `GET /intelligence/win-rate-by-hour`
+and `GET /intelligence/expectancy-by-session-type` to `asyncio.to_thread`.
+Both routes retain their three filters, strict live/backtest selection in
+the query layer, `ValueError` to HTTP 400 mapping, and response envelopes.
+Added a deterministic blocked-query concurrency regression for each route.
+
+Updated `docs/architecture/trading-intelligence-architecture.md` §14 with
+component data flow and route internal flow diagrams. This uses the existing
+read-route offload pattern, so no new architectural decision was required.
+Verification is recorded in `TESTING.md`.
+
+## Boundary
+
+Only the two analytics route calls, one concurrency test, the canonical
+architecture record, and this delivery's change and test records changed.
+The query SQL and other intelligence routes are unchanged.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `feature-engine-panel-session-restore`
 
 ## Current delivery

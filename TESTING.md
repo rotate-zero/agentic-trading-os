@@ -1,3 +1,55 @@
+# TESTING — `info-panel-session-restore`
+
+Pulled `origin/main` on branch `main` before editing; baseline `8109426`.
+The working tree already contained an unrelated, uncommitted analytics
+delivery, including earlier sections in this file and `CHANGES.md`; those
+changes were preserved. No database was used or changed for this task.
+
+- Directly executed the actual `normalizeMainWindow()` function extracted
+  from `WorkspaceContext.tsx` and transpiled with the installed TypeScript
+  compiler. Six fixtures passed: old session missing both Info fields;
+  partial sessions missing either collapse or width; current sessions
+  explicitly collapsed or expanded with custom widths; and current
+  session with explicit defaults. Every fixture also checked preservation
+  of Scanner, Feature Engine, backtest IDs, and sub-window normalization.
+  The harness checked that `makeMainWindow()` declares `false` and `300`.
+- `npm run build` from `frontend/`: passed (`tsc -b` and Vite; 103 modules).
+  Vite emitted its existing advisory for a bundle over 500 kB.
+- `git diff --check`: passed. The tracked TypeScript build cache was
+  restored after the successful build; it was clean before this task.
+
+There is no frontend test script in `frontend/package.json`; the direct
+function fixtures cover the changed restoration path. No Info panel
+interaction code changed.
+
+<!-- Previous delivery record retained below. -->
+
+# TESTING — `performance-analytics-route-read-offload`
+
+Pulled `origin/main` on branch `main` before editing; baseline `8109426`,
+clean working tree. The configured local PostgreSQL development database
+was used by the existing analytics route/query tests; their fixtures clean
+their own `strategy_outcomes` rows. No live broker or external production
+database was used.
+
+- Focused analytics run from `backend/`: `.venv/bin/pytest -q --tb=short
+  --disable-warnings tests/test_performance_analytics_route_concurrency.py
+  tests/test_performance_analytics_routes.py tests/test_performance_queries.py`
+  — **20 passed**. Each new test blocks its query with `threading.Event`,
+  proves `/health` responds before releasing it, and checks forwarding of
+  all three filters and the unchanged empty response envelope.
+- Adjacent backend run: `.venv/bin/pytest -q --tb=short --disable-warnings
+  tests/test_intelligence_routes.py
+  tests/test_intelligence_history_read_concurrency.py
+  tests/test_performance_intelligence.py
+  tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py` —
+  **40 passed**.
+- The initial sandboxed analytics run had two worker-thread timeouts and
+  skipped 18 database tests, matching the previously documented sandbox
+  thread/database restriction. Both runs above passed outside the sandbox.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `feature-engine-panel-session-restore`
 
 Pulled `origin/main` on branch `main` before editing; baseline `533f854`,

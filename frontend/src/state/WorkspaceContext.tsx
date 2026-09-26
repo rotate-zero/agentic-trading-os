@@ -358,6 +358,10 @@ function normalizeMainWindow(w: MainWindowState): MainWindowState {
     // (decision #163) — sessions persisted before this field
     // existed won't have it in localStorage at all.
     lastBacktestSweepId: w.lastBacktestSweepId ?? null,
+    // Match makeMainWindow() for sessions saved before Info panel state.
+    // Nullish backfill preserves an explicitly collapsed or expanded panel.
+    infoCollapsed: w.infoCollapsed ?? false,
+    infoWidthPx: w.infoWidthPx ?? 300,
     // Older sessions can predate the Feature Engine panel state. Match
     // makeMainWindow() while preserving an explicitly expanded panel,
     // resized width, and selected symbol.
