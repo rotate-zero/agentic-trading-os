@@ -1106,3 +1106,35 @@ remain unchanged.
 Route-only, matching this project's established "build the backend capability first, surface it later" sequencing (Context Engine #98→#125, Performance Analytics #122→#127, World View #150→#154) — no frontend change.
 
 ---
+
+### History-route database reads (as built)
+
+`GET /intelligence/strategy-outcomes` and `GET /intelligence/backtest-runs`
+keep their existing parameters, validation, filters, ordering, limits, and
+response shapes. UUID and contradictory-filter validation happen in the async
+route before database work. Each route then runs its synchronous SQLAlchemy
+query and Pydantic row serialization in `asyncio.to_thread`, following the
+existing execution-orders and scanner route pattern. The worker helper opens
+and closes its own `SessionLocal` session, so no session or ORM row crosses
+the thread boundary. The older route-flow diagram above describes the same
+query semantics; the worker boundary now sits between validation and filters.
+
+```
+Frontend history request
+        │
+        ▼
+async route: validate query parameters ── invalid ──► HTTP 400/422
+        │ valid
+        ▼
+asyncio.to_thread(_fetch_strategy_outcomes / _fetch_backtest_runs)
+        │
+        ▼
+worker: open SessionLocal → build filters → query → serialize rows → close session
+        │
+        ▼
+async route: wrap list in existing response key → JSON response
+```
+
+This changes scheduling only. It adds no cache, query, table, or frontend
+behavior. A blocked history read leaves the event loop available to serve an
+independent `/health` request.

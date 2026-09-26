@@ -1,3 +1,26 @@
+# CHANGES — `intelligence-history-read-offload`
+
+## Current delivery
+
+Completed the in-progress offload of `GET /intelligence/strategy-outcomes`
+and `GET /intelligence/backtest-runs`. Both routes retain their existing
+validation, query semantics, and JSON contracts while their synchronous
+database reads and row serialization run in worker threads. Each helper owns
+its database session. Added a concurrency regression for both routes.
+
+Updated the backtest architecture record with the current route flow and
+corrected the execution architecture record's now-stale comparison. This
+follows the established scanner and execution-orders offload pattern; no new
+architecture decision was needed.
+
+## Boundary
+
+Only the two history routes in `backend/app/api/routes/intelligence.py`, their
+route-test wording, one new concurrency test, the two affected architecture
+documents, and this delivery's `CHANGES.md`/`TESTING.md` records change.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-panel-order-history` (decision #182)
 
 ## Current delivery

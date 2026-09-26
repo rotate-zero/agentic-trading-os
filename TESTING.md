@@ -1,3 +1,32 @@
+# TESTING — `intelligence-history-read-offload`
+
+Current branch: `main`, baseline commit `1def0b3`. At inspection, the two
+route edits and the new concurrency test were already uncommitted work in the
+tree. This delivery verified and completed that work; it did not recreate it.
+
+- Focused backend run, from `backend/`:
+  `.venv/bin/pytest -q --tb=short --disable-warnings
+  tests/test_intelligence_history_read_concurrency.py
+  tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py
+  tests/test_backtest_runs_route.py tests/test_execution_orders_route.py` —
+  **42 passed**. The concurrency test covers both changed routes with a
+  blocked worker read and a concurrent `/health` request. Existing database
+  route tests cover filtering, ordering, limits, empty results, and response
+  serialization.
+- The configured local development PostgreSQL database (`localhost:5432`,
+  `trading_workspace`) was at Alembic revision `0011`; it was upgraded to
+  repository head `0014` before the passing run. The first focused run failed
+  because the older schema lacked the current `orders` table and outcome
+  columns. Test fixtures cleaned their own rows; no live broker or external
+  production database was used.
+- Tests ran outside the command sandbox because a standalone
+  `asyncio.to_thread(lambda: 1)` hung inside it but returned `1` immediately
+  outside it. The sandbox symptom also affected the existing scanner
+  concurrency test. This is an execution-environment limitation, not an
+  application failure.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-panel-order-history` (decision #182)
 
 Pulled `main` before editing: `33721e4a73ab1836f932370003c4f2e3c6bc0e91`,

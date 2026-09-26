@@ -15,7 +15,7 @@ a blended query returning the numerically "right" count must still fail.
 Deliberately split into two very different test styles, matching each
 route's own dependency:
 
-- `/strategy-outcomes` is a plain synchronous DB read (no background
+- `/strategy-outcomes` is a worker-thread DB read (no background
   engine, no EventBus subscriber) — a sync `TestClient(app)` is enough,
   same posture as test_market_routes.py. Populated-case rows are
   inserted directly via the real `StrategyOutcomeRecord` ORM model

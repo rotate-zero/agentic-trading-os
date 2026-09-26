@@ -460,17 +460,11 @@ async def get_strategy_outcomes(
     not an error, matching the convention every route in this file
     already follows for a genuinely empty result set.
 
-    Import is local to this function, not hoisted to this file's
-    top-of-file import block — same collision-avoidance reasoning GET
-    /opportunities' own docstring gives above (decision #114).
+    Database and schema imports stay local to `_fetch_strategy_outcomes`.
+    The synchronous query and row serialization run in that worker's own
+    session via `asyncio.to_thread`, following GET /execution-orders.
     """
     import uuid as _uuid
-
-    from sqlalchemy import select
-
-    from app.db.session import SessionLocal
-    from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
-    from app.schemas.performance import StrategyOutcome
 
     backtest_run_uuid: _uuid.UUID | None = None
     if backtest_run_id is not None:
@@ -502,6 +496,20 @@ async def get_strategy_outcomes(
                 detail=f"sweep_id {sweep_id!r} is not a valid UUID",
             ) from exc
 
+    outcomes = await asyncio.to_thread(
+        _fetch_strategy_outcomes, limit, is_backtest, backtest_run_uuid, sweep_uuid
+    )
+    return {"outcomes": outcomes}
+
+
+def _fetch_strategy_outcomes(limit, is_backtest, backtest_run_uuid, sweep_uuid):
+    """Read and serialize outcomes within one worker-owned database session."""
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
+    from app.schemas.performance import StrategyOutcome
+
     filters = [StrategyOutcomeRecord.is_backtest.is_(is_backtest)]
     if backtest_run_uuid is not None:
         filters.append(StrategyOutcomeRecord.backtest_run_id == backtest_run_uuid)
@@ -522,14 +530,12 @@ async def get_strategy_outcomes(
             .order_by(StrategyOutcomeRecord.exit_filled_at.desc())
             .limit(limit)
         ).scalars().all()
+        return [
+            StrategyOutcome.model_validate(row, from_attributes=True).model_dump(mode="json")
+            for row in rows
+        ]
     finally:
         session.close()
-
-    outcomes = [
-        StrategyOutcome.model_validate(row, from_attributes=True).model_dump(mode="json")
-        for row in rows
-    ]
-    return {"outcomes": outcomes}
 
 
 @router.get("/opportunity-conflicts")
@@ -743,11 +749,9 @@ async def get_backtest_runs(
     environment) — same convention every route in this file already
     follows.
 
-    Import is local to this function, not hoisted to this file's
-    top-of-file import block — same collision-avoidance reasoning every
-    other route below GET /opportunities gives (decision #114 and
-    onward): this route is this delivery's only touch to this file,
-    appended as a single additive block.
+    Database and schema imports stay local to `_fetch_backtest_runs`.
+    The synchronous query and row serialization run in that worker's own
+    session via `asyncio.to_thread`, following GET /execution-orders.
 
     No frontend work in this delivery, deliberately — matching this
     project's own established backend-then-frontend sequencing
@@ -759,12 +763,6 @@ async def get_backtest_runs(
     an oversight.
     """
     import uuid as _uuid
-
-    from sqlalchemy import select
-
-    from app.db.session import SessionLocal
-    from app.models.trading_intelligence import BacktestRunRecord
-    from app.schemas.performance import BacktestRun
 
     run_uuid: _uuid.UUID | None = None
     if run_id is not None:
@@ -786,6 +784,20 @@ async def get_backtest_runs(
                 detail=f"sweep_id {sweep_id!r} is not a valid UUID",
             ) from exc
 
+    backtest_runs = await asyncio.to_thread(
+        _fetch_backtest_runs, limit, run_uuid, strategy_name, sweep_uuid
+    )
+    return {"backtest_runs": backtest_runs}
+
+
+def _fetch_backtest_runs(limit, run_uuid, strategy_name, sweep_uuid):
+    """Read and serialize backtest runs within one worker-owned database session."""
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.trading_intelligence import BacktestRunRecord
+    from app.schemas.performance import BacktestRun
+
     filters = []
     if run_uuid is not None:
         filters.append(BacktestRunRecord.run_id == run_uuid)
@@ -802,14 +814,12 @@ async def get_backtest_runs(
             .order_by(BacktestRunRecord.created_at.desc())
             .limit(limit)
         ).scalars().all()
+        return [
+            BacktestRun.model_validate(row, from_attributes=True).model_dump(mode="json")
+            for row in rows
+        ]
     finally:
         session.close()
-
-    backtest_runs = [
-        BacktestRun.model_validate(row, from_attributes=True).model_dump(mode="json")
-        for row in rows
-    ]
-    return {"backtest_runs": backtest_runs}
 
 
 @router.get("/world-view")
@@ -968,11 +978,7 @@ async def get_execution_orders(
     doesn't ask for, so they stay out — a later, explicitly-approved
     widening, not an omission to fix quietly.
 
-    **Off the event loop, on purpose.** Unlike GET /strategy-outcomes and
-    GET /backtest-runs above (both call `session.execute(...)` directly
-    inside their own `async def`, blocking the loop for the query's
-    duration — a pre-existing gap in this file this task's own approved
-    scope does not ask this route to fix for them), this route's read runs
+    **Off the event loop, on purpose.** This route's read runs
     through `_fetch_execution_orders` via `asyncio.to_thread`, the same
     convention `api/routes/scanner.py` established (decision
     `scanner-route-db-offload`) for exactly this "sync SQLAlchemy call at
