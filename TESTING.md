@@ -1,3 +1,25 @@
+# TESTING — `feature-engine-panel-session-restore`
+
+Pulled `origin/main` on branch `main` before editing; baseline `533f854`,
+clean working tree. No database was used or changed.
+
+- Directly executed the actual `normalizeMainWindow()` function extracted
+  from `WorkspaceContext.tsx` and transpiled with the installed TypeScript
+  compiler. Six fixtures passed: legacy session missing all three Feature
+  Engine fields; three partial sessions each retaining one explicit field;
+  current session with `false`, custom width, and selected symbol; and
+  current session with explicit defaults. Each case also checked that
+  Scanner state, backtest run ID, and a sub-window were preserved.
+- `npm run build` from `frontend/`: passed (`tsc -b`, then Vite; 103 modules).
+  Vite reported its existing advisory for a bundle over 500 kB.
+- `git diff --check`: passed.
+
+There is no frontend test script or test runner in `frontend/package.json`.
+The direct function fixtures cover restoration values; no browser interaction
+check was performed because panel behavior was outside this change.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `intelligence-history-read-offload`
 
 Current branch: `main`, baseline commit `1def0b3`. At inspection, the two

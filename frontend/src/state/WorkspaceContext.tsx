@@ -358,6 +358,12 @@ function normalizeMainWindow(w: MainWindowState): MainWindowState {
     // (decision #163) — sessions persisted before this field
     // existed won't have it in localStorage at all.
     lastBacktestSweepId: w.lastBacktestSweepId ?? null,
+    // Older sessions can predate the Feature Engine panel state. Match
+    // makeMainWindow() while preserving an explicitly expanded panel,
+    // resized width, and selected symbol.
+    featureEngineCollapsed: w.featureEngineCollapsed ?? true,
+    featureEngineWidthPx: w.featureEngineWidthPx ?? 300,
+    featureEnginePanelSymbol: w.featureEnginePanelSymbol ?? DEFAULT_SYMBOL,
     // Back-fill for sessions persisted before the Scanner panel existed
     // (scanner-design.md §12) — old localStorage sessions predate
     // scannerCollapsed/scannerWidthPx entirely, so both arrive as

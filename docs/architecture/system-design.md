@@ -408,6 +408,31 @@ Two config shapes cover this, split by what they draw: `SubWindowConfig.priceInd
 
 **Multi-monitor: a Main Window can pop out into its own real browser tab, live-synced with the main one — not a second, independent session.** `MainWindowTabs.tsx`'s pop-out button opens `/window/:id` via `window.open()`; `App.tsx`'s minimal hand-rolled router (two shapes only — `/` and `/window/:id`, no routing library) renders a chrome-stripped, single-window view locked to that id via `WorkspaceProvider`'s `lockedMainWindowId`. "Live-synced" is the load-bearing part: every browser tab of this app already persists its full session to `localStorage` on every change (pre-existing, since Phase 1); `frontend/src/state/crossTabSync.ts` adds a `BroadcastChannel`-based ping so every OTHER open tab re-reads `localStorage` and applies the update immediately, instead of only picking it up on next page load. A tab never overrides its own just-applied state with its own subsequent write (tracked via a last-synced-JSON ref, checked before every persist+broadcast) — without that guard, two open tabs would echo each other's updates back and forth indefinitely. A popped-out tab's own `activeMainWindowId` is pinned and exempted from the incoming sync's `activeMainWindowId`, specifically so it keeps showing the one window it was opened for regardless of which tab the main workspace has active at any given moment. Gracefully degrades to today's single-tab-only behavior if `BroadcastChannel` isn't available in the environment — no error, no crash, just no cross-tab live sync. See `../decisions/confirmed-decisions.md` #42.
 
+**Feature Engine panel state in older sessions.** `WorkspaceContext.tsx` stores `featureEngineCollapsed`, `featureEngineWidthPx`, and `featureEnginePanelSymbol` per Main Window. `makeMainWindow()` starts them at `true`, `300`, and `DEFAULT_SYMBOL`. On session load, `normalizeMainWindow()` now backfills each missing value independently with those same defaults, using the established Scanner `??` pattern. An explicitly saved `false`, custom width, or selected symbol passes through. This repairs restoration of older `trading-workspace:session` data; the panel's controls and saved field contract are unchanged.
+
+Data flow during session restoration:
+
+```text
+Browser localStorage["trading-workspace:session"]
+    -> loadSession() parses mainWindows[]
+    -> each MainWindowState enters normalizeMainWindow()
+    -> WorkspaceProvider holds normalized active window
+    -> useWorkspace() exposes its Feature Engine fields
+    -> FeatureEnginePanel renders collapse, width, and symbol
+```
+
+Internal flow in `normalizeMainWindow()` for each restored Main Window:
+
+```text
+saved MainWindowState w
+    -> copy existing fields and normalize subWindows
+    -> featureEngineCollapsed   = w.featureEngineCollapsed   ?? true
+    -> featureEngineWidthPx     = w.featureEngineWidthPx     ?? 300
+    -> featureEnginePanelSymbol = w.featureEnginePanelSymbol ?? DEFAULT_SYMBOL
+    -> continue existing Scanner field backfills
+    -> return normalized MainWindowState
+```
+
 **Volume bars (the histogram pane itself) are now fully customizable per sub-window, distinct from the volume-average lines drawn on top of them.** `SubWindowConfig.volumeBars` (`VolumeBarsConfig`) controls whether the pane shows at all, and whether bars are colored two-color (up/down, each its own hex) or one flat hex color — same `ColorField` swatch-plus-hex-input control already used for every other customizable color in this UI (background, grid, timer, volume-avg lines, indicators, levels), so this isn't a new interaction pattern, just a new place it's applied. Disabling collapses the volume price scale's margins to zero height (`ChartWidget.tsx`), not just hiding the bars, so the candle pane actually reclaims the vertical space. See `../decisions/confirmed-decisions.md` #42.
 
 **Chart Style — candlestick vs. OHLC bar — is a per-sub-window toggle backed directly by `lightweight-charts`' own two native series types, not a custom renderer.** `SubWindowConfig.chartStyle: ChartStyle` (`"candlestick" | "bar"`) follows the same global-default-plus-per-instance-override shape every other display setting here already has — `DEFAULT_CHART_STYLE = "candlestick"` seeds every newly-created sub-window, and a `SubWindowMenu` screen (segmented control, matching Volume Bars' color-mode toggle) overrides it per window. Switching styles swaps the LIVE series in place (`chart.removeSeries` + `addBarSeries`/`addCandlestickSeries` + `setData`) rather than recreating the whole chart, so zoom/pan survive a toggle — the overlays/horizontalLevels/dailyLevels effects below explicitly depend on `chartStyle` too, specifically so their price lines/markers reattach to the new series in the same render rather than being silently orphaned on the removed one. Purely a rendering-layer choice: identical OHLC candle data drives both styles, so no Feature Engine or backend change was needed. See `../decisions/confirmed-decisions.md` #73.

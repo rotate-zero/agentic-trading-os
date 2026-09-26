@@ -1,3 +1,27 @@
+# CHANGES — `feature-engine-panel-session-restore`
+
+## Current delivery
+
+Older workspace sessions now receive the Feature Engine panel defaults in
+`normalizeMainWindow()`: collapsed `true`, width `300`, and symbol
+`DEFAULT_SYMBOL`. Each missing field is filled independently with `??`, so
+an explicitly expanded panel (`false`), custom width, and selected symbol
+survive restoration. This follows the existing Scanner backfill pattern and
+changes no panel interaction or saved field contract.
+
+Updated `docs/architecture/system-design.md` §4.11 with the as-built data
+flow and internal flow diagrams, and added a current-state pointer in
+`docs/architecture/scanner-design.md`. Verification is recorded in
+`TESTING.md`. No new decision was needed: this repairs session restoration
+using established defaults.
+
+## Boundary
+
+Application code changes only in `frontend/src/state/WorkspaceContext.tsx`.
+No panel, backend, API, or other saved field changes.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `intelligence-history-read-offload`
 
 ## Current delivery
