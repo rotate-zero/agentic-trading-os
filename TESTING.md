@@ -1,3 +1,107 @@
+# TESTING — `saved-layouts-restore-isolation`
+
+Repository access was via the tarball endpoint
+(`codeload.github.com/.../tar.gz/refs/heads/main`), not `git clone`, per this
+project's own documented access convention — so there is no local git history
+to point at, only content diffs against fresh pulls. `main` was pulled at the
+start of this task; `docs/decisions/INDEX.md` and `confirmed-decisions.md`
+both ended at #182, agreeing with the latest archive file (`archive/134-160.md`
+plus decisions #161–182 living directly in `confirmed-decisions.md`) — no
+archive rollover pending. Re-pulled `main` again immediately before packaging:
+identical aside from this task's own four files
+(`WorkspaceContext.tsx`, `docs/architecture/system-design.md`, `CHANGES.md`,
+`TESTING.md`) — nothing else landed on `main` in between.
+
+This is a frontend-only change and `frontend/package.json` defines no test
+script; no `.test.`/`.spec.` file exists anywhere under `frontend/` in this
+repository. Verification follows the same posture as every other
+frontend-only delivery already recorded in this file (e.g.
+`scanner-panel-session-restore`) — static/build checks plus direct execution
+of the changed function, rather than a project test-runner run:
+
+- **Direct execution of `loadSavedLayouts()`** — the actual function, not a
+  reimplementation. A temporary same-directory scratch copy of
+  `WorkspaceContext.tsx` exported `loadSavedLayouts` and `normalizeSubWindow`
+  (both otherwise module-private) so `tsx` (Node 22, no browser/DOM) could
+  import and call them directly; relative imports (`../types/workspace`,
+  `./crossTabSync`) resolve unchanged since the copy sits next to the real
+  file. `frontend`'s dependencies were installed (`npm install`, none were
+  present) so `react`/`crossTabSync`'s `BroadcastChannel` import resolved. A
+  fake in-memory `localStorage` backed the `trading-workspace:saved-layouts`
+  key. Eight fixtures, 14 assertions, all passed:
+  - Wholly valid storage, two well-formed saved layouts → both restored,
+    names and order preserved (2/2).
+  - Mixed: entry 2 has no `subWindows` key at all (the exact bug report —
+    "missing subWindows") between two valid entries → both valid entries
+    restored, the malformed one skipped (2/2).
+  - Mixed: entry 2's `subWindows` present but not an array (a string) →
+    same result, both valid entries restored (2/2).
+  - Mixed: entry 1 is `null` outright (hand-edited/corrupted storage) →
+    the two valid entries after it still restore (2/2).
+  - Wholly invalid storage — every entry malformed
+    (`{subWindows: null}`, a bare string, a number) → degrades to an empty
+    array, no thrown error (1/1).
+  - Unparsable JSON entirely (`"{not json"`) → empty array, confirming the
+    pre-existing outer try/catch (JSON.parse failure) still works after
+    moving the per-entry logic inside it (1/1).
+  - Storage key entirely absent → empty array, pre-existing behavior (1/1).
+  - A valid layout with a legacy sub-window (predating `chartStyle`,
+    opacities, `timer`, `volumeAvg`, `volumeBars`, `dailyLevelsConfig`,
+    `hud`) still normalizes and backfills correctly through the per-entry
+    path — confirms the fix only changed fault isolation, not
+    `normalizeSubWindow()`'s own backfill behavior (3/3).
+- **Genuine-regression-guard check.** Reverted the scratch copy's
+  `loadSavedLayouts()` to the pre-fix single-`.map()`-with-outer-catch form
+  and re-ran the identical harness: exactly the 6 assertions covering the
+  three mixed valid/invalid fixtures failed (each collapsed to 0 restored
+  layouts instead of preserving the 2 valid ones — the reported bug,
+  reproduced), while the other 8 (all-valid, wholly-invalid, unparsable-JSON,
+  missing-key, and legacy-backfill cases) still passed, since none of those
+  exercise the fixed code path. Restored the fix and re-confirmed 14/14
+  before proceeding. The scratch copy (`WorkspaceContext.verify.tsx`) and the
+  harness script (`verify-saved-layouts.mts`) were both deleted afterward —
+  neither is part of this delivery.
+- **Harness note:** `crossTabSync.ts` opens a module-scoped `BroadcastChannel`
+  (a real Node 22 global) on import, which keeps a bare `tsx` process alive
+  indefinitely — the harness calls `process.exit()` explicitly after its
+  assertions rather than relying on natural process exit. This is a harness-
+  only concern; no production code path needed to change.
+- **`npm install`** in `frontend/` — no `node_modules` were present in this
+  fresh tarball pull; installed cleanly (137 packages) before any build or
+  harness run.
+- **`npm run build`** (`tsc -b && vite build`) from `frontend/`: clean, 103
+  modules transformed. Vite emitted its existing advisory for a bundle over
+  500 kB (`dist/assets/index-*.js` ~505 kB minified), unrelated to this
+  change and consistent with prior deliveries' own notes on this baseline.
+  The regenerated `tsconfig.tsbuildinfo` build-cache artifact was left out of
+  the packaged delivery (this session has no `.git` to `checkout --` it back
+  with, since access is by tarball; it is simply excluded from the zip
+  rather than tracked-content).
+- No live browser check was possible in this environment — same standing
+  caveat every frontend delivery in this doc already carries.
+- `diff -rq` against the final, independently fresh `main` pull immediately
+  before packaging: exactly four files differ —
+  `frontend/src/state/WorkspaceContext.tsx` (edited, `loadSavedLayouts()`
+  only), `docs/architecture/system-design.md` (edited, new §4.11 note plus
+  two diagrams), and this pair (`CHANGES.md`/`TESTING.md`, both edited, this
+  delivery's entry prepended, every prior entry preserved intact below it).
+
+Package: `saved-layouts-restore-isolation.zip` contains only the changed
+repository-relative files — `frontend/src/state/WorkspaceContext.tsx`
+(edited, `loadSavedLayouts()` only), `docs/architecture/system-design.md`
+(edited, one new note plus two diagrams in §4.11), `CHANGES.md` and
+`TESTING.md` (both edited, this delivery's entry prepended, prior entries
+preserved intact below it). Untouched, exactly as scoped: `normalizeSubWindow`,
+`normalizeMainWindow`, `loadSession`, every workspace interaction
+(`saveCurrentLayout`, `loadLayout`, `deleteLayout`, `exportLayouts`,
+`importLayouts`), the `trading-workspace:session` format, every panel, every
+API call, and every backend file. No decision number was assigned, following
+the `scanner-panel-session-restore`/`feature-engine-panel-session-restore`
+precedent — this repairs an existing normalization/fallback gap using the
+codebase's own established try/catch convention, nothing new decided.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `info-panel-session-restore`
 
 Pulled `origin/main` on branch `main` before editing; baseline `8109426`.

@@ -403,9 +403,25 @@ function loadSavedLayouts(): SavedLayout[] {
     const raw = localStorage.getItem(SAVED_LAYOUTS_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(parsed)) return [];
-    return (parsed as SavedLayout[]).map((l) => ({ ...l, subWindows: l.subWindows.map(normalizeSubWindow) }));
+    // Normalize each saved layout independently. A single malformed entry
+    // (missing/non-array subWindows, or a sub-window shape that makes
+    // normalizeSubWindow itself throw) used to blow up the outer .map() and
+    // fall into the catch below, discarding every OTHER valid saved layout
+    // along with it — the same "one bad item shouldn't sink the whole
+    // collection" fix already applied to storage access and JSON parsing
+    // via the try/catch immediately below, just moved one level in so it
+    // isolates per-entry instead of per-collection.
+    const normalized: SavedLayout[] = [];
+    for (const l of parsed as SavedLayout[]) {
+      try {
+        normalized.push({ ...l, subWindows: l.subWindows.map(normalizeSubWindow) });
+      } catch {
+        // this one saved layout is malformed — skip it, keep the rest
+      }
+    }
+    return normalized;
   } catch {
-    return [];
+    return []; // corrupt storage or unparsable JSON — same fallback as before
   }
 }
 

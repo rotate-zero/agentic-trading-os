@@ -1,3 +1,37 @@
+# CHANGES — `saved-layouts-restore-isolation`
+
+## Current delivery
+
+Fixed `loadSavedLayouts()` in `frontend/src/state/WorkspaceContext.tsx`: one
+malformed saved layout (missing or non-array `subWindows`, or a sub-window
+shape that made `normalizeSubWindow()` itself throw) previously threw out of
+the single `.map()` call over the whole array, was caught by the function's
+own outer try/catch, and discarded every other, otherwise-valid saved layout
+along with it. Each saved layout is now normalized inside its own try/catch,
+so one bad entry is skipped and every other valid layout still restores. The
+outer try/catch is unchanged and still covers storage access and unparsable
+JSON for the collection as a whole; `normalizeSubWindow()` itself, the
+`SavedLayout` shape, `loadSession()`/`normalizeMainWindow()`, and every other
+saved-layout interaction (save, load, delete, export, import) are unchanged.
+
+Updated `docs/architecture/system-design.md` §4.11 with a "Saved layout
+restoration resilience" note plus a data-flow and an internal-flow diagram,
+matching the existing Info panel/Feature Engine panel restoration write-ups
+in the same section. Verification is recorded in `TESTING.md`. This follows
+the same per-entry fault-isolation convention this codebase already uses at
+the collection level (`loadSession()`'s and `importLayouts()`'s own outer
+try/catch); no new product or architecture decision was needed, and no
+decision number was assigned.
+
+## Boundary
+
+The only application code change is in
+`frontend/src/state/WorkspaceContext.tsx` (`loadSavedLayouts()` only — no
+other function in that file changed). No other saved-layout field, workspace
+interaction, or session-format change.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `info-panel-session-restore`
 
 ## Current delivery

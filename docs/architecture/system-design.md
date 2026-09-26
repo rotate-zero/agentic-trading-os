@@ -457,6 +457,32 @@ saved MainWindowState w
     -> return normalized MainWindowState
 ```
 
+**Saved layout restoration resilience.** `WorkspaceContext.tsx` also persists a separate collection — `trading-workspace:saved-layouts` — independent of the single active `trading-workspace:session` blob described in the restoration notes above. `loadSavedLayouts()` parses that collection and normalizes each entry's `subWindows` through `normalizeSubWindow()`, the same function `loadSession()` already uses for the active session. It previously mapped the whole array in one step: one malformed entry (a missing or non-array `subWindows` field, or a sub-window shape that made `normalizeSubWindow()` itself throw) threw out of that single `.map()` call, was caught by the function's outer try/catch, and discarded every other, otherwise-valid saved layout along with it. `loadSavedLayouts()` now normalizes each saved layout inside its own try/catch, so one bad entry is skipped and every other valid layout still restores; the outer try/catch is unchanged and still covers storage access and unparsable JSON for the collection as a whole. No `SavedLayout` field, saved-field contract, or other workspace interaction (session restore, save/load/delete/export/import) changed.
+
+Saved layout restoration data flow:
+
+```text
+Browser localStorage["trading-workspace:saved-layouts"]
+    -> loadSavedLayouts() parses the array
+    -> each SavedLayout entry normalized independently
+    -> WorkspaceProvider holds savedLayouts state
+    -> useWorkspace() exposes savedLayouts
+    -> Saved Layouts UI lists/loads the surviving entries
+```
+
+Internal flow in `loadSavedLayouts()` per stored entry:
+
+```text
+parsed saved-layouts array
+    -> for each entry l:
+         try:
+           subWindows = l.subWindows.map(normalizeSubWindow)
+           push { ...l, subWindows }
+         catch:
+           skip this entry only — every other entry unaffected
+    -> return the surviving, normalized SavedLayout[]
+```
+
 **Volume bars (the histogram pane itself) are now fully customizable per sub-window, distinct from the volume-average lines drawn on top of them.** `SubWindowConfig.volumeBars` (`VolumeBarsConfig`) controls whether the pane shows at all, and whether bars are colored two-color (up/down, each its own hex) or one flat hex color — same `ColorField` swatch-plus-hex-input control already used for every other customizable color in this UI (background, grid, timer, volume-avg lines, indicators, levels), so this isn't a new interaction pattern, just a new place it's applied. Disabling collapses the volume price scale's margins to zero height (`ChartWidget.tsx`), not just hiding the bars, so the candle pane actually reclaims the vertical space. See `../decisions/confirmed-decisions.md` #42.
 
 **Chart Style — candlestick vs. OHLC bar — is a per-sub-window toggle backed directly by `lightweight-charts`' own two native series types, not a custom renderer.** `SubWindowConfig.chartStyle: ChartStyle` (`"candlestick" | "bar"`) follows the same global-default-plus-per-instance-override shape every other display setting here already has — `DEFAULT_CHART_STYLE = "candlestick"` seeds every newly-created sub-window, and a `SubWindowMenu` screen (segmented control, matching Volume Bars' color-mode toggle) overrides it per window. Switching styles swaps the LIVE series in place (`chart.removeSeries` + `addBarSeries`/`addCandlestickSeries` + `setData`) rather than recreating the whole chart, so zoom/pan survive a toggle — the overlays/horizontalLevels/dailyLevels effects below explicitly depend on `chartStyle` too, specifically so their price lines/markers reattach to the new series in the same render rather than being silently orphaned on the removed one. Purely a rendering-layer choice: identical OHLC candle data drives both styles, so no Feature Engine or backend change was needed. See `../decisions/confirmed-decisions.md` #73.
