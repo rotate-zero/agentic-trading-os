@@ -1,3 +1,46 @@
+# CHANGES — `daily-levels-lookback-offload`
+
+## Current delivery
+
+Moved `GET /intelligence/state`'s optional `daily_levels_lookback_days`
+reclustering path off the event loop. That path used to call
+`FeatureEngine.get_daily_levels()` synchronously, in-line, inside the
+async route handler — genuine CPU-bound work (`cluster_daily_levels()`,
+no `await` inside it), not I/O, but the same event-loop-blocking symptom
+as a blocking DB read. Measured directly: ~2.6ms for a realistic 360-candle
+cache at the server's own default lookback (180 days), but ~21ms under a
+pathological near-uniform-price 360-candle cache and ~157ms at a
+1000-candle custom lookback under the same shape — real enough to stall
+concurrent requests, `/health` included. The call now runs via
+`await asyncio.to_thread(_compute_daily_levels_lookback, symbol,
+daily_levels_lookback_days)`, a new module-level helper following this
+file's existing `_fetch_execution_orders`/`_fetch_strategy_outcomes`/
+`_fetch_backtest_runs` offload convention. Response shape, cached-input
+behavior, and the default (no-lookback) path are all unchanged; the
+default path never reaches this code and pays none of this, before or
+after. Added a deterministic blocked-reclustering concurrency regression
+(confirmed to fail against the pre-fix synchronous call before being
+confirmed to pass against the fix).
+
+Updated `docs/architecture/trading-intelligence-architecture.md` §3 with
+an as-built note plus component data-flow and route internal-flow
+diagrams. This uses the existing read-route offload pattern (also used by
+`performance-analytics-route-read-offload` and
+`intelligence-history-read-offload` below), so — following that same
+precedent — no new architectural decision or decision number was needed.
+Verification is recorded in `TESTING.md`.
+
+## Boundary
+
+Only `backend/app/api/routes/intelligence.py` (the one route branch plus
+the new helper) and `backend/tests/test_intelligence_history_read_
+concurrency.py` (one new test) changed, plus this delivery's own
+`CHANGES.md`/`TESTING.md`/architecture-doc records. No clustering rule,
+no database schema, and no other route changed — including `GET
+/intelligence/state`'s own default (no-lookback) path.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `saved-layouts-restore-isolation`
 
 ## Current delivery

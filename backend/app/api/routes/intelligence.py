@@ -249,7 +249,41 @@ async def get_intelligence_state(
         # lookback (decision #62) — overrides whatever the loop above
         # picked up from the pre-computed default snapshot. Cheap: no new
         # provider fetch, see get_daily_levels()'s own docstring.
-        daily_levels = [level.model_dump() for level in get_feature_engine().get_daily_levels(symbol, daily_levels_lookback_days)]
+        #
+        # Off the event loop, on purpose (decision `daily-levels-lookback-
+        # offload`). cluster_daily_levels() (indicators/daily_levels.py)
+        # is genuine CPU-bound work — a greedy pairwise-growth pass with
+        # no `await` anywhere inside it, worse than linear in the number
+        # of cached points — and this call used to run synchronously,
+        # in-line, inside this async handler with no offload at all.
+        # Measured directly against the real function: ~2.6ms for a
+        # realistic 360-candle cache (the server's own default
+        # `daily_levels_lookback_days`, 180 trading days), but ~21ms for
+        # a pathological (tightly-range-bound/near-uniform-price) 360-
+        # candle cache, and ~157ms at a 1000-candle custom lookback under
+        # the same pathological shape — a plausible, not contrived,
+        # production case (a quiet, low-priced symbol) — real enough to
+        # stall every other concurrent request this process is serving,
+        # `/health` included, for the duration. Same class of problem
+        # this file's own `_fetch_execution_orders`/`_fetch_strategy_
+        # outcomes`/`_fetch_backtest_runs` already solve for a blocking
+        # DB read; `_compute_daily_levels_lookback` below is that same
+        # asyncio.to_thread-offloaded, monkeypatch-friendly convention
+        # applied to CPU-bound reclustering instead of I/O. The default
+        # path above (no `daily_levels_lookback_days`) is untouched —
+        # it never reaches get_daily_levels() at all, so it pays none of
+        # this, before or after.
+        #
+        # get_daily_levels()'s own reads (`_daily_levels_state`/
+        # `_daily_candle_cache`) are unsynchronized plain dict gets —
+        # already read from a worker thread elsewhere in this same engine
+        # (_reconcile_and_persist_daily_levels, offloaded by the async
+        # worker loop itself), so running this one from a thread too is
+        # not a new class of race, just the same accepted one applied to
+        # a second caller.
+        daily_levels = await asyncio.to_thread(
+            _compute_daily_levels_lookback, symbol, daily_levels_lookback_days
+        )
 
     # Daily Levels x Level Interaction (Stage 3, confirmed decision #64) —
     # closes the gap decision #61 explicitly left open ("No level_interaction
@@ -276,6 +310,30 @@ async def get_intelligence_state(
         }
 
     return {"symbol": symbol, "timeframes": timeframes, "daily_levels": daily_levels}
+
+
+def _compute_daily_levels_lookback(symbol: str, lookback_days: int) -> list[dict[str, Any]]:
+    """Runs `FeatureEngine.get_daily_levels()` — the custom-lookback
+    reclustering path (decision #62) — and serializes its result, entirely
+    inside whatever thread calls it. Module-level, not inlined in the route
+    above, for the same reason `_fetch_execution_orders`/
+    `_fetch_strategy_outcomes`/`_fetch_backtest_runs` already are: it's
+    this route's patchable target for a concurrency regression test
+    (`test_intelligence_history_read_concurrency.py`'s existing
+    `monkeypatch.setattr(intelligence_routes, helper_name, ...)` pattern),
+    the same way `api/routes/scanner.py`'s own `list_universe_symbols`
+    already is.
+
+    No DB session here, unlike its siblings above — `get_daily_levels()`'s
+    custom-lookback branch is deliberately ad-hoc/unpersisted (its own
+    docstring: "no new provider call... cheap enough to do on every
+    request"), so there is nothing to open or close. `get_feature_engine()`
+    is looked up fresh on every call rather than passed in, matching how
+    the route itself always calls it live — this helper is a thin,
+    directly-testable wrapper around that lookup plus the reclustering
+    call, not an alternate way to reach the engine.
+    """
+    return [level.model_dump() for level in get_feature_engine().get_daily_levels(symbol, lookback_days)]
 
 
 @router.get("/market-state")

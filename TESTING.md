@@ -1,3 +1,49 @@
+# TESTING — `daily-levels-lookback-offload`
+
+Pulled `origin/main` on branch `main` before editing; baseline `a3cdb17`,
+clean working tree. A local PostgreSQL 16 instance was created for this
+session (`trading`/`trading` role, `trading_workspace` database, `alembic
+upgrade head` — 14 migrations, all applied cleanly) since none pre-existed
+in this environment; no live broker or external production database was
+used.
+
+- Baseline, pre-change, full suite from `backend/` (untouched `main`,
+  changes stashed): `python3 -m pytest -q` — **1139 passed**, 0 failed,
+  94.76s.
+- Same command with this delivery's changes restored: **1140 passed** —
+  exactly +1 (the new concurrency test), 0 regressions, 91.35s.
+- Negative control: temporarily reverted the route to its pre-fix
+  synchronous call (keeping the new test as-is) and reran the new test
+  alone — it **failed** with a `TimeoutError` waiting for
+  `_compute_daily_levels_lookback` to start, confirming the test actually
+  exercises the offload rather than passing unconditionally. Restored the
+  fix and reran — **passed** again.
+- `python3 -m pytest tests/test_intelligence_history_read_concurrency.py
+  -q`, repeated 5x: **3 passed** every time, 0.91–1.00s each — deterministic,
+  no flakiness.
+- `python3 -m pytest tests/test_intelligence_routes.py
+  tests/test_intelligence_helpers.py
+  tests/test_intelligence_history_read_concurrency.py -q`: **23 passed**,
+  including both existing Daily Levels tests
+  (`test_daily_levels_appear_in_intelligence_state`,
+  `test_daily_levels_carry_level_interaction_once_touched`) against the
+  real database — confirms the default (no-lookback) path and existing
+  Daily Levels behavior are unaffected.
+- `diff -rq` against a fresh `git clone --depth 1` of the same baseline
+  commit (ignoring `.env`, `.pytest_cache`, and `__pycache__`, none of
+  which are tracked): exactly two files differ —
+  `backend/app/api/routes/intelligence.py` and
+  `backend/tests/test_intelligence_history_read_concurrency.py` — matching
+  this delivery's stated boundary exactly.
+- Benchmarked `cluster_daily_levels()` directly (standalone module import,
+  no package/DB dependency) to quantify the blocking risk cited in
+  `CHANGES.md` and the architecture doc: realistic 360-candle random-walk
+  cache 2.617ms; pathological all-near-identical-price 360-candle cache
+  21.233ms; realistic 1000-candle cache 6.193ms; pathological 1000-candle
+  cache 156.905ms. Investigation only, not part of the shipped test suite.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `saved-layouts-restore-isolation`
 
 Repository access was via the tarball endpoint

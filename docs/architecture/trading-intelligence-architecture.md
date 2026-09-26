@@ -101,6 +101,78 @@ The ASCII chart below is the conceptual target pipeline. For the actual live com
 
 **Portfolio State** and **Market Clock** are drawn as side inputs rather than pipeline stages because they're shared services, not steps — every stage that needs "what do we currently hold" or "what time/session is it" reads them directly rather than having that information passed down the chain. Decision Engine, Governor, Position Monitor, and Performance Intelligence all read Portfolio State independently.
 
+**As-built: `GET /intelligence/state`'s `daily_levels_lookback_days` path moved off the event loop (decision `daily-levels-lookback-offload`).** This route (§1's Feature Engine observability surface, decision #47) has an optional `daily_levels_lookback_days` query param (decision #62) that re-clusters Daily Levels from cached raw candles at a caller-chosen lookback, instead of returning the pre-computed default snapshot. That reclustering — `cluster_daily_levels()` in `indicators/daily_levels.py` — is genuine CPU-bound work with no `await` anywhere inside it, and it used to run synchronously, in-line, inside the route's `async def` handler: the whole call monopolized the single event-loop thread for its duration, the same class of problem the Performance Intelligence routes above already solve for a blocking DB read. Measured directly against the real function rather than assumed: ~2.6ms for a realistic 360-candle cache at the server's own default `daily_levels_lookback_days` (180 trading days), but ~21ms under a pathological near-uniform-price 360-candle cache, and ~157ms at a 1000-candle custom lookback under the same shape — a plausible production case (a quiet, low-priced symbol), not a contrived one, and real enough to stall every other concurrent request the process is serving, `/health` included, for the duration. The fix follows the same `asyncio.to_thread` convention as §14's analytics routes and `GET /intelligence/execution-orders` (decision #181): only the reclustering call moved, nothing about its inputs, its clustering rule, or the route's default (no-lookback) path or response shape.
+
+```text
+Data flow — GET /intelligence/state?daily_levels_lookback_days=N
+
+HTTP client
+     │ GET /intelligence/state?symbol=...&daily_levels_lookback_days=N
+     ▼
+app/api/routes/intelligence.py — get_intelligence_state()   (event loop thread)
+     │ feature_snapshot = get_feature_engine().get_snapshot(symbol)        ─┐
+     │ level_snapshot   = get_level_interaction_engine().get_snapshot(...)  ├─ unchanged,
+     │ timeframes{}, daily_levels[] built from the pre-computed snapshot   ─┘  still on the loop
+     │
+     │ daily_levels_lookback_days is not None
+     ▼
+await asyncio.to_thread(_compute_daily_levels_lookback, symbol, lookback_days)
+     │                                              event loop is free again the instant
+     │                                              this is awaited — /health, other routes,
+     │                                              and WebSocket pushes keep being served
+     ▼
+_compute_daily_levels_lookback(symbol, lookback_days)         (worker thread, off the loop)
+     │
+     ▼
+FeatureEngine.get_daily_levels(symbol, lookback_days)
+     │ reads FeatureEngine._daily_candle_cache /._daily_levels_state
+     │ (in-memory dicts; same dicts the async worker loop's own
+     │  _reconcile_and_persist_daily_levels already reads off-thread)
+     ▼
+cluster_daily_levels()  — indicators/daily_levels.py, pure CPU, no I/O, no DB
+     │
+     ▼
+[DailyLevel, ...] .model_dump() per level
+     │ result rejoins the event loop when the awaited call completes
+     ▼
+daily_levels = [...] ──▶ merged with Level Interaction (unchanged) ──▶ JSON response
+```
+
+```text
+Internal flow — get_intelligence_state(), daily_levels_lookback_days branch only
+
+get_intelligence_state(symbol, ..., daily_levels_lookback_days)
+     │
+     │ feature_snapshot / level_snapshot / timeframes{} / default daily_levels[]
+     │ — all built from the pre-computed snapshot; unaffected by this delivery
+     ▼
+daily_levels_lookback_days is None?
+     ├─ yes ──▶ keep the default daily_levels[] built above ──▶ (skip straight to merge, below)
+     │
+     └─ no  ──▶ before this delivery:
+                     daily_levels = [level.model_dump() for level in
+                         get_feature_engine().get_daily_levels(symbol, lookback_days)]
+                     — one inline statement; no `await` inside cluster_daily_levels(),
+                       so the coroutine (and the event loop under it) is occupied for
+                       the full clustering duration
+                │
+                ▼    after this delivery:
+                     daily_levels = await asyncio.to_thread(
+                         _compute_daily_levels_lookback, symbol, daily_levels_lookback_days)
+                     — `_compute_daily_levels_lookback` (new module-level helper, same
+                       file) does the identical get_daily_levels() + model_dump() work,
+                       but inside a worker thread; the `await` yields the event loop
+                       back the instant the thread starts, and resumes this coroutine
+                       only once the thread returns
+     │
+     ▼
+...Daily Levels × Level Interaction merge (unchanged, reads whichever daily_levels[] above)...
+     ▼
+return {"symbol", "timeframes", "daily_levels"}   — response shape unchanged
+```
+
+Scope held deliberately narrow: no clustering rule, no database schema, and no other route changed. The default path (`daily_levels_lookback_days` omitted) never reaches `get_daily_levels()` at all — it stays exactly as fast, and exactly as synchronous-on-the-loop, as before, because it was never the slow part. Regression coverage lives in `test_intelligence_history_read_concurrency.py`, alongside the equivalent blocked-history-read tests for the Performance Intelligence pattern above: it monkeypatches `_compute_daily_levels_lookback` to block on a `threading.Event`, confirms `GET /health` stays responsive while that thread is blocked, then releases it and confirms `GET /intelligence/state` still completes normally.
+
 ---
 
 ## 4. Market State — Has Memory, Not a Snapshot
