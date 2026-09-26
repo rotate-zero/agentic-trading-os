@@ -227,7 +227,7 @@ Verification before this was sent: `tsc -b` (only the known, pre-existing `GridP
 
 **Built — top-8 display.** `GET /scanner/state?top_n=8` (default) slices the ranked list before returning it; `total_scored` in the response says how many of the full universe actually had data, independent of the display cut.
 
-**Built — the Scanner panel collapses/resizes now**, matching `FeatureEnginePanel`'s exact pattern: `scannerCollapsed`/`scannerWidthPx` added to `MainWindowState` (`types/workspace.ts`) and `WorkspaceContext.tsx`, same drag-resize handle, same persistence (and the same pre-existing `normalizeMainWindow` gap `featureEngineCollapsed` already has — old saved sessions predating this field get `undefined` rather than a backfilled default; not something introduced by this change, just inherited from following the identical existing pattern).
+**Built — the Scanner panel collapses/resizes now**, matching `FeatureEnginePanel`'s exact pattern: `scannerCollapsed`/`scannerWidthPx` added to `MainWindowState` (`types/workspace.ts`) and `WorkspaceContext.tsx`, same drag-resize handle, same persistence (and the same pre-existing `normalizeMainWindow` gap `featureEngineCollapsed` already has — old saved sessions predating this field get `undefined` rather than a backfilled default; not something introduced by this change, just inherited from following the identical existing pattern — the Scanner side of this gap is fixed in §15 below; `featureEngineCollapsed`/`featureEngineWidthPx` remain unfixed, out of that delivery's scope).
 
 **Verification:** this round was checked against **real infrastructure**, not mocks — PostgreSQL 16 installed fresh, all four migrations (0001-0004) run against it, every universe CRUD function exercised directly against real rows, then the actual FastAPI app booted and every route hit over real HTTP (`GET /scanner/universe`, `POST` both a valid and a format-invalid symbol, `GET /scanner/state` with and without overrides, `DELETE`). 14 backend tests passing (6 scorer + 3 runner + 5 new universe tests, the last of these run against the same real Postgres instance). One real bug was caught and fixed during this process: the first draft of the universe test used a `test_feature_engine.py`-style double-underscore test ticker, which correctly failed the new format validation it was supposed to be testing around — fixed by using a format-valid placeholder ticker instead, not by weakening the validation. `tsc -b` and `vite build` both clean (only the standing `GridPresetPicker` errors, decision #35).
 
@@ -408,3 +408,95 @@ No PostgreSQL was preinstalled in this environment for this delivery either — 
 **Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main` immediately before packaging (identical to the `main` this task started from — no concurrent changes to reconcile): edited — `backend/app/api/routes/scanner.py` (new `_parse_symbols_override()` helper plus the `symbols is not None` branch condition; every other line unchanged), `backend/tests/test_scanner_runner.py` (docstring correction only, no test logic changed). New — `backend/tests/test_scanner_state_route.py`. Untouched, exactly as scoped: `app/scanner/universe.py` (only *called*, not edited — `is_valid_ticker_format` is reused as-is), `app/scanner/runner.py`, `app/scanner/scorer.py`, `main.py`, every execution/frontend file, universe CRUD behavior, scoring, ranking, `top_n`, and the continuous `MarketActivityScanner`/`ScanCadenceSchedule`/promotion path (§4/§5 — still not built).
 
 **No decision number assigned** for this delivery, for the same reason §13 gives none: this reuses an existing, already-decided validation rule (`is_valid_ticker_format`, format-only, deliberately not a liveness/tradability check — see that function's own docstring) to close a consistency gap at a second call site, rather than deciding anything new about what a valid ticker is, how universe membership works, how scoring/ranking behaves, or the shape of the API contract's success path. The only contract change is that malformed input now fails fast with a specific 400 instead of silently degrading into an all-skipped scan — an operational/correctness fix at the route boundary, not a product or architecture decision.
+
+---
+
+## 15. Seventh update — Scanner panel state now survives loading a session saved before the Scanner panel existed
+
+**Problem.** §12 added `scannerCollapsed`/`scannerWidthPx` to `MainWindowState` and noted, at the time, that it was inheriting a pre-existing `normalizeMainWindow` gap rather than fixing it: `normalizeSubWindow` backfills every field it adds (chart style, opacity, HUD, etc. — see that function's own comments), and `normalizeMainWindow` itself already does the same for `lastBacktestRunId`/`lastBacktestSweepId` (decisions #134/#163), but never gained an equivalent backfill for the two Scanner fields when they were introduced. A `trading-workspace:session` blob written by any pre-§12 build of the app has no `scannerCollapsed`/`scannerWidthPx` keys at all, so `JSON.parse` leaves both `undefined` on the restored `MainWindowState` at runtime, despite the TypeScript type claiming they're always present. `ScannerPanel.tsx` reads them unguarded: `scannerCollapsed` undefined is falsy, so `!scannerCollapsed` evaluates true and the panel renders in its *expanded* branch — but `width: scannerWidthPx` is then `undefined`, and the drag-resize handler's `dragStartRef.current.width + delta` becomes `NaN`, permanently breaking that Main Window's resize handle until the tab is reloaded onto a fresh default.
+
+**Fix — the same `??` backfill pattern already used two fields above it, applied to both Scanner fields.** `normalizeMainWindow()` gains two lines: `scannerCollapsed: w.scannerCollapsed ?? true` and `scannerWidthPx: w.scannerWidthPx ?? 300` — the exact defaults `makeMainWindow()` itself uses for a freshly created Main Window, so an old session with no Scanner state renders identically to a brand new one instead of an undefined-width panel. `??` (nullish coalescing), not `||`, is required for `scannerCollapsed` specifically: an old-but-not-ancient session that explicitly saved `scannerCollapsed: false` (user had expanded the panel) must not be silently re-collapsed by the backfill — only `??` leaves an explicit `false` alone, where `||` would treat it as absent. Nothing else in `normalizeMainWindow`, `normalizeSubWindow`, `loadSession`, or `ScannerPanel.tsx` changed — no API calls, polling, or universe editing were touched, and `featureEngineCollapsed`/`featureEngineWidthPx` are left with the identical unfixed gap §12 already documented, since backfilling those was not part of this task's approved scope.
+
+**Diagram 1 — data flow, session restore, before vs. after:**
+
+```
+BEFORE
+  Browser localStorage["trading-workspace:session"]
+  (written by a pre-§12 build — no scannerCollapsed/scannerWidthPx key)
+        │
+        ▼
+  WorkspaceProvider mounts → loadSession()
+        │  JSON.parse(raw)
+        ▼
+  parsed.mainWindows[i]              ← scannerCollapsed, scannerWidthPx
+                                        simply absent from this object
+        │
+        ▼
+  normalizeMainWindow(w)             ← backfills lastBacktestRunId/
+                                        lastBacktestSweepId only
+        │
+        ▼
+  MainWindowState.scannerCollapsed = undefined   ← falsy → renders EXPANDED
+  MainWindowState.scannerWidthPx   = undefined
+        │
+        ▼
+  ScannerPanel.tsx: style={{ width: undefined }}      ← broken layout
+                    dragStartRef.current.width = undefined
+                    → resize handler computes NaN      ← resize permanently broken
+
+AFTER
+  Browser localStorage["trading-workspace:session"]
+  (same old pre-§12 blob — untouched, no migration writes anything back)
+        │
+        ▼
+  WorkspaceProvider mounts → loadSession()
+        │  JSON.parse(raw)
+        ▼
+  parsed.mainWindows[i]              ← same absent keys as before
+        │
+        ▼
+  normalizeMainWindow(w)             ← NEW: also backfills
+                                        scannerCollapsed ?? true
+                                        scannerWidthPx   ?? 300
+        │
+        ▼
+  MainWindowState.scannerCollapsed = true     ← same as a fresh makeMainWindow()
+  MainWindowState.scannerWidthPx   = 300
+        │
+        ▼
+  ScannerPanel.tsx: style={{ width: 300 }} but panel renders COLLAPSED
+                    (COLLAPSED_WIDTH shown instead — see width = scannerCollapsed
+                     ? COLLAPSED_WIDTH : scannerWidthPx)
+                    resize handle inert while collapsed, works correctly
+                    once expanded — dragStartRef.current.width is a real number
+```
+
+**Diagram 2 — internal flow within `normalizeMainWindow()` (only the two new lines shown in context):**
+
+```
+normalizeMainWindow(w: MainWindowState) -> MainWindowState
+        │
+        ▼
+  { ...w,
+      subWindows: w.subWindows.map(normalizeSubWindow),        UNCHANGED
+      lastBacktestRunId:   w.lastBacktestRunId   ?? null,      UNCHANGED
+      lastBacktestSweepId: w.lastBacktestSweepId ?? null,      UNCHANGED
+      scannerCollapsed:    w.scannerCollapsed    ?? true,      ← NEW
+      scannerWidthPx:      w.scannerWidthPx      ?? 300,       ← NEW
+  }
+        │
+        ▼
+  w.scannerCollapsed is `false` (explicit)?  ──► `??` passes `false` through
+                                                  unchanged (NOT `||`, which
+                                                  would treat falsy `false`
+                                                  as missing and overwrite it)
+  w.scannerCollapsed is `undefined`?         ──► becomes `true`
+  w.scannerWidthPx   is a number (any value)? ──► passes through unchanged
+  w.scannerWidthPx   is `undefined`?          ──► becomes `300`
+```
+
+**Testing.** No frontend test runner exists in this repository (`frontend/package.json` defines no `test` script and no `.test.`/`.spec.` file exists anywhere under `frontend/`), so verification here follows the same posture every other frontend-only delivery in this doc has carried (§11's own standing caveat): `tsc -b` and `vite build` for static/build correctness, plus direct execution of the changed function against representative fixtures. For the latter, `normalizeMainWindow`/`makeMainWindow` were temporarily exported from a same-directory scratch copy of `WorkspaceContext.tsx` and exercised with `tsx` (Node, no browser) against five fixture shapes: (1) a fully old session missing both fields — backfills to `true`/`300`; (2) a current session with explicit non-default values (`scannerCollapsed: false`, `scannerWidthPx: 420`) — both preserved exactly, confirming `??` does not clobber an explicit `false`; (3) a current session with explicit default values (`true`/`300`) — passes through unchanged; (4) a partial/hand-edited session missing only `scannerCollapsed` with `scannerWidthPx` present — each field backfills independently; (5) unrelated fields (`lastBacktestRunId`, `subWindows`) on the same object — confirmed still correct, guarding against scope creep inside the same function. All 10 assertions passed. Confirmed this is a genuine regression guard, not a false positive: re-ran the identical fixtures against the function with the two new lines removed — the 3 assertions covering the two missing-field cases failed exactly as expected (falling back to `undefined`), the other 7 (explicit-value and unrelated-field cases) still passed, then the fix was restored and re-confirmed at 10/10. The scratch copy and harness were both deleted before packaging; they are not part of this delivery. `tsc -b`: clean, no errors. `vite build`: clean production build (103 modules transformed, no new warnings beyond the pre-existing chunk-size advisory).
+
+**Footprint**, confirmed by `diff -rq` against a freshly re-pulled `main` immediately before packaging (`main` had advanced to include decision #181, `execution-orders-route`, since this task started — confirmed zero file overlap: that delivery touched only `backend/app/api/routes/intelligence.py`, `backend/tests/test_execution_orders_route.py`, `docs/architecture/execution-engine-design.md`, `docs/decisions/confirmed-decisions.md`, and `docs/decisions/INDEX.md`): edited — `frontend/src/state/WorkspaceContext.tsx` (two lines added inside `normalizeMainWindow`, plus their comment; nothing else in the file changed), `docs/architecture/scanner-design.md` (this section, plus one clause appended to §12's own sentence pointing forward to it). Untouched, exactly as scoped: `ScannerPanel.tsx`, `normalizeSubWindow`, `loadSession`, `loadSavedLayouts`, `featureEngineCollapsed`/`featureEngineWidthPx` (left with the identical unfixed gap), every backend file, every other frontend panel, all API calls and polling hooks, and universe editing.
+
+**No decision number assigned**, per this project's own standing instruction and the precedent §13/§14 already set: this backfills a documented gap using the identical `??`-default pattern `normalizeMainWindow` already applies to `lastBacktestRunId`/`lastBacktestSweepId` two lines above it — nothing about the Scanner panel's fields, defaults, or contract is new or changed, only a pre-existing restoration bug is corrected.

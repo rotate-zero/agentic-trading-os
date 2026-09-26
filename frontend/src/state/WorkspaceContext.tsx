@@ -358,6 +358,21 @@ function normalizeMainWindow(w: MainWindowState): MainWindowState {
     // (decision #163) — sessions persisted before this field
     // existed won't have it in localStorage at all.
     lastBacktestSweepId: w.lastBacktestSweepId ?? null,
+    // Back-fill for sessions persisted before the Scanner panel existed
+    // (scanner-design.md §12) — old localStorage sessions predate
+    // scannerCollapsed/scannerWidthPx entirely, so both arrive as
+    // `undefined` at runtime despite the type saying they're always
+    // present (this was a known, documented gap — see §12's own note —
+    // not something newly introduced here). `??` is required for
+    // scannerCollapsed specifically, not `||`: an explicitly saved
+    // `false` (panel left expanded) must survive the backfill, and only
+    // `??` treats `false` as a real value rather than something to
+    // replace. Defaults match makeMainWindow()'s own initial values for
+    // a freshly created Main Window (collapsed by default, 300px) —
+    // an old session with no Scanner state looks the same as a brand
+    // new one, rather than rendering with an undefined width.
+    scannerCollapsed: w.scannerCollapsed ?? true,
+    scannerWidthPx: w.scannerWidthPx ?? 300,
   };
 }
 

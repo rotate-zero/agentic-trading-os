@@ -1,3 +1,51 @@
+# CHANGES — `scanner-panel-session-restore`
+
+## Current delivery
+
+Fixed Scanner panel state when loading a workspace session saved before the
+Scanner panel existed. `makeMainWindow()` defaults `scannerCollapsed` to
+`true` and `scannerWidthPx` to `300` for a freshly created Main Window, but
+`normalizeMainWindow()` — the function that back-fills every field missing
+from an older localStorage session (same pattern already applied to
+`lastBacktestRunId`/`lastBacktestSweepId`, decisions #134/#163) — never
+gained an equivalent backfill for these two fields when §12 of
+`scanner-design.md` introduced them, a gap that section's own text already
+flagged as inherited rather than fixed. A session written before the Scanner
+panel existed left both fields `undefined` at runtime: `ScannerPanel.tsx`
+then rendered in its expanded branch (`undefined` is falsy) with an
+`undefined` width, and the drag-resize handle's width arithmetic produced
+`NaN`, permanently breaking that Main Window's resize handle until reload.
+
+`normalizeMainWindow()` now backfills `scannerCollapsed ?? true` and
+`scannerWidthPx ?? 300` — the same defaults `makeMainWindow()` itself uses,
+and the same `??`-based pattern already used two lines above for the
+backtest fields. `??` rather than `||` is required for `scannerCollapsed`
+specifically so an explicitly saved `false` (panel left expanded) survives
+the backfill untouched rather than being silently re-collapsed. No other
+field, component, API call, poll, or panel changed.
+
+Verified by direct execution of the changed function against five
+representative fixtures (fully-old session, explicit non-default values,
+explicit default values, partial old session, and unrelated fields) — see
+`TESTING.md` — plus a clean `tsc -b` and `vite build`. Updated
+`docs/architecture/scanner-design.md` with a new §15 documenting the fix
+(as-built notes plus two diagrams) and a one-clause forward-reference added
+to §12's own text.
+
+## Boundary
+
+Exactly one application file changes: `frontend/src/state/WorkspaceContext.tsx`
+(two lines added inside `normalizeMainWindow`, plus their comment — nothing
+else in the file touched). Docs: `docs/architecture/scanner-design.md`
+(new §15, one clause added to §12), plus this file and `TESTING.md`.
+Untouched: `ScannerPanel.tsx`, `normalizeSubWindow`, `loadSession`, every
+API call, poll, and universe-editing code path, every other panel
+(`featureEngineCollapsed`/`featureEngineWidthPx` keep the identical,
+still-unfixed gap), and every backend file. No decision number assigned —
+see `scanner-design.md` §15's closing note for why.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #181: `execution-orders-route`
 
 ## Current delivery
