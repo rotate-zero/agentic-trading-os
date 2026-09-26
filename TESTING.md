@@ -1,3 +1,30 @@
+# TESTING — `execution-panel-order-history` (decision #182)
+
+Pulled `main` before editing: `33721e4a73ab1836f932370003c4f2e3c6bc0e91`,
+clean working tree. Rechecked `origin/main` immediately before numbering:
+the same commit; `INDEX.md` and `confirmed-decisions.md` ended at #181,
+and the latest archive ends at #160. Assigned #182 at the true log tail.
+
+- `npm run build` from `frontend/`: passed (`tsc -b` and `vite build`). Vite
+  emitted its existing advisory about a bundle over 500 kB; build succeeded.
+- Direct React server rendering of the actual `RecentSimulatedOrders` JSX:
+  passed loading, empty, populated, and request-error visible-state checks.
+  The temporary `/tmp` harness exported the existing component from a copy,
+  injected each load state, and compiled with the installed esbuild/React;
+  it did not alter the repository. The populated fixture checked both rows,
+  newest-first order, symbol, side, effect, quantity, status, venue, and exit
+  and rejection reasons. Empty and error messages were checked as distinct.
+- `git diff --check`: passed.
+
+There is no frontend test runner or browser automation dependency in this
+repository. The direct rendering check validates displayed states; it does
+not exercise browser clicks or a live backend request. The route's simulated
+filter, bounded default, and newest-first result are existing decision #181
+behavior covered by `backend/tests/test_execution_orders_route.py`; this
+frontend delivery changed no backend code or database state.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `scanner-panel-session-restore`
 
 Repository access was via the tarball endpoint

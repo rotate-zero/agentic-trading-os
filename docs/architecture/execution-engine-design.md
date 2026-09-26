@@ -433,7 +433,7 @@ Lost acknowledgement after commit -> order retained; duplicate sends nothing
 - `OrderFilled` already carries `order_id` (= the client-order ID); it gains `venue_fill_id`, `cumulative_qty`, `leaves_qty`, `execution_venue`, and an optional `commission` (`None` unless the venue supplies it).
 - New models: `TradePlanned`, `PositionClosed` (§6.5), and reserved `OpportunitySelected`, `PositionAdjusted`; `PositionClosed` joins `CRITICAL_EVENT_TYPES` (EX-6); a venue-level rejection/cancel needs a representation distinct from plan-level `PlanRejected{symbol, reasons}` (EX-9).
 
-**As built (decision #181, `execution-orders-route`).** `GET /intelligence/execution-orders` is the first reader of the `orders` ledger anywhere in this codebase (confirmed by grep before writing it: `governor/`, `execution_engine/`, and `portfolio_state/` all import `Order` to WRITE it; nothing reads it back). Hard-scoped to `execution_mode == "simulated"` — not a query parameter, since `simulated` is the only mode the authorizer stub can produce today (EX-1) and the only mode any row can honestly carry until a real venue exists (§8). Optional exact `symbol` match; `limit` bounded `[1, 100]`, default 50; ordered by `orders.id` (the ledger's own monotonic primary key) descending. Curated fields only — order identity (`id`, `client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`, `qty`, `status`, `execution_venue`, `exit_reason`, `reject_reason`, `created_at`, `updated_at` — not a full-row dump (`order_type`, `limit_price`, `venue_order_id` stay out). Same honest-empty convention as every route in this file: an empty table, or a `symbol` with no matches, is `{"orders": []}`, never an error. The synchronous SQLAlchemy read runs through `asyncio.to_thread` (`api/routes/scanner.py`'s established convention, decision `scanner-route-db-offload`) rather than blocking the event loop the way this file's own older `GET /strategy-outcomes` and `GET /backtest-runs` routes still do. Observation only: no order placement, no ledger write, no frontend consumer yet (that gap is unchanged from §8's own "Frontend" line — `orders.status` still has no UI widget; this route is a diagnostic/ops surface, not that prerequisite).
+**As built (decision #181, `execution-orders-route`).** `GET /intelligence/execution-orders` is the first reader of the `orders` ledger anywhere in this codebase (confirmed by grep before writing it: `governor/`, `execution_engine/`, and `portfolio_state/` all import `Order` to WRITE it; nothing reads it back). Hard-scoped to `execution_mode == "simulated"` — not a query parameter, since `simulated` is the only mode the authorizer stub can produce today (EX-1) and the only mode any row can honestly carry until a real venue exists (§8). Optional exact `symbol` match; `limit` bounded `[1, 100]`, default 50; ordered by `orders.id` (the ledger's own monotonic primary key) descending. Curated fields only — order identity (`id`, `client_order_id`), `trade_id`, `symbol`, `side`, `position_effect`, `qty`, `status`, `execution_venue`, `exit_reason`, `reject_reason`, `created_at`, `updated_at` — not a full-row dump (`order_type`, `limit_price`, `venue_order_id` stay out). Same honest-empty convention as every route in this file: an empty table, or a `symbol` with no matches, is `{"orders": []}`, never an error. The synchronous SQLAlchemy read runs through `asyncio.to_thread` (`api/routes/scanner.py`'s established convention, decision `scanner-route-db-offload`) rather than blocking the event loop the way this file's own older `GET /strategy-outcomes` and `GET /backtest-runs` routes still do. Observation only: no order placement or ledger write. The route's original delivery had no frontend consumer; the later read-only panel consumer is documented below. `orders.status` still has no WebSocket UI widget.
 
 ```
 governor/ AuthorizerStub ──INSERT trades──┐
@@ -447,10 +447,10 @@ execution_engine/ ExecutionEngine ──INSERT/UPDATE orders, fills──┤
                                                                   │   (asyncio.to_thread — worker thread, not the event loop)
                                                                   ▼
                                         GET /intelligence/execution-orders
-                                            curated fields; observation only — no write path, no frontend consumer
+                                            curated fields; observation only — no write path
                                                                   │ read on demand
                                                                   ▼
-                                              caller (ops diagnostic / curl / future frontend — none built yet)
+                                         caller (ops diagnostic / Execution panel)
 ```
 
 **Internal flow (as built):**
@@ -475,6 +475,42 @@ _fetch_execution_orders()  [worker thread — opens AND closes its own Session]
        │
        ▼  list[dict] crosses back to the event loop
 {"orders": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
+```
+
+**Frontend read path (as built, `execution-panel-order-history`).** The Execution
+panel reads the route's unfiltered default result set when expanded and on
+manual Refresh. This is the latest 50 simulated ledger rows by ID, with no
+pagination or polling. It shows symbol, side, open/close effect, quantity,
+status, venue, updated time, and any exit or rejection reason. The created
+time is available on the time label's tooltip. Request failure, loading, and
+an empty ledger have separate displays. The WebSocket activity feed remains
+transient and independent: an event cannot establish that an order persisted,
+and a ledger refresh never adds an event to that feed.
+
+```
+orders ledger ──► GET /intelligence/execution-orders ──► fetchExecutionOrders()
+                      simulated only; default 50                │
+                                                                 ▼
+                                             ExecutionLifecyclePanel
+                                             Recent simulated orders
+
+Event Bus ──► orders.status WebSocket ──► useOrderLifecycle()
+                                             │
+                                             ▼
+                                    WebSocket activity feed
+```
+
+```
+panel collapsed ──► expand ──► mount RecentSimulatedOrders ──► loading
+manual Refresh ──► refreshKey increment ────────────────────────┘
+       │
+       ▼
+fetchExecutionOrders() ──► HTTP error ──► request failure message
+       │ 200
+       ├─ orders: [] ──► empty ledger message
+       └─ rows ──► render in server order, keyed by ledger id
+                   (symbol/side/effect/qty/status/venue/time/reasons)
+collapse ──► unmount and ignore any late response
 ```
 
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
@@ -1033,7 +1069,7 @@ These are recorded so they are not rediscovered; none is recommended for now.
 - **Manual mode** — Input Layer, `TradeTarget`, hotkeys, Approval Queue UI, placement-mode change events, and the manual trade's stop source (F10a).
 - **A real Governor rule engine, Decision Engine (D1), and Opportunity Engine (D4)** — the stub is designed so these replace it without changing Execution.
 - **Position Monitor proper** — thesis-validity checks, stop management, partials, reversal, manual-position handling (`future-ideas.md` #14).
-- **Frontend** — Positions / Trade Management / order-status widgets, and any consumer of `orders.status`.
+- **Frontend** — Positions / Trade Management / live order-status widgets, and any consumer of `orders.status`. The separate read-only simulated order history uses the ledger route (§6.3).
 - **World View `portfolio` slot** — reads the running restored Portfolio State through `main.py`'s separate lifecycle dependency; see `trading-intelligence-architecture.md` §15. Position Monitor is now wired separately as an observed-only diagnostic; neither path places an exit.
 - **Retiring `is_backtest`** — kept only for compatibility; its removal is a later decision.
 

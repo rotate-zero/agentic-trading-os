@@ -352,6 +352,36 @@ export async function fetchExecutionStartupStatus(): Promise<ExecutionStartupSta
   return (await res.json()) as ExecutionStartupStatusWireShape;
 }
 
+// GET /intelligence/execution-orders (decision #181). The route returns
+// only persisted simulated orders, newest ledger ID first, default limit 50.
+export interface ExecutionOrderWireShape {
+  id: number;
+  client_order_id: string;
+  trade_id: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  position_effect: "open" | "close";
+  qty: number;
+  status: string;
+  execution_venue: string;
+  exit_reason: string | null;
+  reject_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExecutionOrdersWireShape {
+  orders: ExecutionOrderWireShape[];
+}
+
+export async function fetchExecutionOrders(): Promise<ExecutionOrdersWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-orders`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionOrdersWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's current contents) —

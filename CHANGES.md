@@ -1,3 +1,30 @@
+# CHANGES — `execution-panel-order-history` (decision #182)
+
+## Current delivery
+
+Added a read-only Recent simulated orders section to the Execution panel.
+The typed API client requests the existing simulated-only
+`GET /intelligence/execution-orders` route without query parameters, retaining
+its default newest-first 50-row cap. The section loads on panel expansion
+and manual Refresh, and shows symbol, side, open/close effect, quantity,
+status, venue, updated time, and any exit or rejection reason. Loading,
+request failure, and an empty ledger each have their own visible state.
+Persisted orders stay separate from the transient WebSocket activity feed.
+
+Updated `docs/architecture/execution-engine-design.md` §6.3 with the
+as-built frontend behavior and component data-flow and internal-flow
+diagrams; corrected its deferred-frontend note. Appended decision #182 to
+`docs/decisions/confirmed-decisions.md` and its index entry. Verification is
+recorded in `TESTING.md`.
+
+## Boundary
+
+Application changes are limited to `frontend/src/services/api-client.ts` and
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`. No backend,
+migration, order action, polling, or global state change.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `scanner-panel-session-restore`
 
 ## Current delivery

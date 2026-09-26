@@ -1395,3 +1395,24 @@ read). New — `backend/tests/test_execution_orders_route.py`. Untouched,
 exactly as scoped: every `governor/`, `execution_engine/`, `portfolio_state/`,
 scanner, and frontend file; `models/execution_ledger.py`; every prior
 decision entry; EX-5/EX-12.
+
+### 182. Read-only simulated order history in the Execution panel (`execution-panel-order-history`)
+
+The Execution panel consumes decision #181's existing
+`GET /intelligence/execution-orders` through a typed API client. It requests
+the route's unfiltered default 50-row, newest-ledger-ID-first result when the
+panel expands and on manual Refresh. The route retains its hard simulated-only
+scope and bounded limit; this delivery adds no backend change. The compact
+section shows symbol, side, open/close effect, quantity, status, venue,
+updated time, and any exit or rejection reason, with created time available
+on the time tooltip. Loading, request failure, and an empty ledger render
+separately. Rows stay in the server's order and are keyed by ledger ID.
+
+Persisted rows remain separate from `useOrderLifecycle`'s transient WebSocket
+activity. An event is not treated as proof of a durable order; fetching or
+refreshing the ledger never inserts into that feed. The panel adds no order
+action, polling, or global state. The new section follows the existing
+panel's local fetch-on-mount and manual-Refresh pattern. See
+`execution-engine-design.md` §6.3 for component data flow and panel internal
+flow. Frontend build and direct rendering checks of loading, empty,
+populated, and error states passed; see `TESTING.md`.
