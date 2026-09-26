@@ -425,6 +425,40 @@ function loadSavedLayouts(): SavedLayout[] {
   }
 }
 
+// Parses an imported "export layouts" JSON file and normalizes each entry
+// independently, the same per-entry isolation loadSavedLayouts() above
+// applies to localStorage restore. This used to map the whole imported
+// array in one step: one malformed entry (missing/non-array subWindows, or
+// a sub-window shape that made normalizeSubWindow() itself throw) threw out
+// of that single .map(), was caught by one outer try/catch, and rejected
+// every other, otherwise-valid layout in the imported file along with it.
+// Each entry now gets its own try/catch, so one bad entry is skipped and
+// every other valid entry in the file still imports. Accepted layouts get a
+// fresh id (never reuse an id from the imported file) with every other
+// field preserved as-is. Returns [] for unparsable JSON or a non-array top
+// level — the same fallback importLayouts() always had for those two cases.
+function normalizeImportedLayouts(json: string): SavedLayout[] {
+  try {
+    const parsed = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    const withFreshIds: SavedLayout[] = [];
+    (parsed as SavedLayout[]).forEach((l, i) => {
+      try {
+        withFreshIds.push({
+          ...l,
+          id: `layout-${Date.now()}-${i}`,
+          subWindows: l.subWindows.map(normalizeSubWindow),
+        });
+      } catch {
+        // this one imported entry is malformed — skip it, keep the rest
+      }
+    });
+    return withFreshIds;
+  } catch {
+    return []; // unparsable JSON — same fallback as before
+  }
+}
+
 /**
  * lockedMainWindowId: only set for a popped-out `/window/:id` tab (see
  * App.tsx). When present, this tab's `activeMainWindowId` is pinned to it
@@ -657,18 +691,9 @@ export function WorkspaceProvider({
   };
 
   const importLayouts = (json: string) => {
-    try {
-      const parsed = JSON.parse(json);
-      if (!Array.isArray(parsed)) return;
-      const withFreshIds = (parsed as SavedLayout[]).map((l, i) => ({
-        ...l,
-        id: `layout-${Date.now()}-${i}`,
-        subWindows: l.subWindows.map(normalizeSubWindow),
-      }));
-      setSavedLayouts((prev) => [...prev, ...withFreshIds]);
-    } catch {
-      // malformed file — silently ignored, nothing to recover
-    }
+    const withFreshIds = normalizeImportedLayouts(json);
+    if (withFreshIds.length === 0) return; // nothing valid to add
+    setSavedLayouts((prev) => [...prev, ...withFreshIds]);
   };
 
   const value = useMemo<WorkspaceContextValue>(

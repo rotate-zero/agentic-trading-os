@@ -1,3 +1,110 @@
+# TESTING — `layout-import-fault-isolation`
+
+Repository access was via `git clone --depth 1`, per this project's
+documented convention. `main` was pulled at the start of this task; baseline
+`358db5d` ("Daily levels lookback offload"), clean working tree. Re-pulled
+`main` into a second, independent fresh clone immediately before packaging:
+identical `358db5d` — nothing else landed on `main` in between. `diff -rq`
+between that fresh clone and this task's working tree (ignoring `.git`,
+`node_modules`, `dist`, and the regenerated `tsconfig.tsbuildinfo` build-cache
+artifact, none of which are part of the delivery) shows exactly three files
+differ: `frontend/src/state/WorkspaceContext.tsx`, `docs/architecture/
+system-design.md`, and `CHANGES.md` — matching this delivery's stated
+boundary exactly (this file, `TESTING.md`, is the fourth, edited after that
+check).
+
+This is a frontend-only change and, as recorded in the retained
+`saved-layouts-restore-isolation` entry below, `frontend/package.json`
+defines no test script and no `.test.`/`.spec.` file exists anywhere under
+`frontend/` in this repository — unchanged as of this task. Verification
+follows that same delivery's own posture: static/build checks plus direct
+execution of the changed function, rather than a project test-runner run.
+
+- **Direct execution of `normalizeImportedLayouts()`** — the actual function,
+  not a reimplementation. `importLayouts()`'s parsing logic was pulled out
+  into this new module-level function specifically so it, like
+  `loadSavedLayouts()`, can be imported and called directly without going
+  through React state. A temporary same-directory scratch copy of
+  `WorkspaceContext.tsx` (`WorkspaceContext.verify.tsx`) additionally
+  exported `normalizeImportedLayouts` and `normalizeSubWindow` (both
+  otherwise module-private); `tsx` (Node 22, no browser/DOM) imported and
+  called them directly via a scratch harness
+  (`verify-import-layouts.mts`, run with `npx tsx`), relative imports
+  resolving unchanged since the copy sits next to the real file.
+  `frontend`'s dependencies were installed (`npm install`, 137 packages,
+  none were present) so `crossTabSync.ts`'s `BroadcastChannel` import
+  resolved. `normalizeImportedLayouts()` takes a JSON string directly and
+  touches no `localStorage`, so no fake storage was needed for this harness
+  (unlike `loadSavedLayouts()`'s own verification). Eight fixtures, 17
+  assertions, all passed:
+  - Wholly valid import, two well-formed layouts → both imported, names and
+    order preserved, each given a fresh id distinct from the file's own ids,
+    ids unique from each other, `subWindows` preserved (5/5).
+  - Mixed: one entry has no `subWindows` key at all, between two valid
+    entries → both valid entries imported in order, the malformed one
+    skipped (2/2).
+  - Mixed: one entry's `subWindows` present but not an array (a string) →
+    same result, both valid entries imported (1/1).
+  - Mixed: one entry is `null` outright → the two valid entries around it
+    still import, in order (2/2).
+  - Wholly invalid import — every entry malformed (`{subWindows: null}`, a
+    bare string, a number, `null`) → degrades to an empty array, no thrown
+    error (1/1).
+  - Unparsable JSON entirely (`"{not json"`) → empty array, confirming the
+    pre-existing outer try/catch (JSON.parse failure) still works after
+    moving the per-entry logic inside it (1/1).
+  - Non-array top level (a JSON object instead of an array) → empty array,
+    pre-existing behavior unchanged (1/1).
+  - A valid layout with a legacy sub-window (predating `chartStyle`,
+    `timer`, `volumeAvg`, and the rest) still normalizes and backfills
+    correctly through the per-entry path — confirms the fix only changed
+    fault isolation and id assignment, not `normalizeSubWindow()`'s own
+    backfill behavior, reused unchanged from the import path (4/4).
+- **Genuine-regression-guard check.** Reverted the scratch copy's
+  `normalizeImportedLayouts()` to the pre-fix single-`.map()`-with-outer-catch
+  form (the same shape `importLayouts()` had before this delivery) and
+  re-ran the identical harness: exactly the 5 assertions covering the three
+  mixed valid/invalid fixtures failed (each collapsed to 0 imported entries
+  instead of preserving the 2 valid ones — the reported bug, reproduced),
+  while the other 12 (wholly-valid, wholly-invalid, unparsable-JSON,
+  non-array-top-level, and legacy-backfill cases) still passed, since none
+  of those exercise the fixed code path. Restored the fix and re-confirmed
+  17/17 before proceeding. The scratch copy and the harness script were both
+  deleted afterward — neither is part of this delivery.
+- **Harness note:** same `BroadcastChannel`-keeps-the-process-alive
+  consideration already recorded in the retained `saved-layouts-restore-
+  isolation` entry below — the harness calls `process.exit()` explicitly.
+  Harness-only; no production code path needed to change.
+- **`npm run build`** (`tsc -b && vite build`) from `frontend/`, run twice —
+  once with the scratch harness files present, once after they were deleted
+  (the delivered state): both clean, 103 modules transformed, identical
+  output hashes both times. Vite emitted its existing advisory for a bundle
+  over 500 kB (`dist/assets/index-*.js` ~505 kB minified), unrelated to this
+  change and consistent with prior deliveries' own notes on this baseline.
+  The regenerated `tsconfig.tsbuildinfo` build-cache artifact was reverted
+  (`git checkout --`) rather than included, matching this repository's own
+  git-access convention for this kind of artifact.
+- No live browser check was possible in this environment — same standing
+  caveat every frontend delivery in this doc already carries.
+- Final `diff -rq` against the independently fresh `main` pull immediately
+  before packaging (see above): exactly three application/doc files differ,
+  plus this pair (`CHANGES.md`/`TESTING.md`, both edited, this delivery's
+  entry prepended, every prior entry preserved intact below it).
+
+Package contains only the changed repository-relative files:
+`frontend/src/state/WorkspaceContext.tsx` (edited — `importLayouts()`
+reduced to a thin wrapper, new `normalizeImportedLayouts()` added;
+`loadSavedLayouts()`, `normalizeSubWindow()`, `normalizeMainWindow()`,
+`loadSession()`, and every other function untouched), `docs/architecture/
+system-design.md` (edited — one new §4.11 note plus two diagrams,
+immediately below the existing "Saved layout restoration resilience" note),
+`CHANGES.md` and `TESTING.md` (both edited, this delivery's entry prepended,
+prior entries preserved intact below it). Untouched, exactly as scoped:
+`loadSavedLayouts()`, `normalizeSubWindow()`, session restoration, and every
+other saved-layout interaction (save, load, delete, export).
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `daily-levels-lookback-offload`
 
 Pulled `origin/main` on branch `main` before editing; baseline `a3cdb17`,

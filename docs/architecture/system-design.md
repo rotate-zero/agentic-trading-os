@@ -483,6 +483,35 @@ parsed saved-layouts array
     -> return the surviving, normalized SavedLayout[]
 ```
 
+**Layout import fault isolation.** `importLayouts()` reads a JSON file exported by `exportLayouts()` (or hand-edited) and adds its entries to `savedLayouts` via the Saved Layouts UI's Import control. Its parsing now lives in a new module-level `normalizeImportedLayouts()`, extracted the same way `loadSavedLayouts()` already is, so it can be exercised directly rather than only through the closure. It previously mapped the whole imported array in one step, the identical shape `loadSavedLayouts()` itself had before its own fix above: one malformed entry (a missing or non-array `subWindows` field, or a sub-window shape that made `normalizeSubWindow()` itself throw) threw out of that single `.map()` call, was caught by the function's outer try/catch, and rejected every other, otherwise-valid layout in the imported file along with it. `normalizeImportedLayouts()` now normalizes each imported entry inside its own try/catch — the same per-entry isolation `loadSavedLayouts()` uses — so one bad entry in the file is skipped and every other valid entry still imports; the outer try/catch is unchanged and still covers unparsable JSON and a non-array top level for the file as a whole. Accepted entries are given a fresh `id` (an imported file's own ids are never reused, avoiding any collision with layouts already saved locally) with every other field preserved as normalized. `importLayouts()` itself now only calls `normalizeImportedLayouts()` and, when it returns at least one entry, appends them to `savedLayouts`; a file that yields nothing valid to import leaves `savedLayouts` untouched, same net effect as before. No `SavedLayout` field, saved-field contract, or other workspace interaction (session restore, save/load/delete/export, or `loadSavedLayouts()` itself) changed.
+
+Layout import data flow:
+
+```text
+Imported file (via LayoutsMenu's file input)
+    -> importLayouts(json) calls normalizeImportedLayouts(json)
+    -> each entry in the parsed array normalized independently
+    -> accepted entries get a fresh id
+    -> WorkspaceProvider appends surviving entries to savedLayouts state
+    -> useWorkspace() exposes the updated savedLayouts
+    -> Saved Layouts UI lists the newly imported entries alongside existing ones
+```
+
+Internal flow in `normalizeImportedLayouts()` per imported entry:
+
+```text
+JSON.parse(json)
+    -> not an array? return [] (unchanged: same fallback as before)
+    -> for each entry l at index i:
+         try:
+           subWindows = l.subWindows.map(normalizeSubWindow)
+           push { ...l, id: `layout-${Date.now()}-${i}`, subWindows }
+         catch:
+           skip this entry only — every other entry unaffected
+    -> return the surviving, normalized, freshly-id'd SavedLayout[]
+    -> unparsable JSON anywhere above: caught by the outer try/catch, return []
+```
+
 **Volume bars (the histogram pane itself) are now fully customizable per sub-window, distinct from the volume-average lines drawn on top of them.** `SubWindowConfig.volumeBars` (`VolumeBarsConfig`) controls whether the pane shows at all, and whether bars are colored two-color (up/down, each its own hex) or one flat hex color — same `ColorField` swatch-plus-hex-input control already used for every other customizable color in this UI (background, grid, timer, volume-avg lines, indicators, levels), so this isn't a new interaction pattern, just a new place it's applied. Disabling collapses the volume price scale's margins to zero height (`ChartWidget.tsx`), not just hiding the bars, so the candle pane actually reclaims the vertical space. See `../decisions/confirmed-decisions.md` #42.
 
 **Chart Style — candlestick vs. OHLC bar — is a per-sub-window toggle backed directly by `lightweight-charts`' own two native series types, not a custom renderer.** `SubWindowConfig.chartStyle: ChartStyle` (`"candlestick" | "bar"`) follows the same global-default-plus-per-instance-override shape every other display setting here already has — `DEFAULT_CHART_STYLE = "candlestick"` seeds every newly-created sub-window, and a `SubWindowMenu` screen (segmented control, matching Volume Bars' color-mode toggle) overrides it per window. Switching styles swaps the LIVE series in place (`chart.removeSeries` + `addBarSeries`/`addCandlestickSeries` + `setData`) rather than recreating the whole chart, so zoom/pan survive a toggle — the overlays/horizontalLevels/dailyLevels effects below explicitly depend on `chartStyle` too, specifically so their price lines/markers reattach to the new series in the same render rather than being silently orphaned on the removed one. Purely a rendering-layer choice: identical OHLC candle data drives both styles, so no Feature Engine or backend change was needed. See `../decisions/confirmed-decisions.md` #73.

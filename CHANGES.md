@@ -1,3 +1,52 @@
+# CHANGES — `layout-import-fault-isolation`
+
+## Current delivery
+
+Fixed `importLayouts()` in `frontend/src/state/WorkspaceContext.tsx`: it
+previously mapped an entire imported "export layouts" JSON array in one
+`.map()` call — the exact same shape `loadSavedLayouts()` had before its own
+fix (`saved-layouts-restore-isolation`, retained below). One malformed entry
+in the imported file (a missing or non-array `subWindows` field, or a
+sub-window shape that made `normalizeSubWindow()` itself throw) threw out of
+that single `.map()`, was caught by the function's outer try/catch, and
+rejected every other, otherwise-valid layout in the same file along with it.
+
+The parsing logic is now a new module-level `normalizeImportedLayouts()`,
+extracted from the `importLayouts()` closure the same way `loadSavedLayouts()`
+is already its own module-level function — this makes it directly callable
+for verification, not just reachable through a React state setter. Each
+imported entry is now normalized inside its own try/catch, the identical
+per-entry isolation `loadSavedLayouts()` already uses, so one bad entry in
+the file is skipped and every other valid entry still imports. Accepted
+entries are given a fresh `id` (the imported file's own ids are never
+reused) with every other field preserved as normalized — unchanged from
+before. The outer try/catch is unchanged and still covers unparsable JSON
+and a non-array top level for the file as a whole, returning no entries in
+either case, exactly as before. `importLayouts()` itself now just calls
+`normalizeImportedLayouts()` and appends whatever it returns to
+`savedLayouts`; a file that yields nothing valid leaves `savedLayouts`
+untouched, the same net effect the old all-or-nothing outer catch produced
+for that case.
+
+Updated `docs/architecture/system-design.md` §4.11 with a "Layout import
+fault isolation" note plus a data-flow and an internal-flow diagram,
+directly below the existing "Saved layout restoration resilience" note it
+mirrors. Verification is recorded in `TESTING.md`. This follows the same
+per-entry fault-isolation convention `loadSavedLayouts()` itself now uses;
+no new product or architecture decision was needed, and no decision number
+was assigned.
+
+## Boundary
+
+Application code changes are confined to `frontend/src/state/WorkspaceContext.tsx`:
+`importLayouts()` (now a thin wrapper) and the new `normalizeImportedLayouts()`
+function. `loadSavedLayouts()`, `normalizeSubWindow()`, `normalizeMainWindow()`,
+`loadSession()`, and every other saved-layout or session interaction
+(save, load, delete, export) are unchanged. No `SavedLayout` field or
+saved-field contract changed.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `daily-levels-lookback-offload`
 
 ## Current delivery
