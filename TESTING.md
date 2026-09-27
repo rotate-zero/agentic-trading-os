@@ -1,3 +1,90 @@
+# TESTING — `execution-doc-drift-r1-r5-r9`
+
+Repository access was via the project's tarball convention (`curl -sL
+https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main
+| tar -xzf - --strip-components=1`), plus a shallow `git fetch` of the same
+branch to get an exact base SHA: **`b16ac8b9d880ae95b255c2e21155a9590a9bc9e0`**.
+`main` was re-fetched immediately before packaging — identical SHA, and a
+`diff -rq` of the edited working tree against a completely fresh second pull
+lists exactly the two docs files below as different; nothing else landed on
+`main` in between and nothing else in the tree drifted.
+
+This delivery is **documentation only**. No file under `backend/` or
+`frontend/` changed, no migration, schema, or event model was touched, so no
+application test suite was run. Verification here is source-checking: each
+factual claim added to the docs was checked against the actual current code,
+not assumed from the design doc's own findings list.
+
+## Required reading, done before editing
+
+`AGENTS.md` (delivery/decision-log conventions), `docs/architecture/
+execution-engine-design.md` (§10 findings R1/R5/R9, read verbatim before any
+edit), `docs/architecture/system-design.md` (the five sections in scope),
+decision #1 (`docs/decisions/archive/001-060.md` — IBKR-only, Alpaca deferred,
+no `AlpacaAdapter` stub, reason given: no account-opening path found for a
+Bangladesh-resident account holder) and decision #170 onward in
+`confirmed-decisions.md` (introduces `execution_mode`/`execution_venue`, the
+`OrderVenue` port, and the `execution` registry role; its own entry already
+lists "Alpaca and `ApprovedOrder` naming drift in `system-design.md`" among
+findings "reported, not fixed" — the source of R1/R5), plus the actual
+`BrokerAdapter` (`backend/app/broker_adapters/base.py`) and `OrderVenue`
+(`backend/app/broker_adapters/order_venue.py`) interfaces.
+
+## Claim-to-source checks (all re-verified against current `main`, not the
+design doc's prior audit)
+
+| Claim now stated in `system-design.md` | Result | Where checked |
+|---|---|---|
+| No `AlpacaAdapter` file/class exists anywhere in the repo | PASS | `grep -rn "AlpacaAdapter" backend/` → 0 matches outside comments already fixed |
+| No `ApprovedOrder` class exists anywhere in the repo | PASS | `grep -rn "ApprovedOrder" docs/ backend/` → only this delivery's own corrective text and decision #170's entry (historical, describing the drift itself), no class |
+| `OrderApproved` is the real payload class | PASS | `class OrderApproved` in `backend/app/schemas/events/execution.py` |
+| `OrderVenue` port exists with `place_order`/`cancel_order`/`get_positions`-style methods, separate from `BrokerAdapter` | PASS | `backend/app/broker_adapters/order_venue.py` |
+| `broker_registry.py` treats `execution` as a third, separately-typed role (never a `MarketDataProvider`) | PASS | module docstring + `_execution_venue: OrderVenue \| None` in `backend/app/services/broker_registry.py` |
+| `BrokerAdapter.place_order`/`cancel_order`/`get_positions` have zero callers in `backend/app` or `backend/tests` | PASS | `grep -rn "\.place_order(\|\.cancel_order(\|\.get_positions("` — every hit is on a `venue`/`OrderVenue`-typed object (incl. `_FakeVenue` subclasses in tests), none on a `BrokerAdapter`-typed object |
+| `BrokerAdapter`'s own docstring confirms these three methods are declared but unwired | PASS | `backend/app/broker_adapters/base.py`: "NOT wired to any HTTP route or consumer... only the Governor should ever be able to trigger a real order" |
+| `IBKRAdapter.place_order`/`cancel_order` still raise `NotImplementedError` | PASS | `backend/app/broker_adapters/ibkr_adapter.py` |
+| Actual execution call sites use `OrderVenue.place_order` | PASS | `backend/app/execution_engine/engine.py`, `backend/app/portfolio_state/reconciliation.py` |
+| Decision #1 text matches "Alpaca deferred, not stubbed" | PASS | `docs/decisions/archive/001-060.md` |
+| Decision #170 introduces `OrderVenue`/`execution` role and lists the Alpaca/`ApprovedOrder` drift as reported-not-fixed | PASS | `docs/decisions/confirmed-decisions.md` (decision #170 entry — read, not edited) |
+
+## Diagram check
+
+The two edited boxes in the §3 diagram were measured, not eyeballed: the
+`(IBKR)` broker-name line is padded to the same width (44 chars, `│...│`
+inclusive) as the box's other lines, so the box border is unbroken. The
+Execution Engine fork (`OrderVenue` port → `SimulatedVenue [built]` /
+`IBKR order venue [deferred]`) mirrors the fork style already used in
+`execution-engine-design.md` §6.1 for the same kind of branch, rather than
+inventing a new diagram convention.
+
+## Footprint
+
+| File | Change |
+|---|---|
+| `docs/architecture/system-design.md` | §2 principle 1, §3 diagram, §4.1, §4.9 (first paragraph only), §5 "Opportunity → Execution" — no other line touched |
+| `docs/architecture/execution-engine-design.md` | §10 only — R1, R5, R9 each get a `RESOLVED`/`Fixed:` addition appended to their existing text; R2–R4, R6–R8 and every other section untouched |
+| `CHANGES.md`, `TESTING.md` | this delivery's records, prepended |
+
+No decision-log file (`confirmed-decisions.md`, `INDEX.md`, or any archive)
+changed, and no decision number was assigned — this corrects prose describing
+already-decided architecture (decisions #1 and #170), not a new decision, per
+standing instruction. `docs/architecture/trading-intelligence-architecture.md`
+(R7's territory) and every other `docs/architecture/*.md` file are untouched.
+
+## What this delivery deliberately didn't touch
+
+R2 (`TradePlanned` prose disagreement), R3 (`trading-intelligence-
+architecture.md` §18.8's nonexistent `trades` table reference), R4
+(`performance.py` docstring / D17 live-half note), R6 (`IBKRAdapter.
+get_positions()` untested), R7 (the `ExecutionMode`/placement-mode naming
+reconciliation — `system-design.md` §4.9's "Mode-aware" paragraph is left
+exactly as it was), and R8 (whether `BrokerAdapter`'s unwired execution
+methods should eventually be removed) are all left exactly as `execution-
+engine-design.md` §10 already had them. EX-5 and EX-12 (open design forks)
+are untouched. No application code, interface, or test file changed.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `count-lower-bound-validation`
 
 Repository access was via the project's tarball convention

@@ -20,7 +20,7 @@ This is not a TradingView clone. It is a **personal trading operating system**: 
 
 ## 2. Architectural Principles (non-negotiable)
 
-1. **Broker independence** — nothing above the adapter layer knows IBKR or Alpaca exists. Everything talks to a `BrokerAdapter` interface.
+1. **Broker independence** — nothing above the adapter layer knows IBKR exists (Alpaca was the original plan but is deferred, not stubbed — no account-opening path for a Bangladesh-resident account holder, confirmed decision #1). Market data connectivity talks to a `BrokerAdapter` interface; order execution talks to the narrower `OrderVenue` port instead (§4.9; `execution-engine-design.md` §6.4, decision #170) — `BrokerAdapter`'s own dormant `place_order`/`cancel_order`/`get_positions` stay unwired (§10 R8).
 2. **Separation of concerns** — chart doesn't calculate indicators, agents don't fetch data, execution doesn't generate signals. Each module has exactly one job.
 3. **Single source of truth for shared state** — the Market Data Engine owns market state, the Portfolio State Engine owns account/position state. Nothing else caches or recomputes either independently.
 4. **Push, don't poll** — all frontend updates arrive over WebSocket channels.
@@ -38,7 +38,7 @@ This diagram shows the **engineering** layering only. The domain logic inside th
 ```
                     ┌────────────────────┐
                     │     Broker APIs      │
-                    │  (IBKR / Alpaca)     │
+                    │       (IBKR)         │
                     └──────────┬──────────┘
                                │
                      BrokerAdapter interface
@@ -69,10 +69,17 @@ This diagram shows the **engineering** layering only. The domain logic inside th
              │  Trade Plan (approved)
              ▼
      ┌───────────────┐
-     │ Execution Engine │──────► BrokerAdapter interface ──────► Broker API
+     │ Execution Engine │
      └───────┬───────┘
-             │ fills (via Event Bus)
-             ▼
+             │ OrderVenue port (NOT BrokerAdapter — §4.9, §10 R9)
+             │ obtained via the `execution` registry role
+     ┌───────┴─────────────────────────────┐
+     ▼                                     ▼
+SimulatedVenue  [built]              IBKR order venue  [deferred;
+execution_mode = simulated           live/paper — not built]
+     │
+     │ fills (via Event Bus)
+     ▼
      ┌───────────────┐        ┌──────────────────────┐
      │ Position Monitor │──────► Performance Intelligence │
      └───────────────┘        └──────────────────────┘
@@ -101,7 +108,7 @@ class BrokerAdapter(ABC):
     def on_tick(self, callback: Callable[[Tick], None]) -> None: ...
 ```
 
-`IBKRAdapter` and `AlpacaAdapter` implement this. The Market Data Engine and Execution Engine depend only on `BrokerAdapter`, never on a concrete class. Adding a new broker = one new adapter file, zero changes elsewhere.
+`IBKRAdapter` implements this (`AlpacaAdapter` was the original plan but is deferred, not stubbed — no account-opening path for a Bangladesh-resident account holder, confirmed decision #1). The Market Data Engine depends only on `BrokerAdapter`, never on a concrete class, for market-data connectivity. The Execution Engine does **not** depend on `BrokerAdapter` for order placement — it depends on the narrower `OrderVenue` port instead (§4.9; `execution-engine-design.md` §6.4, decision #170); `BrokerAdapter`'s own `place_order`/`cancel_order`/`get_positions` are declared below but stay unwired, with no caller (§10 R8 — their eventual removal is a later decision). Adding a new broker = one new adapter file, zero changes elsewhere.
 
 **IBKR connection management reaches the frontend for the first time (decision #144).** `POST /broker/connect`, `POST /broker/subscribe`, `POST /broker/unsubscribe`, `GET /broker/status`, `POST /broker/disconnect` (`app/api/routes/broker.py`) are five real, working routes with zero UI representation before this — only `curl` could connect IBKR, check its status, or subscribe a symbol. A new `<main>` sibling panel now sits alongside `ScannerPanel`/`FeatureEnginePanel`/`BacktestPanel`/`BacktestResultsPanel` in both `App.tsx` shells (`FullWorkspaceShell` and `PoppedOutWindowShell`):
 
@@ -378,7 +385,7 @@ class Strategy(ABC):
 **Further extended, now built (`strategy-engine-design.md` §8, decisions #88, #99):** `evidence` gains a documented `basis: "live" | "closed"` convention (no schema change — `conditions` was already an open dict), and `Opportunity` gains `status` (`potential`/`waiting`/`actionable`/`expired`, defaulting to `actionable` so today's one-shot behavior is unchanged), `wait_reason`, `wait_expires_at`, and three lifecycle timestamps — the ACT/WAIT/ABANDON model, not a bar-close-specific mechanism. See the design doc for why `confirmation_timeframe` was considered and rejected. ORB (decision #99) ships with `allows_waiting=False`, `status="actionable"` always — the first real strategy to use this shape, but not the first to exercise waiting.
 
 ### 4.9 Execution Engine
-Only module allowed to place orders. Consumes `OrderApproved` (payload: `ApprovedOrder`), routes through `BrokerAdapter.place_order`, tracks order lifecycle (`pending → filled/partial/rejected`), and emits `OrderFilled` onto the Event Bus so the UI and Position Monitor both update without polling. Must support a **dry-run mode** by default — mirrors the pattern already used in the Polymarket bot.
+Only module allowed to place orders. Consumes `OrderApproved` (the payload class is `OrderApproved` itself, `schemas/events/execution.py` — there is no separate `ApprovedOrder` class), routes through the `OrderVenue` port (§4.1; `execution-engine-design.md` §6.4, decision #170) rather than `BrokerAdapter.place_order`, tracks order lifecycle (`pending → filled/partial/rejected`), and emits `OrderFilled` onto the Event Bus so the UI and Position Monitor both update without polling. Must support a **dry-run mode** by default — mirrors the pattern already used in the Polymarket bot.
 
 **Mode-aware since manual trading (`trading-intelligence-architecture.md` §18):** a system-wide `ExecutionMode` (`auto` | `manual`, owned by Portfolio State, broadcast via `ExecutionModeChanged`) gates the one place this module talks to the broker. In `auto` mode, `OrderApproved` flows straight to `place_order` as above, unchanged. In `manual` mode, an approved `TradePlan` is written to an **Approval Queue** (`trades`, `status=pending_confirmation`) instead of firing immediately; a `PlanAwaitingConfirmation` event notifies the UI, and only an explicit `ManualConfirmOrder` (or `ManualDiscardOrder`) actually calls `place_order`. This is the only module whose behavior changes between modes — Decision Engine, Trade Planning Engine, and Governor are identical either way.
 
@@ -551,7 +558,7 @@ Deferred, not created in v1 migrations (names reserved so the schema doesn't fig
 Broker push → `BrokerAdapter` → `Normalizer` → `StateCache` update → `Publisher` emits `PriceUpdated` onto the Event Bus → WebSocket Gateway (a subscriber, not a special path) fans out to subscribed Chart widgets → Lightweight Charts renders. In parallel, `HistoricalWriter` persists the candle asynchronously, and Feature Engine recomputes affected features.
 
 **Opportunity → Execution:**
-Scanner promotes a symbol using Feature Engine's already-computed activity metrics → Strategy Engine strategies evaluate in parallel off the same `MarketState` / `FeatureSet` / `Context` snapshot → each emits `OpportunityCreated` → Opportunity Engine ranks the field per symbol → Decision Engine arbitrates against Portfolio State (exposure, correlation) → Trade Planning Engine drafts entry/stop/target/size → Governor authorizes or rejects against Portfolio State + Context → if approved, Execution Engine places the order via `BrokerAdapter` → `OrderFilled` flows back over the Event Bus → UI updates via WebSocket, and Position Monitor takes over the open position.
+Scanner promotes a symbol using Feature Engine's already-computed activity metrics → Strategy Engine strategies evaluate in parallel off the same `MarketState` / `FeatureSet` / `Context` snapshot → each emits `OpportunityCreated` → Opportunity Engine ranks the field per symbol → Decision Engine arbitrates against Portfolio State (exposure, correlation) → Trade Planning Engine drafts entry/stop/target/size → Governor authorizes or rejects against Portfolio State + Context → if approved, Execution Engine places the order via the `OrderVenue` port — `SimulatedVenue` today; a live/paper IBKR order venue is deferred (§4.9; decision #170) — → `OrderFilled` flows back over the Event Bus → UI updates via WebSocket, and Position Monitor takes over the open position.
 
 ---
 
