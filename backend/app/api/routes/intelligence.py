@@ -376,7 +376,14 @@ async def get_context_snapshot(symbol: str | None = Query(None)) -> dict[str, An
 async def get_intelligence_series(
     symbol: str = Query(...),
     timeframe: str = Query("1m"),
-    count: int = Query(240, le=1000),
+    # `ge=1` (alongside the pre-existing `le=1000`) — same bound GET
+    # /market/candles' own `count` now carries (see that route's comment
+    # for the zero/negative failure modes this closes: an inverted
+    # `start`/`end` range plus `candles[-count:]`'s misleading slice
+    # behavior at `count<=0`), and the same `Query(..., ge=1, le=N)`
+    # convention GET /scanner/state's `top_n` and GET /intelligence/
+    # execution-orders' `limit` already use.
+    count: int = Query(240, ge=1, le=1000),
 ) -> dict[str, Any]:
     if timeframe not in _MINUTES_PER_UNIT:
         raise HTTPException(

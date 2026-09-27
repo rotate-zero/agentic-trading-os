@@ -503,6 +503,76 @@ async def test_intelligence_series_reflects_real_persisted_candles():
         _clean_test_symbol(ticker)
 
 
+# --- GET /intelligence/series `count` bounds (zero/negative rejection) -----
+# `count` declared `Query(240, le=1000)` with no lower bound let `count=0`
+# or a negative `count` through request validation entirely and into
+# `start = end - timedelta(minutes=... * count)` / `candles[-count:]` — a
+# zero-width or inverted `start`/`end` range, plus `[-0:]`'s own Python
+# slice quirk (returns the WHOLE list, not zero items). Now `ge=1` alongside
+# the pre-existing `le=1000` rejects both at the request-validation layer,
+# before any of that logic runs — proven directly below, alongside the two
+# boundary values (`1`, `1000`) that must still work exactly as before.
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_rejects_zero_count():
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/intelligence/series", params={"symbol": "ANY", "timeframe": "1m", "count": 0}
+            )
+        assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_rejects_negative_count():
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/intelligence/series", params={"symbol": "ANY", "timeframe": "1m", "count": -1}
+            )
+        assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_accepts_count_of_one():
+    """`count=1` is the new lower boundary (`ge=1`) — confirms it still
+    reaches the route's own logic (a normal 200, same shape as
+    test_intelligence_series_empty_for_never_recorded_symbol above) rather
+    than being rejected by request validation."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/intelligence/series",
+                params={"symbol": "__T_SERIES_NEVER_SEEN__", "timeframe": "1m", "count": 1},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["symbol"] == "__T_SERIES_NEVER_SEEN__"
+        assert body["series"]["sma_9"] == []
+
+
+@pytest.mark.asyncio
+async def test_intelligence_series_accepts_count_of_1000():
+    """`count=1000` is the pre-existing upper boundary (`le=1000`),
+    unchanged by this fix — confirms it still reaches the route's own
+    logic rather than being rejected by request validation."""
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/intelligence/series",
+                params={"symbol": "__T_SERIES_NEVER_SEEN__", "timeframe": "1m", "count": 1000},
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["symbol"] == "__T_SERIES_NEVER_SEEN__"
+        assert body["series"]["sma_9"] == []
+
+
 # --- Previous-day levels, Camarilla, pre-market H/L (confirmed decision #56) -
 # Fixed real trading-day timestamps (_et helper above), not datetime.now() —
 # these levels need an actual "previous day" to exist relative to "today,"

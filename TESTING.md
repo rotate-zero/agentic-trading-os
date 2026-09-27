@@ -1,3 +1,124 @@
+# TESTING — `count-lower-bound-validation`
+
+Repository access was via the project's tarball convention
+(`curl -sL https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main | tar -xzf - --strip-components=1`).
+`main` was pulled at the start of this task; re-pulled again immediately
+before packaging — identical, nothing else landed on `main` in between.
+
+No PostgreSQL preinstalled in this sandbox — installed Postgres 16
+(`apt-get install postgresql postgresql-contrib`, `archive.ubuntu.com`/
+`security.ubuntu.com` allowed by the network egress list), started it
+manually (`pg_ctl` against the Debian-layout config under
+`/etc/postgresql/16/main/postgresql.conf`, since the packaged `service`/
+`systemd` units are policy-blocked in this environment), created the
+`trading`/`trading_workspace` role and database matching `core/config.py`'s
+conventions, ran `alembic upgrade head` — 14 migrations, all applied
+cleanly. Python venv, `pip install -r backend/requirements.txt` (unchanged
+from `main` — no new dependency).
+
+- **Baseline, pre-change, full suite** (`python3 -m pytest -q` from
+  `backend/`, untouched pull, fresh `trading_workspace` database, single
+  run): **1140 passed**, 0 failed, 99.74s (reconfirmed later on a
+  re-recreated pristine database at 98.15s — identical count, see the
+  database-state note below).
+- **Targeted, post-change**: `python3 -m pytest -q tests/test_market_routes.py
+  tests/test_intelligence_routes.py` — **33 passed** (25 pre-existing + 8
+  new), 0 failed.
+- **Full suite, post-change, fresh database, single run**: **1148 passed** —
+  exactly +8 (the new tests below), 0 failed, 98.79s.
+- **Database-state note**: this project's suite runs entirely against real
+  PostgreSQL, and repeatedly re-running the full suite against the *same*
+  long-lived database (done here purely from re-verifying several times
+  during this task) accumulates rows across runs and produced two
+  transient, non-reproducible artifacts along the way — a single
+  `test_backtest_routes.py` failure (unrelated to this change: a
+  timestamp mismatch between two backtest runs' level-interaction state)
+  on one repeated run, and a larger burst of constraint-violation errors
+  on another where two `pytest` invocations briefly overlapped against the
+  same database. Both vanished on a `DROP DATABASE`/recreate/`alembic
+  upgrade head` and a single subsequent run — neither reproduced against a
+  pristine database, before or after this change, so neither is
+  attributed to it. The baseline and post-change counts above are each
+  from one clean run against a database recreated immediately beforehand.
+- **New tests, `test_market_routes.py`** (4): `test_market_candles_rejects_zero_count`
+  and `test_market_candles_rejects_negative_count` assert a `422` for
+  `count=0`/`count=-1` with no adapter connected — pure request-validation
+  rejection, before the route body ever runs. `test_market_candles_accepts_count_of_one`
+  and `test_market_candles_accepts_count_of_1000` assert the two boundary
+  values still reach the route's own logic unchanged — reusing the existing
+  `_FakeConnectedAdapter`/`SymbolNotFoundError` pattern
+  (`test_market_candles_returns_400_for_unresolvable_symbol`'s own shape):
+  a `400` naming the unresolvable symbol proves validation passed the
+  request through, not that it was rejected.
+- **New tests, `test_intelligence_routes.py`** (4): the same four cases
+  against `GET /intelligence/series`, via this file's existing
+  `app.router.lifespan_context` + `httpx.ASGITransport` pattern (needed for
+  the route's real singleton engines, same as every other test in this
+  file). `count=0`/`count=-1` → `422`. `count=1`/`count=1000` → `200`, same
+  empty-series shape as the existing
+  `test_intelligence_series_empty_for_never_recorded_symbol` for a symbol
+  with no recorded history — confirms both boundaries reach `compute_series`
+  unchanged.
+- **Negative control**: reverted both routes' `count` declaration to the
+  pre-fix `Query(240, le=1000)` (no `ge=1`) and reran just the four new
+  zero/negative tests in each file — all 4 **failed**: both `GET
+  /market/candles` cases (`count=0`, `count=-1`) fell through validation and
+  reached the route body, which then returned its ordinary `400` ("no
+  historical provider connected") since the test symbol has no
+  self-recorded data in this database — `assert 400 == 422`; both `GET
+  /intelligence/series` cases similarly reached `compute_series` on a
+  zero-width/inverted range and returned an ordinary `200` empty-series
+  response — `assert 200 == 422`. Neither case happened to hit the
+  `[-0:]`-whole-list slice bug directly (that needs the test symbol to
+  actually have self-recorded/aggregated candles for it to return
+  everything instead of nothing — described analytically in `CHANGES.md`,
+  not separately reproduced here), but the core claim — invalid `count`
+  values reached application logic instead of being rejected at validation
+  — is exactly what this failure demonstrates. Restored `ge=1` on both
+  routes and reran — all 8 passed again.
+- Final `main` re-check immediately before packaging: identical to the
+  task-start pull aside from this task's own files (this delivery's zip
+  manifest, below) — no concurrent-session collision.
+
+**Manual spot-check**, matching this file's own existing "Manually
+exercising `/market/candles`" convention below: ran a real `uvicorn`
+process (no provider connected, no data recorded for the test symbol).
+`curl "http://localhost:8000/market/candles?symbol=NVDA&count=0"` and
+`count=-1` both now return a `422` —
+`{"detail":[{"type":"greater_than_equal","loc":["query","count"],"msg":
+"Input should be greater than or equal to 1", ...}]}` — instead of reaching
+the route body at all. The equivalent `GET
+/intelligence/series?symbol=NVDA&count=0` returns the identical `422`
+shape. `count=1` and `count=1000` on `GET /market/candles` both still
+return the pre-existing, unchanged `400` ("no historical provider
+connected") rather than a validation error — confirming both boundaries
+still reach the route's own logic exactly as before.
+
+**What this delivery deliberately didn't touch:** candle retrieval order
+(self-recorded → aggregated → external provider on `GET /market/candles`;
+self-recorded/aggregated only, no provider fallback, on `GET
+/intelligence/series`), `compute_series`'s own computation, either route's
+response shape, the `timeframe` parameter or its own unsupported-value
+`400` handling, or the pre-existing `le=1000` upper bound and `240` default.
+`test_intelligence_routes.py` has no corresponding row in `backend/README.md`'s
+test table — a pre-existing documentation gap, present before this task and
+unrelated to this change (the file already existed, undocumented, prior to
+this delivery); noted here rather than fixed, per this project's own scope-
+discipline convention, since fixing it would mean documenting roughly a
+dozen pre-existing tests this delivery didn't write or touch.
+
+Delivered as `count-lower-bound-validation.zip`: `backend/app/api/routes/
+market.py` (edited — `count`'s `Query(...)` declaration plus an explanatory
+comment; no other line changed), `backend/app/api/routes/intelligence.py`
+(edited — the same, on `GET /intelligence/series`), `backend/tests/
+test_market_routes.py` (4 new tests), `backend/tests/test_intelligence_routes.py`
+(4 new tests), `backend/README.md` (edited — the `GET /market/candles`
+bullet and the `test_market_routes.py` table row), `CHANGES.md` and this
+file (both edited, this delivery's entry prepended, every prior entry
+preserved intact below it).
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `layout-import-fault-isolation`
 
 Repository access was via `git clone --depth 1`, per this project's

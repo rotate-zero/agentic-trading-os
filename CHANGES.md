@@ -1,3 +1,54 @@
+# CHANGES — `count-lower-bound-validation`
+
+## Current delivery
+
+`GET /market/candles` and `GET /intelligence/series` both declared their
+`count` query parameter as `Query(240, le=1000)` — an upper bound with no
+lower one. `count=0` or a negative `count` previously passed FastAPI's own
+request validation untouched and reached each route's retrieval logic with
+an invalid range: `start = end - timedelta(minutes=... * count)` produces a
+zero-width (`count=0`) or inverted (`count<0`) `start`/`end` window, and the
+final `[-count:]` slice on the resulting candle list has its own misleading
+behavior at those values — `count=0` means `[-0:]`, a genuine Python slice
+quirk that means "from index 0," i.e. the WHOLE list, not "the last zero
+items," so a caller asking for zero candles got back everything instead;
+`count<0` is a positive-index slice at that point (`recorded[-(-1):]` ==
+`recorded[1:]`), an unrelated and equally misleading result.
+
+Both routes now declare `count: int = Query(240, ge=1, le=1000)` — the same
+`Query(..., ge=1, le=N)` bounding convention `GET /scanner/state`'s `top_n`
+and `GET /intelligence/execution-orders`' `limit` already use. `count=0` or
+negative is now a clean `422` at the request-validation layer, before any
+retrieval logic runs. The pre-existing upper bound (`le=1000`), the default
+(`240`), and every other query parameter, retrieval path, and response
+shape on both routes are unchanged — including candle-store/aggregator
+lookup order and external-provider fallback on `GET /market/candles`, and
+the Feature-Engine-scoped, no-fallback retrieval on `GET /intelligence/series`.
+
+No new product or architecture decision was needed — this closes a gap in
+an existing parameter's validation range, the same "reuse an existing
+bounding convention at a new call site" shape `scanner-override-ticker-
+validation` and `scanner-route-db-offload` already used — so no decision
+number was assigned and `docs/decisions/confirmed-decisions.md`/`INDEX.md`
+are untouched.
+
+`backend/README.md` updated: the `GET /market/candles?symbol=&count=&
+timeframe=` bullet now states the `[1, 1000]` bound and the failure mode it
+closes; the `test_market_routes.py` test-table row now mentions the new
+`count`-bound coverage. Verification is recorded in `TESTING.md`.
+
+## Boundary
+
+Application code changes are confined to the `count` parameter declaration
+on `GET /market/candles` (`backend/app/api/routes/market.py`) and `GET
+/intelligence/series` (`backend/app/api/routes/intelligence.py`) — one line
+each, plus an explanatory comment. No other query parameter, function
+signature, retrieval logic, or response shape on either route changed.
+Candle retrieval, series computation, and provider behavior are byte-for-
+byte unchanged for every `count` value that was already valid (`1`–`1000`).
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `layout-import-fault-isolation`
 
 ## Current delivery

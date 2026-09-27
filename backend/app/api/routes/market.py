@@ -46,7 +46,18 @@ _MINUTES_PER_UNIT = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 60 * 24}
 @router.get("/candles")
 async def get_candles(
     symbol: str = Query(...),
-    count: int = Query(240, le=1000),
+    # `ge=1` (alongside the pre-existing `le=1000`) — same
+    # `Query(..., ge=1, le=N)` bounding convention GET /scanner/state's
+    # `top_n` and GET /intelligence/execution-orders' `limit` already use.
+    # Zero/negative previously slipped through FastAPI's own validation
+    # entirely: `count=0` builds a zero-width `start`..`end` range and then
+    # `recorded[-0:]` (Python slice quirk — `[-0:]` means "from index 0",
+    # i.e. the WHOLE list, not "the last 0 items") silently returned every
+    # recorded candle instead of none; a negative `count` produces an
+    # inverted `start > end` range and a `recorded[-count:]` positive-index
+    # slice with its own misleading behavior. Both are now a clean 422 at
+    # the request-validation layer, before any of that logic runs.
+    count: int = Query(240, ge=1, le=1000),
     timeframe: str = Query("1m"),
 ) -> dict:
     if timeframe not in _MINUTES_PER_UNIT:

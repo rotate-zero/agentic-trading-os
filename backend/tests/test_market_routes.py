@@ -95,6 +95,60 @@ def test_market_candles_rejects_4h_cleanly():
         broker_registry.clear_all()
 
 
+# --- GET /market/candles `count` bounds (zero/negative rejection) ---------
+# `count` declared `Query(240, le=1000)` with no lower bound let `count=0`
+# or a negative `count` through request validation entirely and into
+# `start = end - timedelta(minutes=... * count)` / `recorded[-count:]` — a
+# zero-width or inverted `start`/`end` range, plus `[-0:]`'s own Python
+# slice quirk (returns the WHOLE list, not zero items, for `count=0`). Now
+# `ge=1` alongside the pre-existing `le=1000` rejects both at the request-
+# validation layer, before any of that logic runs — proven directly below,
+# alongside the two boundary values (`1`, `1000`) that must still work
+# exactly as before.
+
+
+def test_market_candles_rejects_zero_count():
+    with TestClient(app) as client:
+        r = client.get("/market/candles", params={"symbol": "NVDA", "count": 0})
+    assert r.status_code == 422
+
+
+def test_market_candles_rejects_negative_count():
+    with TestClient(app) as client:
+        r = client.get("/market/candles", params={"symbol": "NVDA", "count": -1})
+    assert r.status_code == 422
+
+
+def test_market_candles_accepts_count_of_one():
+    """`count=1` is the new lower boundary (`ge=1`) — confirms it still
+    reaches the route's own logic (a 400 from the fake adapter's
+    SymbolNotFoundError, same as
+    test_market_candles_returns_400_for_unresolvable_symbol above) rather
+    than being rejected by request validation."""
+    broker_registry.set_historical_provider(_FakeConnectedAdapter())
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/candles", params={"symbol": "NOTREAL", "count": 1})
+        assert r.status_code == 400
+        assert "NOTREAL" in r.json()["detail"]
+    finally:
+        broker_registry.clear_all()
+
+
+def test_market_candles_accepts_count_of_1000():
+    """`count=1000` is the pre-existing upper boundary (`le=1000`),
+    unchanged by this fix — confirms it still reaches the route's own
+    logic rather than being rejected by request validation."""
+    broker_registry.set_historical_provider(_FakeConnectedAdapter())
+    try:
+        with TestClient(app) as client:
+            r = client.get("/market/candles", params={"symbol": "NOTREAL", "count": 1000})
+        assert r.status_code == 400
+        assert "NOTREAL" in r.json()["detail"]
+    finally:
+        broker_registry.clear_all()
+
+
 def test_market_subscribe_requires_connection():
     broker_registry.clear_all()
     with TestClient(app) as client:

@@ -49,7 +49,12 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
 - `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever
   provider currently holds the **historical role** (`app/services/broker_registry.py`
   — see below). **This is what the frontend actually calls now** — the mock-swap
-  (`frontend/src/hooks/useLiveCandles.ts`) is done, not just planned.
+  (`frontend/src/hooks/useLiveCandles.ts`) is done, not just planned. `count` is
+  bounded `[1, 1000]` (`Query(240, ge=1, le=1000)`) — `0`/negative are a clean `422`
+  now rather than reaching `start = end - timedelta(...)`/`candles[-count:]` with an
+  invalid range and Python's own `[-0:]` slice quirk (the whole list, not zero items).
+  `GET /intelligence/series`'s own `count` carries the identical `[1, 1000]` bound,
+  for the same reason.
 - `POST /market/subscribe?symbol=` — tells whichever provider holds the **streaming
   role** to start streaming a symbol. Provider-agnostic on purpose: the frontend calls
   this one route regardless of whether Finnhub, Polygon, or IBKR is actually
@@ -366,7 +371,7 @@ PostgreSQL for a complete suite rather than treating a skip-only run as final va
 | `test_ibkr_historical.py` | DB-free mocked IBKR acquisition: canonical candles, serial chunks, exact filtering, UTC normalization/order, overlap dedup/conflict detection, auxiliary lookbacks, error/event mapping, zero bars, and cleanup without streaming or order calls |
 | `test_ibkr_backtest_route.py` | Real-PostgreSQL sibling-route validation, configuration/client-ID rules, 24-hour cap, stable failure responses, no run row on acquisition failure, successful preloaded-provider persistence, and the IBKR live-provider `409` guard |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
-| `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
+| `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Also covers `count`'s `[1, 1000]` bound directly: `0`/negative → 422, `1`/`1000` still reach the route's own logic unchanged. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |
 | `test_polygon_provider.py` | `PolygonAdapter`'s pure logic, all via monkeypatched `get_aggs` (no real API key or network access): timeframe mapping, ABC compliance, `get_historical`'s bad-symbol handling (empty-list-not-exception, same trap as `qualifyContractsAsync`), and the polling dedup logic — a new bar fires `on_tick`, the same bar polled again doesn't, a client exception doesn't kill the loop |
 | `test_finnhub_provider.py` | `FinnhubAdapter`'s pure logic: missing-key handling, ABC compliance, `get_historical` correctly raising `HistoricalDataUnavailableError` (confirmed decision #32), and WS message parsing — ping/unknown types ignored, single and multi-trade messages parsed, malformed entries skipped without crashing the batch |
