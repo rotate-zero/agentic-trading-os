@@ -166,11 +166,13 @@ def test_two_separate_runs_isolate_level_interaction_state_and_events():
         state_rows = session.execute(
             text(
                 "SELECT lis.id, lis.is_backtest, lis.backtest_run_id, lis.level_key, "
-                "lis.trading_day, lis.touch_count_today, lis.zone, lis.zone_entered_ts, "
-                "lis.touch_anchor_price, lis.touch_entered_ts, lis.touch_entered_from "
+                "lis.timeframe, lis.trading_day, lis.touch_count_today, lis.zone, "
+                "lis.zone_entered_ts, lis.touch_anchor_price, lis.touch_entered_ts, "
+                "lis.touch_entered_from "
                 "FROM level_interaction_state lis "
                 "JOIN symbols s ON s.id = lis.symbol_id "
-                "WHERE s.ticker = :ticker ORDER BY lis.backtest_run_id, lis.level_key"
+                "WHERE s.ticker = :ticker "
+                "ORDER BY lis.backtest_run_id, lis.level_key, lis.timeframe"
             ),
             {"ticker": D20_ISOLATION_SYMBOL},
         ).mappings().all()
@@ -211,8 +213,21 @@ def test_two_separate_runs_isolate_level_interaction_state_and_events():
     # final checkpoint identity/zone/timestamps are the isolation contract;
     # touch_count_today is inspected independently rather than made an
     # equality precondition for the strategy outcome this regression proves.
+    #
+    # level_interaction_state tracks each level_key once per timeframe (this
+    # scenario's replay produces 1m/5m/15m/1h rows for "vwap"), so a lookup
+    # keyed on level_key alone is ambiguous: it ties on (backtest_run_id,
+    # level_key) and SQL does not guarantee which tied row a scan returns
+    # first. Pin the timeframe every v1 strategy actually reads (decision
+    # #99) so the comparison targets one well-defined row instead of an
+    # arbitrary one — this was the root cause of this test's intermittent
+    # failures (see TESTING.md).
     vwap_rows = {
-        run_id: next(row for row in states_by_run[run_id] if row["level_key"] == "vwap")
+        run_id: next(
+            row
+            for row in states_by_run[run_id]
+            if row["level_key"] == "vwap" and row["timeframe"] == "1m"
+        )
         for run_id in run_ids
     }
 

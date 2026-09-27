@@ -1,70 +1,62 @@
-# CHANGES — `execution-doc-drift-r1-r5-r9`
+# CHANGES — `backtest-isolation-flake-fix`
 
 ## Current delivery
 
-Documentation-only correction of the three execution-path drift findings
-`execution-engine-design.md` §10 already catalogued against `system-design.md`
-as "reported, not fixed": **R1** (Alpaca still described as an implemented
-second broker, when decision #1 deferred it — no stub was ever written),
-**R5** (the `OrderApproved` event payload misnamed `ApprovedOrder`, a class
-that doesn't exist), and **R9** (principle 1 still saying every module talks
-to a `BrokerAdapter`, when decision #170 gave order execution its own,
-narrower `OrderVenue` port instead).
+Fixed the intermittent failure in
+`test_two_separate_runs_isolate_level_interaction_state_and_events`
+(`backend/tests/test_backtest_routes.py`). `level_interaction_state`
+legitimately tracks each `level_key` once per timeframe (this scenario's
+replay produces independent `1m`/`5m`/`15m`/`1h` rows for `level_key
+== "vwap"`), but the test's own comparison query selected and ordered by
+`level_key` without `timeframe`, then picked "the" vwap row with
+`next(row for row in ... if row["level_key"] == "vwap")`. Four rows tied
+on that predicate per run; SQL gives no guaranteed order among tied rows
+without an explicit tiebreaker, so the row returned first — and therefore
+compared — could differ from run to run independent of any real state
+divergence. Reproduced on a freshly migrated database, first attempt, 4
+times out of 5 consecutive attempts, always with the same
+`14:30`/`16:02` signature; confirmed by direct column dump that the two
+runs' actual per-timeframe state was identical every time, and that only
+the query's tied-row selection varied.
 
-`system-design.md` changes, each re-checked against current `main`
-(`backend/app/broker_adapters/base.py`, `order_venue.py`, `ibkr_adapter.py`;
-`backend/app/services/broker_registry.py`; `backend/app/schemas/events/
-execution.py`; confirmed decisions #1 and #170):
+Not a production defect: `LevelInteractionEngine`/`FeatureEngine` are
+constructed fresh per backtest run with run-scoped DB reads/writes
+(decision #160/D20), VWAP's cold-start backfill only ever reads *live*
+(non-backtest) candle history, and production's own `get_snapshot()`
+already nests its results by timeframe correctly. Checked
+`test_backtest_sweep_route.py`, `test_level_interaction_engine.py`,
+`test_replay_state_producer.py`, and `test_symbol_namespace.py` for the
+same pick-one-of-several-ties pattern — found nowhere else.
 
-- **§2 principle 1** — "nothing above the adapter layer knows IBKR or Alpaca
-  exists. Everything talks to a `BrokerAdapter` interface" now says IBKR only
-  (Alpaca deferred, not stubbed — decision #1) and distinguishes market-data
-  connectivity (`BrokerAdapter`) from order execution (`OrderVenue`, decision
-  #170), naming `BrokerAdapter`'s own `place_order`/`cancel_order`/
-  `get_positions` as declared but unwired (R8, left open — not resolved here).
-- **§3 diagram** — the broker box now reads "(IBKR)"; the Execution Engine's
-  outgoing arrow no longer points at "BrokerAdapter interface → Broker API".
-  It now shows the `OrderVenue` port branching to `SimulatedVenue [built]`
-  versus a deferred `IBKR order venue [live/paper — not built]`, matching
-  `broker_registry.py`'s own third, separately-typed `execution` role.
-- **§4.1** — dropped the false "`IBKRAdapter` and `AlpacaAdapter` implement
-  this"; states `AlpacaAdapter` was the original plan, deferred per decision
-  #1 (verified: no such file exists under `backend/app/broker_adapters/`).
-  Clarifies the Execution Engine does not depend on `BrokerAdapter` for order
-  placement — confirmed by source: zero calls to a `BrokerAdapter`-typed
-  `place_order`/`cancel_order`/`get_positions` anywhere in `backend/app` or
-  `backend/tests` (every call found is on an `OrderVenue`/fake-venue
-  instance); `IBKRAdapter.place_order`/`cancel_order` still raise
-  `NotImplementedError`.
-- **§4.9** — first paragraph now names the real payload class (`OrderApproved`
-  itself, confirmed in `schemas/events/execution.py` — no `ApprovedOrder`
-  anywhere in the repo) and routes it through the `OrderVenue` port instead of
-  `BrokerAdapter.place_order`. The second ("Mode-aware") and third ("Design
-  pass") paragraphs are untouched — the second is R7's territory (a separate,
-  already-catalogued naming reconciliation, explicitly left open) and the
-  third already correctly describes the `OrderVenue`/`execution`-role split.
-- **§5, "Opportunity → Execution" walkthrough** — same `BrokerAdapter` →
-  `OrderVenue`/`SimulatedVenue` correction; this sentence carried the
-  identical drift and falls under "any directly related flow sentence" in
-  scope for this task.
+Fix, in `backend/tests/test_backtest_routes.py` only: added
+`lis.timeframe` to the state query's `SELECT`/`ORDER BY`, and filtered the
+`vwap_rows` lookup to `timeframe == "1m"` (the timeframe every v1 strategy
+actually reads, decision #99) in addition to `level_key == "vwap"`. The
+test's meaningful contract — two identical replays must produce
+independent, equivalent persisted state — is unchanged; it now checks that
+contract against one well-defined row instead of an arbitrarily-selected
+one among four legitimate rows. No assertion weakened, no sleep added, no
+production file touched.
 
-`execution-engine-design.md` §10 — R1, R5, and R9 each get a
-`RESOLVED (execution-doc-drift-r1-r5-r9, docs-only)` tag and a one-line
-"Fixed:" pointer to the corrected sections. Original finding text is
-preserved verbatim above the tag; nothing is deleted or reworded. R2, R3, R4,
-R6, R7, and R8 are untouched, as are EX-5 and EX-12.
-
-No application code, interface, schema, or decision-log file changed; no new
-decision number was assigned — this corrects prose describing an already-
-decided architecture (decisions #1 and #170), not a new decision. Verification
-is recorded in `TESTING.md`.
+Also corrected three prior `TESTING.md` entries
+(`count-lower-bound-validation`, `execution-authorizer-and-engine`,
+`execution-ledger-and-venue`) that had each independently observed this
+same failure and mischaracterized it — twice as this project's own
+long-documented `#119` `FeatureEngine`-warmup cluster (a different,
+unrelated set of tests), once as "non-reproducible against a pristine
+database" (it reproduces on one 80% of the time, first attempt). Corrected
+in place with dated footnotes rather than rewritten, so both the original,
+honestly-reported-at-the-time conclusion and this correction remain
+visible. No decision number assigned — a test-query correction, not an
+architecture change.
 
 ## Boundary
 
-Exactly four files change: `docs/architecture/system-design.md`,
-`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
-Nothing under `backend/`, `frontend/`, `docs/decisions/`, or any other
-`docs/architecture/*.md` file changes.
+Application code is entirely untouched. The only file changed is
+`backend/tests/test_backtest_routes.py` (two `SELECT`/`ORDER BY` query
+lines and the `vwap_rows` lookup filter, plus an explanatory comment), and
+documentation (`TESTING.md`, this file). No other test file, route,
+engine, or migration changed.
 
 <!-- Previous delivery record retained below. -->
 

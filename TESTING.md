@@ -1,87 +1,195 @@
-# TESTING — `execution-doc-drift-r1-r5-r9`
+# TESTING — `backtest-isolation-flake-fix`
 
-Repository access was via the project's tarball convention (`curl -sL
-https://codeload.github.com/rotate-zero/agentic-trading-os/tar.gz/refs/heads/main
-| tar -xzf - --strip-components=1`), plus a shallow `git fetch` of the same
-branch to get an exact base SHA: **`b16ac8b9d880ae95b255c2e21155a9590a9bc9e0`**.
-`main` was re-fetched immediately before packaging — identical SHA, and a
-`diff -rq` of the edited working tree against a completely fresh second pull
-lists exactly the two docs files below as different; nothing else landed on
-`main` in between and nothing else in the tree drifted.
+## Task
 
-This delivery is **documentation only**. No file under `backend/` or
-`frontend/` changed, no migration, schema, or event model was touched, so no
-application test suite was run. Verification here is source-checking: each
-factual claim added to the docs was checked against the actual current code,
-not assumed from the design doc's own findings list.
+Investigate and fix the intermittent failure in
+`backend/tests/test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events`.
+Approved, scoped task — no other test or production file in scope unless
+evidence required it (it did not).
 
-## Required reading, done before editing
+## Environment setup
 
-`AGENTS.md` (delivery/decision-log conventions), `docs/architecture/
-execution-engine-design.md` (§10 findings R1/R5/R9, read verbatim before any
-edit), `docs/architecture/system-design.md` (the five sections in scope),
-decision #1 (`docs/decisions/archive/001-060.md` — IBKR-only, Alpaca deferred,
-no `AlpacaAdapter` stub, reason given: no account-opening path found for a
-Bangladesh-resident account holder) and decision #170 onward in
-`confirmed-decisions.md` (introduces `execution_mode`/`execution_venue`, the
-`OrderVenue` port, and the `execution` registry role; its own entry already
-lists "Alpaca and `ApprovedOrder` naming drift in `system-design.md`" among
-findings "reported, not fixed" — the source of R1/R5), plus the actual
-`BrokerAdapter` (`backend/app/broker_adapters/base.py`) and `OrderVenue`
-(`backend/app/broker_adapters/order_venue.py`) interfaces.
+- Fresh `git clone --depth 1 https://github.com/rotate-zero/agentic-trading-os.git`,
+  base commit `b16ac8b9d880ae95b255c2e21155a9590a9bc9e0`. Re-checked
+  `origin/main` immediately before packaging — identical, nothing else
+  landed in between.
+- No PostgreSQL preinstalled in this sandbox — installed Postgres 16
+  (`apt-get install postgresql postgresql-contrib`), started manually via
+  `pg_ctl` against the Debian-layout config
+  (`/etc/postgresql/16/main/postgresql.conf`; the packaged `service`/
+  `systemd` units are policy-blocked here), matching this project's own
+  documented workaround from prior sessions.
+- Created the `trading`/`trading_workspace` role and database exactly per
+  `core/config.py`'s documented convention, plus a second, separate scratch
+  database, `trading_workspace_flaketest`, used only for the
+  accumulating-database reproduction below — kept apart from
+  `trading_workspace` so the fresh-DB and accumulating-DB evidence can't
+  cross-contaminate. **Neither is Saqib's own development database — both
+  are dedicated to this task and disposable.** Python venv,
+  `pip install -r backend/requirements.txt`, unchanged from `main`.
+- All reproduction and verification runs were strictly serial — one
+  `pytest` process at a time against a given database, never overlapping,
+  per this task's own instruction.
+- **Packaging-time collision check**: `origin/main` advanced during this
+  session, to `f08363cd7534f316d5035addbf9e84e1932085e0` — a docs-only
+  sibling delivery (`execution-doc-drift-r1-r5-r9`) touching
+  `docs/architecture/execution-engine-design.md` and `system-design.md`
+  only. `diff -rq` against a fresh clone of that newer `main` confirms zero
+  file overlap with this delivery's own three changed files
+  (`backend/tests/test_backtest_routes.py`, `TESTING.md`, `CHANGES.md`).
+  No rebase needed; this delivery's own base remains
+  `b16ac8b9d880ae95b255c2e21155a9590a9bc9e0`.
 
-## Claim-to-source checks (all re-verified against current `main`, not the
-design doc's prior audit)
+## Diagnosis
 
-| Claim now stated in `system-design.md` | Result | Where checked |
-|---|---|---|
-| No `AlpacaAdapter` file/class exists anywhere in the repo | PASS | `grep -rn "AlpacaAdapter" backend/` → 0 matches outside comments already fixed |
-| No `ApprovedOrder` class exists anywhere in the repo | PASS | `grep -rn "ApprovedOrder" docs/ backend/` → only this delivery's own corrective text and decision #170's entry (historical, describing the drift itself), no class |
-| `OrderApproved` is the real payload class | PASS | `class OrderApproved` in `backend/app/schemas/events/execution.py` |
-| `OrderVenue` port exists with `place_order`/`cancel_order`/`get_positions`-style methods, separate from `BrokerAdapter` | PASS | `backend/app/broker_adapters/order_venue.py` |
-| `broker_registry.py` treats `execution` as a third, separately-typed role (never a `MarketDataProvider`) | PASS | module docstring + `_execution_venue: OrderVenue \| None` in `backend/app/services/broker_registry.py` |
-| `BrokerAdapter.place_order`/`cancel_order`/`get_positions` have zero callers in `backend/app` or `backend/tests` | PASS | `grep -rn "\.place_order(\|\.cancel_order(\|\.get_positions("` — every hit is on a `venue`/`OrderVenue`-typed object (incl. `_FakeVenue` subclasses in tests), none on a `BrokerAdapter`-typed object |
-| `BrokerAdapter`'s own docstring confirms these three methods are declared but unwired | PASS | `backend/app/broker_adapters/base.py`: "NOT wired to any HTTP route or consumer... only the Governor should ever be able to trigger a real order" |
-| `IBKRAdapter.place_order`/`cancel_order` still raise `NotImplementedError` | PASS | `backend/app/broker_adapters/ibkr_adapter.py` |
-| Actual execution call sites use `OrderVenue.place_order` | PASS | `backend/app/execution_engine/engine.py`, `backend/app/portfolio_state/reconciliation.py` |
-| Decision #1 text matches "Alpaca deferred, not stubbed" | PASS | `docs/decisions/archive/001-060.md` |
-| Decision #170 introduces `OrderVenue`/`execution` role and lists the Alpaca/`ApprovedOrder` drift as reported-not-fixed | PASS | `docs/decisions/confirmed-decisions.md` (decision #170 entry — read, not edited) |
+Read `AGENTS.md`, this file, `docs/architecture/` (backtest runner and
+level-interaction-engine design), the decision-archive entries for #133
+(D18), #159/#160 (D20, `EngineBackedReplayStateProducer`), and the full
+source of `level_interaction_engine.py`, `replay_state_producer.py`,
+`runner.py`, `engine_singleton_guard.py`, `fixture_provider.py`,
+`scenarios.py`, `candle_store.py`, and the `FeatureEngine` VWAP accumulator
+before changing anything.
 
-## Diagram check
+Ruled out, with evidence, not assumption:
 
-The two edited boxes in the §3 diagram were measured, not eyeballed: the
-`(IBKR)` broker-name line is padded to the same width (44 chars, `│...│`
-inclusive) as the box's other lines, so the box border is unbroken. The
-Execution Engine fork (`OrderVenue` port → `SimulatedVenue [built]` /
-`IBKR order venue [deferred]`) mirrors the fork style already used in
-`execution-engine-design.md` §6.1 for the same kind of branch, rather than
-inventing a new diagram convention.
+- **Wall-clock-dependent replay settlement.** Every persisted
+  `zone_entered_ts`/`touch_entered_ts`/`entered_ts`/`exited_ts` in
+  `level_interaction_engine.py` is derived from the replayed `candle_ts`
+  (`_process_level`/`_process_one`), never `datetime.now()`. The file's one
+  real `datetime.now(timezone.utc)` call (`get_snapshot()`, a live
+  metadata field) is never written to any column this test inspects.
+  Fixture candle timestamps come straight from the static
+  `first_pullback_vwap_dip.csv` (`fixture_provider.py`) and are never
+  rebased to "today."
+- **Test data left across runs.** `EngineBackedReplayStateProducer`
+  constructs a brand-new `LevelInteractionEngine`/`FeatureEngine` instance
+  per run (fresh in-memory state), and all DB reads/writes are scoped by
+  that run's own fresh `backtest_run_id` (decision #160/D20).
+  `FeatureEngine`'s VWAP cold-start backfill
+  (`candle_store.get_recorded_candles`) filters `Symbol.is_backtest.is_(False)`
+  — it only ever reads *live* candle history, so it cannot be polluted by a
+  prior backtest run of this test's synthetic ticker. Confirmed empirically
+  with a standalone diagnostic script (bypassing the test's own lookup,
+  dumping every column including `timeframe`): the two runs'
+  `level_interaction_state` rows are byte-identical per timeframe, every
+  time, fixed or not.
 
-## Footprint
+**Actual root cause — a test-query defect, not a production defect.**
+`level_interaction_state` legitimately tracks each `level_key` once **per
+timeframe** (this scenario's 129-candle replay produces independent
+`1m`/`5m`/`15m`/`1h` rows for `level_key='vwap'`, each with its own
+`zone_entered_ts` — confirmed by direct query). The test's own SQL selected
+`level_key` but never `timeframe`, and ordered only by
+`lis.backtest_run_id, lis.level_key`; it then picked "the" vwap row with
+`next(row for row in states_by_run[run_id] if row["level_key"] == "vwap")`.
+Four rows match that predicate per run, tied on the only sort key the query
+provides. SQL does not guarantee relative order among tied rows without an
+explicit tiebreaker, so `next()` returned whichever physical row Postgres's
+scan surfaced first for that execution — which can differ run to run
+depending on heap/page layout, independent of any real state divergence.
+Confirmed directly: dumping `timeframe` alongside the other columns showed
+the `14:30` value belongs to the `5m`/`15m`/`1h` rows and `16:02` to the
+`1m` row, for both runs, every time — the two runs' actual state was
+identical; only which tied row the ambiguous query happened to return
+first differed.
 
-| File | Change |
-|---|---|
-| `docs/architecture/system-design.md` | §2 principle 1, §3 diagram, §4.1, §4.9 (first paragraph only), §5 "Opportunity → Execution" — no other line touched |
-| `docs/architecture/execution-engine-design.md` | §10 only — R1, R5, R9 each get a `RESOLVED`/`Fixed:` addition appended to their existing text; R2–R4, R6–R8 and every other section untouched |
-| `CHANGES.md`, `TESTING.md` | this delivery's records, prepended |
+Checked for the same pick-one-of-several-ties pattern elsewhere
+(`test_backtest_sweep_route.py`, `test_level_interaction_engine.py`,
+`test_replay_state_producer.py`, `test_symbol_namespace.py`) and in
+production's own `get_snapshot()` (which correctly nests by timeframe):
+found nowhere else. **No production behavior defect; no scope expansion
+needed or done.**
 
-No decision-log file (`confirmed-decisions.md`, `INDEX.md`, or any archive)
-changed, and no decision number was assigned — this corrects prose describing
-already-decided architecture (decisions #1 and #170), not a new decision, per
-standing instruction. `docs/architecture/trading-intelligence-architecture.md`
-(R7's territory) and every other `docs/architecture/*.md` file are untouched.
+### Correcting prior entries in this file
 
-## What this delivery deliberately didn't touch
+This exact failure (same `14:30`/`16:02` signature) was already observed
+and logged at least three times before this task — see the corrections
+inserted in place at the `count-lower-bound-validation`,
+`execution-authorizer-and-engine`, and `execution-ledger-and-venue`
+sections below. Each time it was re-run once or twice, seen to "pass in
+isolation," and filed away as either "non-reproducible against a pristine
+database" or this project's own long-documented **#119** intermittent
+cluster (`test_vwap_publishes_even_while_sma_is_still_warming_up` and three
+sibling `FeatureEngine`-warmup tests — see decision #149,
+`flaky-test-cluster-rootcause`). Neither characterization holds: this task
+reproduced the failure on a freshly migrated database, first attempt, 4
+times out of 5 consecutive fresh-database attempts (below) — it is not
+tied to database accumulation, and it has nothing to do with the `#119`
+cluster (different test file, different mechanism — a query tiebreak, not
+`FeatureEngine` warmup timing).
 
-R2 (`TradePlanned` prose disagreement), R3 (`trading-intelligence-
-architecture.md` §18.8's nonexistent `trades` table reference), R4
-(`performance.py` docstring / D17 live-half note), R6 (`IBKRAdapter.
-get_positions()` untested), R7 (the `ExecutionMode`/placement-mode naming
-reconciliation — `system-design.md` §4.9's "Mode-aware" paragraph is left
-exactly as it was), and R8 (whether `BrokerAdapter`'s unwired execution
-methods should eventually be removed) are all left exactly as `execution-
-engine-design.md` §10 already had them. EX-5 and EX-12 (open design forks)
-are untouched. No application code, interface, or test file changed.
+## Reproduction
+
+Dedicated database `trading_workspace`, `DROP DATABASE`/recreate/`alembic
+upgrade head` before each attempt, one `pytest` process at a time:
+
+```
+python -m pytest -q tests/test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events
+```
+
+**Before the fix, 5 consecutive fresh-database attempts: 4 failed, 1
+passed** — all 4 failures with the identical signature
+`datetime(2026, 2, 2, 14, 30, ...) != datetime(2026, 2, 2, 16, 2, ...)` at
+the `vwap_state(run_ids[0]) == vwap_state(run_ids[1])` assertion.
+
+**After the fix, 10 consecutive fresh-database attempts: 10 passed, 0
+failed.** A further 15 consecutive attempts against one never-wiped,
+never-recreated database (`trading_workspace_flaketest`, so row count and
+heap layout keep growing exactly as they did historically) — the condition
+under which this failure was previously observed — also **15 passed, 0
+failed**. 25/25 total with the fix.
+
+## Fix
+
+`backend/tests/test_backtest_routes.py` only — no production file touched:
+
+- Added `lis.timeframe` to the `level_interaction_state` `SELECT` and to
+  the `ORDER BY` (now `ORDER BY lis.backtest_run_id, lis.level_key,
+  lis.timeframe`) — fully deterministic ordering, no remaining ties.
+- `vwap_rows` now filters `row["timeframe"] == "1m"` in addition to
+  `row["level_key"] == "vwap"` — pins the lookup to the timeframe every v1
+  strategy actually reads (decision #99), which is what the test's own
+  comment already intended before this ambiguity existed.
+- Added an inline comment explaining the timeframe-tie mechanism so a
+  future reader doesn't have to re-derive this diagnosis.
+
+No change to the test's meaningful contract: it still asserts that two
+identical replays produce independent, equivalent persisted state
+(row-count disjointness, `is_backtest` flags, the full VWAP checkpoint
+tuple, and the full normalized event sequence) — it now asserts this
+against one well-defined row instead of an arbitrarily-selected one among
+four legitimate rows. No assertion weakened, no sleep added.
+
+`level_interaction_events`/`normalized_events()` needed no change — that
+query already orders by `lie.id` (a true, monotonic tiebreaker), and the
+diagnostic script's raw dump showed the two runs' event sequences matching
+exactly, content for content.
+
+## Checks and results
+
+- **Targeted, fixed, repeated**: see Reproduction above — 25/25 passed
+  across fresh and accumulating databases.
+- **Full suite, post-fix, fresh database, single run**:
+  `POSTGRES_DB=trading_workspace python -m pytest -q tests/` — **1148
+  passed, 0 failed, 99.22s**. Identical count to this file's own
+  `count-lower-bound-validation` baseline, so this fix adds no test and
+  removes none — it only changes two query lines and a lookup filter
+  inside one existing test.
+- **No decision number assigned** — a test-query correction, not an
+  architecture change, matching this task's own instruction.
+
+## Not covered / limitations
+
+- The `count-lower-bound-validation` entry's *other* transient artifact —
+  "a larger burst of constraint-violation errors ... where two `pytest`
+  invocations briefly overlapped against the same database" — is a
+  different failure mode (genuine process overlap against one database)
+  that this task did not investigate and makes no claim about; that part
+  of its entry is left as originally written.
+- This task did not attempt to characterize or fix the actual `#119`
+  cluster (`test_vwap_publishes_even_while_sma_is_still_warming_up` and its
+  three siblings) — out of scope; per decision #149 it already has its own
+  root-cause task.
 
 <!-- Previous delivery record retained below. -->
 
@@ -127,6 +235,16 @@ from `main` — no new dependency).
   pristine database, before or after this change, so neither is
   attributed to it. The baseline and post-change counts above are each
   from one clean run against a database recreated immediately beforehand.
+  **Correction (`backtest-isolation-flake-fix`, see below):** the
+  `test_backtest_routes.py` half of this claim was wrong. That failure
+  *does* reproduce on a freshly migrated, pristine database — 4 times out
+  of 5 consecutive attempts, in a later task that root-caused it to a
+  timeframe-ambiguous test query, not to database accumulation. It was
+  "not reproduced" here only because this session happened to re-run it
+  too few times on the un-migrated-fresh path to catch it; it was never
+  actually non-reproducible. The constraint-violation half of this note
+  (genuinely overlapping `pytest` processes) is unrelated and uninvestigated
+  by that later task — left as originally written.
 - **New tests, `test_market_routes.py`** (4): `test_market_candles_rejects_zero_count`
   and `test_market_candles_rejects_negative_count` assert a `422` for
   `count=0`/`count=-1` with no adapter connected — pure request-validation
@@ -1324,7 +1442,7 @@ Footprint confirmed by `diff -rq` of a freshly re-pulled `main` (post-#171) agai
   - AC #9, #11, #12, #13 — `test_portfolio_state.py` (9 tests): open/close/idempotent `apply_fill`; `rebuild_from_ledger()` recovering an open AND a closed position from committed-but-never-"published" fills (this delivery builds no publish path at all — J2 — so every closure in this suite genuinely is "critical event never handled," AC #12's own scenario, by construction rather than by simulation); ledger-wins-over-corrupted-memory with a logged warning; overfill and unmatched-order fills persisted and flagged, never dropped.
   - AC #10 — `test_reconciliation.py` (7 tests): all four `§6.9` step-3 branches (cancelled-stale-entry, resubmitted-exit, expired-lost-state, advanced-with-missing-fills-applied) against a real (fresh-instance) `SimulatedVenue`; reconciliation-pass idempotency; open-order and position-quantity discrepancy reporting.
   - `test_simulated_venue.py` (10 tests): market/limit fills, idempotent placement, session guard, honest-`None` for an unknown order, no memory across instances (the restart precondition §6.9 depends on), injectable partial-fill planner, cancel semantics, derived `get_positions()`.
-- **Combined regression, final:** merged onto post-#171 `main`, migrated through `0012`, full suite: **922 passed, 0 failed** (one run of two surfaced the same intermittent `test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events` failure #171 itself documented — reproduced in isolation 3× on unmodified code (pass, pass, fail), confirming it is this project's own long-documented #119 wall-clock-timing cluster, unrelated to this delivery; 810 (original baseline) + 37 (this delivery) + 75 (#171) = 922, exact).
+- **Combined regression, final:** merged onto post-#171 `main`, migrated through `0012`, full suite: **922 passed, 0 failed** (one run of two surfaced the same intermittent `test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events` failure #171 itself documented — reproduced in isolation 3× on unmodified code (pass, pass, fail), confirming it is this project's own long-documented #119 wall-clock-timing cluster, unrelated to this delivery; 810 (original baseline) + 37 (this delivery) + 75 (#171) = 922, exact). **Correction (`backtest-isolation-flake-fix`, see top of file):** the #119 attribution was wrong — #119 is a different, four-test `FeatureEngine`-warmup cluster in unrelated files; this failure is `test_backtest_routes.py`'s own, root-caused to a timeframe-ambiguous test query, unrelated to wall-clock timing.
 - **Migration round-trip:** `alembic downgrade 0011` → `alembic upgrade head` run twice during development (once to fix the CHECK-vs-NULL bug, once to verify the final state) — both directions clean against real Postgres 16.
 
 ## Not covered by this delivery's own tests, stated precisely
@@ -1357,7 +1475,7 @@ Footprint confirmed by `diff -rq` of a freshly re-pulled, untouched `main` again
 
 Targeted: `pytest tests/test_governor_rules.py tests/test_governor_config.py tests/test_governor_engine.py tests/test_execution_engine.py tests/test_execution_event_schemas.py -q` → **75 passed**.
 
-Full suite: `pytest -q` → **885 collected**. First run: 885 passed, 0 failed. A second full run surfaced one intermittent failure, `test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events` (a wall-clock-time-sensitive assertion, `datetime(...,14:30,...)` vs `datetime(...,16:02,...)` — matches this project's own long-documented #119 intermittent cluster, e.g. decisions #128/#129/#131's own notes on the same class of test). Confirmed pre-existing, not caused by this delivery, per this project's own testing philosophy ("pre-existing flakiness must be confirmed pre-existing... before attributing any test failure to new work"): (1) the same test passes in isolation every time; (2) the full suite run against a **freshly re-pulled, completely untouched `main`** (zero files from this delivery present) reproduces the exact same failure with the exact same values, 809 passed / 1 failed — 809 + this delivery's 75 = 884, matching this delivery's own second-run count of 884 passed / 1 failed exactly. Zero regressions attributable to this delivery either way.
+Full suite: `pytest -q` → **885 collected**. First run: 885 passed, 0 failed. A second full run surfaced one intermittent failure, `test_backtest_routes.py::test_two_separate_runs_isolate_level_interaction_state_and_events` (described at the time as a wall-clock-time-sensitive assertion, `datetime(...,14:30,...)` vs `datetime(...,16:02,...)` — matches this project's own long-documented #119 intermittent cluster, e.g. decisions #128/#129/#131's own notes on the same class of test — **correction, `backtest-isolation-flake-fix`, see top of file: neither characterization holds; it is not wall-clock-driven and not the #119 cluster, it is `test_backtest_routes.py`'s own timeframe-ambiguous test query**). Confirmed pre-existing, not caused by this delivery, per this project's own testing philosophy ("pre-existing flakiness must be confirmed pre-existing... before attributing any test failure to new work"): (1) the same test passes in isolation every time; (2) the full suite run against a **freshly re-pulled, completely untouched `main`** (zero files from this delivery present) reproduces the exact same failure with the exact same values, 809 passed / 1 failed — 809 + this delivery's 75 = 884, matching this delivery's own second-run count of 884 passed / 1 failed exactly. Zero regressions attributable to this delivery either way.
 
 **Why fakes, not real Postgres, for `test_governor_engine.py`/`test_execution_engine.py`:** fork 1 (Saqib, 2026-09-22) — this task's file boundary forbids the real ledger tables/migration, so `TradeLedgerPort`/`PortfolioStateReader`/`OrderLedgerPort`/`DecisionAuthorizationPort` have no concrete real-Postgres implementation to test against yet. `test_governor_rules.py` (the pure rule pipeline this task DOES own outright) is real, DB-free, mock-free pure-function testing per the usual convention — only the persistence SEAM uses fakes, not this task's own logic.
 
