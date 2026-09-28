@@ -1,16 +1,9 @@
 """
-ExecutionEngine — consumes OrderApproved (critical lane), mints/verifies
-the deterministic client-order ID, performs an idempotent ledger insert,
-checks the configured venue supports the order's execution mode, and
-calls OrderVenue.place_order(). See package docstring
-(execution_engine/__init__.py) for the original delivery's scope
-boundary (entry orders only). Fill processing (§6.3 step 6) was added
-by entry-lifecycle-wiring: when a FillLedgerPort is supplied, this
-engine also registers OrderVenue.on_order_update(), persists each fill,
-advances the order's ledger status, and publishes OrderFilled — see
-_process_venue_update() below. Still entry-only: a non-"open"
-position_effect is still dropped (see _process_one()), and exits
-remain EX-5/EX-12 territory.
+ExecutionEngine — routes authorized entries and durable, position-bound
+simulated stop/target exits through the configured venue. Fill updates
+are committed before OrderFilled is published. The OrderApproved entry
+handler still rejects a close payload; exits use the Position Monitor
+handoff and PostgresExitLedger reservation instead.
 
 Own queue + worker (I7): OrderApproved is only ever enqueued by the Event
 Bus subscriber callback (`_on_order_approved`, must stay fast); the actual
@@ -30,6 +23,7 @@ from app.core.config import Settings, get_settings
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.execution_engine.fill_ledger import FillLedgerError, FillLedgerPort, FillRecord
+from app.execution_engine.exit_ledger import ExitLedgerError, PostgresExitLedger
 from app.execution_engine.ports import (
     DecisionAuthorizationPort,
     ExecutionVenueProvider,
@@ -67,6 +61,8 @@ class ExecutionEngine:
         decision_authorization: DecisionAuthorizationPort,
         *,
         fill_ledger: FillLedgerPort | None = None,
+        exit_ledger: PostgresExitLedger | None = None,
+        portfolio_state: Any | None = None,
         venue_provider: ExecutionVenueProvider | None = None,
         execution_mode_provider: Callable[[], str | None] | None = None,
         settings: Settings | None = None,
@@ -80,6 +76,9 @@ class ExecutionEngine:
         # behavior exactly (every caller/test that predates this delivery
         # keeps working unmodified).
         self._fill_ledger = fill_ledger
+        self._exit_ledger = exit_ledger
+        self._portfolio_state = portfolio_state
+        self._pending_intents: dict[Any, Any] = {}
         self._venue_provider = venue_provider or _NoVenueProvider()
         # Same defensive getattr as governor/engine.py — execution_mode is
         # the sibling `execution-ledger-and-venue` task's own config.py
@@ -131,6 +130,12 @@ class ExecutionEngine:
         """Reject callbacks and queued work before rollback awaits anything."""
         self._accepting = False
 
+    def on_exit_intent(self, intent: Any) -> None:
+        """Fast handoff from Position Monitor; the worker persists and retries it."""
+        if self._accepting and self._exit_ledger is not None:
+            self._pending_intents[intent.position_id] = intent
+            self._queue.put_nowait(("exit_intent", intent.position_id))
+
     # --- Event Bus subscriber (must stay fast — I7) -------------------------
 
     def _on_order_approved(self, envelope: EventEnvelope) -> None:
@@ -159,7 +164,15 @@ class ExecutionEngine:
     async def _worker_loop(self) -> None:
         try:
             while True:
-                item = await self._queue.get()
+                try:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if self._accepting and self._exit_ledger is not None:
+                        try:
+                            await self._service_exits()
+                        except Exception:
+                            logger.exception("ExecutionEngine failed to service durable exits")
+                    continue
                 if item is _STOP_SENTINEL:
                     self._queue.task_done()
                     break
@@ -168,6 +181,8 @@ class ExecutionEngine:
                         pass
                     elif isinstance(item, tuple) and len(item) == 2 and item[0] == "venue_update":
                         await self._process_venue_update(item[1])
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] == "exit_intent":
+                        await self._service_exits()
                     else:
                         await self._process_one(item)  # type: ignore[arg-type]
                 except Exception:  # noqa: BLE001 — one bad order/update must not stall the rest
@@ -176,6 +191,51 @@ class ExecutionEngine:
                     self._queue.task_done()
         except asyncio.CancelledError:
             pass
+
+    async def _service_exits(self) -> None:
+        assert self._exit_ledger is not None
+        for position_id, intent in tuple(self._pending_intents.items()):
+            try:
+                observed = await asyncio.to_thread(self._exit_ledger.observe, intent)
+            except ExitLedgerError:
+                logger.exception("ExitIntent for position %s was not committed; retry retained", position_id)
+                continue
+            if observed:
+                self._pending_intents.pop(position_id, None)
+            else:
+                self._pending_intents.pop(position_id, None)  # position already closed
+
+        venue = self._venue_provider.get_execution_venue()
+        if venue is None or "simulated" not in venue.supported_modes:
+            return
+        position_ids = await asyncio.to_thread(self._exit_ledger.pending_position_ids)
+        for position_id in position_ids:
+            action = await asyncio.to_thread(self._exit_ledger.prepare, position_id)
+            if action is None:
+                continue
+            if action.kind == "cancel_entry":
+                await venue.cancel_order(action.client_order_id)
+                for update in await venue.get_fills(action.client_order_id):
+                    await self._process_venue_update(update)
+                report = await venue.get_order(action.client_order_id)
+                if report is None or report.status == "cancelled":
+                    changed = await asyncio.to_thread(self._exit_ledger.set_status,
+                        action.client_order_id, "cancelled", reason="protective_exit_entry_cancel")
+                    if changed and self._portfolio_state is not None:
+                        await self._portfolio_state.refresh()
+                continue
+
+            if not await asyncio.to_thread(self._exit_ledger.confirm_recovery_exit, action.client_order_id):
+                raise ExitLedgerError("reserved exit no longer matches open position")
+            instruction = VenueOrderInstruction(action.client_order_id, action.symbol, action.side,
+                action.qty, "market", None, "close")
+            ack = await venue.place_order(instruction)
+            if ack.status == "rejected":
+                await asyncio.to_thread(self._exit_ledger.set_status, action.client_order_id,
+                    "rejected", reason=ack.reason or "venue_rejected", venue_order_id=ack.venue_order_id)
+            else:
+                await asyncio.to_thread(self._exit_ledger.set_status, action.client_order_id,
+                    "submitted", venue_order_id=ack.venue_order_id)
 
     async def _process_one(self, payload: dict[str, Any]) -> None:
         try:
@@ -312,15 +372,12 @@ class ExecutionEngine:
 
     async def _process_venue_update(self, update: Any) -> None:
         if update.venue_fill_id is None:
-            # A pure status update (a cancel ack, a plain rejection notice
-            # with no fill attached) — not built in this delivery. The
-            # entry path never cancels; a real cancel/exit path is EX-5/
-            # EX-12 territory, out of this task's scope exactly like the
-            # position_effect != "open" branch in _process_one() above.
-            logger.info(
-                "Venue order update for %s carries no fill (status=%s) — not processed in this delivery",
-                update.client_order_id, update.status,
-            )
+            if self._exit_ledger is not None and update.status in {"cancelled", "rejected"}:
+                changed = await asyncio.to_thread(self._exit_ledger.set_status,
+                    update.client_order_id, update.status, reason=update.reason,
+                    venue_order_id=update.venue_order_id)
+                if changed and self._portfolio_state is not None:
+                    await self._portfolio_state.refresh()
             return
         if self._fill_ledger is None:
             # Unreachable in practice — _on_venue_update is only ever
@@ -407,6 +464,8 @@ def get_execution_engine(
     order_ledger: OrderLedgerPort | None = None,
     decision_authorization: DecisionAuthorizationPort | None = None,
     fill_ledger: FillLedgerPort | None = None,
+    exit_ledger: PostgresExitLedger | None = None,
+    portfolio_state: Any | None = None,
 ) -> ExecutionEngine:
     """Lazy singleton, same pattern as get_authorizer_stub()/
     get_level_interaction_engine(). `order_ledger`/`decision_authorization`
@@ -423,6 +482,7 @@ def get_execution_engine(
                 "(no default OrderLedgerPort/DecisionAuthorizationPort exists)"
             )
         _execution_engine = ExecutionEngine(
-            bus or get_event_bus(), order_ledger, decision_authorization, fill_ledger=fill_ledger
+            bus or get_event_bus(), order_ledger, decision_authorization, fill_ledger=fill_ledger,
+            exit_ledger=exit_ledger, portfolio_state=portfolio_state
         )
     return _execution_engine

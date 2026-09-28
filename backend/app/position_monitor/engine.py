@@ -43,7 +43,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
-from typing import Literal
+from typing import Callable, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -76,11 +76,7 @@ def _regular_session_close_utc(clock: MarketClock, trading_day: date) -> datetim
 
 @dataclass(frozen=True)
 class ExitIntent:
-    """The typed, in-process output this module's whole job is to
-    produce (§3) — nothing more. No `client_order_id`: minting one is
-    explicitly the order-placement half of §6.6's "the position moves to
-    `closing` first" line, out of scope here per §3/§4 item 4 — that is
-    the later task's job, once EX-5 is confirmed."""
+    """A market observation; Execution owns durable order identity and placement."""
 
     position_id: UUID
     symbol: str
@@ -182,10 +178,12 @@ class PositionMonitor:
         position_reader: PositionReader,
         *,
         clock: MarketClock | None = None,
+        on_exit_intent: Callable[[ExitIntent], None] | None = None,
     ) -> None:
         self._bus = bus
         self._position_reader = position_reader
         self._clock = clock or get_market_clock()
+        self._on_exit_intent = on_exit_intent
         self._queue: asyncio.Queue[EventEnvelope | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._accepting = False
@@ -264,6 +262,9 @@ class PositionMonitor:
             intent = _evaluate(position, bar, self._clock)
             if intent is not None:
                 self._exit_intents[position.position_id] = intent
+                if self._on_exit_intent is not None and intent.exit_reason in {"stop", "target"}:
+                    # The execution worker owns commit/retry. EOD stays observed-only.
+                    self._on_exit_intent(intent)
                 logger.info(
                     "PositionMonitor: ExitIntent produced position_id=%s symbol=%s reason=%s trigger_price=%s",
                     position.position_id,

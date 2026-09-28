@@ -1,3 +1,36 @@
+# CHANGES — decision #184: simulated protective exits
+
+## Current delivery
+
+Finished the existing simulated stop/target exit work. Position Monitor now
+hands those observations to Execution Engine, which persists a position-bound
+request, cancels unfinished entries, waits for fill accounting, and reserves
+one reduce-only close order for the committed remaining quantity. Failed close
+attempts retry with a new deterministic attempt ID. Simulated venue fills use
+the existing fill ledger and Portfolio State path; a full close marks the
+trade closed. EOD flatten remains observed only.
+
+Migration `0015` adds `exit_requests`, `orders.position_id`, and a partial
+unique index preventing two active closes for one position. Startup applies
+pending fills before reconciliation. Reconciliation validates approved exits
+without placing them; the execution worker rechecks safety immediately before
+submission. A fresh simulated venue with a missing position blocks execution
+on discrepancy.
+
+Updated the execution and trading architecture, system design, decision
+index/log, and `TESTING.md`. Added PostgreSQL reservation and real-lifespan
+stop/target tests. Decision #184 resolves EX-5 for simulated stop/target exits
+only; live outcome writing and other exit modes remain separate work.
+
+## Package
+
+`simulated-protective-exits.zip` contains the changed application files,
+migration, tests, architecture and decision records, `CHANGES.md`, and
+`TESTING.md`, all root-relative. The local `.exit-validation/` database is
+excluded.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-panel-fill-history`
 
 ## Current delivery

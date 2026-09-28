@@ -121,8 +121,8 @@ async def test_approved_entry_never_sent_is_cancelled_as_stale() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approved_exit_never_sent_is_resubmitted() -> None:
-    """§6.9: approved, never sent, exit -> re-submitted (idempotent on client_order_id)."""
+async def test_approved_exit_is_not_sent_into_missing_venue_position() -> None:
+    """A fresh simulated venue cannot safely receive an orphaned close."""
     session = SessionLocal()
     try:
         trade = _make_trade(session)
@@ -147,11 +147,10 @@ async def test_approved_exit_never_sent_is_resubmitted() -> None:
         report = await reconcile_with_venue(session, venue, ps)
 
         session.refresh(exit_order)
-        assert exit_order.status == "submitted"
-        assert exit_order.venue_order_id is not None
-        assert exit_order.client_order_id in report.resubmitted_exits
-        # The venue really does now have it (idempotent, re-submitted for real).
-        assert await venue.get_order(exit_order.client_order_id) is not None
+        assert exit_order.status == "approved"
+        assert report.has_discrepancy
+        assert exit_order.client_order_id not in report.resubmitted_exits
+        assert await venue.get_order(exit_order.client_order_id) is None
     finally:
         session.close()
 

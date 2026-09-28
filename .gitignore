@@ -83,3 +83,5 @@ logs/
 *:Zone.Identifier
 
 .portfolio-state-validation/
+
+.exit-validation/

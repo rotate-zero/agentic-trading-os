@@ -1,6 +1,7 @@
 """
 The execution ledger — `trades`, `orders`, `fills`, `positions`,
-`portfolio_state_cursor` (design doc §6.8, decision #172).
+`portfolio_state_cursor` (design doc §6.8, decision #172), plus
+`exit_requests` (decision #184).
 **These tables are authoritative (I12)** — Portfolio State
 (`app/portfolio_state/`) is a cache over them, never the record.
 
@@ -49,6 +50,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Date,
+    DateTime,
     ForeignKey,
     Identity,
     Integer,
@@ -178,6 +180,7 @@ class Order(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     client_order_id: Mapped[str] = mapped_column(String(128), nullable=False)
     trade_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("trades.trade_id"), nullable=False)
+    position_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("positions.position_id"), nullable=True)
     execution_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     execution_venue: Mapped[str] = mapped_column(String(32), nullable=False)
     venue_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -266,6 +269,24 @@ class Position(Base):
         CheckConstraint("side IN ('BUY', 'SELL')", name="ck_positions_side"),
         CheckConstraint("status IN ('open', 'closing', 'closed')", name="ck_positions_status"),
         CheckConstraint(_MODE_VENUE_PAIRING, name="ck_positions_mode_venue_pairing"),
+    )
+
+
+class ExitRequest(Base):
+    """Durable monitor observation; the position, not a bus event, owns retries."""
+
+    __tablename__ = "exit_requests"
+
+    position_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("positions.position_id"), primary_key=True)
+    exit_reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    trigger_price: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    trigger_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("exit_reason IN ('stop', 'target')", name="ck_exit_requests_reason"),
+        CheckConstraint("trigger_price > 0", name="ck_exit_requests_price"),
     )
 
 

@@ -202,6 +202,8 @@ def apply_session_fill(owner, session, row):
         session.flush()
         return None
     _write_position(session, result.position)
+    if result.position.status == "closed":
+        trade.status = "closed"
     # Execution may already have committed filled/cancelled before notification.
     # Terminal status does not invalidate a legitimate, not-yet-applied fill.
     if order.status not in TERMINAL_STATUSES:

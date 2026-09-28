@@ -5,6 +5,10 @@ docs/architecture/execution-engine-design.md §6.6 and decision #171's own
 this package is that extension point's consumer, named directly there as
 "a clearly separate, later increment (Position Monitor-lite's own task)".
 
+The original scope paragraph below describes decision #175's delivery.
+The later `simulated-protective-exits` delivery wires stop/target intents
+to Execution Engine through an optional callback; EOD remains observation only.
+
 Scope, restated precisely (this task's own §3 judgment call): decide WHEN
 and WHY a held position should exit — stop, target, or end-of-day flatten
 (EX-11's recommendation (a), in-process monitoring) — and latch that

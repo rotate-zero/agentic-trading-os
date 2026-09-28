@@ -207,6 +207,7 @@ async def lifespan(app: FastAPI):
     from app.db.session import SessionLocal
     from app.execution_engine.engine import get_execution_engine
     from app.execution_engine.fill_ledger import PostgresFillLedger
+    from app.execution_engine.exit_ledger import PostgresExitLedger
     from app.execution_engine.postgres import PostgresOrderLedger
     from app.governor.engine import get_authorizer_stub
     from app.governor.portfolio_state_reader import PortfolioStateAdapter
@@ -229,6 +230,15 @@ async def lifespan(app: FastAPI):
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
 
+        # Apply any fill committed before its notification was delivered
+        # through the production receipt-producing adapter before the
+        # Session compatibility reconciliation inspects the checkpoint.
+        position_ledger = PostgresPositionLedger(SessionLocal)
+        portfolio_state = PortfolioState(
+            execution_mode=settings.execution_mode, ledger=position_ledger, bus=bus
+        )
+        await portfolio_state.start()
+
         # §6.9 step 2 (rebuild) + step 3 (reconcile) — a throwaway,
         # Session-mode PortfolioState (no ledger/bus): the OLD Session-
         # based reconciliation API decision #172 built (engine.py's own
@@ -241,6 +251,11 @@ async def lifespan(app: FastAPI):
             reconciliation_report = await reconcile_with_venue(
                 recon_session, execution_venue, recon_portfolio_state
             )
+
+        # Reconciliation can expire or cancel orders after the production
+        # worker's initial restore. Refresh before the governor reads it.
+        if not reconciliation_report.has_discrepancy:
+            await portfolio_state.refresh()
 
         if reconciliation_report.has_discrepancy:
             # I13: never silently proceed on a discrepancy. This task's own
@@ -258,6 +273,8 @@ async def lifespan(app: FastAPI):
                 reconciliation_report.discrepancies,
             )
             await execution_venue.disconnect()
+            await portfolio_state.stop()
+            portfolio_state = None
             execution_venue = None
             app.state.execution_startup_status = _execution_startup_status(
                 "reconciliation_blocked",
@@ -267,15 +284,10 @@ async def lifespan(app: FastAPI):
         else:
             broker_registry.set_execution_venue(execution_venue)
 
-            position_ledger = PostgresPositionLedger(SessionLocal)
-            portfolio_state = PortfolioState(
-                execution_mode=settings.execution_mode, ledger=position_ledger, bus=bus
-            )
-            await portfolio_state.start()
-
             order_ledger = PostgresOrderLedger(SessionLocal)
             trade_ledger = PostgresTradeLedger(SessionLocal)
             fill_ledger = PostgresFillLedger(SessionLocal)
+            exit_ledger = PostgresExitLedger(SessionLocal)
             portfolio_state_reader = PortfolioStateAdapter(portfolio_state, SessionLocal)
 
             authorizer_stub = get_authorizer_stub(bus, trade_ledger, portfolio_state_reader)
@@ -283,13 +295,18 @@ async def lifespan(app: FastAPI):
 
             # order_ledger doubles as decision_authorization — PostgresOrderLedger
             # implements both OrderLedgerPort and DecisionAuthorizationPort.
-            execution_engine = get_execution_engine(bus, order_ledger, order_ledger, fill_ledger)
+            execution_engine = get_execution_engine(
+                bus, order_ledger, order_ledger, fill_ledger, exit_ledger, portfolio_state
+            )
             execution_engine.start()
 
-            # Observe received market events against the same restored
-            # Portfolio State instance. The monitor only retains in-memory
-            # ExitIntents; it cannot place an exit order or close a position.
-            position_monitor = PositionMonitor(bus, PortfolioStatePositionReader(portfolio_state))
+            # Observe market events against restored Portfolio State. The
+            # monitor hands stop/target intents to Execution; the latter
+            # persists and places reduce-only simulated close orders.
+            position_monitor = PositionMonitor(
+                bus, PortfolioStatePositionReader(portfolio_state),
+                on_exit_intent=execution_engine.on_exit_intent,
+            )
             position_monitor.start()
             app.state.position_monitor = position_monitor
 

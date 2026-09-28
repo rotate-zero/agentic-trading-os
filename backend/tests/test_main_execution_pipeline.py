@@ -44,6 +44,7 @@ from app.event_bus.bus import get_event_bus
 from app.main import app as fastapi_app
 from app.models.execution_ledger import (
     Fill,
+    ExitRequest,
     Order,
     PortfolioStateCursor,
     Position,
@@ -69,8 +70,11 @@ def clean():
         fills = select(Fill.ledger_seq).where(Fill.client_order_id.in_(orders))
         s.query(PositionFillReceipt).filter(PositionFillReceipt.ledger_seq.in_(fills)).delete(synchronize_session=False)
         s.query(Fill).filter(Fill.client_order_id.in_(orders)).delete(synchronize_session=False)
-        s.query(Position).filter(Position.trade_id.in_(ids)).delete(synchronize_session=False)
+        s.query(ExitRequest).filter(ExitRequest.position_id.in_(
+            select(Position.position_id).where(Position.trade_id.in_(ids))
+        )).delete(synchronize_session=False)
         s.query(Order).filter(Order.trade_id.in_(ids)).delete(synchronize_session=False)
+        s.query(Position).filter(Position.trade_id.in_(ids)).delete(synchronize_session=False)
         s.query(TradeReservation).filter(TradeReservation.trade_id.in_(ids)).delete(synchronize_session=False)
         s.query(Trade).filter(Trade.strategy_name == NAME).delete(synchronize_session=False)
         s.query(PortfolioStateCursor).delete()
@@ -313,7 +317,13 @@ def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries
     assert fastapi_app.state.world_view_portfolio_reader is None
 
 
-def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch):
+@pytest.mark.parametrize(
+    ("trigger_price", "reason", "level", "fill_price", "realized_pnl"),
+    [(89.0, "stop", 90.0, 85.0, -150), (121.0, "target", 120.0, 125.0, 250)],
+)
+def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
+    monkeypatch, trigger_price, reason, level, fill_price, realized_pnl
+):
     from app.position_monitor.engine import PositionMonitor
 
     monkeypatch.setattr(MarketClock, "is_regular_session", lambda self, ts=None: True)
@@ -354,7 +364,7 @@ def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch
             assert position.stop == 90
             assert len(s.scalars(select(Fill).where(Fill.client_order_id == order.client_order_id)).all()) == 1
 
-        def send_stop(price: float) -> None:
+        def send_price(price: float) -> None:
             envelope = EventEnvelope(
                 event_type=EventType.PRICE_UPDATED, symbol=SYMBOL,
                 payload=PriceUpdated(price=price, size=100, exchange_ts=NOW).model_dump(mode="json"),
@@ -362,7 +372,8 @@ def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch
             client.portal.call(bus.publish, envelope)
             client.portal.call(asyncio.sleep, 0.1)
 
-        send_stop(89.0)
+        send_price(trigger_price)
+        client.portal.call(asyncio.sleep, 0.8)
         response = client.get("/intelligence/exit-intents")
         assert response.status_code == 200
         body = response.json()
@@ -370,8 +381,8 @@ def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch
             "monitor_status": "running", "intent_status": "observed_only",
             "exit_intents": [{
                 "position_id": str(position.position_id), "symbol": SYMBOL,
-                "side": "BUY", "qty": position.qty, "exit_reason": "stop",
-                "trigger_price": 90.0, "trigger_ts": NOW.isoformat().replace("+00:00", "Z"),
+                "side": "BUY", "qty": position.qty, "exit_reason": reason,
+                "trigger_price": level, "trigger_ts": NOW.isoformat().replace("+00:00", "Z"),
             }],
         }
         assert client.get("/intelligence/exit-intents?symbol=OTHER").json() == {
@@ -379,15 +390,32 @@ def test_position_monitor_observes_one_stop_without_creating_an_exit(monkeypatch
         }
         assert client.get(f"/intelligence/exit-intents?symbol={SYMBOL}").json() == body
 
-        send_stop(85.0)
         assert client.get("/intelligence/exit-intents").json() == body
-        assert EventType.POSITION_CLOSED not in [event.event_type for event in published]
-
         with SessionLocal() as s:
-            assert len(s.scalars(select(Order).where(Order.trade_id == trade.trade_id)).all()) == 1
+            orders = s.scalars(select(Order).where(Order.trade_id == trade.trade_id)).all()
+            assert len(orders) == 2
+            close = next(o for o in orders if o.position_effect == "close")
+            assert close.client_order_id == f"{trade.trade_id}:exit:1"
+            assert close.side == "SELL" and close.qty == position.qty
+            assert close.exit_reason == reason and close.position_id == position.position_id
+            assert close.status == "submitted"
             assert len(s.scalars(select(Fill).where(Fill.client_order_id == order.client_order_id)).all()) == 1
             position_after = s.scalar(select(Position).where(Position.trade_id == trade.trade_id))
             assert position_after.status == "open" and position_after.qty == position.qty
+
+        venue = broker_registry.get_execution_venue()
+        assert venue is not None
+        client.portal.call(venue.ingest_tick, SYMBOL, fill_price, NOW)
+        client.portal.call(asyncio.sleep, 0.4)
+        with SessionLocal() as s:
+            closed = s.get(Position, position.position_id)
+            assert closed.status == "closed" and closed.qty == 0
+            assert closed.realized_pnl == realized_pnl
+            assert s.get(Trade, trade.trade_id).status == "closed"
+            close_fill = s.scalar(select(Fill).where(Fill.client_order_id == close.client_order_id))
+            assert close_fill.price == fill_price
+            assert len(s.scalars(select(PositionFillReceipt).where(PositionFillReceipt.position_id == position.position_id)).all()) == 2
+            assert EventType.POSITION_CLOSED in [event.event_type for event in published]
 
     assert fastapi_app.state.position_monitor is None
     assert monitor._worker_task is None

@@ -1,7 +1,7 @@
 """
-Execution Engine — entry-order half only (decision execution-authorizer-
-and-engine). See docs/architecture/execution-engine-design.md §6.3/§6.4
-and decisions #168/#170.
+Execution Engine. See docs/architecture/execution-engine-design.md §6.3/§6.4
+and decisions #168/#170. The original entry-only scope below is historical;
+later deliveries added fill ingestion and simulated stop/target exits.
 
 Scope, restated precisely (this task's own scope item 2, read against the
 AC ownership list in §6 of the task prompt — flagged as a judgment call,

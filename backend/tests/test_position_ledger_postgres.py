@@ -449,4 +449,4 @@ def test_migration_downgrade_refuses_to_destroy_applied_receipts(ledger):
         command.downgrade(config, "0012")
     assert ledger.load_state("simulated").positions == (app.position,)
     with SessionLocal() as s:
-        assert s.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+        assert s.scalar(text("SELECT version_num FROM alembic_version")) == "0015"

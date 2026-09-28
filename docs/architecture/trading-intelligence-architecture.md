@@ -516,12 +516,14 @@ shutdown. It receives `PriceUpdated`/`CandleClosed` events and latches one
 in-memory stop, target, or end-of-day `ExitIntent` per position. The read-only
 `GET /intelligence/exit-intents` route exposes these as `observed_only`, with a
 symbol filter and deterministic ordering; it distinguishes unavailable startup
-from a running monitor with no intents. It does not publish an exit event, place
-an order, produce a fill, close a position, protect it between events, or restore
-intents after restart. The broader management behavior and cadence described
-below remain design direction, not the behavior of this lite observer. See
-`execution-engine-design.md` §6.6 for its cross-component and internal-flow
-diagrams.
+from a running monitor with no intents. The route remains a read of monitor
+observations. Simulated stop/target observations now also enter Execution
+Engine's durable, position-bound close path; EOD observations do not. The
+simulated venue loses its position book on restart, so an open-position
+discrepancy blocks execution rather than sending an orphaned close. The broader
+management behavior and cadence described below remain design direction. See
+`execution-engine-design.md` §6.6 for the current cross-component and
+internal-flow diagrams.
 
 Underweighted in early drafts of this system — deliberately elevated here. Not a passive "position is open" tracker. It continuously asks, against live Market State and Features:
 
@@ -557,7 +559,7 @@ Fridays?
 
 Feeds back into two places: **Strategy Engine** (reweight or retire underperforming strategies) and **Trade Planning Engine** (recalibrate sizing/stop logic based on realized outcomes, not assumptions). This is the seed of an eventual optimization engine, though building that optimization loop itself is out of scope for now.
 
-**Schema built (decision #120):** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — a real migration, real ORM (`StrategyOutcomeRecord`), real write path (`record_strategy_outcome()`). This line previously read "Schema direction-locked, not yet built," true when originally written, stale since decision #120 landed; corrected here. `strategy_outcomes` has real backtest-derived rows since decision #128; the running entry pipeline does not yet write live closed-trade outcomes because exit execution and OutcomeRecorder remain unwired. "Rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5, itself now built, see `backtest-runner-design.md` §7), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5 / `backtest-runner-design.md` §7 (decisions #87, #89, #120).
+**Schema built (decision #120):** an atomic `StrategyOutcome` record per closed trade (strategy + immutable version, evidence snapshot, market/context state at entry and exit, realized R/net P&L) persists to `strategy_outcomes` (renamed from `strategy_performance` — decision #89) — a real migration, real ORM (`StrategyOutcomeRecord`), real write path (`record_strategy_outcome()`). This line previously read "Schema direction-locked, not yet built," true when originally written, stale since decision #120 landed; corrected here. `strategy_outcomes` has real backtest-derived rows since decision #128; simulated stop/target exits now run, but the pipeline does not yet write live closed-trade outcomes because OutcomeRecorder remains unwired. "Rank," "expectancy by regime," and every other performance vector are `GROUP BY` queries over this table, computed on demand, never stored as a fact on the strategy itself. Reweighting/retirement stays human-reviewed for v1: automation may search and evaluate (Backtest Runner, extending the deferred Replay Engine — `future-ideas.md` #5, itself now built, see `backtest-runner-design.md` §7), but promoting, retiring, or modifying a live `StrategyConfig` requires Saqib's sign-off, no exception. `strategy-engine-design.md` §5 / `backtest-runner-design.md` §7 (decisions #87, #89, #120).
 
 **As-built analytics route read flow.** The two decision #127 routes expose the decision #122 query functions. Each async route offloads its synchronous SQLAlchemy read with `asyncio.to_thread`, following the established read-route pattern; the query SQL and population selector stay in `performance_queries.py`.
 

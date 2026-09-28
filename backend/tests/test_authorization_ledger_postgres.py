@@ -323,7 +323,7 @@ def test_reservation_migration_refuses_destructive_downgrade():
         command.downgrade(config, "0013")
     assert PostgresPositionLedger(SessionLocal).get_order(record.client_order_id).qty == 10
     with SessionLocal() as s:
-        assert s.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+        assert s.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
 
 
 @pytest.mark.parametrize("mode,venue", [(None, None), ("simulated", None), (None, "simulated"), ("unknown", "ibkr"), ("paper", "simulated")])

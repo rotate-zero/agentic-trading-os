@@ -1,3 +1,55 @@
+# TESTING — decision #184: simulated protective exits
+
+## Environment and results
+
+- Baseline branch `main` at `3fdaacf98876b476373b5b08d93da2960e3096ef`;
+  GitHub `main` matched before decision #184 was assigned. Existing
+  uncommitted simulated-exit files were inspected and completed in place.
+- Isolated local PostgreSQL 18 database `agentic_exit_tests` on port 55432,
+  under the repository's `.exit-validation/` directory. No live broker or
+  external database was contacted. `alembic current` reports `0015 (head)`.
+  The migration was already applied to this isolated database at the start
+  of this resumed delivery; tests verified its active-close unique index
+  with an actual duplicate insert rejected by PostgreSQL.
+- Full backend suite with `PGTZ=UTC`: **1168 passed**, zero failures
+  (`pytest -q --disable-warnings`, 101.63 s). Focused exit, lifespan,
+  reconciliation, and monitor suite after the final test addition:
+  **28 passed**. `git diff --check`: clean.
+- The first full run without `PGTZ=UTC` had 1165 passes and two existing
+  timestamp assertion failures: PostgreSQL returned `+06:00` to tests
+  expecting UTC. Both passed with `PGTZ=UTC`; the final full run used that
+  session setting. No timestamp assertion or unrelated route was changed.
+- `alembic check` is not clean on this baseline: it reports many existing
+  model/migration differences, including partition tables, historical indexes,
+  and timezone types. The new `exit_requests` timestamp fields were aligned
+  with migration `0015` after this check. The unrelated drift was left intact.
+
+## Behavior verified
+
+- Real FastAPI lifespan: both stop and target observations create one durable
+  close order; a later simulated tick fills it, closes the position, marks the
+  trade closed, and produces a `PositionClosed` event.
+- PostgreSQL ledger: duplicate observations collapse to one request; an
+  unfinished entry must be cancelled first; a rejected close waits before a
+  new attempt ID is reserved; the partial unique index rejects a second active
+  close; a closed position gets no new order.
+- The pre-submit guard blocks placement if a new entry is active or a fill
+  lacks a position receipt. Restart reconciliation blocks a close when a
+  fresh simulated venue has lost its open position; it does not submit during
+  startup.
+
+## Limits and follow-up
+
+EOD flatten remains observed only. A restarted simulated venue has no durable
+position book, so an open-position discrepancy blocks execution and needs
+manual resolution; the durable exit request does not by itself protect that
+position across restart. Live/paper protective orders and live outcome writing
+remain separate work. The pre-existing decision log exceeds its documented
+rollover size; an archive rollover should be handled separately while
+preserving all historical decision bodies and index mappings.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-panel-fill-history`
 
 ## Environment and results

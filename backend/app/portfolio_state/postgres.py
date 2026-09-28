@@ -58,7 +58,7 @@ class PostgresPositionLedger:
                     session.execute(text("SET LOCAL synchronous_commit = on"))
                     session.execute(text(
                         "LOCK TABLE trades, orders, trade_reservations, fills, positions, portfolio_state_cursor, "
-                        "position_fill_receipts IN SHARE ROW EXCLUSIVE MODE"
+                        "position_fill_receipts, exit_requests IN SHARE ROW EXCLUSIVE MODE"
                     ))
                     policy = session.execute(text(
                         "SELECT a.attidentity, s.seqcache FROM pg_attribute a "
@@ -264,6 +264,10 @@ class PostgresPositionLedger:
                 if computed.position != application.position or realized != application.realized:
                     raise PositionLedgerError("application disagrees with authoritative accounting")
                 _write_position(session, computed.position)
+                if computed.position.status == "closed":
+                    trade = session.get(Trade, computed.position.trade_id)
+                    if trade is not None:
+                        trade.status = "closed"
                 session.flush()
                 session.add(PositionFillReceipt(ledger_seq=fill.ledger_seq, execution_mode=fill.execution_mode,
                     execution_venue=fill.execution_venue, venue_fill_id=fill.venue_fill_id,

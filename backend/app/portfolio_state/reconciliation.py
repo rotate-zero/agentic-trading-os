@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.broker_adapters.order_venue import OrderInstruction, OrderVenue
-from app.models.execution_ledger import Fill, Order
+from app.broker_adapters.order_venue import OrderVenue
+from app.models.execution_ledger import ExitRequest, Fill, Order, Position
 from app.portfolio_state.engine import PortfolioState
 
 logger = logging.getLogger(__name__)
@@ -76,11 +76,15 @@ async def reconcile_with_venue(
     orders = session.execute(
         select(Order).where(Order.execution_mode == execution_mode, Order.status.in_(NON_TERMINAL_ORDER_STATUSES))
     ).scalars().all()
+    approved_exits: list[Order] = []
 
     for order in orders:
         venue_report = await venue.get_order(order.client_order_id)
 
         if venue_report is None:
+            if order.status == "approved" and order.position_effect == "close":
+                approved_exits.append(order)
+                continue
             await _reconcile_unknown_to_venue(session, venue, order, report)
             continue
 
@@ -90,6 +94,19 @@ async def reconcile_with_venue(
 
     await _check_open_orders_discrepancy(session, venue, execution_mode, report)
     await _check_positions_discrepancy(venue, portfolio_state, report)
+
+    # The execution worker rechecks the reservation, working entries, and
+    # unapplied fills just before placement. Reconciliation only verifies
+    # identity; it never sends a close while startup is still in progress.
+    for order in approved_exits:
+        position = session.get(Position, order.position_id) if order.position_id else None
+        request = session.get(ExitRequest, order.position_id) if order.position_id else None
+        if not position or not request or position.status == "closed" or position.qty != order.qty or (
+            position.trade_id, position.symbol, position.execution_mode, position.execution_venue
+        ) != (order.trade_id, order.symbol, order.execution_mode, order.execution_venue) or (
+            order.side != ("SELL" if position.side == "BUY" else "BUY")
+        ):
+            report.discrepancies.append(f"unsafe approved exit reservation {order.client_order_id!r}")
 
     return report
 
@@ -101,23 +118,7 @@ async def _reconcile_unknown_to_venue(session: Session, venue: OrderVenue, order
             order.reject_reason = "stale_opportunity_not_resubmitted"
             report.cancelled_stale_entries.append(order.client_order_id)
         else:
-            instruction = OrderInstruction(
-                client_order_id=order.client_order_id,
-                symbol=order.symbol,
-                side=order.side,  # type: ignore[arg-type]
-                qty=order.qty,
-                order_type=order.order_type,  # type: ignore[arg-type]
-                limit_price=float(order.limit_price) if order.limit_price is not None else None,
-                position_effect=order.position_effect,  # type: ignore[arg-type]
-            )
-            ack = await venue.place_order(instruction)
-            if ack.status == "submitted":
-                order.status = "submitted"
-                order.venue_order_id = ack.venue_order_id
-                report.resubmitted_exits.append(order.client_order_id)
-            else:
-                order.status = "rejected"
-                order.reject_reason = ack.reason
+            report.discrepancies.append(f"unreserved approved exit {order.client_order_id!r}")
     else:
         # submitted / partially_filled / unknown, and the venue genuinely has no record —
         # its own fills already in the ledger stand (design doc §6.9); only the order's
