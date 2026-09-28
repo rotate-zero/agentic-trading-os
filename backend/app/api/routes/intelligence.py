@@ -1372,3 +1372,125 @@ async def get_execution_positions(
     """
     positions = await asyncio.to_thread(_fetch_execution_positions, symbol, limit)
     return {"positions": positions}
+
+
+def _fetch_execution_exit_requests(symbol: str | None, limit: int) -> list[dict[str, Any]]:
+    """Synchronous read of the persisted `exit_requests` table
+    (`models/execution_ledger.py`, decision #184), joined to its position —
+    same module-level, patchable-for-tests shape as the sibling
+    `_fetch_execution_*` helpers above. Opens and closes its own `Session`
+    entirely inside whatever thread runs it.
+
+    **This is the durable record, not the monitor's in-memory view.**
+    `GET /exit-intents` reports what the running Position Monitor has
+    observed (process memory, lost on restart, labeled `observed_only`);
+    this helper reads the rows Execution's `PostgresExitLedger.observe()`
+    committed. The two are different populations and this route never
+    consults the monitor.
+
+    **The join is load-bearing.** `ExitRequest` has no `execution_mode`,
+    `symbol` or quantity column — it is keyed one-to-one by
+    `position_id` (a `FOREIGN KEY` into `positions`), so an `INNER JOIN`
+    never drops a request. Hard-scoping to `Position.execution_mode ==
+    "simulated"` (see `get_execution_exit_requests`) and the exact `symbol`
+    match are both filters on the joined `Position` row.
+
+    **Ordering: `trigger_ts` descending, then `position_id` descending.**
+    `trigger_ts` is the monitor's observation time and two requests can share
+    it; `position_id` is the table's primary key, so the pair is a strict
+    total order and repeated reads (and a `limit` that lands inside a tie)
+    never reshuffle rows. The tie-break is stable but **not chronological**:
+    `position_id` is a random `uuid4`.
+
+    `trigger_price` is `Numeric(18, 6)` and is converted to `str` explicitly
+    (the same exception the fills and positions helpers document) so a
+    caller sees the exact stored value. `retry_after` is nullable and stays
+    `None`; it is the stored timestamp only. Timestamps and UUIDs are left
+    as native types for FastAPI's `jsonable_encoder`.
+
+    Returned per row: the request's `position_id`, `exit_reason`,
+    `trigger_price`, `trigger_ts`, `retry_after`, `created_at`; the
+    position's `symbol`; and the position's **current** `status` and `qty`
+    as `position_status` / `remaining_qty`. Nothing is derived: no order
+    status, no protection claim, no retry outcome.
+    """
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.execution_ledger import ExitRequest, Position
+
+    session = SessionLocal()
+    try:
+        filters = [Position.execution_mode == "simulated"]
+        if symbol is not None:
+            filters.append(Position.symbol == symbol)
+        rows = session.execute(
+            select(ExitRequest, Position)
+            .join(Position, Position.position_id == ExitRequest.position_id)
+            .where(*filters)
+            .order_by(ExitRequest.trigger_ts.desc(), ExitRequest.position_id.desc())
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "position_id": request.position_id,
+                "symbol": position.symbol,
+                "exit_reason": request.exit_reason,
+                "trigger_price": str(request.trigger_price),
+                "trigger_ts": request.trigger_ts,
+                "retry_after": request.retry_after,
+                "created_at": request.created_at,
+                "position_status": position.status,
+                "remaining_qty": position.qty,
+            }
+            for request, position in rows
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/execution-exit-requests")
+async def get_execution_exit_requests(
+    limit: int = Query(50, ge=1, le=100, description="Newest-first cap on returned rows, 1-100."),
+    symbol: str | None = Query(None, description="Exact match on the position's symbol. Omit to return every symbol."),
+) -> dict[str, Any]:
+    """
+    Read-only snapshot of the **persisted** simulated exit requests — the
+    `exit_requests` table decision #184 introduced, which no HTTP route
+    exposed. Completes the ledger read routes alongside `GET
+    /execution-orders`, `/execution-fills` and `/execution-positions`.
+
+    **Not `GET /exit-intents`.** That route returns the running Position
+    Monitor's in-memory observations (`monitor_status`, `intent_status:
+    observed_only`) and is empty after a restart. This route returns only
+    rows Execution committed to PostgreSQL, whether or not the monitor is
+    running, and never reads the monitor. A request row means "a stop or
+    target observation was durably recorded for this position" and nothing
+    more.
+
+    **`execution_mode` is hard-scoped to `"simulated"`** through the joined
+    position, not a query parameter. **`symbol` is an exact match** (no case
+    folding, no partial match). **`limit` is bounded `[1, 100]`**, default 50.
+    **Newest `trigger_ts` first, ties broken by `position_id` descending** —
+    see `_fetch_execution_exit_requests` for why that is a total order and
+    why the tie-break is stable but not chronological.
+
+    **Curated fields:** `position_id`, `symbol`, `exit_reason` (`stop` |
+    `target`), `trigger_price` (exact decimal string), `trigger_ts`,
+    `retry_after` (null when unset), `created_at`, plus the position's
+    *current* `position_status` (`open` | `closing` | `closed`) and
+    `remaining_qty`. The last two are read at request time, not as of the
+    trigger.
+
+    **What this does not say.** No order status, no claim that the position
+    is protected, and no retry outcome are returned or inferred:
+    `retry_after` is the stored timestamp, not proof a retry happened or
+    succeeded. Orders and fills stay on their own routes.
+
+    Off the event loop via `asyncio.to_thread`, the same
+    `scanner-route-db-offload` convention as the siblings; the helper opens
+    and closes its own `Session` inside the worker. An empty table or a
+    non-matching symbol returns `{"exit_requests": []}`, 200. Read-only.
+    """
+    exit_requests = await asyncio.to_thread(_fetch_execution_exit_requests, symbol, limit)
+    return {"exit_requests": exit_requests}

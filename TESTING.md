@@ -1,3 +1,71 @@
+# TESTING — `execution-exit-requests-route`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main`, base `e1814fd`; `origin/main` re-fetched
+  before packaging and unchanged. Local branch only; nothing merged or pushed.
+- PostgreSQL 16, database `trading_workspace` (user `trading`), migrated to
+  head (`0015`). No migration added.
+- Baseline before the change: **1191 passed**.
+
+## Results
+
+- New file `backend/tests/test_execution_exit_requests_route.py`: **25 passed**.
+- Full backend suite on a wiped and recreated database (drop, create, `alembic
+  upgrade head`, then pytest): **1216 passed** (1191 + 25), zero regressions.
+- Regression guard: with `intelligence.py` restored to `main`, the new file
+  gives **24 failed, 1 error**; with the route back, 25/25 pass.
+
+Coverage (real PostgreSQL, hand-inserted rows, `httpx.ASGITransport`):
+
+- Mode isolation (2): backtest, paper and live positions' requests are excluded;
+  an `execution_mode` query value cannot widen the scope.
+- Symbol filter (3): exact match; lower-case and partial values return nothing;
+  no symbol returns rows across symbols.
+- Ordering (3): newest `trigger_ts` first regardless of insertion order; ties
+  break by `position_id` descending and are stable across reads; a `limit`
+  inside a tie keeps the same rows.
+- Bounds (7 tests, 4 of them parametrized rejects): limit caps to the newest; default is 50 (51 inserted,
+  oldest cut); 0, -1, 101 and "abc" return 422; 1 and 100 accepted.
+- Empty (3): unknown symbol; only other-mode rows; a position with no request.
+- Serialization (4): exactly the nine curated fields; `retry_after` null when
+  unset and the stored timestamp when set; `trigger_price` exact strings
+  (`12345678901.123456`, `0.100000`); position status and remaining quantity for
+  `open`, `closing` (4 left) and `closed` (0).
+- Distinct from `/exit-intents` (1): with no monitor, `/exit-intents` reports
+  `unavailable` and no rows while the new route returns the durable row and none
+  of the monitor envelope fields.
+- Read-only (1): GET leaves request and position untouched; four write verbs
+  return 405.
+- Event loop (1): a helper blocked on a `threading.Event` runs in a worker
+  thread while `/health` still answers within 2 s.
+
+## Notes on the harness
+
+- No app lifespan is booted (same choice as the positions route tests): the
+  lifespan would run Portfolio State's restore against fill-less positions and
+  log a `PositionLedgerError`. Cleanup is scoped to a strategy-name tag and
+  deletes `exit_requests`, then `positions`, then `trades`; symbols are
+  synthetic (`ZZXR*`).
+- PostgreSQL was installed in the sandbox for this run (`apt`), not available
+  before.
+
+## Not covered
+
+- No test against rows written by a live Execution Engine run; requests are
+  hand-inserted. Creation and retry behavior belong to decision #184's tests.
+- `retry_after` semantics beyond "stored value is returned" are not asserted.
+- Query plan and behavior at large table sizes were not measured.
+
+## Package
+
+`execution-exit-requests-route.zip` contains exactly five files, root-relative:
+`backend/app/api/routes/intelligence.py`,
+`backend/tests/test_execution_exit_requests_route.py`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-fills-symbol-filter-implementation`
 
 ## Environment

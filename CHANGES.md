@@ -1,3 +1,85 @@
+# CHANGES — `execution-exit-requests-route`
+
+## Current delivery
+
+Added read-only `GET /intelligence/execution-exit-requests`: the first HTTP view
+of the persisted `exit_requests` rows (decision #184). Backend only.
+
+**Provenance.** `exit_requests` and `PostgresExitLedger` already exist on `main`
+(decision #184, restored to the record by `restore-protective-exits-record`).
+Nothing outside that ledger read the table. This task adds the missing reader; it
+does not change how requests are created, retried or acted on.
+
+**Not `/intelligence/exit-intents`.** That route reports the running Position
+Monitor's in-memory observations and is empty after a restart. The new route reads
+only PostgreSQL, works with no monitor, and never consults it. Neither route's
+behavior changed.
+
+- `backend/app/api/routes/intelligence.py`: new module-level
+  `_fetch_execution_exit_requests(symbol, limit)` (opens and closes its own
+  `Session` inside the worker; patchable by tests) and the async route
+  `get_execution_exit_requests`, which calls it through `asyncio.to_thread` —
+  the same convention as the orders, fills and positions routes.
+- `backend/tests/test_execution_exit_requests_route.py` (new): 25 tests.
+
+**Behavior.**
+
+- `exit_requests` INNER JOIN `positions` on `position_id`; hard-scoped to
+  `Position.execution_mode == "simulated"` (not a parameter — an
+  `execution_mode` query value is ignored). The join drops nothing: the request
+  is keyed one-to-one by a foreign key.
+- Optional exact `symbol` (on the position; no case-folding, no partial match).
+  `limit` 1-100, default 50; out of range or non-integer returns 422.
+- Order: `trigger_ts` descending, then `position_id` descending. The pair is a
+  strict total order, so repeated reads and a `limit` inside a tie return the
+  same rows. The tie-break is stable, not chronological (`position_id` is a
+  random uuid4).
+- Fields: `position_id`, `symbol`, `exit_reason`, `trigger_price` (exact decimal
+  string), `trigger_ts`, `retry_after` (null when unset), `created_at`, plus the
+  position's **current** `position_status` and `remaining_qty` (read at request
+  time, not as of the trigger).
+- Not returned or inferred: order status, any protection guarantee, retry
+  outcome. `retry_after` is the stored timestamp only.
+- Empty result (empty table, other-mode rows only, no match): `{"exit_requests": []}`, 200.
+- Read-only; POST/PUT/PATCH/DELETE return 405.
+
+Documentation: `execution-engine-design.md` §6.6 gains an as-built note with a
+comparison against `/exit-intents`, a data-flow diagram and the route's internal
+flow diagram; §6.8 gains the `exit_requests` table row (the table was not listed
+there). `TESTING.md` records verification.
+
+Decision number: none assigned. This delivery runs in parallel with other work,
+so the slug `execution-exit-requests-route` is the temporary identifier;
+`confirmed-decisions.md` and `INDEX.md` are deliberately untouched. Whether a
+read-only route needs its own number, or falls under #184, is left to
+integration after re-checking `main` and the canonical logs (`origin/main` at
+packaging: `e1814fd`; log and index both end at #184).
+
+**Integration note.** This delivery prepends its own record to `CHANGES.md` and
+`TESTING.md`, as do sibling deliveries. Apply sequentially: keep every sibling's
+record and this one, newest on top, and do not replace either file wholesale.
+
+## Findings (recorded, not acted on)
+
+- `retry_after` is set only when a close order is rejected or cancelled and is
+  never cleared, so a non-null value can outlive a later successful close. The
+  route reports it as stored; it is not a "retry pending" signal.
+- `exit_requests` has no index on `trigger_ts`; the sort scans the
+  mode/symbol-filtered join. Fine at this ledger's diagnostic volume (one
+  concurrent position per EX-4); a migration is out of scope.
+- No frontend consumer. The Execution panel still shows only `/exit-intents`.
+  Showing persisted requests would be a separate task.
+- The design doc's §6.8 table did not list `exit_requests`; the row added here
+  describes it and the new route only.
+
+## Boundary
+
+No migration, frontend, exit-policy, Position Monitor, Execution Engine,
+placement or trading-control change. `PostgresExitLedger`, `/exit-intents` and the
+sibling routes are untouched.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-fills-symbol-filter-implementation`
 
 ## Current delivery
