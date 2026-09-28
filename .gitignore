@@ -85,3 +85,9 @@ logs/
 .portfolio-state-validation/
 
 .exit-validation/
+
+# Database / Local storage
+*.sqlite
+*.db
+pgdata/
+.*-validation/
