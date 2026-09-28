@@ -607,6 +607,115 @@ delivery took before its later, separate panel-consumer decision. This
 delivery adds no order placement, ledger write, schema migration, or change
 to any execution decision.
 
+**As built (`execution-positions-route`; decision number assigned at integration).** `GET /intelligence/execution-positions` is the
+third read-only HTTP view over the execution ledger, after `execution-orders`
+(#181) and `execution-fills` (#183), and the first over `positions` — Portfolio
+State's durable projection of `fills` (§6.5, §6.8). Internal code already reads
+the table directly (Portfolio State's restore and Session API, startup
+reconciliation, the Execution Engine's exit ledger — confirmed by grep; the
+Position Monitor and governor see positions only through Portfolio State), but
+no HTTP route exposed the persisted rows to an operator. `Position` carries its
+own `execution_mode`, so unlike the fills route no join is needed: the read is
+hard-scoped to `execution_mode == "simulated"` (not a parameter; same EX-1/§8
+reasoning as the sibling routes, and `backtest`-mode rows are a different
+population, I4). `symbol` is an exact match on `positions.symbol`; `limit` is
+bounded `[1, 100]`, default 50.
+
+**Ordering.** `opened_at` descending, then `position_id` descending. `opened_at`
+is the venue timestamp of the opening fill and can be shared by several
+positions; `position_id` is the primary key, so the pair is a strict total
+order and repeated reads never reshuffle tied rows — including which tied rows
+survive a `limit` that lands inside a tie. The tie-break is deterministic but
+**not chronological**: `position_id` is a random Python-side `uuid4`, so among
+rows with equal `opened_at` the order is stable but arbitrary. Nothing else on
+the table is both unique and time-ordered; a sequence column would be a schema
+change, outside this route's scope. The table's only secondary indexes are
+`(symbol, status)` and `trade_id`, so the `opened_at` sort is a scan of the
+mode/symbol-filtered rows — acceptable at this ledger's diagnostic volume (one
+concurrent position per EX-4), and deliberately not fixed with a migration here.
+
+**Curated fields:** `position_id`, `trade_id`, `symbol`, `side`, `qty`, `status`,
+`avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `realized_pnl`.
+Semantics are exactly what Portfolio State persists (§6.5 "Accounting"), not
+re-derived by the route: `qty` is the quantity **currently held** (decreases on
+reductions, `0` once `closed`); `avg_price` is the weighted-average **entry**
+cost (adds re-average it, reductions do not move it) — the column name is kept
+rather than renamed `entry_price`, matching the sibling routes' raw-column
+naming; `status` is `open`, `closing` (partially reduced) or `closed`;
+`realized_pnl` is the lifetime **gross** realized amount (profit − loss, before
+commissions, which Portfolio State tracks separately and this route does not
+expose). `avg_price`, `stop`, `target` and `realized_pnl` are `Numeric(18, 6)`
+and are returned as **exact decimal strings**, the same narrower-than-default
+exception `execution-fills` documents; `stop`, `target`, `closed_at` and
+`realized_pnl` are JSON `null` when unset — never omitted, never `0` (I3:
+"no stop recorded" and "nothing realized yet" are not zero). `execution_mode`
+(constant by the filter), `execution_venue` and `exit_attempt` are left out.
+
+**A persisted-row view, not a live portfolio.** Rows come straight from the
+table, not from `PortfolioState.get_snapshot()`'s in-process cache: no mark
+price, unrealized P&L, exposure or daily total is computed or returned. A fill
+that is committed but not yet applied by Portfolio State is not reflected until
+it is (positions are a projection of `fills`, §6.5). The synchronous read runs
+through a new `_fetch_execution_positions()` helper via `asyncio.to_thread`,
+the same `scanner-route-db-offload` convention as the sibling routes. An empty
+table, or a `symbol` with no matches, returns `{"positions": []}`, 200. Read-only:
+no position is created, reduced or closed, no exit is placed.
+
+```
+execution_engine/ ── INSERT orders / fills ──► orders + fills  [ledger — authoritative, I12]
+                                                       │
+                              Portfolio State  (single writer of `positions`)
+                              apply fill ─► accounting.py ─► COMMIT position + receipt + cursor
+                                                       │
+                                                       ▼
+                                              positions  [durable projection of fills]
+                       ┌───────────────────────────────┴─────────────────────────────┐
+          (existing, internal)                                        (new, this delivery)
+          restore / reconciliation /                     SELECT positions
+          exit_ledger read the rows                        WHERE execution_mode = 'simulated'
+                                                             [AND symbol = :symbol]
+                                                           ORDER BY opened_at DESC, position_id DESC
+                                                           LIMIT :limit   (asyncio.to_thread — worker thread)
+                                                                       ▼
+                                                     GET /intelligence/execution-positions
+                                                       curated fields; money as decimal strings;
+                                                       observation only — no write path
+                                                                       │ read on demand
+                                                                       ▼
+                                                             caller (ops diagnostic)
+
+not read here: PortfolioState.get_snapshot() cache · marks · unrealized P&L · exposure
+```
+
+**Internal flow (as built):**
+
+```
+GET /intelligence/execution-positions?symbol=...&limit=...
+       │
+       ▼
+FastAPI query validation ── limit outside [1, 100] or non-integer ──► 422  (before any DB touch)
+       │ limit valid (default 50), symbol optional
+       ▼
+await asyncio.to_thread(_fetch_execution_positions, symbol, limit)   ── event loop free while this runs
+       │
+       ▼
+_fetch_execution_positions()  [worker thread — opens AND closes its own Session]
+       SessionLocal() ──► filters = [positions.execution_mode == 'simulated'] (+ positions.symbol == :symbol)
+                     ──► SELECT positions.* WHERE <filters>
+                           ORDER BY opened_at DESC, position_id DESC LIMIT :limit
+                     ──► build curated dicts
+                           avg_price / stop / target / realized_pnl : str(Decimal), or None if NULL
+                           position_id / trade_id / opened_at / closed_at : native types (jsonable_encoder)
+                     ──► session.close()  (finally — always, even on a query error)
+       │
+       ▼  list[dict] crosses back to the event loop
+{"positions": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
+```
+
+No frontend consumer — this delivery adds no order placement, ledger write,
+schema migration, position accounting, exit placement, or trading-control
+change.
+
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
 
 **A new narrow interface; `BrokerAdapter` is not enlarged.** `BrokerAdapter` keeps its job — market-data connectivity (it extends `MarketDataProvider`). Its dormant `place_order`/`cancel_order`/`get_positions` declarations stay exactly as they are: unwired, not extended, not implemented (their eventual removal is a later decision — §10, R8). The Execution Engine depends only on `OrderVenue`.
@@ -861,7 +970,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 | `trade_reservations` (entry-lifecycle-wiring) | Durable approval terms before order insertion, retained after handoff | `trade_id` PK/FK, deterministic `client_order_id` UNIQUE, positive `qty`, finite positive exact `reference_price`, `created_at`; migration downgrade refuses to discard reservations or decision records |
 | `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order. Exposed over HTTP by `GET /intelligence/execution-fills` (decision #183, §6.3) — curated, joined to `orders` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]` | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
-| `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills` | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
+| `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills`. Exposed over HTTP by `GET /intelligence/execution-positions` (`execution-positions-route`, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]`, newest `opened_at` first (ties: `position_id` descending) | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
 | `position_fill_receipts` (entry-lifecycle-wiring — mislabeled "#174" in an earlier edit of this row; #174 was frontend-only, "no backend logic changed" per its own decision entry, and never built this table) | Durable fill application and exact replay inputs | `ledger_seq` PK/FK, unique `(execution_venue, venue_fill_id)`, `execution_mode`, `position_id` FK, `fill_data` JSONB, `trading_day`, `gross_pnl` |
 

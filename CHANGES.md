@@ -1,3 +1,80 @@
+# CHANGES — `execution-positions-route`
+
+## Current delivery
+
+Added `GET /intelligence/execution-positions`, a read-only diagnostic view of
+persisted simulated positions — the third HTTP view over the execution ledger
+after `execution-orders` (#181) and `execution-fills` (#183), and the first
+over `positions` (Portfolio State's durable projection of `fills`). Internal
+code already reads the table (Portfolio State restore/Session API, startup
+reconciliation, the Execution Engine's exit ledger); no HTTP route exposed the
+persisted rows.
+
+- `backend/app/api/routes/intelligence.py`: new `_fetch_execution_positions()`
+  (module-level, patchable, opens/closes its own `Session` inside the worker)
+  and the route, run through `asyncio.to_thread` like the sibling routes.
+  Hard-scoped to `Position.execution_mode == "simulated"` (not a parameter; no
+  join needed because `Position` has its own mode column). Optional exact
+  `symbol`, `limit` bounded `[1, 100]` default 50, honest `{"positions": []}`
+  when empty.
+- Ordering: `opened_at` descending, then `position_id` descending. The pair is
+  a strict total order (`position_id` is the primary key), so repeated reads
+  and a `limit` cutting through tied rows are stable. The tie-break is
+  deterministic but not chronological (`position_id` is a random `uuid4`).
+- Response fields: `position_id`, `trade_id`, `symbol`, `side`, `qty`,
+  `status`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`,
+  `realized_pnl`. `avg_price`/`stop`/`target`/`realized_pnl` are exact decimal
+  strings; unset `stop`, `target`, `closed_at`, `realized_pnl` are `null`.
+  Field meanings are Portfolio State's own: `qty` is the quantity currently
+  held (0 once closed), `avg_price` the weighted-average entry cost,
+  `realized_pnl` lifetime gross realized P&L before commissions.
+- `backend/tests/test_execution_positions_route.py` (new, 23 tests): mode
+  isolation (backtest/paper/live excluded; an `execution_mode` query parameter
+  cannot widen scope), exact symbol filter, newest-first ordering, `opened_at`
+  ties and a limit cutting through a tie, limit cap/default/bounds, empty
+  results, exact-decimal and null serialization, partially reduced and closed
+  rows, read-only behavior, and an event-loop responsiveness regression.
+- `docs/architecture/execution-engine-design.md` §6.3: as-built note plus
+  component data-flow and route internal-flow diagrams; §6.8 `positions` row
+  annotated.
+
+Decision number: none assigned. This delivery runs in parallel with another
+task, so the slug `execution-positions-route` is the temporary identifier;
+`confirmed-decisions.md` and `INDEX.md` are deliberately untouched. The final
+number is to be assigned at integration after re-checking `main` and the
+canonical logs (`origin/main` at packaging: `a00dbd0`, unchanged since the
+task started).
+
+Findings (recorded, not worked around):
+
+- The tests do not boot the app lifespan. They insert `positions` rows with no
+  fills behind them; booting the lifespan with such a row logs a
+  `PositionLedgerError: positions do not match durable fill history` from
+  `portfolio_state/postgres.py` `load_state()` (the row is left unmodified).
+  Requests go through `httpx.ASGITransport`, which skips the lifespan.
+- In that same experiment `GET /health/execution-startup` reported `ready`
+  although Portfolio State's restore had raised. Seen once; not investigated.
+- Commit `a00dbd0` (labeled `execution-fills-symbol-filter`) removed the
+  decision #184 entries from `confirmed-decisions.md`/`INDEX.md`, the #184
+  sections of `execution-engine-design.md`, and the top records of `CHANGES.md`
+  and `TESTING.md`, while the #184 code (migration `0015`, `exit_ledger.py`)
+  remains on `main`. Not restored here (out of scope; it needs a decision-log
+  action).
+- `execution-engine-design.md`'s fills note still says "No frontend consumer
+  yet", although the frontend fill-history panel commit exists on `main`.
+
+## Boundary
+
+No writes, migrations, frontend, position accounting, exit placement, or
+trading-control changes. `governor/`, `execution_engine/`,
+`portfolio_state/`, `models/execution_ledger.py`, and `main.py` untouched. No
+mark price, unrealized P&L, exposure or daily total is computed; rows come from
+the table, not `PortfolioState.get_snapshot()`'s cache. The `opened_at` sort has
+no supporting index (only `(symbol, status)` and `trade_id` exist); acceptable
+at diagnostic volume, not fixed here.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — decision #183: `execution-fills-route`
 
 ## Current delivery

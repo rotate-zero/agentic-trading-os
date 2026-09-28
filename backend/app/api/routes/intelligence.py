@@ -1225,3 +1225,150 @@ async def get_execution_fills(
     """
     fills = await asyncio.to_thread(_fetch_execution_fills, symbol, limit)
     return {"fills": fills}
+
+
+def _fetch_execution_positions(symbol: str | None, limit: int) -> list[dict[str, Any]]:
+    """Synchronous read of the `positions` table (`models/execution_ledger.py`,
+    decision #172; owner: Portfolio State, `execution-engine-design.md` §6.5/
+    §6.8) — same module-level, patchable-for-tests shape as
+    `_fetch_execution_orders`/`_fetch_execution_fills` above, for the same
+    reason (the concurrency regression monkeypatches it by name in this
+    module's namespace). Opens and closes its own `Session` entirely inside
+    whatever thread runs it.
+
+    Hard-scoped to `execution_mode == "simulated"` — `Position` carries its
+    own `execution_mode` column, so unlike `_fetch_execution_fills` no join
+    is needed. `symbol`, when given, is an exact `==` match, no case-folding.
+
+    **Ordering: `opened_at` descending, then `position_id` descending.**
+    `opened_at` is the venue timestamp of the position's opening fill
+    (`portfolio_state/accounting.py`), so two positions can legitimately
+    share it. `position_id` is the table's primary key, so the
+    pair is a strict total order and repeated reads never reshuffle tied
+    rows. It is deterministic, **not** chronological: `position_id` is a
+    random Python-side `uuid4` (see `Position`'s own docstring), so among
+    rows tied on `opened_at` the order is stable but arbitrary. Nothing else
+    on this table is both unique and time-ordered, and adding a sequence
+    column is a schema change outside this route's scope.
+
+    **Decimal columns are converted to `str` here, explicitly** — the same
+    deliberate exception `_fetch_execution_fills` documents for `price`/
+    `commission`: `avg_price`, `stop`, `target` and `realized_pnl` are
+    `Numeric(18, 6)`, and FastAPI's default `Decimal`→float conversion can
+    misrepresent trailing precision for values a caller must treat as exact
+    money. `stop`, `target` and `realized_pnl` are nullable and stay `None`
+    (JSON `null`) — never `"0"` and never omitted — because "no stop
+    recorded" and "nothing realized yet" are different facts from zero
+    (I3). Timestamps and UUIDs are returned as native Python types and left
+    to FastAPI's `jsonable_encoder`, matching the sibling helpers.
+
+    Returned columns are a curated subset. `execution_mode` is constant by
+    construction of the filter, and `execution_venue` and `exit_attempt`
+    are not part of this route's approved field list, so they stay out.
+    """
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.execution_ledger import Position
+
+    def _exact(value: Any) -> str | None:
+        return None if value is None else str(value)
+
+    session = SessionLocal()
+    try:
+        filters = [Position.execution_mode == "simulated"]
+        if symbol is not None:
+            filters.append(Position.symbol == symbol)
+        rows = session.execute(
+            select(Position)
+            .where(*filters)
+            .order_by(Position.opened_at.desc(), Position.position_id.desc())
+            .limit(limit)
+        ).scalars().all()
+        return [
+            {
+                "position_id": row.position_id,
+                "trade_id": row.trade_id,
+                "symbol": row.symbol,
+                "side": row.side,
+                "qty": row.qty,
+                "status": row.status,
+                "avg_price": _exact(row.avg_price),
+                "stop": _exact(row.stop),
+                "target": _exact(row.target),
+                "opened_at": row.opened_at,
+                "closed_at": row.closed_at,
+                "realized_pnl": _exact(row.realized_pnl),
+            }
+            for row in rows
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/execution-positions")
+async def get_execution_positions(
+    limit: int = Query(50, ge=1, le=100, description="Newest-first cap on returned rows, 1-100."),
+    symbol: str | None = Query(None, description="Exact match on positions.symbol. Omit to return every symbol."),
+) -> dict[str, Any]:
+    """
+    Read-only snapshot of persisted simulated positions — the `positions`
+    counterpart to `GET /execution-orders` (decision #181) and `GET
+    /execution-fills` (decision #183), completing the HTTP view over the
+    execution ledger's three accounting tables. `positions` is Portfolio
+    State's durable projection of `fills` (§6.5): what the system holds (or
+    held) after applying every fill, as opposed to the raw orders and fills
+    that produced it. Internal code already reads the table directly
+    (Portfolio State's restore and Session API, startup reconciliation, and
+    the Execution Engine's exit ledger — confirmed by grep; the Position
+    Monitor and governor see positions only through Portfolio State), but no
+    HTTP route exposed the persisted rows to an operator.
+
+    **`execution_mode` is hard-scoped to `"simulated"`, not a query
+    parameter** — identical reasoning to the two sibling routes: `simulated`
+    is the only mode the authorizer stub may run today (EX-1, decision #170)
+    and the only one any `positions` row can honestly carry until a real
+    venue exists (`execution-engine-design.md` §8). `backtest`-mode rows are
+    a different population (I4) and are never returned.
+
+    **`symbol` is an exact match** — no case-folding, no partial match.
+    **`limit` is bounded `[1, 100]`**, default 50, the same diagnostic-tail
+    sizing as the sibling routes, not a paged export.
+
+    **Newest first by `opened_at`, ties broken by `position_id`
+    descending** — see `_fetch_execution_positions` for why that pair is a
+    total order and why the tie-break is stable but not chronological.
+
+    **Curated fields:** `position_id`, `trade_id`, `symbol`, `side`, `qty`,
+    `status`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`,
+    `realized_pnl`. Field semantics are exactly what Portfolio State
+    persists, not re-derived here: `qty` is the quantity **currently held**
+    (it decreases on reductions and is `0` once `status` is `"closed"`);
+    `avg_price` is the weighted-average **entry** cost (adds re-average it;
+    reductions do not move it); `status` is `open`, `closing` (partially
+    reduced) or `closed`; `realized_pnl` is the position's lifetime **gross**
+    realized amount (profit minus loss, before commissions — fees are
+    tracked separately by Portfolio State and are not exposed here). The
+    four money fields are exact decimal strings, and `stop`, `target`,
+    `closed_at` and `realized_pnl` are JSON `null` when unset.
+
+    This is a **persisted-row view, not a live portfolio**: no mark price,
+    unrealized P&L, exposure or daily total is computed or returned, and the
+    rows are read straight from the table rather than from
+    `PortfolioState.get_snapshot()`'s in-process cache.
+
+    **Off the event loop, on purpose** — the read runs through
+    `_fetch_execution_positions` via `asyncio.to_thread`, the same
+    `scanner-route-db-offload` convention the sibling routes follow: the
+    helper opens and closes its own `Session` entirely inside the worker
+    thread, so a slow or blocked read cannot hold up an unrelated request.
+
+    An empty `positions` table, or a `symbol` with no matching rows,
+    returns `{"positions": []}`, 200 — never an error.
+
+    Read-only: no position is created, reduced or closed, no exit is
+    placed, and no ledger write happens here or anywhere reachable from
+    this route.
+    """
+    positions = await asyncio.to_thread(_fetch_execution_positions, symbol, limit)
+    return {"positions": positions}

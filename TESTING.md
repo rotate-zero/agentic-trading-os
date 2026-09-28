@@ -1,3 +1,64 @@
+# TESTING — `execution-positions-route`
+
+## Environment
+
+- Fresh `git clone`, base commit `a00dbd0337774978ad2ace59243dc696ed2f5af2`;
+  `origin/main` re-fetched before the final run and at packaging — unchanged.
+- Postgres 16 installed via apt and started with `pg_ctlcluster`;
+  `trading`/`trading_workspace` per `core/config.py`; `alembic upgrade head` to
+  `0015`; `backend/requirements.txt` installed.
+
+## Results
+
+- Baseline on an untouched clean worktree of `a00dbd0`: **1168 passed**.
+- New file alone: **23 passed**, repeated runs, no flakes.
+- **Final verification on a wiped and recreated database**
+  (`DROP/CREATE DATABASE`, `alembic upgrade head`): full backend suite
+  **1191 passed** (1168 + 23), zero regressions. Afterward the database held no
+  tagged `trades` rows and empty `positions`/`orders`/`fills`.
+- Regression guard: with the route reverted to `HEAD` (new test file kept),
+  22 tests fail and 1 errors; restored afterward.
+- Mutation checks, each restored afterward (all caught by the intended tests):
+  no mode filter, no symbol filter, ascending `opened_at`, float money, null
+  rendered as `"0"`, limit ignored, no tie-break, ascending tie-break, and the
+  read run on the event loop instead of `asyncio.to_thread`.
+
+## What the tests cover
+
+Real Postgres throughout; rows are hand-inserted, so Portfolio State's write
+path is not re-tested here (see the position-ledger tests). Backtest/paper/live
+positions excluded and an `execution_mode` query parameter ignored; exact
+symbol filter (lowercase and substring rejected); no-symbol read across
+symbols; newest-first by `opened_at` with rows inserted out of time order;
+`opened_at` ties broken by `position_id` descending, stable across reads, and a
+limit landing inside a tie keeping the same rows; limit cap, default 50 keeping
+the newest 50, 422 for 0/-1/101/non-integer, both edges accepted; honest empty
+list for an unknown symbol and for a symbol with only other-mode rows; open
+position with `stop`/`target`/`closed_at`/`realized_pnl` all `null` and only the
+curated keys present; closed position with exact strings and close time; a
+17-significant-digit price and a `"0.000000"` P&L kept as strings; `closing`
+position with remaining quantity; GET leaves the row unchanged and
+POST/PUT/PATCH/DELETE return 405; and a blocked `_fetch_execution_positions` in
+a worker thread must not block `/health`.
+
+## Issues met while testing
+
+1. My first tie tests could pass by chance with the tie-break removed, because
+   random `uuid4` ids sometimes land in the expected order. Mutation checking
+   exposed it. Tied rows are now inserted with explicitly sorted ascending ids
+   while the route must return them descending; both tie tests then fail 6/6
+   with the tie-break removed or reversed.
+2. The no-symbol test could have been displaced from the 100-row window by
+   unrelated newer simulated rows; its timestamps are pinned far in the future.
+3. The lifespan is deliberately not booted (see `CHANGES.md` findings).
+4. A mutation-check script of mine crashed once mid-run and left the route
+   file mutated. It was restored from a saved copy and byte-compared before any
+   further run; the delivered file is the verified one.
+5. My first background baseline run died silently (empty log). The baseline
+   above is from a detached rerun.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — decision #183: `execution-fills-route`
 
 ## Environment
