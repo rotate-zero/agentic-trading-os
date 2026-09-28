@@ -513,6 +513,100 @@ fetchExecutionOrders() ──► HTTP error ──► request failure message
 collapse ──► unmount and ignore any late response
 ```
 
+**As built (decision #183, `execution-fills-route`).** `GET /intelligence/execution-fills` is the first HTTP route
+that exposes the `fills` ledger. `execution_engine/fill_ledger.py` has been
+inserting real rows since `entry-lifecycle-wiring`, and internal consumers
+already read them (Portfolio State's rebuild/reconciliation, the governor's
+`PortfolioStateReader`, `fill_ledger.py`'s own dedupe lookups — confirmed by
+grep) — but nothing an operator can reach showed what was actually
+persisted. `Fill` carries no `execution_mode` column at all
+(`models/execution_ledger.py`'s own module docstring: "a fill's mode is
+derivable via its `orders` row"), so hard-scoping to `execution_mode ==
+"simulated"` — same fixed, non-parameterized scope as `GET
+/execution-orders`, same EX-1/§8 reasoning — is expressed by an `INNER
+JOIN` to the owning `orders` row (`fills.client_order_id` is a NOT NULL
+`FOREIGN KEY` into `orders.client_order_id`, so the join never silently
+drops a row). `symbol`, similarly not a `Fill` column, is an exact match on
+the joined order's `symbol`. `limit` is bounded `[1, 100]`, default 50,
+same diagnostic-tail sizing as the orders route. Rows are ordered by
+`fills.ledger_seq` descending — the ledger's own strictly-monotonic
+`BigInteger Identity(always=True)` primary key, the same "ledger order" role
+`orders.id` plays for the sibling route.
+
+Curated fields: `ledger_seq`, `client_order_id`, `trade_id` and `symbol`
+(both pulled from the joined `orders` row), `execution_venue` (`Fill`'s own
+column — independent of `orders.execution_venue`: an order's venue is where
+it was placed, a fill's is where it actually executed), `venue_fill_id`,
+`qty`, `price`, `venue_ts`, `commission`, `anomaly`, `created_at`. **`price`
+and `commission` are serialized as exact decimal strings, not JSON
+numbers** — a deliberate, narrower departure from `GET /execution-orders`'
+posture of leaving every field to FastAPI's default `jsonable_encoder`: both
+are `Numeric(18, 6)` columns, and the default `Decimal`→float conversion can
+misrepresent trailing precision for values a caller needs to treat as exact
+money — the same reasoning `PositionFillReceipt`'s own docstring gives and
+the same `str(value) if isinstance(value, Decimal)` convention
+`portfolio_state/postgres.py`'s `_encode()` already uses on this schema.
+`commission` stays `null`, never a fabricated `0`, when the venue never
+reported one (I3). The synchronous read runs through a new
+`_fetch_execution_fills()` helper via `asyncio.to_thread` — the same
+`scanner-route-db-offload` convention `GET /execution-orders` already
+follows. An empty table, or a `symbol` with no matches, returns
+`{"fills": []}`, 200, never an error. Read-only: no fill is inserted, no
+order status is advanced.
+
+```
+execution_engine/ ExecutionEngine ──INSERT/UPDATE orders──┐
+execution_engine/fill_ledger.py ──INSERT fills, UPDATE orders.status──┤
+                                                     ▼
+                              orders + fills  [ledger — authoritative, I12]
+                                     │                         │
+                     (existing, internal)                (new, this delivery)
+                     Portfolio State / governor          SELECT fills JOIN orders
+                     reconciliation reads                  ON fills.client_order_id = orders.client_order_id
+                                                           WHERE orders.execution_mode = 'simulated'
+                                                           [AND orders.symbol = :symbol]
+                                                           ORDER BY fills.ledger_seq DESC LIMIT :limit
+                                                           (asyncio.to_thread — worker thread)
+                                                                 ▼
+                                                  GET /intelligence/execution-fills
+                                                    curated fields; price/commission as decimal strings
+                                                    observation only — no write path
+                                                                 │ read on demand
+                                                                 ▼
+                                                        caller (ops diagnostic)
+```
+
+**Internal flow (as built):**
+
+```
+GET /intelligence/execution-fills?symbol=...&limit=...
+       │
+       ▼
+FastAPI query validation ── limit outside [1, 100] ──► 422  (rejected before any DB touch)
+       │ limit valid (default 50), symbol optional
+       ▼
+await asyncio.to_thread(_fetch_execution_fills, symbol, limit)   ── event loop free while this runs
+       │
+       ▼
+_fetch_execution_fills()  [worker thread — opens AND closes its own Session]
+       SessionLocal() ──► filters = [orders.execution_mode == 'simulated'] (+ orders.symbol == :symbol if given)
+                     ──► SELECT fills.*, orders.trade_id, orders.symbol
+                           FROM fills JOIN orders ON fills.client_order_id = orders.client_order_id
+                           WHERE <filters> ORDER BY fills.ledger_seq DESC LIMIT :limit
+                     ──► build curated dicts (ledger_seq, client_order_id, trade_id, symbol,
+                         execution_venue, venue_fill_id, qty, price [str], venue_ts,
+                         commission [str | null], anomaly, created_at)
+                     ──► session.close()  (finally — always, even on a query error)
+       │
+       ▼  list[dict] crosses back to the event loop
+{"fills": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
+```
+
+No frontend consumer yet — same posture the orders route's own original
+delivery took before its later, separate panel-consumer decision. This
+delivery adds no order placement, ledger write, schema migration, or change
+to any execution decision.
+
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
 
 **A new narrow interface; `BrokerAdapter` is not enlarged.** `BrokerAdapter` keeps its job — market-data connectivity (it extends `MarketDataProvider`). Its dormant `place_order`/`cancel_order`/`get_positions` declarations stay exactly as they are: unwired, not extended, not implemented (their eventual removal is a later decision — §10, R8). The Execution Engine depends only on `OrderVenue`.
@@ -766,7 +860,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 | `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= accepted `opportunity_id` for approvals; audit identity for rejections), `decision_record` (entry-lifecycle-wiring exact authorization inputs), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
 | `trade_reservations` (entry-lifecycle-wiring) | Durable approval terms before order insertion, retained after handoff | `trade_id` PK/FK, deterministic `client_order_id` UNIQUE, positive `qty`, finite positive exact `reference_price`, `created_at`; migration downgrade refuses to discard reservations or decision records |
 | `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
-| `fills` | Every fill, deduplicated, in ledger order | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
+| `fills` | Every fill, deduplicated, in ledger order. Exposed over HTTP by `GET /intelligence/execution-fills` (decision #183, §6.3) — curated, joined to `orders` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]` | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
 | `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills` | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
 | `position_fill_receipts` (entry-lifecycle-wiring — mislabeled "#174" in an earlier edit of this row; #174 was frontend-only, "no backend logic changed" per its own decision entry, and never built this table) | Durable fill application and exact replay inputs | `ledger_seq` PK/FK, unique `(execution_venue, venue_fill_id)`, `execution_mode`, `position_id` FK, `fill_data` JSONB, `trading_day`, `gross_pnl` |

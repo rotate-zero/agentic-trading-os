@@ -1,3 +1,65 @@
+# TESTING — decision #183: `execution-fills-route`
+
+## Environment
+
+- Fresh `git clone --depth 1`, base commit
+  `b65d6ed0a185d2f73ad377591a714cab45e73312`; `origin/main` re-fetched at the
+  mid-task check and again at packaging — unchanged, no rebase needed.
+- Postgres 16 installed via apt, started manually with `pg_ctl`
+  (`/etc/postgresql/16/main/postgresql.conf`); `trading`/`trading_workspace`
+  per `core/config.py`; `alembic upgrade head` to `0014`; venv with
+  `backend/requirements.txt`. The server was restarted once mid-session after
+  the sandbox paused; nothing else changed.
+
+## Results
+
+- Baseline on the untouched clone: **1148 passed**.
+- New file alone: **15 passed**, three consecutive runs, no flakes.
+- **Final verification on a wiped and recreated database**
+  (`DROP/CREATE DATABASE`, `alembic upgrade head`): full backend suite
+  **1163 passed** (1148 + 15), zero regressions. After the run the database
+  held no leftover tagged `trades` rows, and `fills`/`positions`/
+  `position_fill_receipts` were empty.
+- Regression guard: with the route reverted (`git stash`, new test file kept),
+  all 15 new tests fail (14 failed, 1 error); restored afterward.
+- Execution-related files together (`fills`/`orders` route, ledger, engine,
+  main pipeline): 51 passed.
+
+## What the tests cover
+
+Newest-first ordering by `ledger_seq`; exact symbol filter (lowercase and
+substring rejected); a `backtest`-mode order's fill excluded by the join;
+limit cap, default, 422 at 0 and 101, both edges accepted; honest empty
+list; curated fields with UUID/timestamps serialized, `price` an exact
+string, no `execution_mode` field; `commission` null when absent and exact
+string when set; `anomaly` passthrough; and a concurrency regression (blocked
+`_fetch_execution_fills` in a worker thread must not block `/health`).
+Real Postgres throughout; rows are hand-inserted, so the write path is not
+re-tested here (see `test_execution_ledger.py`/`test_execution_engine.py`).
+
+## Issues met while testing
+
+1. Cleanup first failed on a `positions` FK: booting `TestClient(app)`
+   reconciles inserted simulated fills into `positions` and
+   `position_fill_receipts`. Cleanup now deletes receipts, positions, fills,
+   orders, trades in that order.
+2. A test with fill `qty` 17 against order `qty` 10 returned `anomaly:
+   "overfill"` — real behavior (`portfolio_state/legacy.py` flags it during
+   reconciliation), not a route bug. Test data was corrected.
+3. A commission test that opened `TestClient(app)` twice failed at the second
+   shutdown with "Queue is bound to a different event loop" in
+   `bus.stop()`. A scan of the suite found no other test doing this. Split
+   into two single-boot tests; `main.py`/`event_bus` left untouched.
+4. Two of my own docstring/doc sentences claimed this was the first reader of
+   `fills` anywhere; a grep showed internal readers exist. Corrected to "first
+   HTTP route" in the route, test file, design doc and decision entry.
+
+Startup logs during these tests include a CRITICAL "reconciliation found 1
+discrepancy" line: expected, because hand-inserted fills were never placed
+through the simulated venue. It is not a failure.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `backtest-isolation-flake-fix`
 
 ## Task

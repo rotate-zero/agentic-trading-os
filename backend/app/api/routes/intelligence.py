@@ -1066,3 +1066,162 @@ async def get_execution_orders(
     """
     orders = await asyncio.to_thread(_fetch_execution_orders, symbol, limit)
     return {"orders": orders}
+
+
+def _fetch_execution_fills(symbol: str | None, limit: int) -> list[dict[str, Any]]:
+    """Synchronous read of the `fills` ledger (`models/execution_ledger.py`,
+    decision #172), joined to its owning `orders` row — same module-level,
+    patchable-for-tests shape as `_fetch_execution_orders` directly above,
+    for the same reason (the concurrency regression below monkeypatches it
+    by name in `app.api.routes.intelligence`'s own namespace).
+
+    **The join is load-bearing, not cosmetic.** `Fill` carries no
+    `execution_mode` column at all — `models/execution_ledger.py`'s own
+    module docstring states this explicitly ("a fill's mode is derivable
+    via its `orders` row"), and `client_order_id` is a NOT NULL `FOREIGN
+    KEY` into `orders.client_order_id`, so every `fills` row has exactly
+    one owning order and an `INNER JOIN` never silently drops a row. Hard-
+    scoping to `execution_mode == "simulated"` — see `get_execution_fills`'s
+    own docstring for why this is fixed, not a query parameter — is
+    therefore only expressible by filtering on the JOINED `Order` row, not
+    on `Fill` alone. `symbol`, similarly, is not a `Fill` column; the exact-
+    match filter is `Order.symbol`, the same table `_fetch_execution_orders`
+    already filters for the sibling route.
+
+    `trade_id` and `symbol` are pulled from the joined `Order` row (the
+    task's own curated field list asks for both, and neither exists on
+    `Fill`); `execution_venue` is `Fill.execution_venue` itself, NOT
+    `Order.execution_venue` — the two are independent columns on this
+    schema (an order's venue is where it was placed; a fill's venue is
+    where it was actually executed), and the design doc's own column list
+    for `fills` names `execution_venue` as one of its real columns, not a
+    borrowed one.
+
+    Ordered by `Fill.ledger_seq` descending — the ledger's own strictly-
+    monotonic `BigInteger Identity(always=True)` primary key (`models/
+    execution_ledger.py`'s own docstring: "BOTH the primary key and the
+    ... sequence Portfolio State's replay cursor advances against"), the
+    exact `orders.id`-descending role `_fetch_execution_orders` already
+    gives its own table's ledger key.
+
+    **`price` and `commission` are converted to `str` here, explicitly** —
+    unlike every timestamp/UUID field in this function (and every field in
+    `_fetch_execution_orders` above), which are returned as their native
+    Python types and left to FastAPI's own `jsonable_encoder`. This is a
+    deliberate, narrower exception: both columns are `Numeric(18, 6)`
+    (`models/execution_ledger.py`), and `jsonable_encoder`'s default float
+    conversion of a `Decimal` can lose or misrepresent trailing precision
+    for values a caller needs to treat as exact money — the same reasoning
+    `PositionFillReceipt`'s own docstring gives for storing decimal fill
+    inputs as JSON strings, and the same `str(value) if isinstance(value,
+    Decimal)` convention `portfolio_state/postgres.py`'s `_encode()` already
+    uses for this schema's own ledger rows. `commission` is nullable (I3:
+    "never fabricated" — a venue that doesn't report it stays `None`, not
+    `0`); the `str()` conversion is skipped, not applied to a
+    stand-in zero, so an absent commission serializes as JSON `null`.
+    """
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.execution_ledger import Fill, Order
+
+    session = SessionLocal()
+    try:
+        filters = [Order.execution_mode == "simulated"]
+        if symbol is not None:
+            filters.append(Order.symbol == symbol)
+        rows = session.execute(
+            select(Fill, Order.trade_id, Order.symbol)
+            .join(Order, Fill.client_order_id == Order.client_order_id)
+            .where(*filters)
+            .order_by(Fill.ledger_seq.desc())
+            .limit(limit)
+        ).all()
+        return [
+            {
+                "ledger_seq": fill.ledger_seq,
+                "client_order_id": fill.client_order_id,
+                "trade_id": trade_id,
+                "symbol": order_symbol,
+                "execution_venue": fill.execution_venue,
+                "venue_fill_id": fill.venue_fill_id,
+                "qty": fill.qty,
+                "price": str(fill.price),
+                "venue_ts": fill.venue_ts,
+                "commission": str(fill.commission) if fill.commission is not None else None,
+                "anomaly": fill.anomaly,
+                "created_at": fill.created_at,
+            }
+            for fill, trade_id, order_symbol in rows
+        ]
+    finally:
+        session.close()
+
+
+@router.get("/execution-fills")
+async def get_execution_fills(
+    limit: int = Query(50, ge=1, le=100, description="Most-recent-first cap on returned rows, 1-100."),
+    symbol: str | None = Query(None, description="Exact match on the fill's order symbol. Omit to return every symbol."),
+) -> dict[str, Any]:
+    """
+    Raw recent-rows observability into the `fills` ledger (`models/
+    execution_ledger.py`, decision #172), joined to `orders` for scoping —
+    the same "make a built-but-unwired capability visible outside of tests"
+    purpose `GET /execution-orders` (decision #181) already served for the
+    neighboring `orders` table, applied here to the one ledger table that
+    records money actually changing hands (`fills`, not merely an order's
+    state machine). `execution_engine/fill_ledger.py` has been inserting
+    real `fills` rows since `entry-lifecycle-wiring`. Internal consumers
+    already read them (Portfolio State's rebuild/reconciliation, the
+    governor's `PortfolioStateReader`, and `fill_ledger.py`'s own dedupe
+    lookups — confirmed by grep before writing this route), but this is the
+    first HTTP route that exposes them: nothing an operator can reach
+    shows what was actually persisted.
+
+    **`execution_mode` is hard-scoped to `"simulated"`, not a query
+    parameter** — identical reasoning to `GET /execution-orders`, applied
+    through the join described in `_fetch_execution_fills`'s own docstring
+    rather than directly on `Fill` (which carries no `execution_mode`
+    column at all): `simulated` is the only mode the authorizer stub is
+    technically permitted to run today (EX-1, decision #170), and the only
+    mode any `fills` row can honestly carry until a real venue exists
+    (`execution-engine-design.md` §8's still-deferred "A real venue"
+    prerequisite). Exposing a mode filter today would let a caller ask for
+    `paper`/`live` rows that can never exist yet and get a silently-empty
+    result indistinguishable from "not built" (I4).
+
+    **`symbol` is an exact match** against the owning order's symbol — no
+    case-folding, no partial match, the same approved scope `GET
+    /execution-orders` uses. **`limit` is bounded `[1, 100]`**
+    (`Query(..., ge=1, le=100)`, default 50) — the same diagnostic-tail
+    sizing as `GET /execution-orders`, not a paged export.
+
+    **Ordered by `fills.ledger_seq` descending** — the ledger's own
+    strictly-monotonic identity column (see `_fetch_execution_fills`'s own
+    docstring), not `created_at`, which could tie within one statement.
+
+    **Curated fields, not a full-row dump**: `ledger_seq`,
+    `client_order_id`, `trade_id`, `symbol`, `execution_venue`,
+    `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission`, `anomaly`,
+    `created_at`. `price` and `commission` are serialized as `str`, not
+    JSON numbers — see `_fetch_execution_fills`'s own docstring for why;
+    `commission` is `null` when the venue never reported one (I3: never
+    fabricated as `0`). `anomaly` is `null` unless `execution_engine/
+    fill_ledger.py` flagged the fill `overfill`/`unmatched_order`.
+
+    **Off the event loop, on purpose** — the read runs through
+    `_fetch_execution_fills` via `asyncio.to_thread`, the same
+    `scanner-route-db-offload` convention `GET /execution-orders` already
+    follows: the helper opens and closes its own `Session` entirely inside
+    the worker thread, so a slow or blocked read here cannot hold up an
+    unrelated concurrent request this process is serving.
+
+    An empty `fills` table, or a `symbol` with no matching rows, returns
+    `{"fills": []}`, 200 — the same honest-empty convention every route in
+    this file already follows, never an error.
+
+    Read-only: no fill is inserted, no order status is advanced, and no
+    ledger write happens here or anywhere reachable from this route.
+    """
+    fills = await asyncio.to_thread(_fetch_execution_fills, symbol, limit)
+    return {"fills": fills}

@@ -1,3 +1,54 @@
+# CHANGES — decision #183: `execution-fills-route`
+
+## Current delivery
+
+Added `GET /intelligence/execution-fills`, a read-only diagnostic view of
+persisted simulated fills — the `fills` counterpart to decision #181's
+`GET /intelligence/execution-orders`, and the first HTTP route over the
+`fills` ledger (Portfolio State, the governor's `PortfolioStateReader` and
+`fill_ledger.py` already read it internally).
+
+- `backend/app/api/routes/intelligence.py`: new `_fetch_execution_fills()`
+  (module-level, patchable, opens/closes its own `Session` inside the worker)
+  and the route. `fills` is `INNER JOIN`ed to `orders` on `client_order_id`
+  because `Fill` has no `execution_mode` or `symbol` column; the read is
+  hard-scoped to `Order.execution_mode == "simulated"` (not a parameter).
+  Optional exact `symbol` (on the order), `limit` bounded `[1, 100]` default
+  50, newest `ledger_seq` first, honest `{"fills": []}` when empty.
+- Response fields: `ledger_seq`, `client_order_id`, `trade_id`, `symbol`,
+  `execution_venue` (the fill's own), `venue_fill_id`, `qty`, `price`,
+  `venue_ts`, `commission`, `anomaly`, `created_at`. `price` and `commission`
+  are exact decimal strings; unknown `commission` is `null`.
+- `backend/tests/test_execution_fills_route.py` (new, 15 tests): ordering,
+  exact-symbol filtering (case/partial rejected), backtest-mode isolation via
+  the join, limit bounds and default, empty result, curated serialization,
+  null and exact-string commission, anomaly passthrough, and an event-loop
+  responsiveness regression (blocked read vs `/health`).
+- `docs/architecture/execution-engine-design.md` §6.3: as-built note,
+  component data-flow diagram and route internal-flow diagram; §6.8 `fills`
+  row annotated.
+- `docs/decisions/confirmed-decisions.md` + `INDEX.md`: decision #183
+  (observed next number 183, assigned 183; `origin/main` re-checked at
+  packaging, unchanged).
+
+Findings (recorded, not worked around): `TestClient(app)` runs the real
+`lifespan()`, which reconciles hand-inserted simulated fills into
+`positions`/`position_fill_receipts`, so the new tests' cleanup covers those
+tables; a fill larger than its order is retroactively flagged `overfill`, so
+test quantities are kept consistent; opening `TestClient(app)` twice in one
+test function fails at the second shutdown (`bus.stop()`, "bound to a
+different event loop") — no other test does this, so the tests use one boot
+per function and the bus was not modified.
+
+## Boundary
+
+No writes, migrations, trading controls, or frontend. `governor/`,
+`execution_engine/`, `portfolio_state/`, `models/execution_ledger.py`, and
+`main.py` untouched. Flagged, not acted on: `confirmed-decisions.md` is now
+~200KB, well past the ~100KB rollover threshold (a standing follow-up).
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `backtest-isolation-flake-fix`
 
 ## Current delivery

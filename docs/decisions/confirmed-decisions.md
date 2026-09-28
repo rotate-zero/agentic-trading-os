@@ -1416,3 +1416,55 @@ panel's local fetch-on-mount and manual-Refresh pattern. See
 `execution-engine-design.md` §6.3 for component data flow and panel internal
 flow. Frontend build and direct rendering checks of loading, empty,
 populated, and error states passed; see `TESTING.md`.
+
+### 183. Read-only `fills` ledger observability (`execution-fills-route`)
+
+The `fills` ledger (decision #172) has had a real writer since
+`entry-lifecycle-wiring` (`execution_engine/fill_ledger.py`) and internal
+readers (Portfolio State's rebuild/reconciliation, the governor's
+`PortfolioStateReader`, `fill_ledger.py`'s own dedupe lookups — confirmed by
+grep), but no HTTP route: nothing an operator can reach shows what was
+actually persisted. Sibling of decision #181's `GET /intelligence/execution-orders`,
+applied to the ledger table that records money actually changing hands.
+
+Added `GET /intelligence/execution-fills` to
+`backend/app/api/routes/intelligence.py`. `Fill` has no `execution_mode`
+column (`models/execution_ledger.py`: a fill's mode is derivable via its
+`orders` row), so the read `INNER JOIN`s `fills` to `orders` on
+`client_order_id` (a NOT NULL FK, so the join cannot drop a row) and
+hard-scopes `Order.execution_mode == "simulated"` — not a query parameter,
+same EX-1/§8 reasoning as #181. Optional `symbol` is an exact match on the
+joined order's symbol (`Fill` has no symbol column). `limit` is bounded
+`[1, 100]`, default 50. Rows are ordered by `fills.ledger_seq` descending
+(the ledger's monotonic identity key), not `created_at`. Curated fields:
+`ledger_seq`, `client_order_id`, `trade_id`, `symbol`, `execution_venue`
+(`Fill`'s own column, not `orders.execution_venue`), `venue_fill_id`, `qty`,
+`price`, `venue_ts`, `commission`, `anomaly`, `created_at`.
+
+**Exact decimals as strings.** `price` and `commission` (both
+`Numeric(18, 6)`) are serialized as `str`, not left to FastAPI's default
+`Decimal`→float encoding — a deliberate departure from #181's posture (which
+had no decimal fields in its curated set), following the convention
+`PositionFillReceipt` and `portfolio_state/postgres.py`'s `_encode()` already
+use on this schema. An unknown `commission` is `null`, never a fabricated `0`
+(I3). The synchronous read runs in a new module-level `_fetch_execution_fills()`
+via `asyncio.to_thread`, opening and closing its own `Session` entirely
+inside the worker (`scanner-route-db-offload`'s convention, as #181). Empty
+table or non-matching symbol returns `{"fills": []}`, 200. Read-only: no
+write, migration, trading control, or UI; no frontend consumer yet.
+
+Findings recorded, not worked around: (1) `TestClient(app)` runs the real
+`lifespan()`, whose unconditional `rebuild_from_ledger()` genuinely applies
+hand-inserted simulated fills and writes `positions`/`position_fill_receipts`
+rows — the new test file's cleanup therefore covers those tables, unlike
+`test_execution_orders_route.py`'s. (2) A fill whose `qty` exceeds its order's
+`qty` is retroactively flagged `anomaly = "overfill"` by that reconciliation
+(`portfolio_state/legacy.py`), so tests keep order and fill quantities
+consistent unless they are testing the anomaly. (3) A test opening
+`TestClient(app)` twice in one function failed at the second shutdown
+(`bus.stop()`: `Queue ... is bound to a different event loop`); no other test
+in the suite does this. The tests were split to one boot per function; the
+singleton bus's behavior under a double boot is outside this route's
+footprint and was not changed. See `execution-engine-design.md` §6.3
+(as-built note, component data-flow and internal-flow diagrams) and §6.8's
+`fills` row annotation; verification in `TESTING.md`.
