@@ -392,6 +392,36 @@ export async function fetchExecutionOrders(symbol?: string): Promise<ExecutionOr
   return (await res.json()) as ExecutionOrdersWireShape;
 }
 
+// GET /intelligence/execution-fills (decision #183): simulated fills in
+// descending ledger_seq order, default limit 50. Keep exact decimal strings
+// intact; converting price or commission to number would lose precision.
+export interface ExecutionFillWireShape {
+  ledger_seq: number;
+  client_order_id: string;
+  trade_id: string;
+  symbol: string;
+  execution_venue: string;
+  venue_fill_id: string;
+  qty: number;
+  price: string;
+  venue_ts: string;
+  commission: string | null;
+  anomaly: string | null;
+  created_at: string;
+}
+
+export interface ExecutionFillsWireShape {
+  fills: ExecutionFillWireShape[];
+}
+
+export async function fetchExecutionFills(): Promise<ExecutionFillsWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-fills`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionFillsWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's current contents) —

@@ -1,3 +1,32 @@
+# TESTING — `execution-panel-fill-history`
+
+## Environment and results
+
+- Current `main` at `f0a624914488b769176582bcf04ef70aae093f6b`;
+  GitHub `main` matched immediately before packaging. Working tree was clean
+  before this delivery. Frontend only; no database or backend test run.
+- `npm run build` in `frontend/`: passed (`tsc -b && vite build`, 103 modules).
+  Vite's >500 kB chunk advisory remains.
+- Focused direct execution of the shipped `fetchExecutionFills` function via
+  TypeScript transpilation and a stubbed `fetch`: bare route URL, exact price
+  and commission strings, preserved response order, and HTTP error detail/
+  status all passed. Source-level panel guards confirmed expansion mounting,
+  refresh dependency, stale-response cleanup, distinct loading/error/empty
+  branches, ordered mapping keyed by `ledger_seq`, and required field renders.
+
+The repo has no frontend DOM test runner. The source guards do not simulate
+clicks or prove visual fit at narrow widths; a browser check with populated
+fills remains useful. The first scratch check failed because its VM context
+omitted CommonJS `exports`; the corrected harness passed. No scratch files
+were retained.
+
+## Package
+
+`execution-panel-fill-history.zip` contains exactly:
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
 # TESTING — `execution-orders-symbol-filter`
 
 ## Environment

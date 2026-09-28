@@ -1,3 +1,28 @@
+# CHANGES — `execution-panel-fill-history`
+
+## Current delivery
+
+Added a typed `fetchExecutionFills()` client for decision #183's existing
+`GET /intelligence/execution-fills` route and a compact "Recent simulated
+fills" section to the Execution panel. Opening the panel fetches the
+unfiltered default 50 simulated fills; the section's Refresh fetches again.
+Rows retain the route's descending `ledger_seq` order and show symbol,
+quantity, exact price string, venue time, known exact commission, and any
+anomaly. Unknown commission is omitted. Loading, empty, and request error
+states are distinct, and late responses after collapse or refresh are ignored.
+
+The persisted fills section remains separate from the transient WebSocket
+activity feed. There is no backend, database, polling, or trading-control
+change. The existing execution design now describes this as-built frontend
+path. No new decision was needed: decision #183 establishes the read contract,
+and this consumer follows the existing panel's persisted-order read pattern.
+
+## Package
+
+`execution-panel-fill-history.zip` contains the two frontend files,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, and
+`TESTING.md`, all root-relative.
+
 # CHANGES — `execution-orders-symbol-filter`
 
 ## Current delivery

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
 import {
+  fetchExecutionFills,
   fetchExecutionOrders,
   fetchExecutionStartupStatus,
   fetchExitIntents,
+  type ExecutionFillsWireShape,
   type ExecutionOrdersWireShape,
   type ExecutionStartupStatusWireShape,
   type ExitIntentsWireShape,
@@ -20,8 +22,8 @@ const DEFAULT_WIDTH = 300;
 // Deliberately local component state (collapsed/widthPx), not threaded
 // through WorkspaceContext.tsx — same reasoning BacktestResultsPanel.tsx's
 // own header comment gives for itself. The event list is transient; the
-// separate exit-intent and persisted-order snapshots are fetched again when
-// this panel opens. Neither snapshot is merged into the WebSocket feed.
+// separate exit-intent, persisted-order, and persisted-fill snapshots are
+// fetched again when this panel opens. None is merged into the WebSocket feed.
 
 // Time-only, like InfoTab.tsx's formatExitTime/AIAnalysisPanel.tsx's
 // formatDetectedAt (a "recent activity, today" feed, same posture) — but
@@ -282,6 +284,63 @@ function RecentSimulatedOrders() {
   );
 }
 
+type ExecutionFillsLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExecutionFillsWireShape };
+
+function RecentSimulatedFills() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<ExecutionFillsLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExecutionFills()
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return (
+    <section className="border-b border-base-border" aria-label="Recent simulated fills">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Recent simulated fills</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          disabled={load.kind === "loading"}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+        >
+          Refresh
+        </button>
+      </div>
+      {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading simulated fills…</p>}
+      {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch simulated fills: {load.message}</p>}
+      {load.kind === "ready" && load.data.fills.length === 0 && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">No simulated fills recorded yet.</p>
+      )}
+      {load.kind === "ready" && load.data.fills.length > 0 && (
+        <div className="max-h-48 overflow-y-auto border-t border-base-border">
+          {load.data.fills.map((fill) => (
+            <div key={fill.ledger_seq} className="border-b border-base-border px-2 py-1.5 font-mono text-[10px] last:border-b-0">
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <span className="text-text-primary">{fill.symbol} · {fill.qty} @ {fill.price}</span>
+                <time className="text-text-muted" dateTime={fill.venue_ts}>{formatTriggerTime(fill.venue_ts)}</time>
+              </div>
+              {fill.commission !== null && <div className="text-text-muted">Commission: {fill.commission}</div>}
+              {fill.anomaly !== null && <div className="text-bear">Anomaly: {fill.anomaly}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 type StartupStatusLoad =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -472,6 +531,7 @@ export function ExecutionLifecyclePanel() {
         {!collapsed && <StartupStatusLine />}
         {!collapsed && <ObservedExitTriggers />}
         {!collapsed && <RecentSimulatedOrders />}
+        {!collapsed && <RecentSimulatedFills />}
         {!collapsed && <ExecutionLifecycleBody />}
       </div>
     </div>

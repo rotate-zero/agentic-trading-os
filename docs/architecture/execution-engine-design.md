@@ -602,10 +602,44 @@ _fetch_execution_fills()  [worker thread — opens AND closes its own Session]
 {"fills": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
 ```
 
-No frontend consumer yet — same posture the orders route's own original
-delivery took before its later, separate panel-consumer decision. This
-delivery adds no order placement, ledger write, schema migration, or change
-to any execution decision.
+At the route delivery there was no frontend consumer — the orders route's
+original delivery took the same posture before its panel consumer. The route
+adds no order placement, ledger write, or schema migration.
+
+**Frontend read path (as built, `execution-panel-fill-history`).** The Execution
+panel mounts a separate "Recent simulated fills" section when expanded. It
+fetches the route's unfiltered default 50 rows on mount and on that section's
+manual Refresh. Rows remain in the server's descending `ledger_seq` order,
+keyed by `ledger_seq`; the panel shows symbol, quantity, exact price string,
+venue timestamp, known commission (exact string), and any anomaly. Unknown
+commission is omitted rather than shown as zero. Loading, empty, and request
+failure have distinct displays. Collapse unmounts the section and its
+in-flight response is ignored. The persisted fill snapshot does not enter
+the transient WebSocket activity feed and has no polling or action control.
+
+```
+fills JOIN orders ──► GET /intelligence/execution-fills ──► fetchExecutionFills()
+ simulated only; default 50; ledger_seq DESC                │
+                                                            ▼
+                                       ExecutionLifecyclePanel
+                                       Recent simulated fills
+
+Event Bus ──► execution WebSocket ──► useOrderLifecycle()
+                                           │
+                                           ▼
+                                  WebSocket activity feed
+```
+
+```
+panel expands ──► mount RecentSimulatedFills ──► loading ──► fetchExecutionFills()
+manual Refresh ──► refreshKey increment ───────────────────────────┘
+       │
+       ├─ request error ──► error message
+       └─ 200 ──► fills: [] ──► empty ledger message
+                  └─ rows ──► render in server order, keyed by ledger_seq
+                               (symbol/qty/exact price/venue time/known fee/anomaly)
+collapse ──► unmount and ignore any late response
+```
 
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
 
