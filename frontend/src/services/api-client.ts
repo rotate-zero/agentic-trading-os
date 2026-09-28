@@ -430,6 +430,45 @@ export async function fetchExecutionFills(symbol?: string): Promise<ExecutionFil
   return (await res.json()) as ExecutionFillsWireShape;
 }
 
+// GET /intelligence/execution-positions (route added in `execution-positions-route`;
+// table and semantics from decision #172): persisted simulated positions,
+// `opened_at` descending with a stable `position_id` tie-break, default limit
+// 50. This is a persisted-row snapshot, not a live portfolio — no mark price,
+// unrealized P&L or exposure is returned. `qty` is the quantity currently
+// held (0 once `status` is "closed"), `avg_price` the weighted-average entry
+// cost, and `realized_pnl` the lifetime GROSS realized amount (before
+// commissions). The four money fields are exact decimal strings — keep them
+// as strings; converting to number would lose precision. `stop`, `target`,
+// `closed_at` and `realized_pnl` are null when unset, which is different from
+// zero. No `symbol`/`limit` arguments: the panel's only caller wants the
+// default unfiltered 50 rows.
+export interface ExecutionPositionWireShape {
+  position_id: string;
+  trade_id: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  qty: number;
+  status: "open" | "closing" | "closed";
+  avg_price: string;
+  stop: string | null;
+  target: string | null;
+  opened_at: string;
+  closed_at: string | null;
+  realized_pnl: string | null;
+}
+
+export interface ExecutionPositionsWireShape {
+  positions: ExecutionPositionWireShape[];
+}
+
+export async function fetchExecutionPositions(): Promise<ExecutionPositionsWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-positions`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionPositionsWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's current contents) —

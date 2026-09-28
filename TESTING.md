@@ -1,3 +1,104 @@
+# TESTING — `execution-panel-position-history`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main`. Code and harness were authored and run on
+  base `e1814fd`; `origin/main` then advanced to `a8c4b84`
+  (`execution-exit-requests-route`), which changed only backend and
+  documentation files (no `frontend/` file). The work was fast-forwarded onto
+  `a8c4b84` and the build re-run there; the scratch harness was **not** re-run
+  after the fast-forward (it had already been deleted), which is safe only
+  because no frontend file changed between the two bases. Local branch only;
+  nothing merged or pushed.
+- Frontend only. No backend, database or Python test was run: no backend file
+  changed.
+- `npm ci` from the committed lockfile.
+
+## Results
+
+- `npm run build` (`tsc -b && vite build`): **clean, zero type errors, 103
+  modules transformed** — on the base before the change, after it, and again after
+  the fast-forward. The >500 kB chunk advisory is pre-existing.
+- Scratch behavioral harness: **18 tests, all passing**, run against the real
+  `ExecutionLifecyclePanel` and the real `fetchExecutionPositions` in jsdom, with a
+  stubbed global `fetch` and a stubbed `useOrderLifecycle` hook that emits one
+  fixed WebSocket-side event:
+  - Client (2): the request is the bare `/intelligence/execution-positions` path
+    (no query string); exact strings (`0.1000000000000000055511151231257827`,
+    `1E+3`) come back untouched; a non-OK response throws `ApiError`.
+  - Fetch timing (1): nothing is requested while the panel is collapsed; expanding
+    requests once.
+  - Rendering (4): loading text, then rows in server order (`ZZZ, AAA, MMM` is not
+    re-sorted); symbol, side, status, qty, exact average entry, stop/target and
+    gross realized P&L all render, with the loss tone; null stop, target and P&L
+    are omitted (checked with each null in turn) rather than shown as zero; known
+    `0.000000` and `-0.000000` P&L are shown and neutral while a gain is green.
+  - Closed positions (1): `closed` with qty 0 reads "Qty 0 — closed, nothing
+    held" and is dimmed; a `closed` row with qty 5 shows `Qty 5` and no "nothing
+    held" wording.
+  - States (2): empty text versus error text are distinct and each recovers on a
+    later Refresh; a network failure (rejected fetch) shows the error line.
+  - Refresh and staleness (4): Refresh re-requests the identical URL; with two
+    requests in flight, a stale response is discarded whether it resolves after
+    or before the newer one; a stale *failure* does not overwrite newer rows.
+  - Lifecycle (2): a response arriving after unmount is discarded with no React
+    error logged; collapse discards the in-flight response and re-expanding
+    fetches afresh, showing loading and not the discarded row.
+  - Separation (2): the WebSocket-only event appears outside the positions section
+    and the snapshot row appears in no other section; each of the positions,
+    orders and fills endpoints is hit exactly once with no polling; the section
+    says it is "not the live portfolio"; Refreshing positions issues exactly one
+    request and does not refetch the sibling sections.
+- Regression guards: with the original `api-client.ts` restored, **all 18 fail**
+  (the panel then imports a function that does not exist, so the file cannot run at
+  all); with the original panel restored, **16 of 18 fail** (the two client tests
+  still pass); with both new files back, 18/18 pass.
+- `git diff --check`: clean.
+
+## How the harness ran (and its limits)
+
+The repo has no frontend test runner, so `vitest@2`, `jsdom@24`,
+`@testing-library/react@16` and `@testing-library/dom@10` were installed with
+`npm install --no-save`, and the harness lived in an untracked `frontend/.scratch/`
+directory. All of it was deleted, and `npm ci` re-run, before the final build and
+packaging; `package.json`, `package-lock.json` and `tsconfig.tsbuildinfo` are
+unchanged (the build rewrites the last one, so it was restored with
+`git checkout`).
+
+## Not covered
+
+- Browser rendering, styling, colour and narrow-panel fit were not looked at;
+  jsdom has no layout. The dimmed style for closed rows is asserted by class name,
+  not by looking at it.
+- Tone (gain/loss/neutral) is asserted by the `text-bull` / `text-bear` class
+  names, not by rendered colour.
+- No test against a running backend or real `positions` rows. Server ordering,
+  the simulated scope and the `null` semantics are covered by
+  `backend/tests/test_execution_positions_route.py`, which this delivery does not
+  touch and did not re-run.
+- No test with 50+ rows or very long decimal strings for layout; the list is a
+  `max-h-48` scroll box like its siblings.
+
+## Manual check (recommended)
+
+With the backend running and a mix of open, partially reduced and closed simulated
+positions: expand the Execution panel and confirm the section shows them in the
+same order as `curl /intelligence/execution-positions`; a closed position reads
+"Qty 0 — closed, nothing held"; a position with no stop shows no Stop text; press
+Refresh after changing a position and confirm the new values appear; stop the
+backend and press Refresh to see the error line; collapse and re-expand to see it
+reload. Confirm the WebSocket activity list and the World View portfolio behave as
+before.
+
+## Package
+
+`execution-panel-position-history.zip` contains exactly five files, root-relative:
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-exit-requests-route`
 
 ## Environment

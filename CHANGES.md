@@ -1,3 +1,95 @@
+# CHANGES — `execution-panel-position-history`
+
+## Current delivery
+
+Added a compact "Recent simulated positions" section to the Execution panel
+(`ExecutionLifecyclePanel.tsx`) and a typed `fetchExecutionPositions()` client
+(`api-client.ts`). Frontend only.
+
+**Provenance.** `GET /intelligence/execution-positions` was added by
+`execution-positions-route` (commit `9dcb879`) over the `positions` table built by
+decision #172. Nothing in the frontend called it; its record says "No frontend
+consumer". This task is that missing caller, the positions counterpart of the
+orders and fills panel sections. It is not a contract change, and no backend file
+was touched.
+
+- `frontend/src/services/api-client.ts`: new `ExecutionPositionWireShape`,
+  `ExecutionPositionsWireShape` and `fetchExecutionPositions()`. It requests the
+  bare route (server default 50 rows) and throws `ApiError` on a non-OK response,
+  like its siblings. `avg_price`, `stop`, `target` and `realized_pnl` are typed as
+  strings (`stop`, `target`, `realized_pnl` nullable) and never converted to
+  numbers.
+- `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`: new
+  `RecentSimulatedPositions` section (mounted after the fills section), a
+  `PositionRow`, and a small `pnlSign()` helper. Nothing else in the file changed
+  except the imports, one header comment sentence, and the mount line.
+
+**Behavior.**
+
+- Fetches when the panel expands (the section mounts) and on the section's own
+  Refresh. No polling, no filter, no `limit` argument.
+- Rows are rendered in server order, keyed by `position_id`; nothing re-sorts.
+- Each row: symbol · side, status, `Qty <n>`, `Avg entry <exact string>`,
+  `Stop`/`Target` only when non-null, and `Gross realized P&L` only when non-null.
+  A known `0.000000` P&L is shown, in the neutral colour; `null` is omitted, never
+  shown as zero.
+- A closed position with quantity zero reads "Qty 0 — closed, nothing held" and
+  is dimmed. The wording needs both `status === "closed"` and `qty === 0`; a
+  closed row with a non-zero quantity shows the real quantity.
+- Distinct loading, empty ("No simulated positions recorded yet.") and error
+  states.
+- Each effect run has an `active` flag cleared by its cleanup, so a response or
+  failure that arrives after unmount/collapse, or after a newer Refresh, is
+  discarded.
+- The section says it is a persisted snapshot, not the live portfolio, that qty is
+  what is currently held, and that P&L is gross (before commissions).
+- Separate from the WebSocket activity feed and from the live World View
+  portfolio: it neither reads nor feeds either, and Refreshing it does not refetch
+  the other sections.
+
+**One deliberate difference from the orders/fills sections:** Refresh stays
+enabled while a request is loading (those sections disable their controls). The
+task requires discarding a response superseded by Refresh, which is only
+reachable if Refresh can be pressed mid-flight, and this section has no input
+that could change under a pending request. Say so if you prefer the disabled
+pattern; it is a one-attribute change.
+
+Documentation: `execution-engine-design.md` §6.3 gains a "Frontend read path (as
+built, `execution-panel-position-history`)" note with data-flow and internal-flow
+diagrams, directly after the positions route section. That section's sentence "No
+frontend consumer" was true only of the route delivery, so it now says so and
+points to the new note; no other existing text was changed. `TESTING.md` records
+the verification.
+
+Decision number: none assigned. This delivery runs in parallel with other work,
+so the slug `execution-panel-position-history` is the temporary identifier;
+`confirmed-decisions.md` and `INDEX.md` are deliberately untouched. The routes
+and ledger this consumes are already covered by their own records; whether a
+UI-only consumer needs its own number is left to integration, after re-checking
+`main` and the canonical logs (`origin/main` at packaging: `a8c4b84`).
+
+## Findings (recorded, not acted on)
+
+- Positions rows show the server's exact strings, so a value such as `185.100000`
+  keeps its trailing zeros, matching the fills section's treatment of `price`. A
+  friendlier display format would be a separate presentation choice.
+- The list is capped at the route's 50 rows with a scrolling `max-h-48` box. There
+  is no "showing latest 50" note and no paging; older positions are simply not
+  visible in the panel.
+- The repo still has no frontend test runner or `test` script. Verification used a
+  scratch harness that is not shipped (see `TESTING.md`).
+
+## Boundary
+
+No backend, migration, ledger write, position accounting, exit or trading-control
+change. `RecentSimulatedOrders`, `RecentSimulatedFills`, `StartupStatusLine`,
+`ObservedExitTriggers`, the WebSocket hook and every existing API function are
+untouched. `package.json`, `package-lock.json` and `tsconfig.tsbuildinfo` are
+unchanged. This file sits on top of `execution-exit-requests-route` (`a8c4b84`);
+the previous delivery records are retained below.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-exit-requests-route`
 
 ## Current delivery

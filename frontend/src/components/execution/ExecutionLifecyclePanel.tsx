@@ -3,10 +3,13 @@ import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLife
 import {
   fetchExecutionFills,
   fetchExecutionOrders,
+  fetchExecutionPositions,
   fetchExecutionStartupStatus,
   fetchExitIntents,
   type ExecutionFillsWireShape,
   type ExecutionOrdersWireShape,
+  type ExecutionPositionWireShape,
+  type ExecutionPositionsWireShape,
   type ExecutionStartupStatusWireShape,
   type ExitIntentsWireShape,
 } from "../../services/api-client";
@@ -23,7 +26,9 @@ const DEFAULT_WIDTH = 300;
 // through WorkspaceContext.tsx — same reasoning BacktestResultsPanel.tsx's
 // own header comment gives for itself. The event list is transient; the
 // separate exit-intent, persisted-order, and persisted-fill snapshots are
-// fetched again when this panel opens. None is merged into the WebSocket feed.
+// fetched again when this panel opens (the persisted-position snapshot too).
+// None is merged into the WebSocket feed, and none is the live World View
+// portfolio.
 
 // Time-only, like InfoTab.tsx's formatExitTime/AIAnalysisPanel.tsx's
 // formatDetectedAt (a "recent activity, today" feed, same posture) — but
@@ -74,6 +79,18 @@ function emptyOrdersMessage(appliedSymbol: string | undefined): string {
 // that matches nothing must not read as "the ledger is empty."
 function emptyFillsMessage(appliedSymbol: string | undefined): string {
   return appliedSymbol ? `No simulated fills for ${appliedSymbol}.` : "No simulated fills recorded yet.";
+}
+
+// Sign of an exact decimal string for tone only — the displayed value stays
+// the server's string verbatim (never round-tripped through a number). A
+// leading "-" is negative; otherwise a value with any non-zero digit in its
+// mantissa is positive, so "0", "0.000000" and "-0.000000" all read as flat.
+function pnlSign(value: string): "gain" | "loss" | "flat" {
+  const trimmed = value.trim();
+  const negative = trimmed.startsWith("-");
+  const mantissa = trimmed.replace(/^[+-]/, "").split(/e/i)[0];
+  if (!/[1-9]/.test(mantissa)) return "flat";
+  return negative ? "loss" : "gain";
 }
 
 type Tone = "bull" | "bear" | "signal" | "muted";
@@ -390,6 +407,112 @@ function RecentSimulatedFills() {
   );
 }
 
+type ExecutionPositionsLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExecutionPositionsWireShape };
+
+const POSITION_STATUS_TONE: Record<ExecutionPositionWireShape["status"], Tone> = {
+  open: "signal",
+  closing: "signal",
+  closed: "muted",
+};
+
+function PositionRow({ position }: { position: ExecutionPositionWireShape }) {
+  // A closed position with nothing held is the one case worth spelling out:
+  // "qty 0" alone reads like missing data. Only both facts together get the
+  // "flat" wording — a closed row with a non-zero qty (which the ledger should
+  // never produce) shows its real qty and is not dressed up as flat.
+  const closedFlat = position.status === "closed" && position.qty === 0;
+  const sign = position.realized_pnl === null ? null : pnlSign(position.realized_pnl);
+  return (
+    <div
+      className={`border-b border-base-border px-2 py-1.5 font-mono text-[10px] last:border-b-0 ${closedFlat ? "opacity-70" : ""}`}
+      data-testid="execution-position-row"
+      data-status={position.status}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-1">
+        <span className="text-text-primary">
+          {position.symbol} · {position.side}
+        </span>
+        <span className={TONE_CLASS[POSITION_STATUS_TONE[position.status] ?? "muted"]}>{position.status}</span>
+      </div>
+      <div className="text-text-muted">
+        {closedFlat ? "Qty 0 — closed, nothing held" : `Qty ${position.qty}`} · Avg entry {position.avg_price}
+      </div>
+      {(position.stop !== null || position.target !== null) && (
+        <div className="text-text-muted">
+          {position.stop !== null && <span>Stop {position.stop}</span>}
+          {position.stop !== null && position.target !== null && <span> · </span>}
+          {position.target !== null && <span>Target {position.target}</span>}
+        </div>
+      )}
+      {position.realized_pnl !== null && sign !== null && (
+        <div className={sign === "gain" ? "text-bull" : sign === "loss" ? "text-bear" : "text-text-muted"}>
+          Gross realized P&amp;L: {position.realized_pnl}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Persisted `positions` rows only (GET /intelligence/execution-positions) —
+// deliberately NOT the WebSocket feed below and NOT the live World View
+// portfolio: no mark price, unrealized P&L or exposure exists here, and
+// nothing in this section polls or merges with those surfaces. Refresh stays
+// enabled while a request is in flight (unlike the orders/fills sections) so a
+// slow or hung request can be superseded; the effect cleanup discards the
+// superseded response either way.
+function RecentSimulatedPositions() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<ExecutionPositionsLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExecutionPositions()
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    // Runs on unmount (collapse) and before every re-run (Refresh): the
+    // superseded request's response finds active === false and is dropped.
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return (
+    <section className="border-b border-base-border" aria-label="Recent simulated positions">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Recent simulated positions</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
+        >
+          Refresh
+        </button>
+      </div>
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+        Persisted snapshot — not the live portfolio. Qty is what is currently held; P&amp;L is gross realized, before
+        commissions.
+      </p>
+      {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading simulated positions…</p>}
+      {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch simulated positions: {load.message}</p>}
+      {load.kind === "ready" && load.data.positions.length === 0 && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">No simulated positions recorded yet.</p>
+      )}
+      {load.kind === "ready" && load.data.positions.length > 0 && (
+        <div className="max-h-48 overflow-y-auto border-t border-base-border">
+          {load.data.positions.map((position) => (
+            <PositionRow key={position.position_id} position={position} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 type StartupStatusLoad =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -581,6 +704,7 @@ export function ExecutionLifecyclePanel() {
         {!collapsed && <ObservedExitTriggers />}
         {!collapsed && <RecentSimulatedOrders />}
         {!collapsed && <RecentSimulatedFills />}
+        {!collapsed && <RecentSimulatedPositions />}
         {!collapsed && <ExecutionLifecycleBody />}
       </div>
     </div>

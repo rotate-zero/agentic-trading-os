@@ -783,9 +783,73 @@ _fetch_execution_positions()  [worker thread — opens AND closes its own Sessio
 {"positions": [...]}   200 always; [] for an empty table or a non-matching symbol, never an error
 ```
 
-No frontend consumer — this delivery adds no order placement, ledger write,
-schema migration, position accounting, exit placement, or trading-control
-change.
+At the route delivery there was no frontend consumer — that delivery added no
+order placement, ledger write, schema migration, position accounting, exit
+placement, or trading-control change. The panel consumer is documented next.
+
+**Frontend read path (as built, `execution-panel-position-history`; decision
+number assigned at integration if one is needed).** The Execution panel mounts a
+separate "Recent simulated positions" section when expanded. A typed
+`fetchExecutionPositions()` (`api-client.ts`, wire types
+`ExecutionPositionWireShape` / `ExecutionPositionsWireShape`) requests the bare
+route, so the server's default 50 rows, and the section fetches on mount and on
+its own manual Refresh. It has no `symbol` filter, no `limit` argument and no
+polling. Rows render in the server's order (`opened_at` descending, `position_id`
+tie-break) and are keyed by `position_id`; the panel never re-sorts them.
+
+Each row shows symbol and side, status (`open`, `closing`, `closed`), current
+quantity, average entry price (labelled "Avg entry"), stop and target when
+known, and gross realized P&L when known. `avg_price`, `stop`, `target` and
+`realized_pnl` stay exact decimal strings end to end, so they render verbatim
+(`185.100000`), never through `Number`. A `null` stop, target or realized P&L
+is omitted rather than shown as zero or a dash (I3: unknown is not zero);
+a known `0.000000` P&L is shown, in the neutral tone. Sign is read from the
+string only to pick the gain/loss colour. A closed position whose quantity is
+zero reads "Qty 0 — closed, nothing held" and is dimmed; a `closed` row that
+somehow carries a non-zero quantity shows its real quantity and is not called
+flat. The section states that it is a persisted snapshot, not the live portfolio,
+that quantity is what is currently held, and that P&L is gross, before
+commissions.
+
+Loading, empty ("No simulated positions recorded yet.") and request failure have
+distinct displays. Each effect run owns an `active` flag that its cleanup clears,
+so a response that arrives after collapse/unmount, or after a newer Refresh has
+superseded it, is discarded — success and failure alike. Unlike the orders and
+fills sections, Refresh here stays enabled while a request is in flight, so a
+slow request can be superseded rather than waited out.
+
+The snapshot is independent of everything else in the panel: it is not merged
+into the WebSocket activity feed (`useOrderLifecycle`), does not read or write
+`PortfolioState.get_snapshot()` or the live World View portfolio, computes no
+mark price, unrealized P&L or exposure, and Refreshing it does not refetch the
+sibling sections. No backend, migration, ledger-write or trading-control change.
+
+```
+positions [durable projection of fills, Portfolio State the single writer]
+   │  SELECT ... simulated ... ORDER BY opened_at DESC, position_id DESC LIMIT 50
+   ▼
+GET /intelligence/execution-positions ──► fetchExecutionPositions()   (no query string)
+ money as decimal strings; null = unknown                │
+                                                         ▼
+                                    ExecutionLifecyclePanel
+                                    Recent simulated positions  (own load state, own Refresh)
+
+Event Bus ──► execution WebSocket ──► useOrderLifecycle() ──► WebSocket activity feed
+PortfolioState in-process snapshot ──► live World View portfolio
+        (neither is read by, nor merged into, the positions section)
+```
+
+```
+panel expands ──► mount RecentSimulatedPositions ──► loading ──► fetchExecutionPositions()
+manual Refresh ──► refreshKey++ ─► cleanup marks previous run inactive ─┘   (enabled mid-flight)
+       │
+       ├─ request error ──► error line ("Could not fetch simulated positions: ...")
+       └─ 200 ──► positions: [] ──► "No simulated positions recorded yet."
+                  └─ rows ──► render in server order, keyed by position_id
+                       per row: symbol · side · status · Qty (or "Qty 0 — closed, nothing held")
+                                · Avg entry · [Stop · Target if non-null] · [Gross realized P&L if non-null]
+collapse / unmount ──► cleanup marks run inactive; a late response or late failure is ignored
+```
 
 ### 6.4 `OrderVenue` port, the `execution` registry role, and `SimulatedVenue` (EX-3)
 
