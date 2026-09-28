@@ -1184,7 +1184,75 @@ _fetch_execution_exit_requests()  [worker thread — opens AND closes its own Se
 {"exit_requests": [...]}   200 always; [] for an empty table or a non-matching symbol
 ```
 
-No frontend consumer, migration, exit-policy or placement change.
+The route delivery had no frontend consumer, migration, exit-policy or
+placement change; the read-only panel consumer is documented next.
+
+**Frontend read path (as built, `execution-panel-exit-requests`; decision number
+assigned at integration if one is needed).** The Execution panel mounts a separate
+"Recorded exit requests" section when expanded, directly after "Observed exit
+triggers". A typed `fetchExecutionExitRequests()` (`api-client.ts`, wire types
+`ExecutionExitRequestWireShape` / `ExecutionExitRequestsWireShape`) requests the
+bare route, so the server's default 50 rows, and the section fetches on mount
+(panel expansion) and on its own manual Refresh. It has no `symbol` filter, no
+`limit` argument, no polling and no action control. Rows render in the server's
+order (`trigger_ts` descending, `position_id` tie-break) and are keyed by
+`position_id`; the panel never re-sorts them.
+
+Each row shows the symbol and the reason ("Stop" / "Target"), the trigger time,
+the exact trigger price, the position's *current* status (`open`, `closing`,
+`closed`) and remaining quantity, and — only when the stored value is non-null —
+`Retry after <time>`. `trigger_price` stays the server's exact decimal string
+(`10.123400`, `1E+3`) and is never passed through `Number`. A `null` `retry_after`
+is omitted, not shown as "none" or as a completed retry. The section states that
+a recorded request does not prove an order was placed or that the position is
+protected, and that status and remaining quantity are current, not as of the
+trigger. `retry_after` is displayed as the stored timestamp only; the UI infers
+no retry outcome.
+
+Loading, empty ("No exit requests recorded yet.") and request failure have
+distinct displays. Each effect run owns an `active` flag that its cleanup clears,
+so a response or failure that arrives after collapse/unmount, or after a newer
+Refresh has superseded it, is discarded. As in the positions section, Refresh
+stays enabled while a request is in flight so a slow request can be superseded.
+
+It is deliberately a different surface from its neighbours. "Observed exit
+triggers" reads `GET /intelligence/exit-intents` (the running monitor's in-memory,
+`observed_only` view, empty after a restart); this section reads only the durable
+`exit_requests` rows and never the monitor. It reads no orders or fills, so it
+cannot show which order closed a position or at what price; those stay in their
+own sections. Refreshing it refetches no sibling section, and it is not merged
+into the WebSocket activity feed. No backend, migration, ledger-write, exit-policy
+or trading-control change.
+
+```
+Position Monitor ──► ExitIntent (memory) ──► GET /intelligence/exit-intents ──► "Observed exit triggers"
+       │                                       (unchanged; observed_only)         (separate section)
+       ▼
+Execution Engine ──► PostgresExitLedger.observe() ──► exit_requests  [durable, PK position_id]
+                                                          │  INNER JOIN positions (simulated only)
+                                                          ▼
+                     GET /intelligence/execution-exit-requests ──► fetchExecutionExitRequests()   (no query string)
+                       trigger_price = exact decimal string                     │
+                                                                                ▼
+                                                             ExecutionLifecyclePanel
+                                                             "Recorded exit requests"  (own load state, own Refresh)
+
+not read by this section: /exit-intents · orders · fills · the WebSocket feed · any retry or protection state
+```
+
+```
+panel expands ──► mount RecordedExitRequests ──► loading ──► fetchExecutionExitRequests()
+manual Refresh ──► refreshKey++ ─► cleanup marks previous run inactive ─┘   (enabled mid-flight)
+       │
+       ├─ request error ──► error line ("Could not fetch recorded exit requests: ...")
+       └─ 200 ──► exit_requests: [] ──► "No exit requests recorded yet."
+                  └─ rows ──► render in server order, keyed by position_id
+                       per row: symbol · Stop|Target · trigger time · Trigger price <exact string>
+                                · Position <status> · remaining qty <n> · [Retry after <time> if non-null]
+                       header note: a recorded request does not prove an order was placed
+                                    or that the position is protected
+collapse / unmount ──► cleanup marks run inactive; a late response or late failure is ignored
+```
 
 **What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
@@ -1237,7 +1305,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 | `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order. Exposed over HTTP by `GET /intelligence/execution-fills` (decision #183, §6.3) — curated, joined to `orders` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]` | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
 | `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills`. Exposed over HTTP by `GET /intelligence/execution-positions` (`execution-positions-route`, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]`, newest `opened_at` first (ties: `position_id` descending) | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
-| `exit_requests` (decision #184) | Durable first stop/target observation per position and its retry delay; a recovery record, not a protection guarantee. Exposed over HTTP by `GET /intelligence/execution-exit-requests` (`execution-exit-requests-route`, §6.6) — joined to `positions` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]`, newest `trigger_ts` first (ties: `position_id` descending). Distinct from the in-memory `GET /intelligence/exit-intents` | `position_id` PK/FK, `exit_reason` (`stop` \| `target`), `trigger_price` (> 0), `trigger_ts`, `retry_after` (nullable), `created_at` |
+| `exit_requests` (decision #184) | Durable first stop/target observation per position and its retry delay; a recovery record, not a protection guarantee. Exposed over HTTP by `GET /intelligence/execution-exit-requests` (`execution-exit-requests-route`, §6.6) — joined to `positions` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]`, newest `trigger_ts` first (ties: `position_id` descending). Distinct from the in-memory `GET /intelligence/exit-intents`. Displayed read-only by the Execution panel's "Recorded exit requests" section (`execution-panel-exit-requests`, §6.6) | `position_id` PK/FK, `exit_reason` (`stop` \| `target`), `trigger_price` (> 0), `trigger_ts`, `retry_after` (nullable), `created_at` |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
 | `position_fill_receipts` (entry-lifecycle-wiring — mislabeled "#174" in an earlier edit of this row; #174 was frontend-only, "no backend logic changed" per its own decision entry, and never built this table) | Durable fill application and exact replay inputs | `ledger_seq` PK/FK, unique `(execution_venue, venue_fill_id)`, `execution_mode`, `position_id` FK, `fill_data` JSONB, `trading_day`, `gross_pnl` |
 

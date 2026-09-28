@@ -1,3 +1,99 @@
+# CHANGES — `execution-panel-exit-requests`
+
+## Current delivery
+
+Added a compact "Recorded exit requests" section to the Execution panel
+(`ExecutionLifecyclePanel.tsx`) and a typed `fetchExecutionExitRequests()` client
+(`api-client.ts`). Frontend only.
+
+**Provenance.** `GET /intelligence/execution-exit-requests` was added by
+`execution-exit-requests-route` (commit `a8c4b84`) over the durable `exit_requests`
+table from decision #184. Its record says "No frontend consumer". This task is that
+missing caller, the exit-request counterpart of the orders, fills and positions
+panel sections. It is not a contract change, and no backend file was touched.
+
+- `frontend/src/services/api-client.ts`: new `ExecutionExitRequestWireShape`,
+  `ExecutionExitRequestsWireShape` and `fetchExecutionExitRequests()`. It requests
+  the bare route (server default 50 rows) and throws `ApiError` on a non-OK
+  response, like its siblings. `trigger_price` is typed as a string and never
+  converted to a number; `retry_after` is `string | null`.
+- `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`: new
+  `RecordedExitRequests` section, mounted directly after `ObservedExitTriggers`.
+  It reuses the file's existing `EXIT_REASON_LABEL` and `formatTriggerTime`. Nothing
+  else changed except the imports, one header comment sentence, and the mount line.
+
+**Behavior.**
+
+- Fetches when the panel expands (the section mounts) and on the section's own
+  Refresh. No polling, no filter, no `limit` argument, no buttons other than
+  Refresh, and no trading action.
+- Rows render in server order (`trigger_ts` descending), keyed by `position_id`;
+  nothing re-sorts.
+- Each row: symbol · Stop|Target, trigger time, `Trigger price <exact string>`,
+  `Position <status> · remaining qty <n>`, and `Retry after <time>` only when
+  `retry_after` is non-null.
+- The section says a recorded request does not prove an order was placed or that
+  the position is protected, and that position status and remaining quantity are
+  current, not as of the trigger.
+- Distinct loading, empty ("No exit requests recorded yet.") and error states.
+- Each effect run has an `active` flag cleared by its cleanup, so a response or
+  failure that arrives after collapse/unmount, or after a newer Refresh, is
+  discarded.
+- Separate from "Observed exit triggers" (in-memory `/exit-intents`, different
+  title, note and endpoint), from orders and fills (none is read or implied), and
+  from the WebSocket feed. Refreshing it refetches no other section.
+
+**One deliberate choice, same as the positions section:** Refresh stays enabled
+while a request is loading (the orders, fills and observed-triggers sections
+disable theirs). Discarding a response superseded by Refresh is only reachable if
+Refresh can be pressed mid-flight, and this section has no input that could change
+under a pending request. It is a one-attribute change if you prefer the disabled
+pattern.
+
+Documentation: `execution-engine-design.md` §6.6 gains a "Frontend read path (as
+built, `execution-panel-exit-requests`)" note with data-flow and internal-flow
+diagrams, directly after the exit-requests route section. That section's sentence
+"No frontend consumer" was true only of the route delivery, so it now says so and
+points to the new note; the `exit_requests` row in §6.8 gains one sentence naming
+the panel section. No other existing text was changed. `TESTING.md` records the
+verification.
+
+Decision number: none assigned. This delivery runs in parallel with other work, so
+the slug `execution-panel-exit-requests` is the temporary identifier;
+`confirmed-decisions.md` and `INDEX.md` are deliberately untouched. The route and
+ledger this consumes are already covered by decision #184 and the route's own
+record; whether a UI-only consumer needs its own number is left to integration,
+after re-checking `main` and the canonical logs (`origin/main` at packaging:
+`c2f66e5`; decision log and INDEX end at #184).
+
+## Findings (recorded, not acted on)
+
+- The list is capped at the route's 50 rows with a scrolling `max-h-48` box. There
+  is no "showing latest 50" note and no paging; older requests are not visible.
+- `retry_after` is displayed as stored. The backend never clears it once set
+  (already recorded by `execution-exit-requests-route`), so a past timestamp can
+  remain beside a position that has since closed. The UI does not interpret it.
+- Rows show the exact trigger-price string, so `10.123400` keeps its trailing
+  zeros, as the fills and positions sections do. A friendlier format would be a
+  separate presentation choice.
+- The repo still has no frontend test runner or `test` script. Verification used a
+  scratch harness that is not shipped (see `TESTING.md`).
+- The panel places this section next to "Observed exit triggers" on purpose (same
+  topic, different source). If the two still read as duplicates in use, moving this
+  section below the ledger sections is a layout-only change.
+
+## Boundary
+
+No backend, migration, ledger write, position accounting, exit-policy or
+trading-control change. `RecentSimulatedOrders`, `RecentSimulatedFills`,
+`RecentSimulatedPositions`, `StartupStatusLine`, `ObservedExitTriggers`, the
+WebSocket hook and every existing API function are untouched. `package.json`,
+`package-lock.json` and `tsconfig.tsbuildinfo` are unchanged. This file sits on top
+of `execution-panel-position-history` (`c2f66e5`); the previous delivery records are
+retained below.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-panel-position-history`
 
 ## Current delivery

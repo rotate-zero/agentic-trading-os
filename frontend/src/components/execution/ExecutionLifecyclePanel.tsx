@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
 import {
+  fetchExecutionExitRequests,
   fetchExecutionFills,
   fetchExecutionOrders,
   fetchExecutionPositions,
   fetchExecutionStartupStatus,
   fetchExitIntents,
+  type ExecutionExitRequestsWireShape,
   type ExecutionFillsWireShape,
   type ExecutionOrdersWireShape,
   type ExecutionPositionWireShape,
@@ -26,9 +28,9 @@ const DEFAULT_WIDTH = 300;
 // through WorkspaceContext.tsx — same reasoning BacktestResultsPanel.tsx's
 // own header comment gives for itself. The event list is transient; the
 // separate exit-intent, persisted-order, and persisted-fill snapshots are
-// fetched again when this panel opens (the persisted-position snapshot too).
-// None is merged into the WebSocket feed, and none is the live World View
-// portfolio.
+// fetched again when this panel opens (the persisted-position and recorded
+// exit-request snapshots too). None is merged into the WebSocket feed, and
+// none is the live World View portfolio.
 
 // Time-only, like InfoTab.tsx's formatExitTime/AIAnalysisPanel.tsx's
 // formatDetectedAt (a "recent activity, today" feed, same posture) — but
@@ -655,6 +657,83 @@ function ObservedExitTriggers() {
   );
 }
 
+type ExitRequestsLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExecutionExitRequestsWireShape };
+
+// Durable `exit_requests` rows (GET /intelligence/execution-exit-requests,
+// decision #184) — deliberately NOT the in-memory "Observed exit triggers"
+// section above (different endpoint, different population, survives restart)
+// and NOT orders or fills (no order status or fill is read or implied here).
+// Same manual-Refresh shape as RecentSimulatedPositions: Refresh stays
+// enabled while a request is in flight so a slow or hung request can be
+// superseded, and the effect cleanup discards the superseded response either
+// way (as it does after collapse/unmount). No polling, no action buttons.
+function RecordedExitRequests() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<ExitRequestsLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExecutionExitRequests()
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  return (
+    <section className="border-b border-base-border" aria-label="Recorded exit requests">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Recorded exit requests</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
+        >
+          Refresh
+        </button>
+      </div>
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+        A recorded request does not prove an order was placed or that the position is protected. Position status and
+        remaining quantity are current, not as of the trigger.
+      </p>
+      {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading recorded exit requests…</p>}
+      {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch recorded exit requests: {load.message}</p>}
+      {load.kind === "ready" && load.data.exit_requests.length === 0 && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">No exit requests recorded yet.</p>
+      )}
+      {load.kind === "ready" && load.data.exit_requests.length > 0 && (
+        <div className="max-h-48 overflow-y-auto border-t border-base-border">
+          {load.data.exit_requests.map((request) => (
+            <div
+              key={request.position_id}
+              className="border-b border-base-border px-2 py-1.5 font-mono text-[10px] last:border-b-0"
+              data-testid="execution-exit-request-row"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <span className="text-text-primary">{request.symbol} · {EXIT_REASON_LABEL[request.exit_reason] ?? request.exit_reason}</span>
+                <time className="text-text-muted" dateTime={request.trigger_ts}>{formatTriggerTime(request.trigger_ts)}</time>
+              </div>
+              <div className="text-text-muted">Trigger price {request.trigger_price}</div>
+              <div className="text-text-muted">Position {request.position_status} · remaining qty {request.remaining_qty}</div>
+              {request.retry_after !== null && (
+                <div className="text-text-muted">
+                  Retry after <time dateTime={request.retry_after}>{formatTriggerTime(request.retry_after)}</time>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function ExecutionLifecyclePanel() {
   const [collapsed, setCollapsed] = useState(true); // starts collapsed, same reasoning every other sibling panel here already uses
   const [widthPx, setWidthPx] = useState(DEFAULT_WIDTH);
@@ -702,6 +781,7 @@ export function ExecutionLifecyclePanel() {
 
         {!collapsed && <StartupStatusLine />}
         {!collapsed && <ObservedExitTriggers />}
+        {!collapsed && <RecordedExitRequests />}
         {!collapsed && <RecentSimulatedOrders />}
         {!collapsed && <RecentSimulatedFills />}
         {!collapsed && <RecentSimulatedPositions />}

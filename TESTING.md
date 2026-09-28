@@ -1,3 +1,103 @@
+# TESTING — `execution-panel-exit-requests`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main` at `c2f66e5` (`execution-panel-position-history`
+  on top of `a8c4b84`). `origin/main` was re-fetched immediately before packaging:
+  unchanged. Local branch only; nothing merged or pushed.
+- Frontend only. No backend, database or Python test was run: no backend file
+  changed, and the route's own behavior is covered by
+  `backend/tests/test_execution_exit_requests_route.py`, which this delivery does
+  not touch and did not re-run.
+- `npm ci` from the committed lockfile.
+
+## Results
+
+- `npm run build` (`tsc -b && vite build`): **clean, zero type errors, 103 modules
+  transformed** — on the base before the change and on the final delivery tree. The
+  >500 kB chunk advisory is pre-existing.
+- Scratch behavioral harness: **18 tests, all passing**, run against the real
+  `ExecutionLifecyclePanel` and the real `fetchExecutionExitRequests` in jsdom, with
+  a stubbed global `fetch` (proper empty shapes for every other endpoint) and a
+  stubbed `useOrderLifecycle` hook that emits nothing:
+  - Client (2): the request is the bare `/intelligence/execution-exit-requests`
+    path (no query string); an exact string (`0.1000000000000000055511151231257827`)
+    comes back untouched; a non-OK response throws `ApiError`.
+  - Fetch timing (3): nothing is requested while the panel is collapsed and
+    expanding requests once; no request repeats over 10 minutes of fake time (no
+    polling) while Refresh adds exactly one; collapse then re-expand fetches again.
+  - Rendering (6): loading text, then rows in server order (`ZZZ, AAA, MMM` is not
+    re-sorted) showing symbol, Stop/Target, exact trigger price (`10.123400`,
+    `1E+3`), trigger time attribute, and current status plus remaining quantity
+    (`closing`/3, `open`/7, `closed`/0); `Retry after` appears only for the row with
+    a non-null `retry_after`; the "does not prove an order was placed / position is
+    protected" text is present and the section is distinct from "Observed exit
+    triggers"; empty text versus error text are distinct and each recovers on a
+    later Refresh; a rejected fetch shows the error line; a failing exit-requests
+    request leaves the orders and positions sections rendering normally.
+  - Actions (1): the only button in the section is Refresh.
+  - Late responses (4): with two requests in flight, an older response arriving
+    after the newer one is discarded; an older *failure* arriving after newer rows
+    does not overwrite them; a response arriving after collapse is dropped with no
+    React error logged; a response from a previous expansion does not leak into a
+    re-expansion (it shows loading, then only the new rows).
+  - Separation (1): with distinct symbols in the exit-intents, exit-requests,
+    orders and fills responses, each appears only in its own section, and each of
+    the five endpoints (`exit-intents`, `execution-exit-requests`,
+    `execution-orders`, `execution-fills`, `execution-positions`) is hit exactly
+    once on expansion.
+  - Refresh isolation (1): Refreshing this section issues exactly one request, to
+    its own endpoint.
+- Regression guard (run): with the effect cleanup in `RecordedExitRequests`
+  disabled (`return () => {}` instead of clearing `active`), **2 of 18 fail** — the
+  two Refresh-race tests (stale response, stale failure). With the file restored,
+  18/18 pass. The collapse and re-expansion tests pass either way, because React
+  drops the unmounted component's state; they check observable behavior, not the
+  flag. Reverting the whole client and panel was not separately run.
+- `git diff --check`: clean.
+
+## How the harness ran (and its limits)
+
+The repo has no frontend test runner, so `vitest@2`, `jsdom@25`,
+`@testing-library/react@16` and `@testing-library/dom@10` were installed with
+`npm install --no-save`, and the harness lived in an untracked `frontend/.scratch/`
+directory. All of it was deleted and `npm ci` re-run before the final build and
+packaging; `package.json` and `package-lock.json` are unchanged, and
+`tsconfig.tsbuildinfo` (rewritten by the build) was restored with `git checkout`.
+The harness is not shipped.
+
+## Not covered
+
+- Browser rendering, styling and narrow-panel fit were not looked at; jsdom has no
+  layout.
+- No test against a running backend or real `exit_requests` rows. Server ordering,
+  the simulated scope and `null` semantics are covered by the backend route tests.
+- Time strings are asserted through the `dateTime` attribute, not the
+  locale-formatted text, which depends on the machine's locale and time zone.
+- No test with 50+ rows or very long decimal strings for layout; the list is a
+  `max-h-48` scroll box like its siblings.
+
+## Manual check (recommended)
+
+With the backend running and at least one recorded stop/target request (ideally one
+with a `retry_after` and one whose position is now closed): expand the Execution
+panel and confirm the section lists the same rows in the same order as
+`curl /intelligence/execution-exit-requests`; the trigger price matches the JSON
+string exactly; the position status and remaining quantity match the current
+position; `Retry after` appears only where the JSON has a value. Compare it against
+"Observed exit triggers" after a backend restart: the observed section should empty
+while this one keeps its rows. Stop the backend and press Refresh to see the error
+line; collapse and re-expand to see it reload.
+
+## Package
+
+`execution-panel-exit-requests.zip` contains exactly five files, root-relative:
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-panel-position-history`
 
 ## Environment

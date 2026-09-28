@@ -469,6 +469,45 @@ export async function fetchExecutionPositions(): Promise<ExecutionPositionsWireS
   return (await res.json()) as ExecutionPositionsWireShape;
 }
 
+// GET /intelligence/execution-exit-requests (route added in
+// `execution-exit-requests-route`; table and semantics from decision #184):
+// the DURABLE `exit_requests` rows Execution committed to PostgreSQL, hard-
+// scoped server-side to simulated positions, `trigger_ts` descending with a
+// stable `position_id` tie-break, default limit 50. This is NOT
+// ExitIntentsWireShape above (the running Position Monitor's in-memory,
+// observed-only view, lost on restart) and NOT an order or fill ledger. A row
+// means only "a stop/target observation was durably recorded for this
+// position": it does not say an order was placed, that the position is
+// protected, or that a retry happened. `trigger_price` is an exact decimal
+// string — keep it a string; converting to number would lose precision.
+// `retry_after` is the stored timestamp or null (unset, which is different
+// from "no retry needed"). `position_status` and `remaining_qty` are read at
+// request time from the position, not as of the trigger. No `symbol`/`limit`
+// arguments: the panel's only caller wants the default unfiltered 50 rows.
+export interface ExecutionExitRequestWireShape {
+  position_id: string;
+  symbol: string;
+  exit_reason: "stop" | "target";
+  trigger_price: string;
+  trigger_ts: string;
+  retry_after: string | null;
+  created_at: string;
+  position_status: "open" | "closing" | "closed";
+  remaining_qty: number;
+}
+
+export interface ExecutionExitRequestsWireShape {
+  exit_requests: ExecutionExitRequestWireShape[];
+}
+
+export async function fetchExecutionExitRequests(): Promise<ExecutionExitRequestsWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-exit-requests`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionExitRequestsWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's current contents) —
