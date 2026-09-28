@@ -1,3 +1,80 @@
+# TESTING — `restore-protective-exits-record`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main`, base `9dcb879`; `origin/main` re-fetched
+  before packaging — unchanged. Work on a local branch; nothing merged or
+  pushed.
+- Documentation-only delivery. No database, backend suite, or frontend build was
+  run: no application file changed, and no test reads documentation content
+  (the only `docs/` hits under `backend/tests/` are docstrings and comments).
+
+## Results
+
+- **Application code untouched.** `git diff --stat` against `origin/main` lists
+  only the five documentation files. `4aea47f..a00dbd0` touches no file under
+  `backend/` or `frontend/`, and `4aea47f..main` differs in application code
+  only by the positions route and its tests.
+- **Design doc.** Diffed against `4aea47f`, the file's changed lines are
+  identical (111 of 111) to the lines `9dcb879` itself added — restored text
+  plus the positions-route section, nothing else. The restoration applied
+  `a00dbd0`'s inverse for that file; it applied cleanly with no conflict.
+- **Decision log.** `INDEX.md` and `confirmed-decisions.md` are byte-identical
+  to `4aea47f` (`cmp`). Index and log agree: 184 rows, contiguous `1..184`, no
+  duplicates; the log's tail is `182, 183, 184` in order; row 184 points to
+  `confirmed-decisions.md`; every index pointer names an existing file and
+  numbers fall inside archive filename ranges; no number is in the log or
+  archive but missing from the index. Archive files unchanged.
+- **`CHANGES.md` / `TESTING.md`.** The removed blocks are exactly the first 116
+  and 175 lines of `4aea47f`'s files, which are the lines `a00dbd0` deleted
+  (compared line by line). They were spliced back as pure insertions; the only
+  edits to pre-existing text are the two "Resolved afterwards" annotations in the
+  positions record.
+- `git diff --check`: clean.
+
+## Restored architecture vs current code
+
+Read against `main`, each restored claim held:
+
+- `PostgresExitLedger`: the stop/target-only observation, first-observation
+  storage, entry cancel before close, waiting on fills without a position
+  receipt, reuse or wait for an active close, `<trade_id>:exit:<attempt>` with
+  `positions.exit_attempt` advanced in the same transaction, the 5 s retry
+  delay after a rejected/cancelled close, and the pre-submit recheck.
+- Migration `0015`: `exit_requests`, `orders.position_id`, and the partial
+  unique index `uq_orders_active_exit_per_position` (one active close per
+  position).
+- `ExecutionEngine.on_exit_intent` queues the hand-off; the worker persists,
+  cancels, reserves, rechecks and places. The Position Monitor hands over
+  stop/target only; EOD stays observed. `/intelligence/exit-intents` still
+  reports `intent_status: observed_only`.
+- Startup: Portfolio State applies pending fills before reconciliation;
+  reconciliation validates approved exits without submitting them and reports a
+  discrepancy for an unsafe/unreserved one; a position mismatch against the
+  fresh in-memory `SimulatedVenue` makes reconciliation block execution.
+- The fills-panel text matches `RecentSimulatedFills` and
+  `fetchExecutionFills`: mounts on expand, unfiltered default fetch, Refresh,
+  `ledger_seq` keys, commission omitted when `null`, three distinct states,
+  stale responses ignored.
+
+## Issues met
+
+1. My first design-doc comparison used the wrong reference range
+   (`4aea47f..9dcb879`, which includes `a00dbd0`'s reverts) and reported a false
+   mismatch. Re-run against `a00dbd0..9dcb879` — the delivery's own change —
+   it is identical, as stated above.
+2. My first decision-log parser saw archive headings only from #134 because
+   older archives use another heading style; it was replaced by the
+   pointer/range check above.
+
+## Limits
+
+Verification is by static comparison and code reading; no runtime test of the
+exit path was re-run for this delivery (#184's own record above holds its
+1168-pass suite, the same baseline the positions record reports).
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-positions-route`
 
 ## Environment
@@ -58,6 +135,181 @@ a worker thread must not block `/health`.
    above is from a detached rerun.
 
 <!-- Previous delivery record retained below. -->
+
+# TESTING — decision #184: simulated protective exits
+
+## Environment and results
+
+- Baseline branch `main` at `3fdaacf98876b476373b5b08d93da2960e3096ef`;
+  GitHub `main` matched before decision #184 was assigned. Existing
+  uncommitted simulated-exit files were inspected and completed in place.
+- Isolated local PostgreSQL 18 database `agentic_exit_tests` on port 55432,
+  under the repository's `.exit-validation/` directory. No live broker or
+  external database was contacted. `alembic current` reports `0015 (head)`.
+  The migration was already applied to this isolated database at the start
+  of this resumed delivery; tests verified its active-close unique index
+  with an actual duplicate insert rejected by PostgreSQL.
+- Full backend suite with `PGTZ=UTC`: **1168 passed**, zero failures
+  (`pytest -q --disable-warnings`, 101.63 s). Focused exit, lifespan,
+  reconciliation, and monitor suite after the final test addition:
+  **28 passed**. `git diff --check`: clean.
+- The first full run without `PGTZ=UTC` had 1165 passes and two existing
+  timestamp assertion failures: PostgreSQL returned `+06:00` to tests
+  expecting UTC. Both passed with `PGTZ=UTC`; the final full run used that
+  session setting. No timestamp assertion or unrelated route was changed.
+- `alembic check` is not clean on this baseline: it reports many existing
+  model/migration differences, including partition tables, historical indexes,
+  and timezone types. The new `exit_requests` timestamp fields were aligned
+  with migration `0015` after this check. The unrelated drift was left intact.
+
+## Behavior verified
+
+- Real FastAPI lifespan: both stop and target observations create one durable
+  close order; a later simulated tick fills it, closes the position, marks the
+  trade closed, and produces a `PositionClosed` event.
+- PostgreSQL ledger: duplicate observations collapse to one request; an
+  unfinished entry must be cancelled first; a rejected close waits before a
+  new attempt ID is reserved; the partial unique index rejects a second active
+  close; a closed position gets no new order.
+- The pre-submit guard blocks placement if a new entry is active or a fill
+  lacks a position receipt. Restart reconciliation blocks a close when a
+  fresh simulated venue has lost its open position; it does not submit during
+  startup.
+
+## Limits and follow-up
+
+EOD flatten remains observed only. A restarted simulated venue has no durable
+position book, so an open-position discrepancy blocks execution and needs
+manual resolution; the durable exit request does not by itself protect that
+position across restart. Live/paper protective orders and live outcome writing
+remain separate work. The pre-existing decision log exceeds its documented
+rollover size; an archive rollover should be handled separately while
+preserving all historical decision bodies and index mappings.
+
+<!-- Previous delivery record retained below. -->
+
+# TESTING — `execution-panel-fill-history`
+
+## Environment and results
+
+- Current `main` at `f0a624914488b769176582bcf04ef70aae093f6b`;
+  GitHub `main` matched immediately before packaging. Working tree was clean
+  before this delivery. Frontend only; no database or backend test run.
+- `npm run build` in `frontend/`: passed (`tsc -b && vite build`, 103 modules).
+  Vite's >500 kB chunk advisory remains.
+- Focused direct execution of the shipped `fetchExecutionFills` function via
+  TypeScript transpilation and a stubbed `fetch`: bare route URL, exact price
+  and commission strings, preserved response order, and HTTP error detail/
+  status all passed. Source-level panel guards confirmed expansion mounting,
+  refresh dependency, stale-response cleanup, distinct loading/error/empty
+  branches, ordered mapping keyed by `ledger_seq`, and required field renders.
+
+The repo has no frontend DOM test runner. The source guards do not simulate
+clicks or prove visual fit at narrow widths; a browser check with populated
+fills remains useful. The first scratch check failed because its VM context
+omitted CommonJS `exports`; the corrected harness passed. No scratch files
+were retained.
+
+## Package
+
+`execution-panel-fill-history.zip` contains exactly:
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+# TESTING — `execution-orders-symbol-filter`
+
+## Environment
+
+- Fresh `git clone --depth 1`; work authored on base commit
+  `b65d6ed0a185d2f73ad377591a714cab45e73312`. `origin/main` then advanced to
+  `cbca16cc685af3e0b1441e808cc40d1ae1cbe511` (decision #183,
+  `execution-fills-route`); the work was carried onto it. That commit touches
+  no `frontend/` file and only adds to `intelligence.py` (zero removed lines),
+  so the `GET /intelligence/execution-orders` contract this uses is unchanged.
+  Only `CHANGES.md`/`TESTING.md` overlap, and both entries here are prepended
+  above #183's, which is preserved intact.
+- Frontend only. No backend, database or test-suite run was needed or done.
+
+## Results
+
+- `npm ci` from the committed lockfile (TypeScript 5.9.3), then
+  `npm run build` (`tsc -b && vite build`): **clean, zero type errors, 103
+  modules transformed** — on the original base and again on `cbca16c`. The
+  >500 kB chunk-size advisory is the pre-existing one.
+- Direct execution of the shipped logic, **15 assertions, all passing**
+  (scratch harness, deleted before packaging — see below):
+  - `normalizeSymbolFilter` (7): lowercase, already-upper, surrounding
+    whitespace, mixed case, `""` and whitespace-only -> `undefined`,
+    `brk.b` -> `BRK.B`.
+  - `emptyOrdersMessage` (3): no filter -> "No simulated orders recorded
+    yet."; applied -> "No simulated orders for SYMBOL."
+  - Query construction (5): no symbol / explicit `undefined` -> bare path
+    with no query string; `AAPL` -> `?symbol=AAPL`; `BRK.B` unchanged;
+    `A&B C` -> `?symbol=A%26B%20C`.
+- Regression guards: with the helpers stubbed to no-ops, 8 of the 10 helper
+  assertions fail; with the URL builder stubbed to always append the raw
+  symbol, 3 of the 5 URL assertions fail (including `symbol=undefined`).
+  Real code restored afterward, 15/15 again.
+
+## How the harness ran (and its limits)
+
+The repo has no frontend test runner (no `test` script, no `.test.`/`.spec.`
+files), so this follows the `scanner-panel-session-restore` precedent of
+direct execution with `tsx`. That precedent's whole-file scratch copy could
+not be used: `ExecutionLifecyclePanel.tsx` and `api-client.ts` transitively
+import `config.ts`, which reads `import.meta.env` (Vite-only, undefined under
+plain Node). Instead:
+
+- The two helpers were `sed`-extracted verbatim from the real file, with only
+  `function` -> `export function` changed.
+- For query construction, the three-line `url` expression was `sed`-extracted
+  from the real `fetchExecutionOrders` with `API_BASE_URL` parameterized as
+  `base`. **This tests the URL expression, not `fetchExecutionOrders` itself
+  end to end** (no mocked `fetch`, no `ApiError` path).
+- Scratch files placed inside `src/` break `tsc -b` (Node globals are not
+  typed in the browser tsconfig), so all three were deleted before packaging;
+  the final build above ran with them gone.
+
+## Not covered by any automated check
+
+No DOM or component-render test exists in this repo, so these were verified by
+reading the code only, not by running the UI:
+
+- Enter key and the Apply / Clear buttons; Clear disabled when nothing to clear.
+- Loading and error states still rendering, and controls disabled while loading.
+- Refresh keeping the applied filter (it only bumps `refreshKey`, which does
+  not touch `appliedSymbol`).
+- Stale-response discard when the filter changes quickly (the existing
+  `active`-flag cleanup, now keyed on `[refreshKey, appliedSymbol]`).
+- Visual fit at narrow panel widths.
+
+## Manual check (recommended)
+
+With the backend running and at least two symbols in `orders`: open the
+Execution panel; type `aapl` -> field shows `AAPL`; Enter -> only AAPL rows;
+Refresh -> still AAPL; type a symbol with no orders -> "No simulated orders
+for XYZ."; Clear -> all symbols return and the "recorded yet" text is used
+only when the table is truly empty; stop the backend and Apply -> error line
+appears; click Apply twice quickly with different symbols and confirm the
+final list matches the last one applied.
+
+## Environment note
+
+The first `npm install` left a truncated `node_modules/csstype/index.d.ts`
+(a corrupted download), which made `tsc -b` fail inside `node_modules`. This
+was a sandbox cache problem, not a code or lockfile problem: `npm cache
+verify` + `npm ci` fixed it. One intermediate `npm install typescript@5.5.3`
+rewrote `package-lock.json`; that was reverted with `git checkout`, and the
+lockfile is not part of this delivery. `tsconfig.tsbuildinfo`, regenerated by
+each `tsc -b`, was likewise reverted.
+
+## Package
+
+`execution-orders-symbol-filter.zip` contains exactly four files, root-relative:
+`frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`CHANGES.md`, `TESTING.md`.
 
 # TESTING — decision #183: `execution-fills-route`
 

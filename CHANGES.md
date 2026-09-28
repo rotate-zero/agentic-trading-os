@@ -1,3 +1,102 @@
+# CHANGES — `restore-protective-exits-record`
+
+## Current delivery
+
+Documentation-only repair. No application code, migration, test, or
+`.gitignore` change; no decision number assigned or altered.
+
+**What went wrong.** Commit `a00dbd0` (labeled `execution-fills-symbol-filter`)
+landed on top of `4aea47f` (`simulated-protective-exits`, decision #184). Five
+shared files in it are byte-identical to their `cbca16c` (decision #183) state
+— `CHANGES.md`, `TESTING.md`, `docs/decisions/INDEX.md`,
+`docs/decisions/confirmed-decisions.md`, and
+`docs/architecture/execution-engine-design.md` — consistent with a stale-base
+overwrite that discarded everything those files had gained since `cbca16c`. The
+#184 code (migration `0015`, `exit_ledger.py`, the Position Monitor hand-off,
+startup ordering) stayed on `main`, so the record described an older system
+than the code. `models/execution_ledger.py` still cited "decision #184", a
+number absent from the log.
+
+```
+cbca16c #183 ──► f0a6249 ──► 3fdaacf ──► 4aea47f #184 ──► a00dbd0 ──► 9dcb879
+                 orders      fills        protective      5 shared      positions
+                 symbol      panel        exits           docs reset    route docs
+                 filter                   (+code)         to cbca16c    (built on a00dbd0)
+                    │           │             │               │              │
+                    └───────────┴─────────────┴──── lost ─────┘              │
+                        records/text, restored here from 4aea47f             │
+                                                      preserved as-is ───────┘
+```
+
+**What was restored, all from `4aea47f`:**
+
+- **Decision log.** Row 184 in `INDEX.md` and the `### 184.` entry at the true
+  end of `confirmed-decisions.md`, byte-identical to `4aea47f`. #184 keeps its
+  original number; no other decision was touched.
+- **`execution-engine-design.md`.** Passages `a00dbd0` reverted, re-applied as
+  that commit's inverse (not a file replacement): the header status; invariant
+  I2; §6.3's fills-panel "Frontend read path (as built,
+  `execution-panel-fill-history`)" with its two diagrams, replacing "No
+  frontend consumer yet"; §6.5's "not wired" paragraph; §6.6's observer
+  paragraph, the "As built (`simulated-protective-exits`)" section with both
+  diagrams and the startup/reconciliation paragraph, and the Output bullet; §7's
+  intro, the EX-5 table row, heading and as-built resolution; §7.1's EX-5 item
+  and J4; and the World View bullet in the deferred list.
+- **`CHANGES.md` / `TESTING.md`.** Three delivery records per file, verbatim:
+  #184 (`simulated-protective-exits`), `execution-panel-fill-history`, and
+  `execution-orders-symbol-filter`. The last two were not #184 material but
+  were lost by the same overwrite. They sit below the `execution-positions-route`
+  record and above #183, keeping newest-first order.
+
+**Preserved:** everything `9dcb879` added — the `execution-positions-route`
+as-built section, both diagrams and the `positions` row in §6.8 of the design
+doc, and its `CHANGES.md`/`TESTING.md` records. The design doc now equals
+`4aea47f` plus exactly those additions.
+
+**Contradictory status statements repaired.** Restoring the design doc replaces
+the reverted statements that EX-5 was still open, that no exit hand-off existed
+(§6.6), that fills had "No frontend consumer yet", and J4's pre-#184 recovery
+text. The `execution-positions-route`
+record's two findings that said #184 was "not restored here" and the fills note
+"still says No frontend consumer yet" were true of that delivery; their text is
+unchanged and each now carries a one-line "Resolved afterwards by
+`restore-protective-exits-record`" pointer.
+
+## Findings (recorded, not acted on)
+
+- `a00dbd0` also added six lines to `.gitignore` (`*.sqlite`, `*.db`,
+  `pgdata/`, `.*-validation/`, plus a comment). Not documentation and not part of
+  this task; left as is. `.*-validation/` overlaps the existing
+  `.exit-validation/` entry.
+- `execution_engine/engine.py` `_process_one` still says the `OrderApproved`
+  close branch "needs EX-5, still open". That branch (an authorizer-approved
+  close) is still unbuilt, but the wording predates EX-5's simulated
+  stop/target resolution. Code untouched.
+- `INDEX.md` rows 80–90 point to `confirmed-decisions.md`, while
+  `archive/080-090.md` exists. Pre-existing and unrelated to #184; not
+  touched.
+- The design doc's status header cites `simulated-protective-exits` by slug and
+  "Decisions #171–#183", while J4 cites "#184". Both refer to the same
+  decision, as they did at `4aea47f`; not harmonized here.
+- No `execution-fills-symbol-filter` work is present on `main` (the fills
+  route already had `symbol` in #183). If that task exists elsewhere, it was
+  built on a `cbca16c` base and should be re-based before it is applied.
+
+## Boundary
+
+Five files change: `CHANGES.md`, `TESTING.md`,
+`docs/decisions/INDEX.md`, `docs/decisions/confirmed-decisions.md`, and
+`docs/architecture/execution-engine-design.md`. The diff against `9dcb879` is
+insertions only apart from the design doc's reverted passages and two
+annotation lines.
+
+## Package
+
+`restore-protective-exits-record.zip` contains those five files, root-relative.
+Base: `9dcb879` (`origin/main`, unchanged at packaging). Not merged or pushed.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-positions-route`
 
 ## Current delivery
@@ -59,9 +158,12 @@ Findings (recorded, not worked around):
   sections of `execution-engine-design.md`, and the top records of `CHANGES.md`
   and `TESTING.md`, while the #184 code (migration `0015`, `exit_ledger.py`)
   remains on `main`. Not restored here (out of scope; it needs a decision-log
-  action).
+  action). **Resolved afterwards by `restore-protective-exits-record`** (top
+  record of this file).
 - `execution-engine-design.md`'s fills note still says "No frontend consumer
   yet", although the frontend fill-history panel commit exists on `main`.
+  **Resolved afterwards by `restore-protective-exits-record`**: the
+  fill-history read path is restored to §6.3.
 
 ## Boundary
 
@@ -74,6 +176,122 @@ no supporting index (only `(symbol, status)` and `trade_id` exist); acceptable
 at diagnostic volume, not fixed here.
 
 <!-- Previous delivery record retained below. -->
+
+# CHANGES — decision #184: simulated protective exits
+
+## Current delivery
+
+Finished the existing simulated stop/target exit work. Position Monitor now
+hands those observations to Execution Engine, which persists a position-bound
+request, cancels unfinished entries, waits for fill accounting, and reserves
+one reduce-only close order for the committed remaining quantity. Failed close
+attempts retry with a new deterministic attempt ID. Simulated venue fills use
+the existing fill ledger and Portfolio State path; a full close marks the
+trade closed. EOD flatten remains observed only.
+
+Migration `0015` adds `exit_requests`, `orders.position_id`, and a partial
+unique index preventing two active closes for one position. Startup applies
+pending fills before reconciliation. Reconciliation validates approved exits
+without placing them; the execution worker rechecks safety immediately before
+submission. A fresh simulated venue with a missing position blocks execution
+on discrepancy.
+
+Updated the execution and trading architecture, system design, decision
+index/log, and `TESTING.md`. Added PostgreSQL reservation and real-lifespan
+stop/target tests. Decision #184 resolves EX-5 for simulated stop/target exits
+only; live outcome writing and other exit modes remain separate work.
+
+## Package
+
+`simulated-protective-exits.zip` contains the changed application files,
+migration, tests, architecture and decision records, `CHANGES.md`, and
+`TESTING.md`, all root-relative. The local `.exit-validation/` database is
+excluded.
+
+<!-- Previous delivery record retained below. -->
+
+# CHANGES — `execution-panel-fill-history`
+
+## Current delivery
+
+Added a typed `fetchExecutionFills()` client for decision #183's existing
+`GET /intelligence/execution-fills` route and a compact "Recent simulated
+fills" section to the Execution panel. Opening the panel fetches the
+unfiltered default 50 simulated fills; the section's Refresh fetches again.
+Rows retain the route's descending `ledger_seq` order and show symbol,
+quantity, exact price string, venue time, known exact commission, and any
+anomaly. Unknown commission is omitted. Loading, empty, and request error
+states are distinct, and late responses after collapse or refresh are ignored.
+
+The persisted fills section remains separate from the transient WebSocket
+activity feed. There is no backend, database, polling, or trading-control
+change. The existing execution design now describes this as-built frontend
+path. No new decision was needed: decision #183 establishes the read contract,
+and this consumer follows the existing panel's persisted-order read pattern.
+
+## Package
+
+`execution-panel-fill-history.zip` contains the two frontend files,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, and
+`TESTING.md`, all root-relative.
+
+# CHANGES — `execution-orders-symbol-filter`
+
+## Current delivery
+
+Added a usable symbol filter to the Execution panel's "Recent simulated
+orders" section (`ExecutionLifecyclePanel.tsx`). The backend route this
+calls, `GET /intelligence/execution-orders` (decision #181), already
+accepted an optional, exact-match `symbol` query parameter with no
+frontend caller ever passing it — this delivery is that missing caller,
+not a contract change.
+
+`fetchExecutionOrders` (`api-client.ts`) now takes an optional `symbol`
+and appends `?symbol=<encoded>` when supplied, via the same
+ternary/`encodeURIComponent` pattern `fetchOpportunities` already uses —
+omitted entirely when absent, matching the backend's own "no `symbol` ->
+every symbol" default.
+
+The panel section gained a compact input, "Apply" and "Clear" controls
+(styled and behaviorally matching `ScannerPanel.tsx`'s universe-add
+input: uppercase-as-typed, trim-on-submit, Enter submits). Two pure
+helpers do the actual work, alongside this file's existing
+`formatTime`/`formatNum`/`describeEvent`:
+
+- `normalizeSymbolFilter` — trims and uppercases the typed value; empty
+  after trimming clears the filter (`undefined`) instead of sending
+  `symbol=`, which would exact-match nothing and return zero rows
+  instead of "no filter."
+- `emptyOrdersMessage` — distinct empty-state text: "No simulated orders
+  recorded yet." with no filter vs. "No simulated orders for SYMBOL."
+  with one applied.
+
+The active filter is tracked separately from the existing manual-refresh
+counter, so pressing Refresh keeps whatever filter is currently applied
+(refresh and filter both just feed the same `useEffect`, which already
+re-fires on either changing). The existing stale-request-cancellation
+`active`-flag pattern is unchanged in shape, now scoped by both
+`refreshKey` and the applied symbol, so switching the filter quickly (or
+Refresh firing mid-flight) still lets a superseded response arrive and be
+silently discarded rather than overwriting newer data.
+
+No backend route, database model, event feed, or order-placement code
+changed. No architecture decision needed — the backend contract this
+uses was already approved and shipped under decision #181; this is a
+frontend caller catching up to an existing capability, the same posture
+`count-lower-bound-validation`/`scanner-override-ticker-validation` took
+for their own no-decision-number deliveries.
+
+## Boundary
+
+Exactly two application files change: `frontend/src/services/api-client.ts`
+(`fetchExecutionOrders` signature and its leading comment only) and
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`
+(`RecentSimulatedOrders` and two new module-scope pure helpers only —
+`ExecutionLifecycleBody`, `StartupStatusLine`, `ObservedExitTriggers`, and
+every other component/export in the file are untouched). Plus this file
+and `TESTING.md`. No backend file, migration, test, or documentation
+outside these four changes.
 
 # CHANGES — decision #183: `execution-fills-route`
 
