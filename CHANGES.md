@@ -1,3 +1,61 @@
+# CHANGES — `execution-orders-symbol-filter`
+
+## Current delivery
+
+Added a usable symbol filter to the Execution panel's "Recent simulated
+orders" section (`ExecutionLifecyclePanel.tsx`). The backend route this
+calls, `GET /intelligence/execution-orders` (decision #181), already
+accepted an optional, exact-match `symbol` query parameter with no
+frontend caller ever passing it — this delivery is that missing caller,
+not a contract change.
+
+`fetchExecutionOrders` (`api-client.ts`) now takes an optional `symbol`
+and appends `?symbol=<encoded>` when supplied, via the same
+ternary/`encodeURIComponent` pattern `fetchOpportunities` already uses —
+omitted entirely when absent, matching the backend's own "no `symbol` ->
+every symbol" default.
+
+The panel section gained a compact input, "Apply" and "Clear" controls
+(styled and behaviorally matching `ScannerPanel.tsx`'s universe-add
+input: uppercase-as-typed, trim-on-submit, Enter submits). Two pure
+helpers do the actual work, alongside this file's existing
+`formatTime`/`formatNum`/`describeEvent`:
+
+- `normalizeSymbolFilter` — trims and uppercases the typed value; empty
+  after trimming clears the filter (`undefined`) instead of sending
+  `symbol=`, which would exact-match nothing and return zero rows
+  instead of "no filter."
+- `emptyOrdersMessage` — distinct empty-state text: "No simulated orders
+  recorded yet." with no filter vs. "No simulated orders for SYMBOL."
+  with one applied.
+
+The active filter is tracked separately from the existing manual-refresh
+counter, so pressing Refresh keeps whatever filter is currently applied
+(refresh and filter both just feed the same `useEffect`, which already
+re-fires on either changing). The existing stale-request-cancellation
+`active`-flag pattern is unchanged in shape, now scoped by both
+`refreshKey` and the applied symbol, so switching the filter quickly (or
+Refresh firing mid-flight) still lets a superseded response arrive and be
+silently discarded rather than overwriting newer data.
+
+No backend route, database model, event feed, or order-placement code
+changed. No architecture decision needed — the backend contract this
+uses was already approved and shipped under decision #181; this is a
+frontend caller catching up to an existing capability, the same posture
+`count-lower-bound-validation`/`scanner-override-ticker-validation` took
+for their own no-decision-number deliveries.
+
+## Boundary
+
+Exactly two application files change: `frontend/src/services/api-client.ts`
+(`fetchExecutionOrders` signature and its leading comment only) and
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`
+(`RecentSimulatedOrders` and two new module-scope pure helpers only —
+`ExecutionLifecycleBody`, `StartupStatusLine`, `ObservedExitTriggers`, and
+every other component/export in the file are untouched). Plus this file
+and `TESTING.md`. No backend file, migration, test, or documentation
+outside these four changes.
+
 # CHANGES — decision #183: `execution-fills-route`
 
 ## Current delivery

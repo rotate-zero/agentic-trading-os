@@ -44,6 +44,28 @@ function formatNum(n: number | null, digits = 2): string {
   return n === null ? "—" : n.toFixed(digits);
 }
 
+// Pure so it's directly testable without rendering — same posture
+// formatTime/formatNum/describeEvent above already have in this file.
+// Trims and uppercases regardless of how `rawInput` got its value (the
+// input's own onChange already uppercases as-typed, same convention
+// ScannerPanel.tsx's universe-add input uses, but this is the one place
+// that actually forms the wire value) to match GET /execution-orders'
+// exact, case-sensitive `symbol` match (decision #181's route docstring).
+// Empty-after-trim clears the filter (`undefined`) rather than sending
+// `symbol=`, which the backend would exact-match against literally
+// nothing and return zero rows for, instead of "no filter."
+function normalizeSymbolFilter(rawInput: string): string | undefined {
+  const trimmed = rawInput.trim().toUpperCase();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+// Distinct empty-state text depending on whether a filter is active —
+// "recorded yet" (nothing has ever been persisted) reads very differently
+// from "none for this symbol" (other symbols may well have rows).
+function emptyOrdersMessage(appliedSymbol: string | undefined): string {
+  return appliedSymbol ? `No simulated orders for ${appliedSymbol}.` : "No simulated orders recorded yet.";
+}
+
 type Tone = "bull" | "bear" | "signal" | "muted";
 
 const TONE_CLASS: Record<Tone, string> = {
@@ -161,20 +183,37 @@ type ExecutionOrdersLoad =
 
 function RecentSimulatedOrders() {
   const [refreshKey, setRefreshKey] = useState(0);
+  // symbolInput is the free-typed box; appliedSymbol is the filter actually
+  // in effect (undefined = all symbols, the existing default). Kept apart
+  // so typing doesn't refetch on every keystroke and so Refresh (which only
+  // bumps refreshKey) naturally keeps whatever filter was last applied.
+  const [symbolInput, setSymbolInput] = useState("");
+  const [appliedSymbol, setAppliedSymbol] = useState<string | undefined>(undefined);
   const [load, setLoad] = useState<ExecutionOrdersLoad>({ kind: "loading" });
 
   useEffect(() => {
     let active = true;
     setLoad({ kind: "loading" });
-    fetchExecutionOrders()
+    fetchExecutionOrders(appliedSymbol)
       .then((data) => {
         if (active) setLoad({ kind: "ready", data });
       })
       .catch((error: unknown) => {
         if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
       });
+    // Same stale-request guard as before, now also keyed on appliedSymbol:
+    // switching the filter quickly (or Refresh firing mid-flight) lets each
+    // effect run's own closure ignore a response that arrives after a newer
+    // one has already superseded it.
     return () => { active = false; };
-  }, [refreshKey]);
+  }, [refreshKey, appliedSymbol]);
+
+  const applyFilter = () => setAppliedSymbol(normalizeSymbolFilter(symbolInput));
+  const clearFilter = () => {
+    setSymbolInput("");
+    setAppliedSymbol(undefined);
+  };
+  const canClear = symbolInput !== "" || appliedSymbol !== undefined;
 
   return (
     <section className="border-b border-base-border" aria-label="Recent simulated orders">
@@ -188,10 +227,36 @@ function RecentSimulatedOrders() {
           Refresh
         </button>
       </div>
+      <div className="flex items-center gap-1 border-t border-base-border px-2 py-1">
+        <input
+          value={symbolInput}
+          onChange={(e) => setSymbolInput(e.target.value.toUpperCase())}
+          onKeyDown={(e) => e.key === "Enter" && applyFilter()}
+          disabled={load.kind === "loading"}
+          placeholder="Filter symbol"
+          aria-label="Filter simulated orders by symbol"
+          maxLength={12}
+          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+        />
+        <button
+          onClick={applyFilter}
+          disabled={load.kind === "loading"}
+          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+        >
+          Apply
+        </button>
+        <button
+          onClick={clearFilter}
+          disabled={load.kind === "loading" || !canClear}
+          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:bg-base-bg disabled:opacity-50"
+        >
+          Clear
+        </button>
+      </div>
       {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading simulated orders…</p>}
       {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch simulated orders: {load.message}</p>}
       {load.kind === "ready" && load.data.orders.length === 0 && (
-        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">No simulated orders recorded yet.</p>
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">{emptyOrdersMessage(appliedSymbol)}</p>
       )}
       {load.kind === "ready" && load.data.orders.length > 0 && (
         <div className="max-h-48 overflow-y-auto border-t border-base-border">

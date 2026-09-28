@@ -354,6 +354,13 @@ export async function fetchExecutionStartupStatus(): Promise<ExecutionStartupSta
 
 // GET /intelligence/execution-orders (decision #181). The route returns
 // only persisted simulated orders, newest ledger ID first, default limit 50.
+// `symbol` (this delivery) is an exact, case-sensitive match on
+// `orders.symbol` per the route's own docstring — no case-folding or
+// partial match on the backend — so the caller (ExecutionLifecyclePanel.tsx's
+// symbol filter) is responsible for trimming/uppercasing before it gets
+// here, same division of labor `fetchOpportunities`'s own `symbol` param
+// above already has with its callers. Omit to get every symbol, same
+// `?symbol=` ternary convention `fetchOpportunities` already uses.
 export interface ExecutionOrderWireShape {
   id: number;
   client_order_id: string;
@@ -374,8 +381,11 @@ export interface ExecutionOrdersWireShape {
   orders: ExecutionOrderWireShape[];
 }
 
-export async function fetchExecutionOrders(): Promise<ExecutionOrdersWireShape> {
-  const res = await fetch(`${API_BASE_URL}/intelligence/execution-orders`);
+export async function fetchExecutionOrders(symbol?: string): Promise<ExecutionOrdersWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/execution-orders?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/execution-orders`;
+  const res = await fetch(url);
   if (!res.ok) {
     throw new ApiError(await parseErrorDetail(res), res.status);
   }
