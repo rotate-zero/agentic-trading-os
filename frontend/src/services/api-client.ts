@@ -395,6 +395,11 @@ export async function fetchExecutionOrders(symbol?: string): Promise<ExecutionOr
 // GET /intelligence/execution-fills (decision #183): simulated fills in
 // descending ledger_seq order, default limit 50. Keep exact decimal strings
 // intact; converting price or commission to number would lose precision.
+// `symbol` is an exact, case-sensitive match on the owning order's symbol
+// (the route's own docstring), so the caller (ExecutionLifecyclePanel.tsx's
+// fills symbol filter) trims/uppercases before it gets here — same division
+// of labor and same `?symbol=` ternary `fetchExecutionOrders` above uses.
+// Omit to get every symbol.
 export interface ExecutionFillWireShape {
   ledger_seq: number;
   client_order_id: string;
@@ -414,8 +419,11 @@ export interface ExecutionFillsWireShape {
   fills: ExecutionFillWireShape[];
 }
 
-export async function fetchExecutionFills(): Promise<ExecutionFillsWireShape> {
-  const res = await fetch(`${API_BASE_URL}/intelligence/execution-fills`);
+export async function fetchExecutionFills(symbol?: string): Promise<ExecutionFillsWireShape> {
+  const url = symbol
+    ? `${API_BASE_URL}/intelligence/execution-fills?symbol=${encodeURIComponent(symbol)}`
+    : `${API_BASE_URL}/intelligence/execution-fills`;
+  const res = await fetch(url);
   if (!res.ok) {
     throw new ApiError(await parseErrorDetail(res), res.status);
   }

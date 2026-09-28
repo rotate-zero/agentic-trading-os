@@ -1,3 +1,88 @@
+# TESTING — `execution-fills-symbol-filter-implementation`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main`. Code was authored on base `9dcb879`, then
+  rebased onto `a725d5d` (`restore-protective-exits-record`), which changed only
+  documentation, no `frontend/` file. Code and harness were re-run after the
+  rebase. Local branch only; nothing merged or pushed.
+- Frontend only. No backend, database or Python test run was needed or done:
+  no backend file changed.
+- `npm ci` from the committed lockfile.
+
+## Results
+
+- `npm run build` (`tsc -b && vite build`): **clean, zero type errors, 103
+  modules transformed** — before the change, after it, and again after the
+  rebase. The >500 kB chunk advisory is pre-existing.
+- Scratch behavioral harness: **15 tests, all passing**, run against the real
+  `ExecutionLifecyclePanel` in jsdom with a stubbed global `fetch` and a stubbed
+  `useOrderLifecycle` hook:
+  - `fetchExecutionFills` URL (2): omitted or empty symbol gives the bare path;
+    `BRK.B` stays as is; `A&B C` becomes `A%26B%20C`.
+  - Default (1): first load requests no `symbol`; the orders section is also
+    unfiltered.
+  - Input handling (3): uppercased as typed; `"  brk.b "` sent as `BRK.B` on
+    Enter; Apply button works; other keys do not apply; whitespace-only apply
+    makes no request when nothing is applied, and clears an applied filter to
+    the bare URL (never `symbol=`).
+  - Refresh and Clear (3): Refresh re-sends the applied symbol, not
+    typed-but-unapplied text; Clear resets the input, refetches unfiltered and
+    is disabled when there is nothing to clear; Clear on typed-but-unapplied
+    text empties the box and makes no request.
+  - Loading (1): while a request is pending the loading text shows and input,
+    Apply, Clear and Refresh are all disabled.
+  - Results (3): "No simulated fills recorded yet." versus "No simulated fills
+    for XYZ." and back after Clear; exact decimal strings render verbatim
+    (`185.1000`, `0.1000000000000000055511151231257827`, `1E+3`) with a null
+    commission omitted; an error state recovers on a later Apply.
+  - Isolation (1): applying a fills filter leaves the orders section's input
+    and requests untouched, and the reverse.
+  - Lifecycle (1): a response resolving after unmount is discarded without
+    error.
+- Regression guards: with the original `api-client.ts` restored, 4 of 15 fail;
+  with the original panel restored, 10 of 15 fail; with both new files back,
+  15/15 pass.
+
+## How the harness ran (and its limits)
+
+The repo has no frontend test runner, so `vitest@2`, `jsdom@24` and
+`@testing-library/react@16` were installed with `npm install --no-save` and the
+harness lived in an untracked `frontend/.scratch/` directory. All of it was
+deleted, and `npm ci` was re-run, before the final build and packaging;
+`package.json`, `package-lock.json` and `tsconfig.tsbuildinfo` are unchanged.
+Unlike the orders-filter delivery's extracted-helper harness, this one renders
+the actual component and calls the real `fetchExecutionFills`.
+
+## Not covered
+
+- The stale-response guard cannot be exercised through the UI: every control is
+  disabled during a request, so the filter cannot change while one is in
+  flight. Only discard-after-unmount was tested. The guard is the same
+  `active`-flag pattern as the orders section.
+- Browser rendering, styling and narrow-panel fit were not looked at; jsdom has
+  no layout.
+- No test against a running backend or real `fills` rows. Server-side symbol
+  matching is covered by decision #183's backend tests, which this delivery does
+  not touch.
+
+## Manual check (recommended)
+
+With the backend running and fills for at least two symbols: expand the
+Execution panel; type `aapl` -> field shows `AAPL`; Enter -> only AAPL fills;
+Refresh -> still AAPL; apply a symbol with no fills -> "No simulated fills for
+XYZ."; Clear -> all symbols return; confirm the orders section's filter was
+unaffected throughout; stop the backend and Apply -> error line appears.
+
+## Package
+
+`execution-fills-symbol-filter-implementation.zip` contains exactly five files,
+root-relative: `frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `restore-protective-exits-record`
 
 ## Environment

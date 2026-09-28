@@ -1,3 +1,86 @@
+# CHANGES — `execution-fills-symbol-filter-implementation`
+
+## Current delivery
+
+Added an independent symbol filter to the Execution panel's "Recent simulated
+fills" section (`ExecutionLifecyclePanel.tsx`) and the optional `symbol`
+argument to `fetchExecutionFills()` (`api-client.ts`). Frontend only.
+
+**Provenance.** The backend already supported this: `GET
+/intelligence/execution-fills` (decision #183) has accepted an optional exact,
+case-sensitive `symbol` since its own delivery. Nothing in the frontend ever
+passed it. Commit `a00dbd0` is named `execution-fills-symbol-filter` but
+changed neither frontend file (it changed `.gitignore` and five documentation
+files; see `restore-protective-exits-record` above), so this behavior did not
+exist before this delivery. This task is the missing caller, the fills
+counterpart of `execution-orders-symbol-filter` below; it is not a contract
+change.
+
+- `frontend/src/services/api-client.ts`: `fetchExecutionFills(symbol?)` appends
+  `?symbol=<encodeURIComponent(symbol)>` when a non-empty symbol is passed and
+  requests the bare path otherwise — the same ternary `fetchExecutionOrders`
+  uses. `price` and `commission` remain exact decimal strings; the wire type is
+  unchanged.
+- `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`:
+  `RecentSimulatedFills` gains its own `symbolInput` / `appliedSymbol` state,
+  a compact input with Apply and Clear, and `emptyFillsMessage()` (a sibling of
+  `emptyOrdersMessage`). It reuses the existing `normalizeSymbolFilter()`
+  unchanged (trim, uppercase, empty becomes `undefined`) rather than adding a
+  second copy. Nothing is shared with `RecentSimulatedOrders`: filtering one
+  section never refetches or alters the other.
+
+**Behavior** (deliberately identical to the orders filter):
+
+- The input uppercases as typed; Apply and Enter trim and uppercase before
+  fetching. Empty or whitespace-only clears the filter and never sends
+  `symbol=`.
+- Refresh re-fetches with the last applied symbol; typed-but-unapplied text is
+  not used.
+- Clear empties the input and returns to the unfiltered default; it is
+  disabled when there is nothing to clear.
+- Input, Apply, Clear and Refresh are disabled while loading.
+- Empty result: "No simulated fills recorded yet." with no filter, "No
+  simulated fills for XYZ." with one.
+- Stale responses: the effect is keyed on `[refreshKey, appliedSymbol]` and its
+  cleanup flips an `active` flag, so a response for a superseded filter (or
+  after collapse) is ignored.
+- Applying the same symbol again, or applying an empty box when nothing is
+  applied, changes no state and therefore triggers no request; Refresh is the
+  way to re-read. This matches the orders section.
+
+Documentation: `execution-engine-design.md` §6.3 gains an as-built note with
+two diagrams, directly after the fills read-path diagrams. `TESTING.md` records
+the verification.
+
+Decision number: none assigned. This delivery runs in parallel with other work,
+so the slug `execution-fills-symbol-filter-implementation` is the temporary
+identifier; `confirmed-decisions.md` and `INDEX.md` are deliberately untouched.
+The existing decisions #181 and #183 already cover the routes this consumes;
+whether a UI-only filter needs its own number is left to integration, after
+re-checking `main` and the canonical logs (`origin/main` at packaging:
+`a725d5d`).
+
+## Findings (recorded, not acted on)
+
+- `execution-engine-design.md`'s orders read-path section ("Frontend read path
+  (as built, `execution-panel-order-history`)") does not mention the orders
+  symbol filter that `execution-orders-symbol-filter` added; the orders filter
+  is documented only in `CHANGES.md`/`TESTING.md`. Related follow-up, not done
+  here.
+- The panel has no test runner; the repo has no `test` script or frontend test
+  files. Verification used a scratch harness that is not shipped (see
+  `TESTING.md`). Adding a permanent frontend test setup would be a separate
+  decision.
+
+## Boundary
+
+No backend, migration, ledger write, trading-control or trading-behavior change.
+`RecentSimulatedOrders`, `normalizeSymbolFilter`, `emptyOrdersMessage`, the
+fill row rendering and the `ExecutionFillWireShape` type are untouched.
+`package.json`, `package-lock.json` and `tsconfig.tsbuildinfo` are unchanged.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `restore-protective-exits-record`
 
 ## Current delivery

@@ -641,6 +641,43 @@ manual Refresh ──► refreshKey increment ───────────�
 collapse ──► unmount and ignore any late response
 ```
 
+**Frontend symbol filter (as built, `execution-fills-symbol-filter-implementation`;
+decision number assigned at integration).** The route's exact `symbol` parameter
+(decision #183) had no frontend caller. The "Recent simulated fills" section now
+has a symbol box with Apply and Clear, and `fetchExecutionFills(symbol?)` sends
+`?symbol=<encoded>` only when a symbol is applied; with none, the request is the
+unfiltered default 50 as before. It follows the orders section's filter: the box
+uppercases as typed, Apply and Enter trim and uppercase, and an empty value means
+no filter (never `symbol=`). Refresh keeps the last applied symbol. Controls are
+disabled while loading, and a response for a superseded filter is ignored. The
+empty text distinguishes an empty ledger from "no fills for this symbol". The
+section's state is independent of the orders section's, so neither filter
+refetches or changes the other. The server still hard-scopes to simulated fills
+and orders newest `ledger_seq` first; `price` and `commission` remain exact
+strings. No backend, migration or trading behavior changed.
+
+```
+fills JOIN orders ──► GET /intelligence/execution-fills[?symbol=X] ──► fetchExecutionFills(symbol?)
+ simulated only; exact symbol match; default 50; ledger_seq DESC            │
+                                                                            ▼
+                                                        RecentSimulatedFills (own filter state)
+                                          independent of ──► RecentSimulatedOrders (own filter state)
+```
+
+```
+type ──► symbolInput (uppercased)
+Apply / Enter ──► normalizeSymbolFilter: trim + uppercase; "" ──► undefined
+       │
+       ▼ appliedSymbol changes ──► effect re-runs ──► loading ──► fetchExecutionFills(appliedSymbol)
+Refresh ──► refreshKey++ ─────────────────────────────┘   (keeps appliedSymbol)
+Clear ──► input "" + appliedSymbol undefined ──► unfiltered fetch
+       │
+       ├─ request error ──► error message
+       └─ 200 ──► [] ──► "No simulated fills recorded yet." (no filter) / "...for X." (filtered)
+                  └─ rows ──► render in server order, keyed by ledger_seq
+superseded filter or collapse ──► cleanup marks the run inactive; late response ignored
+```
+
 **As built (`execution-positions-route`; decision number assigned at integration).** `GET /intelligence/execution-positions` is the
 third read-only HTTP view over the execution ledger, after `execution-orders`
 (#181) and `execution-fills` (#183), and the first over `positions` — Portfolio
