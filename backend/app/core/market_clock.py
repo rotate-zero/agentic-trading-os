@@ -100,6 +100,14 @@ class MarketClock:
     def is_holiday(self, d: date) -> bool:
         return d in _HOLIDAYS_2026
 
+    def has_calendar_for_year(self, year: int) -> bool:
+        """Whether holiday and half-day data cover `year` for EOD decisions.
+
+        This is informational: existing session methods retain their current
+        behavior outside the covered year.
+        """
+        return year == 2026
+
     def is_half_day(self, d: date) -> bool:
         return d in _HALF_DAYS_2026
 

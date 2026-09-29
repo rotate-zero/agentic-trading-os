@@ -1,3 +1,29 @@
+# CHANGES — `simulated-eod-flatten-contract` shared foundation (#185)
+
+Saqib approved the four §6.6 policies on 2026-09-29. This delivery builds only the
+shared EOD window contract: `backend/app/core/session_window.py` computes a covered
+entry-day UTC interval `[flatten_at, close_at)`; `MarketClock.has_calendar_for_year()`
+exposes 2026 coverage without changing existing sessions; Settings defaults the validated
+lead to 60 seconds (`1..900`). The new tests cover boundaries, calendar gaps, half-days,
+DST and parity with Backtest Runner's 2026 close derivation.
+
+`docs/architecture/execution-engine-design.md` now separates approved policy, built
+foundation and the still-unbuilt executable EOD path; it adds foundation data/internal
+flow diagrams and boundaries for the two subsequent parallel tasks. Decision #185 was
+appended after the latest GitHub `main` recheck. The over-100KB open decision log was
+rolled over under `docs/decisions/README.md`: #161–#184 moved verbatim to
+`archive/161-184.md`, their index locations changed, and the open log now starts at #185.
+No existing decision body changed. This file and `TESTING.md` document the delivery.
+
+No Position Monitor timer/handoff, exit-ledger state machine, migration, Execution wiring,
+reconciliation or frontend behavior was added. EOD orders cannot execute yet; approved
+flatten behavior remains best-effort even after later implementation.
+
+Package: `simulated-eod-flatten-foundation.zip`, root-relative, contains exactly the
+ten changed/new files listed in `TESTING.md`.
+
+---
+
 # CHANGES — `simulated-eod-flatten-contract` revision (UNAPPROVED)
 
 Design/documentation only, requested by Saqib. Inspected and re-fetched GitHub `main`

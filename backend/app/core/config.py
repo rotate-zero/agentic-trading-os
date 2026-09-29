@@ -244,6 +244,22 @@ class Settings(BaseSettings):
     execution_fixed_notional_usd: float = 1000.0
     execution_daily_loss_cap_usd: float = 100.0
 
+    # Simulated EOD placement lead; the timer and ledger consumers are later tasks.
+    execution_eod_flatten_lead_seconds: int = 60
+
+    @field_validator("execution_eod_flatten_lead_seconds", mode="before")
+    @classmethod
+    def _execution_eod_lead_in_range(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("execution_eod_flatten_lead_seconds must be in 1..900")
+        if isinstance(value, str):
+            if not value.isdecimal():
+                raise ValueError("execution_eod_flatten_lead_seconds must be in 1..900")
+            value = int(value)
+        if not isinstance(value, int) or not 1 <= value <= 900:
+            raise ValueError("execution_eod_flatten_lead_seconds must be in 1..900")
+        return value
+
     # Conservative first-slice defaults for validating the lifecycle, not
     # final risk settings (Saqib, 2026-09-22) — do not silently make these
     # "smarter" (no volatility scaling, no per-symbol overrides, etc.)

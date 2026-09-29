@@ -1,3 +1,35 @@
+# TESTING — `simulated-eod-flatten-contract` shared foundation (#185)
+
+Baseline: clean local `main` and fetched GitHub `main` at `3ac975d`; fetched again
+immediately before assigning decision #185. Decision index and open-log tails both ended
+at #184; archive filenames ended at `134-160.md`. No database state was changed.
+The open log exceeded 200 KB; following `docs/decisions/README.md`, decisions #161–#184
+were moved byte-for-byte to `archive/161-184.md`, 24 index locations updated, and #185
+left as the first entry in the new open log. Existing decision bodies were not edited.
+
+Command: `backend/.venv/bin/pytest -q backend/tests/test_session_window.py
+backend/tests/test_market_clock.py backend/tests/test_fill_simulator_and_gate.py
+backend/tests/test_governor_config.py backend/tests/test_position_monitor_engine.py
+backend/tests/test_simulated_venue.py` — **78 passed**. This includes every supported
+2026 trading day's close parity, both half-days, DST-season dates, exact boundary
+microseconds, covered closed days, unsupported years, invalid leads and existing
+monitor/venue behavior. An initial mistaken expected trading-day count in the new test
+(250 versus the calendar's 251) was corrected; the final run passed.
+
+`git diff --check` and a scoped changed-file/decision/zip review passed. No PostgreSQL,
+migration, full backend suite or frontend checks were needed for this pure foundation.
+A1–A20 in the architecture document remain acceptance cases for subsequent executable
+EOD work, not passing integration tests for this delivery.
+
+Zip: `simulated-eod-flatten-foundation.zip` has root-relative entries:
+`backend/app/core/config.py`, `backend/app/core/market_clock.py`,
+`backend/app/core/session_window.py`, `backend/tests/test_session_window.py`,
+`docs/architecture/execution-engine-design.md`, `docs/decisions/INDEX.md`,
+`docs/decisions/confirmed-decisions.md`, `docs/decisions/archive/161-184.md`,
+`CHANGES.md`, `TESTING.md`.
+
+---
+
 # TESTING — `simulated-eod-flatten-contract` revision (design only)
 
 Baseline: GitHub `main` fetched before design work at `67ef81d`, matching local `main`;
