@@ -1,6 +1,6 @@
 # Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
 **Owner:** Saqib
-**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#183 and `simulated-protective-exits` implement portions of this design; §§6.2–6.6 describe the current persistence, Portfolio State, and simulated stop/target exit paths. The original inventory in §§1–2 and the original build prerequisites in §7.1 are historical. EX-5 is resolved for simulated stop/target exits in `simulated-protective-exits`; Saqib approved simulated EOD policy on 2026-09-29 and its shared session-window foundation is built, while the executable EOD path is not. EX-12 remains open. Baseline: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
+**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#185 and the simulated protective/EOD deliveries implement the simulated entry and exit paths described in §§6.2–6.6. The original inventory in §§1–2 and build prerequisites in §7.1 are historical. Decision #185 governs the executable simulated EOD path; EX-12 remains open. Baseline of the original design: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
 **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
 
 **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
@@ -993,14 +993,16 @@ Postgres position ledger ──restore/fill commits──► Portfolio State
 PriceUpdated / CandleClosed ──► Event Bus ───────┤
                                                 ▼
                                        Position Monitor
-                                                │ in-memory ExitIntent latch
-                                                ▼
-                              GET /intelligence/exit-intents
-                                  observed_only diagnostic
-                                                │ read on panel expansion / Refresh
-                                                ▼
-                              ExecutionLifecyclePanel: Observed exit triggers
-                              (separate from order-lifecycle WebSocket events)
+                                      │                 │
+                      ordered pending │                 │ diagnostic intent
+                                      ▼                 ▼
+                              Execution worker   GET /intelligence/exit-intents
+                                      │                     │ panel read / Refresh
+                                      ▼                     ▼
+                              PostgresExitLedger   ExecutionLifecyclePanel
+                                      │             (observed trigger view)
+                                      ▼
+                              SimulatedVenue ─► real fills ─► Portfolio State
 ```
 
 ```
@@ -1022,16 +1024,18 @@ tuple[PositionView, ...] (empty when restored and flat)
 **Internal observer flow (as built):**
 
 ```
-lifespan startup: reconcile venue + ledger
+lifespan startup: rebuild/reconcile venue + ledger
        ├─ discrepancy/failure ──► app.state.position_monitor = None
-       └─ clean ──► await PortfolioState.start() (restore snapshot)
-                          └─ start entry pipeline
-                                └─ PositionMonitor(bus, PortfolioStatePositionReader(portfolio_state)).start()
+       └─ clean ──► Portfolio State refresh ─► advance persisted EOD expiry
+                          └─ restore original/fallback monitor slots
+                                └─ bind/start Execution, start PositionMonitor
                                       └─ app.state.position_monitor = monitor
 
 received PriceUpdated/CandleClosed ──► held-symbol filter ──► monitor queue/worker
-       └─ fresh PositionView read ──► stop, target, EOD precedence
-              └─ first trigger per position ──► in-memory ExitIntent
+       └─ fresh PositionView read ──► stop/target or pulse-driven EOD
+              └─ slot PENDING ──► callback wakes Execution
+                    └─ observe_exit commit ──► ACKNOWLEDGED
+                       DB error ──► pending retry; EOD window closed ──► EXPIRED
 
 GET /intelligence/exit-intents?symbol=... ──► monitor.get_exit_intents(symbol)
        └─ sort by symbol, trigger_ts, position_id ──► observed_only list
@@ -1041,20 +1045,22 @@ ExecutionLifecyclePanel expands / Refresh ──► typed GET /intelligence/exit
        └─ unavailable / running-empty / fetch error / observed rows
           (no order or position-closure event is inferred)
 
-lifespan shutdown ──► clear app reference ──► stop bus/monitor ──► stop Portfolio State
+lifespan shutdown ──► clear app reference ──► stop monitor timer/subscriptions ─► stop bus
+                    └─ drain Execution ──► stop Portfolio State / disconnect venue
 ```
 
 The diagnostic exposes position ID, symbol, side, quantity, reason, trigger price,
 and trigger timestamp. It is a point-in-time read of received events, not an order,
-fill, or closed position. Intents are lost at process shutdown and are not rebuilt
-from the ledger. No price/candle event means no observation. The monitor alone
-does not place an order; its stop/target callback now requests one through
-Execution. The frontend reads this snapshot when the
+fill, or closed position. New observations are in memory; committed request slots
+are restored from the ledger after clean startup reconciliation. No price/candle
+event means no new observation. The monitor alone
+does not place an order; its observation callback wakes Execution's worker.
+The frontend reads this snapshot when the
 Execution panel expands and on manual refresh, in a section separate from its
 existing order-lifecycle event list; it does not poll or subscribe to another
 WebSocket channel. The `observed_only` label describes the route's own read
-surface, not whether a stop/target observation was handed to Execution.
-EOD observations remain diagnostic only; EX-12 remains open.
+surface, not whether an observation was handed to Execution.
+EOD observations also reach the durable handoff; EX-12 remains open.
 
 **As built (`simulated-protective-exits`).** A stop or target observation is
 handed to Execution Engine's queue. `PostgresExitLedger` commits one durable
@@ -1065,7 +1071,8 @@ order for the committed remaining quantity. The order ID is
 transaction. Rejected or cancelled closes retry after a bounded delay with
 a new ID and the remaining quantity. The existing fill ledger and Portfolio
 State worker apply fills; full closure marks the trade closed. EOD flatten
-still produces an observation only. Paper/live execution is unaffected.
+uses the same position-bound close path with stored window, fallback and
+dispatch claim. Paper/live execution is unaffected.
 
 ```
 PriceUpdated / CandleClosed -> Position Monitor -> stop/target ExitIntent
@@ -1115,8 +1122,8 @@ and never share a source:
 | Source | the running Position Monitor's in-memory intents | PostgreSQL `exit_requests`, joined to `positions` |
 | Survives restart | no | yes |
 | Depends on the monitor | yes (`monitor_status` running / unavailable) | no — works with no monitor, and does not read it |
-| Includes EOD observations | yes (diagnostic only) | only as a durable *original* `eod_flatten` request with its stored window, expiry and optional fallback (`simulated-eod-exit-request-visibility`). The ledger that writes those rows is not wired (`simulated-eod-ledger-handoff`), so a running system has none yet |
-| Row means | "the monitor saw a trigger this process" | "Execution durably recorded a stop/target observation for this position" |
+| Includes EOD observations | yes, including a restored committed original after clean recovery (diagnostic only) | a durable *original* `eod_flatten` request with stored window, expiry and optional fallback (`simulated-eod-exit-request-visibility`) |
+| Row means | "the monitor saw or restored a trigger this process" | "Execution durably recorded an exit observation for this position" |
 | Envelope | `monitor_status`, `intent_status: observed_only`, `exit_intents` | `exit_requests` only |
 
 **Scope and shape.** Hard-scoped to `Position.execution_mode == 'simulated'`
@@ -1413,33 +1420,32 @@ positional construction is unchanged.
 | `get_exit_intents()` | Unchanged diagnostic: first intent per position, any kind, in-memory. |
 | `enqueue_pulse()` | Manual pulse on the shared queue; `False` if coalesced or not accepting. |
 
-Suggested Execution use (not built): drain `pending_observations()` in order, commit each
+Execution drains `pending_observations()` in order, commits each
 through the ledger, then acknowledge; on a window-closed disposition release
 `WINDOW_CLOSED`; hydrate at startup by acknowledging committed kinds before events flow.
-Until then, in the running app the timer and slots exist but no EOD slot is ever
-acknowledged or acted on.
+The callback only wakes the worker; a failed transaction leaves the slot pending.
+A later observation for the same position waits behind a failed earlier one,
+while other positions continue.
 
-**Limits.** Arrival ordering only, not global exchange-time ordering. Slots and cache are
-in memory and lost on restart; a fresh tick must retrigger. Retained per-process
+**Limits.** Arrival ordering only, not global exchange-time ordering. Uncommitted slots
+and the tick cache are lost on restart; committed slots are restored. Retained per-process
 bookkeeping (closed-position and log-throttle maps) is not pruned. A tick stamped ahead of
-the wall clock (clock skew) is rejected. EOD placement remains best-effort and unbuilt.
+the wall clock (clock skew) is rejected. EOD placement remains best-effort.
 
-#### Simulated EOD flatten contract — policy approved; shared foundation built
+#### Simulated EOD flatten contract — policy approved and integrated
 
 **Policy approved by Saqib on 2026-09-29 (`simulated-eod-flatten-contract`).** The
-window helper, config default, calendar coverage accessor and their tests are built against
-GitHub `main` at `3ac975d`. The durable exit-ledger state machine and migration `0016` are
-now built but **unwired** (see "Exit ledger EOD state machine — as built"). The monitor
-timer/handoff, Execution wiring, reconciliation and frontend changes below are still a
-design, so no EOD order can execute. EOD is a **best-effort attempt to flatten**, not a guarantee
+window helper, config default, calendar coverage accessor, monitor handoff,
+durable exit-ledger state machine, migration `0016`, reader/frontend and
+Execution/startup integration are built. EOD is a **best-effort attempt to flatten**, not a guarantee
 of closure by the bell or of no overnight exposure. EX-12, OutcomeRecorder, paper/live exits
 and unrelated modules remain outside this contract.
 
-#### Verified baseline and the flaw
+#### Historical baseline before decision #185 integration
 
 - `position_monitor/engine.py`: `_evaluate()` checks stop, target, then an EOD event timestamp
   at/after the entry day's close. `_exit_intents` suppresses every later intent for that
-  position. Only stop/target reach the callback today.
+  position. Only stop/target reached the callback then.
 - `execution_engine/exit_ledger.py`: `observe()` accepts stop/target only and returns `True`
   for an existing row without changing it. `exit_requests.position_id` is the primary key;
   there is no request lifecycle or fallback slot. `prepare()` reuses an approved close or
@@ -1464,7 +1470,7 @@ cancellation or an unsent reservation: clearing the monitor latch cannot make a 
 stop/target replace it. Its “stop/target remain armed” claim was false for this state.
 The approved correction calls for **a durable fallback observation separate from EOD
 placement eligibility**, in the existing single request row. Active/uncertain orders remain
-exclusive. That state machine is still unbuilt.
+exclusive. That state machine is now implemented by the ledger and worker below.
 
 #### Window, observation freshness and ordering
 
@@ -1499,7 +1505,7 @@ wall time or places an order. The accessor is read-only and leaves all other Mar
 session behavior unchanged. Backtest Runner is not imported by this live helper; its close
 derivation is checked for parity in tests over all supported 2026 trading days.
 
-Component data flow for the **built foundation** and its future callers:
+Component data flow for the shared window helper and its running callers:
 
 ```text
 Settings.execution_eod_flatten_lead_seconds (60; 1..900)
@@ -1512,8 +1518,7 @@ MarketClock.trading_day / has_calendar_for_year / is_holiday / is_half_day
                           EodSessionWindow or None
                           / UnsupportedEodCalendarError
                                     |
-                   proposed Position Monitor poll and Exit Ledger guards
-                   (no caller wired in this foundation delivery)
+                   Position Monitor pulse and PostgresExitLedger guards
 ```
 
 Internal window flow (no implicit clock read):
@@ -1562,12 +1567,12 @@ touches both. This is arrival ordering, not global exchange-time ordering. A del
 candle arriving after the pulse is later work even if stamped earlier. Once EOD commits,
 a later protective observation becomes fallback; no reserved order is relabelled.
 
-#### Durable representation (proposed; more than a reason CHECK)
+#### Durable representation (as built; more than a reason CHECK)
 
 Keep one `exit_requests` row per position and its original `exit_reason`, `trigger_price`,
 `trigger_ts`, `created_at`. Never delete/reinsert the request or rewrite an old order reason.
 
-| Record | Additive fields and meaning (names provisional) |
+| Record | Additive fields and meaning (migration 0016) |
 |---|---|
 | `exit_requests` | Allow `eod_flatten`; add `eod_flatten_at`, `eod_close_at`, `eod_expired_at`. Ordered bounds required only for EOD and immutable. Expiry records placement eligibility ending, not order cancellation or position closure. |
 | `exit_requests` | Nullable `fallback_reason`, `fallback_trigger_price`, `fallback_trigger_ts`: all absent or all present, reason stop/target, finite positive price, aware timestamp; only on original EOD rows. First protective observation wins this immutable slot. |
@@ -1575,9 +1580,9 @@ Keep one `exit_requests` row per position and its original `exit_reason`, `trigg
 
 Preserve `uq_orders_active_exit_per_position` for approved/submitted/partially_filled/unknown,
 monotonic `positions.exit_attempt` and IDs `<trade_id>:exit:<attempt>`. Existing protective
-rows have no EOD fields and retain decision #184 behavior. The future migration must enforce
-field groups, preserve existing rows and refuse downgrade if it would lose EOD/fallback/
-dispatch evidence. Allocate a revision against the then-current head; no `0016` is reserved.
+rows have no EOD fields and retain decision #184 behavior. Migration `0016` enforces
+field groups, preserves existing rows and refuses downgrade if it would lose EOD/fallback/
+dispatch evidence.
 
 **Effective reason:** original EOD is eligible inside its stored window unless durably
 expired; after expiry only a stored fallback is eligible. Without fallback, the row is
@@ -1672,7 +1677,7 @@ or fallback means protective acknowledged. Expired EOD without fallback resumes 
 observation. New EOD needs a fresh eligible cache after restart. Recovery never places directly;
 existing lifespan owns ordering. Actual fills remain authoritative, including late reports.
 
-#### Component data flow (proposed additions)
+#### Component data flow (as built)
 
 ```text
 MarketClock + injected wall clock -> covered entry-day window -> timer pulse
@@ -1683,11 +1688,11 @@ PriceUpdated / CandleClosed ----------------------------------------+-> Monitor 
                                                                         |
                                                          ordered pending intents
                                                                         v
-                     Execution worker -> observe() -> exit_requests
+                     Execution worker -> observe_exit() -> exit_requests
                           ^                |          original + fallback + bounds/expiry
                           |                +-> commit ack/readback -> monitor slots
                           |
-                     prepare() -> orders + attempt counter (one active close)
+                     prepare_exit() -> orders + attempt counter (one active close)
                           |
                  final guard + durable dispatch claim
                           v
@@ -1741,14 +1746,13 @@ Approved EOD at deadline:
   marker present -> uncertain; reconcile, never cancel as unsent
 ```
 
-#### Exit ledger EOD state machine — as built (`simulated-eod-ledger-handoff`; unwired)
+#### Exit ledger EOD state machine — as built (`simulated-eod-ledger-handoff` and integration)
 
 **Built:** `PostgresExitLedger` (`execution_engine/exit_ledger.py`), the `ExitRequest`/`Order`
 models (`models/execution_ledger.py`) and migration `0016_simulated_eod_exit_state.py`
-(parent `0015`; no number was reserved, so re-check the head at integration). Nothing calls
-the new methods in a running system: `execution_engine/engine.py`, the Position Monitor,
-reconciliation, `main.py`, readers and the frontend are untouched. **This does not make the
-EOD path work**; it is the durable half the integration task will wire. EOD remains a
+(parent `0015`). Execution now calls the explicit methods; `main.py` hydrates monitor
+slots after clean reconciliation, and the readers/frontend show the durable request.
+EOD remains a
 best-effort attempt, and a submitted order can still fill after hours or never.
 
 **Schema (names as proposed above, now real).** `exit_requests` gains `eod_flatten_at`,
@@ -1768,8 +1772,8 @@ lock, so observe/prepare/claim/status calls never interleave):
 
 | Surface | Methods | Used by |
 |---|---|---|
-| Legacy, unchanged signatures | `observe`, `pending_position_ids`, `prepare`, `confirm_recovery_exit`, `set_status` | the unchanged Execution worker. Serves stop/target rows exactly as #184 did; `observe()` of an EOD intent returns `False` and stores nothing; EOD rows never appear in `pending_position_ids()` and `prepare()` returns `None` for them, so the worker cannot place an EOD order. |
-| Explicit (new) | `observe_exit`, `prepare_exit`, `claim_dispatch`, `advance_eod_expiry`, `pending_exit_position_ids`, `slot_state`, plus `set_status` | the later integration. Returns typed dispositions instead of booleans. |
+| Legacy, unchanged signatures | `observe`, `pending_position_ids`, `prepare`, `confirm_recovery_exit`, `set_status` | compatibility for older stop/target callers; the monitor uses the explicit surface below. |
+| Explicit | `observe_exit`, `prepare_exit`, `claim_dispatch`, `advance_eod_expiry`, `pending_exit_position_ids`, `slot_state`, plus `set_status` | the running Execution worker and startup hydration. Returns typed dispositions instead of booleans. |
 
 `confirm_recovery_exit()` is now `claim_dispatch(...).send`, so even a legacy caller cannot
 reach an EOD-lifecycle venue call without the durable claim.
@@ -1804,18 +1808,21 @@ intent supplies equal that window (one bound only, naive bounds or a mismatch ar
 bounds are the deadline; a later config change or clock movement cannot reopen an expired
 request.
 
-**Component data flow (built part solid, unbuilt part marked).**
+**Component data flow (as built).**
 
 ```text
 Settings.execution_eod_flatten_lead_seconds ─┐
 positions.opened_at (committed) ─────────────┼─► core.session_window.eod_session_window ─► window
 injected ledger clock ───────────────────────┘                                              │
                                                                                             ▼
-Position Monitor  ─ ExitIntent (+optional eod bounds) ─ ··· not wired ···►  PostgresExitLedger
-Execution worker (unchanged) ── legacy: observe/prepare/confirm/set_status ──►   │  (explicit surface:
-Integration task (later) ────── observe_exit/prepare_exit/claim_dispatch ─────►   │   observe_exit, prepare_exit,
-                                                                                  │   claim_dispatch, advance_eod_expiry,
-                                                                                  │   slot_state)
+EventBus PriceUpdated/CandleClosed ─► Position Monitor slots ─► on_observation wake-up
+                                                  │                     │
+                                                  └─ ordered pending ──► Execution worker
+                                                                   observe_exit/prepare_exit/
+                                                                   claim_dispatch/set_status
+                                                                               │
+                                                                               ▼
+                                                                      PostgresExitLedger
                                      ┌────────────────────────────────────────────┴────────────┐
                                      ▼                                                         ▼
                              exit_requests (one row/position)                        orders (close attempts)
@@ -1823,6 +1830,13 @@ Integration task (later) ────── observe_exit/prepare_exit/claim_disp
                              + first-wins fallback + retry_after                     exit_dispatch_started_at
                                      └──────────── positions.exit_attempt (monotonic IDs) ─────┘
                                      fills / position_fill_receipts ── settled-fill checks
+                                             │
+                                             ▼
+                                Portfolio State ─► restored position snapshot
+                                             │
+                                      clean reconciliation
+                                             ▼
+                         main.py: advance expiry + slot_state ─► restore monitor slots
 ```
 
 **`observe_exit()` internal flow.**
@@ -1879,19 +1893,30 @@ A stale unsent reservation whose quantity no longer matches the committed positi
 reported `UNSAFE` at claim time; the ledger does not cancel and re-reserve it (no such rule
 was approved), so that state needs operator/integration handling.
 
-**Not built here, for the integration task.** Monitor timer, tick cache and ordered handoff;
-Execution worker calls to the explicit surface and venue-side handling of each disposition;
-`portfolio_state/reconciliation.py` sends every approved close that the venue does not
-know into an identity-only `approved_exits` check and does not read the dispatch marker, so
-a marker-set (uncertain) order looks the same as a proven-unsent one. The ledger keeps such
-an order exclusive (never cancelled as unsent, resent or replaced, so a second restart
-cannot make a fallback actionable), but **nothing resolves it**: the integration task must
-make reconciliation treat marker-set + venue-unknown as an unresolved block and define the
-resolution path; hydration of monitor slots from
-`slot_state`; `main.py` ordering; the exit-request reader/frontend, which would show an
-`eod_flatten` row with its raw reason until updated. A1–A20 cases that need the monitor,
-real lifespan, bus or `SimulatedVenue` (A8, A11, A12, A14, A17 and the venue halves of
-A7/A15/A16/A20) are not covered by the ledger tests.
+**Integration as built (`simulated-eod-flatten-integration`).** The monitor's
+`on_observation` callback wakes Execution, which drains `pending_observations()` in
+sequence and acknowledges only committed `observe_exit()` results. A failed observation
+stays pending; subsequent observations for that position wait, while other positions
+continue. The worker serves `pending_exit_position_ids()` through `prepare_exit()` and
+`claim_dispatch()`. Only `CLAIMED` reaches `SimulatedVenue.place_order()`. For an EOD-lifecycle
+close, a venue exception or lost status acknowledgement leaves the dispatch marker and remains uncertain; the
+worker cannot resend it. Rejection stores the venue's reason and permits a new attempt
+after the ledger retry delay if the stored window remains open. Fills pass through the
+existing fill ledger and Portfolio State receipt worker.
+
+At startup, reconciliation treats an approved close with a dispatch marker and no venue
+report as a discrepancy and blocks activation. An approved close without a marker remains
+eligible for the worker's full revalidation after clean reconciliation. A fresh
+`SimulatedVenue` with an open ledger position still fails the venue-position check.
+After clean reconciliation and Portfolio State refresh, `main.py` advances EOD expiry
+from stored bounds, reads `slot_state()`, and restores the original and fallback monitor
+slots before starting the authorizer, Execution and monitor. A proven-unsent expiry
+cancellation triggers another Portfolio State refresh before those subscriptions.
+PostgreSQL `timestamptz` bounds are converted to UTC
+for `ExitIntent`; the persisted instant is unchanged. Shutdown stops the monitor before
+Execution so no new observation enters its draining queue. The read-only request panel
+continues to distinguish the original reason, expiry and fallback; orders and fills are
+separate evidence. Acceptance-case test mapping and limits are in `TESTING.md`.
 
 #### Approved policy (Saqib, 2026-09-29)
 
@@ -1907,23 +1932,21 @@ A7/A15/A16/A20) are not covered by the ledger tests.
 4. **Label freshness:** use a valid post-opening, entry-day tick with no additional maximum
    age. Candles do not label EOD; their bar-open timestamp cannot stand for close-price time.
 
-#### Remaining implementation footprint (subsequent tasks)
+#### Historical staged implementation footprint
 
-Position Monitor engine/ports and Execution engine/exit ledger need slots/handoff, explicit
-dispositions, deadline checks and dispatch claiming. Execution-ledger model plus a future
-migration need the fields/constraints above. `portfolio_state/reconciliation.py` and `main.py`
-need only EOD recovery/hydration integration. Settings, MarketClock coverage and
-`core/session_window.py` now supply the shared clock/window definition. SimulatedVenue and Backtest
-Runner semantics stay unchanged: candle-close backtest exits are not price/time-equivalent to
+The staged plan called for monitor slots and handoff, explicit ledger dispositions,
+deadline checks and dispatch claiming, migration `0016`, then reconciliation and
+lifespan recovery/hydration. These stages are complete. Settings,
+MarketClock coverage and `core/session_window.py` supply the shared clock/window definition.
+SimulatedVenue and Backtest Runner semantics stay unchanged: candle-close backtest exits are not price/time-equivalent to
 live tick-driven attempts.
 
-The existing exit-request reader and frontend types/panel should add EOD bounds/expiry and
+The existing exit-request reader and frontend types/panel include EOD bounds/expiry and
 optional fallback observation, preserving current fields/read-only behavior. An expired row
 must not appear to promise active protection. Order rows remain the source of attempt reason/
 status; monitor diagnostics remain `observed_only`. This exceeds the old one-CHECK footprint
 because durable handoff requires it. No unrelated UI/module changes. The approved policy is
-recorded in decision #185; the remaining implementation
-does not gain an order path merely from that approval.
+recorded in decision #185; the order path is the explicit integration described above.
 
 Parallel task file boundaries, using this foundation's API without editing `core/`:
 
@@ -1937,7 +1960,7 @@ Parallel task file boundaries, using this foundation's API without editing `core
 integration task. A later delivery owns its own `CHANGES.md`, `TESTING.md` and decision-log
 updates at packaging; parallel tasks should not assign competing decision numbers.
 
-#### Acceptance tests for subsequent EOD path (not executed in this foundation)
+#### Acceptance cases for the integrated EOD path
 
 Use real PostgreSQL for atomic transitions, injected clocks and the real lifespan/bus/
 SimulatedVenue for delivery and fills. Assert absence of extra orders, venue calls and fills,
@@ -1970,8 +1993,7 @@ Regression targets: `test_position_monitor_engine.py` (replace the exact-close E
 `test_exit_ledger_postgres.py`, `test_execution_engine.py`, `test_reconciliation.py`,
 `test_simulated_venue.py`, `test_market_clock.py`, `test_main_execution_pipeline.py`;
 add focused A1–A20 coverage, then backend suite and frontend type/build checks if readers change.
-Foundation-only window parity, calendar, config and boundary tests now pass. The A1–A20
-integration and transition tests remain future work; none is claimed to pass here.
+The case-to-test map and exact verification results are in `TESTING.md`.
 
 **Related follow-ups, not implemented:** #184 stop/target retries can accumulate rejected
 orders every five seconds outside session; a promoted fallback inherits this limitation.
@@ -1982,7 +2004,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
 **What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
 - **Inputs (as built):** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).
-- **Output:** the monitor's `ExitIntent` remains in process and has no client-order ID. For stop/target, Execution stores the observation and mints a durable position-linked order ID `"<trade_id>:exit:<n>"`; EOD flatten remains observed only. A stored request is retried while the process runs, but a fresh simulated venue with a lost position book blocks startup reconciliation rather than placing an orphaned close.
+- **Output:** the monitor's `ExitIntent` remains in process and has no client-order ID. For stop/target and eligible EOD flatten, Execution stores the observation and mints a durable position-linked order ID `"<trade_id>:exit:<n>"`. A stored request is serviced while the process runs, but a fresh simulated venue with a lost position book blocks startup reconciliation rather than placing an orphaned close.
 - **Stop/target enforcement is in-process** — acceptable for a simulated venue with no broker, **not** for a real one (a crash would leave a position without a stop): broker-side protective orders are a hard prerequisite before any real venue (§8, EX-11).
 
 ### 6.7 `OutcomeRecorder` and D17's live half (`trading_intelligence/`)

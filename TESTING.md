@@ -1,3 +1,71 @@
+# TESTING — `simulated-eod-flatten-integration`
+
+Baseline: clean GitHub `main` `f9b6d77`; decision #185 and migration `0016` were
+already committed. Tests used an isolated PostgreSQL 18.6 cluster and database
+`agentic_eod_test` on localhost port 5433, migrated with `alembic upgrade head` through
+`0016`. The test database session timezone was set to UTC. The first full-suite attempt
+used the cluster's Asia/Dhaka default and produced two unrelated timestamp-format
+assertion failures in backtest/outcome route tests; rerunning after setting this isolated
+database to UTC passed. No production or external database was contacted.
+
+New `test_simulated_eod_integration.py` exercises the real EventBus, Position Monitor,
+Execution worker, PostgreSQL ledgers, Portfolio State receipt worker and SimulatedVenue:
+EOD observation/order inside the window, one accepted order with no synthetic fill,
+real after-hours fill and closure, no tick/missed window, active EOD followed by a stored
+stop fallback, protective stop before EOD, actual venue rejection and one delayed retry, partial fills with the
+remaining quantity held by the same close, unfinished-entry cancellation with deduped fill
+evidence, ordered replay after an injected observation
+failure, and three real FastAPI lifespan starts (retained venue recovery with hydrated
+expired EOD/fallback slots, then fresh venue discrepancy block). Two further lifespan
+starts verify that a proven-unsent approved EOD reservation is sent only inside its
+stored window and cancelled at the deadline. Two fault cases prove that a venue exception
+or lost status commit after an EOD dispatch claim cannot resend or replace that order.
+Shared injected wall
+time drives monitor, ledger and venue session boundaries in these tests.
+`test_reconciliation.py` adds a missing dispatch-marked approved-close report that blocks
+startup and a retained report that advances the same ID after a lost status commit.
+
+§6.6 acceptance-case map (existing focused tests remain part of this delivery's
+verification; `test_simulated_eod_integration.py` is abbreviated as `integration`):
+
+| Case | Test evidence |
+|---|---|
+| A1 | `test_position_monitor_eod.py::test_pulse_boundaries`, `test_repeated_pulses_create_one_eod_with_stable_label`; `integration::test_eod_attempt_then_real_late_fill_closes_once` |
+| A2 | `test_position_monitor_eod.py::test_missing_tick_creates_nothing_and_logs_bounded`, protective stop/target tests; `integration::test_no_tick_no_order_and_missed_window` |
+| A3 | `test_exit_ledger_eod_postgres.py::test_expiry_persists_even_when_entry_or_receipt_delays_the_reservation`; `integration::test_working_entry_is_cancelled_and_its_existing_fill_is_deduped_before_eod_close` |
+| A4 | `test_exit_ledger_eod_postgres.py::test_unsent_approved_reservation_is_cancelled_atomically_at_the_deadline_and_never_reused`, `test_claim_after_deadline_never_sends_and_cancels_the_unsent_reservation` |
+| A5 | `test_exit_ledger_eod_postgres.py::test_terminal_eod_inside_window_retries_eod_on_a_new_id_and_duplicates_add_nothing`; `integration::test_venue_rejection_keeps_actual_reason_and_retries_once_before_close` |
+| A6 | `test_exit_ledger_eod_postgres.py::test_terminal_eod_at_or_after_close_expires_and_only_a_fallback_can_place` (rejection/cancellation, stop/target parametrization) |
+| A7 | `test_exit_ledger_eod_postgres.py::test_submitted_order_stays_working_past_close_and_fallback_cannot_place`; `integration::test_eod_attempt_then_real_late_fill_closes_once` |
+| A8 | `integration::test_eod_attempt_then_real_late_fill_closes_once`; `test_simulated_venue.py` delayed-tick acceptance behavior |
+| A9 | `test_exit_ledger_eod_postgres.py::test_partial_fill_keeps_one_active_order_then_fallback_sizes_the_settled_remainder`, `test_partial_cancellation_without_fallback_is_dormant_and_full_closure_makes_fallback_inert`; `integration::test_partial_venue_fills_keep_one_close_until_real_remaining_fill` |
+| A10 | `test_exit_ledger_eod_postgres.py::test_partial_cancellation_without_fallback_is_dormant_and_full_closure_makes_fallback_inert`; fill dedupe in `test_fill_ledger_postgres.py` |
+| A11 | `test_position_monitor_eod.py` pulse/tie/queued-event cases; `integration::test_protective_stop_before_pulse_prevents_eod_order`, `test_eod_attempt_then_real_late_fill_closes_once` |
+| A12 | `test_position_monitor_eod.py` pending/release cases; `integration::test_failed_eod_commit_retains_both_ordered_slots_until_replay` |
+| A13 | `test_position_monitor_eod.py` pre-entry/reopened/future/invalid tick cases; `test_exit_ledger_eod_postgres.py::test_invalid_eod_observations_are_rejected_and_never_stored` |
+| A14 | `test_position_monitor_eod.py` monotonic/equal-time cache, delayed candle, queue-order cases |
+| A15 | `test_exit_ledger_eod_postgres.py::test_dispatch_marked_approved_close_at_close_is_uncertain_not_unsent`; `integration::test_claimed_eod_call_is_never_blindly_resent_after_uncertainty`; `test_reconciliation.py::test_dispatch_marked_approved_exit_without_venue_report_blocks_recovery`, `test_dispatch_marked_approved_exit_with_retained_venue_ack_recovers_same_id` |
+| A16 | `test_exit_ledger_eod_postgres.py` expiry, dormant, fallback, unsent, submitted and partial cases; `integration::test_real_lifespan_eod_and_fresh_venue_restart_block` and `test_lifespan_revalidates_proven_unsent_eod_reservation` verify retained venue, persisted expiry, inside/outside window revalidation and hydrated slots before subscription |
+| A17 | `integration::test_real_lifespan_eod_and_fresh_venue_restart_block`; `test_reconciliation.py::test_approved_exit_is_not_sent_into_missing_venue_position` |
+| A18 | `test_session_window.py`, `test_position_monitor_eod.py::test_half_day_window_uses_13_00_et`, `test_exit_ledger_eod_postgres.py::test_advance_expiry_recovers_from_stored_bounds_and_config_or_clock_cannot_reopen_it` |
+| A19 | `test_exit_ledger_eod_postgres.py` concurrent observers/prepares/claims, guard and receipt tests; `integration::test_failed_eod_commit_retains_both_ordered_slots_until_replay` |
+| A20 | `test_exit_ledger_eod_migration.py`, `test_execution_exit_requests_route.py`, `test_execution_startup_status_route.py`, `integration::test_real_lifespan_eod_and_fresh_venue_restart_block` |
+
+Deterministic tests reproduce A15's two persisted crash states rather than killing the
+Python process at the exact instruction boundary. Retained venue evidence is exercised by
+reusing a `SimulatedVenue` book across lifespan starts; this is not a durable broker and
+cannot prove recovery from an external production venue. The fresh-venue restart uses a
+new actual `SimulatedVenue` instance. No browser click-through or real market feed was used.
+
+Validation: focused reconciliation/integration tests **21 passed**; full backend suite
+**1361 passed, 0 failed**; `npx tsc -b` passed; `npm run build` passed (Vite's existing
+large-chunk advisory). `git diff --check` passed. These counts include the final test
+additions and are recorded after the final rerun below.
+
+Package: `simulated-eod-flatten-integration.zip`, root-relative files listed in the zip.
+
+---
+
 # TESTING — `simulated-eod-exit-request-visibility`
 
 **Verified against Task 2:** GitHub `main` `c1d09e4` ("Simulated eod ledger handoff",

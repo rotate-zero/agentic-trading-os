@@ -1,3 +1,41 @@
+# CHANGES — `simulated-eod-flatten-integration`
+
+Connects decision #185's already-built monitor handoff, PostgreSQL exit state machine,
+migration `0016`, and read-only request view to the running simulated execution path.
+GitHub `main` was `f9b6d77` at start; no new decision or migration was needed.
+
+- `ExecutionEngine` drains monitor observations in sequence. The callback is only a wake-up;
+  a slot is acknowledged after `observe_exit()` commits. Database failure retains the slot,
+  and a later observation for the same position cannot overtake it. Distinct window, closed,
+  invalid and wait dispositions are handled. The legacy stop/target callback is not wired
+  alongside this handoff.
+- The worker services `pending_exit_position_ids()` using `prepare_exit()` and
+  `claim_dispatch()`. Only `CLAIMED` places a close at `SimulatedVenue`. It cancels unfinished
+  entries and collects reported fills, records actual venue rejection reasons, and leaves
+  EOD-lifecycle claims with exceptions or lost status commits uncertain. Each position is isolated
+  so one failure does not stop the others.
+- Reconciliation blocks startup when an approved close has a dispatch marker but the venue
+  has no report. A clean retained venue can resolve the same order ID; a fresh venue with
+  an open ledger position still blocks activation. After clean reconciliation and Portfolio
+  State refresh, startup advances persisted EOD expiry and restores the original/fallback
+  monitor slots before authorizer/Execution/monitor subscriptions. If expiry cancels a
+  proven-unsent order, Portfolio State refreshes again before those subscriptions.
+  PostgreSQL timestamp offsets are
+  converted to UTC for the monitor's `ExitIntent` contract.
+- Lifespan shutdown stops the monitor before draining Execution. The existing entry path,
+  stop/target flow, read-only `/health/execution-startup`, and simulated-only mode gate remain
+  in effect. The order and fill readers retain their separate meanings: a request is durable
+  intent; a reserved order is not venue acceptance; venue acceptance is not a fill; only a
+  committed fill receipt can reduce or close the position.
+- Added real PostgreSQL, EventBus, SimulatedVenue and three-start lifespan tests; extended
+  reconciliation tests for both missing and retained venue evidence. Updated §6.6's as-built
+  diagrams and acceptance status, plus this file and `TESTING.md`.
+
+EOD is a best-effort placement attempt. An accepted order can fill after hours or remain
+unfilled indefinitely. EX-12/OutcomeRecorder and paper/live execution are unchanged.
+
+---
+
 # CHANGES — `simulated-eod-exit-request-visibility` (read path only)
 
 Shows the durable EOD request state Task 2 introduced in the existing

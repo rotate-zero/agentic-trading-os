@@ -1,9 +1,9 @@
 """
 ExecutionEngine — routes authorized entries and durable, position-bound
-simulated stop/target exits through the configured venue. Fill updates
+simulated stop/target/EOD exits through the configured venue. Fill updates
 are committed before OrderFilled is published. The OrderApproved entry
-handler still rejects a close payload; exits use the Position Monitor
-handoff and PostgresExitLedger reservation instead.
+handler still rejects a close payload; exits use the Position Monitor's
+ordered observation handoff and PostgresExitLedger reservation instead.
 
 Own queue + worker (I7): OrderApproved is only ever enqueued by the Event
 Bus subscriber callback (`_on_order_approved`, must stay fast); the actual
@@ -23,7 +23,11 @@ from app.core.config import Settings, get_settings
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.execution_engine.fill_ledger import FillLedgerError, FillLedgerPort, FillRecord
-from app.execution_engine.exit_ledger import ExitLedgerError, PostgresExitLedger
+from app.execution_engine.exit_ledger import (
+    ClaimDisposition, ExitLedgerError, ObserveDisposition, PostgresExitLedger,
+    PrepareDisposition,
+)
+from app.position_monitor.handoff import ReleaseReason
 from app.execution_engine.ports import (
     DecisionAuthorizationPort,
     ExecutionVenueProvider,
@@ -79,6 +83,7 @@ class ExecutionEngine:
         self._exit_ledger = exit_ledger
         self._portfolio_state = portfolio_state
         self._pending_intents: dict[Any, Any] = {}
+        self._position_monitor: Any | None = None
         self._venue_provider = venue_provider or _NoVenueProvider()
         # Same defensive getattr as governor/engine.py — execution_mode is
         # the sibling `execution-ledger-and-venue` task's own config.py
@@ -136,6 +141,15 @@ class ExecutionEngine:
             self._pending_intents[intent.position_id] = intent
             self._queue.put_nowait(("exit_intent", intent.position_id))
 
+    def bind_position_monitor(self, monitor: Any) -> None:
+        """Bind the restored monitor before it starts accepting market events."""
+        self._position_monitor = monitor
+
+    def on_observation(self, observation: Any) -> None:
+        """A wake-up only; pending_observations remains the retry source."""
+        if self._accepting and self._exit_ledger is not None:
+            self._queue.put_nowait(("exit_observation", observation.sequence))
+
     # --- Event Bus subscriber (must stay fast — I7) -------------------------
 
     def _on_order_approved(self, envelope: EventEnvelope) -> None:
@@ -181,7 +195,7 @@ class ExecutionEngine:
                         pass
                     elif isinstance(item, tuple) and len(item) == 2 and item[0] == "venue_update":
                         await self._process_venue_update(item[1])
-                    elif isinstance(item, tuple) and len(item) == 2 and item[0] == "exit_intent":
+                    elif isinstance(item, tuple) and len(item) == 2 and item[0] in {"exit_intent", "exit_observation"}:
                         await self._service_exits()
                     else:
                         await self._process_one(item)  # type: ignore[arg-type]
@@ -194,6 +208,34 @@ class ExecutionEngine:
 
     async def _service_exits(self) -> None:
         assert self._exit_ledger is not None
+        if self._position_monitor is not None:
+            failed_positions = set()
+            for observation in self._position_monitor.pending_observations():
+                position_id = observation.intent.position_id
+                if position_id in failed_positions:
+                    continue  # preserve this position's observation order after a failed commit
+                try:
+                    result = await asyncio.to_thread(self._exit_ledger.observe_exit, observation.intent)
+                except Exception:
+                    failed_positions.add(position_id)
+                    logger.exception("Exit observation for %s was not committed; pending slot retained", position_id)
+                    continue
+                if result.acknowledged:
+                    self._position_monitor.acknowledge_observation(position_id, observation.kind)
+                elif result.disposition is ObserveDisposition.WINDOW_CLOSED:
+                    self._position_monitor.release_observation(position_id, observation.kind, ReleaseReason.WINDOW_CLOSED)
+                elif result.disposition is ObserveDisposition.POSITION_CLOSED:
+                    self._position_monitor.release_observation(position_id, observation.kind, ReleaseReason.POSITION_CLOSED)
+                elif result.disposition is ObserveDisposition.INVALID:
+                    logger.warning("Exit observation for %s invalid: %s", position_id, result.reason)
+                    self._position_monitor.release_observation(position_id, observation.kind, ReleaseReason.INVALID)
+                elif result.disposition is ObserveDisposition.WINDOW_NOT_OPEN:
+                    failed_positions.add(position_id)
+                else:
+                    failed_positions.add(position_id)
+                    logger.error("Unhandled exit observation disposition %s for %s", result.disposition, position_id)
+
+        # Compatibility for callers that still use the legacy stop/target handoff.
         for position_id, intent in tuple(self._pending_intents.items()):
             try:
                 observed = await asyncio.to_thread(self._exit_ledger.observe, intent)
@@ -206,36 +248,71 @@ class ExecutionEngine:
                 self._pending_intents.pop(position_id, None)  # position already closed
 
         venue = self._venue_provider.get_execution_venue()
+        position_ids = await asyncio.to_thread(self._exit_ledger.pending_exit_position_ids)
+        for position_id in position_ids:
+            try:
+                await self._service_exit_position(position_id, venue)
+            except Exception:
+                logger.exception("ExecutionEngine failed to service exit for %s; other positions continue", position_id)
+
+    async def _service_exit_position(self, position_id: Any, venue: Any) -> None:
+        assert self._exit_ledger is not None
+        prepared = await asyncio.to_thread(self._exit_ledger.prepare_exit, position_id)
+        if prepared.cancelled_order_id is not None and self._portfolio_state is not None:
+            await self._portfolio_state.refresh()  # proven-unsent expiry changed an order row
+        if prepared.disposition in {
+            PrepareDisposition.NO_REQUEST, PrepareDisposition.POSITION_CLOSED,
+            PrepareDisposition.WAIT_PENDING_FILL, PrepareDisposition.WAIT_ACTIVE_ORDER,
+            PrepareDisposition.WAIT_UNCERTAIN_DISPATCH, PrepareDisposition.WAIT_RETRY_DELAY,
+            PrepareDisposition.WAIT_WINDOW_NOT_OPEN, PrepareDisposition.DORMANT,
+        }:
+            return
+        action = prepared.action
+        if action is None:
+            raise ExitLedgerError(f"{prepared.disposition} had no action")
         if venue is None or "simulated" not in venue.supported_modes:
             return
-        position_ids = await asyncio.to_thread(self._exit_ledger.pending_position_ids)
-        for position_id in position_ids:
-            action = await asyncio.to_thread(self._exit_ledger.prepare, position_id)
-            if action is None:
-                continue
-            if action.kind == "cancel_entry":
-                await venue.cancel_order(action.client_order_id)
-                for update in await venue.get_fills(action.client_order_id):
-                    await self._process_venue_update(update)
-                report = await venue.get_order(action.client_order_id)
-                if report is None or report.status == "cancelled":
-                    changed = await asyncio.to_thread(self._exit_ledger.set_status,
-                        action.client_order_id, "cancelled", reason="protective_exit_entry_cancel")
-                    if changed and self._portfolio_state is not None:
-                        await self._portfolio_state.refresh()
-                continue
-
-            if not await asyncio.to_thread(self._exit_ledger.confirm_recovery_exit, action.client_order_id):
-                raise ExitLedgerError("reserved exit no longer matches open position")
-            instruction = VenueOrderInstruction(action.client_order_id, action.symbol, action.side,
-                action.qty, "market", None, "close")
-            ack = await venue.place_order(instruction)
-            if ack.status == "rejected":
-                await asyncio.to_thread(self._exit_ledger.set_status, action.client_order_id,
-                    "rejected", reason=ack.reason or "venue_rejected", venue_order_id=ack.venue_order_id)
-            else:
-                await asyncio.to_thread(self._exit_ledger.set_status, action.client_order_id,
-                    "submitted", venue_order_id=ack.venue_order_id)
+        if prepared.disposition is PrepareDisposition.CANCEL_ENTRY:
+            await venue.cancel_order(action.client_order_id)
+            for update in await venue.get_fills(action.client_order_id):
+                await self._process_venue_update(update)
+            report = await venue.get_order(action.client_order_id)
+            if report is None or report.status == "cancelled":
+                changed = await asyncio.to_thread(self._exit_ledger.set_status,
+                    action.client_order_id, "cancelled", reason="protective_exit_entry_cancel")
+                if changed and self._portfolio_state is not None:
+                    await self._portfolio_state.refresh()
+            return
+        if prepared.disposition is not PrepareDisposition.SUBMIT:
+            raise ExitLedgerError(f"unhandled prepare disposition {prepared.disposition}")
+        claim = await asyncio.to_thread(self._exit_ledger.claim_dispatch, action.client_order_id)
+        if claim.disposition is ClaimDisposition.WINDOW_EXPIRED and self._portfolio_state is not None:
+            await self._portfolio_state.refresh()  # claim cancelled the proven-unsent reservation
+        if claim.disposition in {
+            ClaimDisposition.ALREADY_CLAIMED, ClaimDisposition.STALE,
+            ClaimDisposition.WINDOW_EXPIRED, ClaimDisposition.WAIT_WINDOW_NOT_OPEN,
+            ClaimDisposition.WAIT_ENTRY_ACTIVITY, ClaimDisposition.WAIT_PENDING_FILL,
+        }:
+            return
+        if claim.disposition is ClaimDisposition.UNSAFE:
+            raise ExitLedgerError(f"unsafe exit dispatch {action.client_order_id}: {claim.reason}")
+        if claim.disposition is not ClaimDisposition.CLAIMED or claim.action is None:
+            raise ExitLedgerError(f"unhandled claim disposition {claim.disposition}")
+        claimed = claim.action
+        instruction = VenueOrderInstruction(claimed.client_order_id, claimed.symbol, claimed.side,
+            claimed.qty, "market", None, "close")
+        # An EOD-lifecycle claim has a durable marker: an exception or lost
+        # status commit is uncertain and cannot resend this ID. Legacy
+        # protective rows retain decision #184's marker-free semantics.
+        ack = await venue.place_order(instruction)
+        if ack.status == "rejected":
+            changed = await asyncio.to_thread(self._exit_ledger.set_status, claimed.client_order_id,
+                "rejected", reason=ack.reason or "venue_rejected", venue_order_id=ack.venue_order_id)
+        else:
+            changed = await asyncio.to_thread(self._exit_ledger.set_status, claimed.client_order_id,
+                "submitted", venue_order_id=ack.venue_order_id)
+        if changed and self._portfolio_state is not None:
+            await self._portfolio_state.refresh()
 
     async def _process_one(self, payload: dict[str, Any]) -> None:
         try:

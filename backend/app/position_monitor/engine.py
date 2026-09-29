@@ -355,6 +355,21 @@ class PositionMonitor:
         callback — is the retry source after a failed commit or lost ack."""
         return tuple(o for o in self.get_observations() if o.state is ObservationState.PENDING)
 
+    def restore_observation(self, kind: ObservationKind, intent: ExitIntent, state: ObservationState) -> None:
+        """Re-arm a committed request before start() subscribes to market events.
+
+        The caller reads the ledger after reconciliation. A restored slot is
+        never pending because its durable observation has already committed.
+        """
+        if self._accepting or state is ObservationState.PENDING:
+            raise ValueError("only committed observations may be restored before start")
+        key = (intent.position_id, kind)
+        if key in self._slots:
+            raise ValueError("duplicate restored observation")
+        self._slot_sequence += 1
+        self._slots[key] = _Slot(self._slot_sequence, intent, state)
+        self._exit_intents.setdefault(intent.position_id, intent)
+
     # --- handoff: consumer -> monitor --------------------------------------------
 
     def acknowledge_observation(self, position_id: UUID, kind: ObservationKind) -> bool:

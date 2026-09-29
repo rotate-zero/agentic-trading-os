@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -192,7 +194,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("POLYGON_API_KEY not set — skipping Polygon auto-connect")
 
-    # Execution pipeline (entry-lifecycle-wiring) — wires decisions #171
+    # Execution pipeline (entry-lifecycle-wiring and simulated EOD integration) — wires decisions #171
     # (AuthorizerStub, ExecutionEngine: entry orders, built against fakes)
     # and #172 (execution ledger, SimulatedVenue, Portfolio State: also
     # built against fakes) together against real Postgres-backed adapters,
@@ -215,8 +217,11 @@ async def lifespan(app: FastAPI):
     from app.portfolio_state.engine import PortfolioState
     from app.portfolio_state.postgres import PostgresPositionLedger
     from app.portfolio_state.reconciliation import reconcile_with_venue
-    from app.position_monitor.engine import PositionMonitor
+    from app.position_monitor.engine import ExitIntent, PositionMonitor
+    from app.position_monitor.handoff import ObservationState
     from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
+    from app.models.execution_ledger import ExitRequest, Position
+    from sqlalchemy import select
 
     authorizer_stub = None
     execution_engine = None
@@ -291,22 +296,57 @@ async def lifespan(app: FastAPI):
             portfolio_state_reader = PortfolioStateAdapter(portfolio_state, SessionLocal)
 
             authorizer_stub = get_authorizer_stub(bus, trade_ledger, portfolio_state_reader)
-            authorizer_stub.start()
 
             # order_ledger doubles as decision_authorization — PostgresOrderLedger
             # implements both OrderLedgerPort and DecisionAuthorizationPort.
             execution_engine = get_execution_engine(
                 bus, order_ledger, order_ledger, fill_ledger, exit_ledger, portfolio_state
             )
-            execution_engine.start()
-
-            # Observe market events against restored Portfolio State. The
-            # monitor hands stop/target intents to Execution; the latter
-            # persists and places reduce-only simulated close orders.
+            # Restore durable EOD expiry and both observation slots before
+            # the monitor accepts market events. The same ledger instance
+            # drives subsequent observation and placement work.
             position_monitor = PositionMonitor(
                 bus, PortfolioStatePositionReader(portfolio_state),
-                on_exit_intent=execution_engine.on_exit_intent,
+                on_observation=execution_engine.on_observation,
             )
+            with SessionLocal() as recovery_session:
+                recovery_rows = recovery_session.execute(
+                    select(ExitRequest, Position).join(Position, ExitRequest.position_id == Position.position_id)
+                    .where(Position.execution_mode == "simulated", Position.qty > 0, Position.status != "closed")
+                    .order_by(ExitRequest.created_at)
+                ).all()
+            cancelled_unsent = False
+            for request, position in recovery_rows:
+                expiry = await asyncio.to_thread(exit_ledger.advance_eod_expiry, position.position_id)
+                cancelled_unsent = cancelled_unsent or expiry.cancelled_order_id is not None
+                slot = await asyncio.to_thread(exit_ledger.slot_state, position.position_id)
+                if slot is None:
+                    raise RuntimeError("exit request disappeared during startup hydration")
+                original = ExitIntent(
+                    position_id=position.position_id, symbol=position.symbol, side=position.side,
+                    qty=position.qty, exit_reason=request.exit_reason,
+                    trigger_price=float(request.trigger_price), trigger_ts=request.trigger_ts,
+                    eod_flatten_at=(slot.eod_flatten_at.astimezone(timezone.utc)
+                                    if slot.eod_flatten_at is not None else None),
+                    eod_close_at=(slot.eod_close_at.astimezone(timezone.utc)
+                                  if slot.eod_close_at is not None else None),
+                )
+                kind = "eod" if slot.is_eod else "protective"
+                state = (ObservationState.EXPIRED if slot.is_eod and slot.eod_expired
+                         else ObservationState.ACKNOWLEDGED)
+                position_monitor.restore_observation(kind, original, state)
+                if slot.fallback_reason is not None:
+                    fallback = ExitIntent(
+                        position_id=position.position_id, symbol=position.symbol, side=position.side,
+                        qty=position.qty, exit_reason=slot.fallback_reason,
+                        trigger_price=float(slot.fallback_trigger_price), trigger_ts=slot.fallback_trigger_ts,
+                    )
+                    position_monitor.restore_observation("protective", fallback, ObservationState.ACKNOWLEDGED)
+            if cancelled_unsent:
+                await portfolio_state.refresh()  # expiry cancelled approved orders after the first refresh
+            execution_engine.bind_position_monitor(position_monitor)
+            authorizer_stub.start()
+            execution_engine.start()
             position_monitor.start()
             app.state.position_monitor = position_monitor
 
@@ -356,10 +396,10 @@ async def lifespan(app: FastAPI):
             execution_engine.deactivate()
         if authorizer_stub is not None:
             await authorizer_stub.stop()
-        if execution_engine is not None:
-            await execution_engine.stop()
         if position_monitor is not None:
             await position_monitor.stop()
+        if execution_engine is not None:
+            await execution_engine.stop()
         if portfolio_state is not None:
             await portfolio_state.stop()
         if execution_venue is not None:
@@ -405,6 +445,12 @@ async def lifespan(app: FastAPI):
         await context_engine.stop()
         await fundamentals_refresh_jobs.stop()
 
+        # The monitor owns a timer independent of the bus. Unsubscribe and
+        # stop that producer before the bus/Execution drain so no shutdown
+        # pulse can create a fresh exit observation while workers stop.
+        if position_monitor is not None:
+            await position_monitor.stop()
+
         # Bus stops FIRST, deliberately, not last — separately confirmed
         # (decision #47) via the same debugging session. With engines
         # stopped before the bus: while CandleRecorder.stop() is still
@@ -435,7 +481,7 @@ async def lifespan(app: FastAPI):
         # queue, nothing to drain).
         await opportunity_cache.stop()
 
-        # Execution pipeline (entry-lifecycle-wiring) — same "stops after
+    # Execution pipeline — same "stops after
         # the bus" posture as everything else in this block: each engine's
         # own stop() then only has to drain a fixed, already-queued
         # backlog. Producer-to-consumer order (authorizer -> execution
@@ -448,8 +494,6 @@ async def lifespan(app: FastAPI):
             await authorizer_stub.stop()
         if execution_engine is not None:
             await execution_engine.stop()
-        if position_monitor is not None:
-            await position_monitor.stop()
         if portfolio_state is not None:
             await portfolio_state.stop()
         if execution_venue is not None:

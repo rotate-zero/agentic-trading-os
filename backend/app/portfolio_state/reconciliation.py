@@ -83,6 +83,11 @@ async def reconcile_with_venue(
 
         if venue_report is None:
             if order.status == "approved" and order.position_effect == "close":
+                if order.exit_dispatch_started_at is not None:
+                    report.discrepancies.append(
+                        f"uncertain dispatched exit {order.client_order_id!r}: venue has no report"
+                    )
+                    continue
                 approved_exits.append(order)
                 continue
             await _reconcile_unknown_to_venue(session, venue, order, report)
