@@ -1254,6 +1254,327 @@ manual Refresh ──► refreshKey++ ─► cleanup marks previous run inactive
 collapse / unmount ──► cleanup marks run inactive; a late response or late failure is ignored
 ```
 
+#### Proposed — simulated EOD flatten contract (UNAPPROVED)
+
+**PROPOSED — NOT APPROVED, NOT IMPLEMENTED (`simulated-eod-flatten-contract`; temporary
+slug, no decision number).** Nothing below exists in code. It is the design for taking
+EOD flatten from today's observation to a simulated reduce-only close, and it needs one
+confirmation from Saqib (§ "The one policy to confirm"). It changes nothing in EX-12 or
+`OutcomeRecorder`.
+
+**What `main` does today (verified against `f517834`).** `PositionMonitor._evaluate()`
+emits an `eod_flatten` intent from a **tick or candle whose timestamp is at or after the
+regular-session close**, keyed to the position's entry trading day. The intent is
+in-memory and observed only: the callback filters it out (`exit_reason in {"stop",
+"target"}`), `PostgresExitLedger.observe()` returns `False` for it, and the
+`exit_requests` CHECK allows only `stop`/`target`.
+
+**Four findings that shape the design** (the first two were executed, not just read):
+
+1. **The current EOD instant can never be acted on.** `SimulatedVenue.place_order` rejects
+   with `outside_regular_session` at exactly 16:00:00 ET (accepted at 15:59:59, rejected at
+   16:00:00 and 16:00:01), because `MarketClock.is_regular_session()` is false from the
+   close instant. A close triggered by the first tick at/after 16:00 is always refused.
+2. **The EOD observation disables stop handling.** It latches the position in
+   `_exit_intents` ("no second intent, ever"). A tick at 16:00 produced an EOD intent; a
+   later 16:05 tick at 80 against a stop of 90 produced nothing, and nothing reached
+   Execution. Harmless while EOD is diagnostic; not acceptable once EOD is real.
+3. **No tick, no evaluation.** The monitor only evaluates on events. If no tick or candle
+   for the symbol arrives at or after the boundary, nothing fires. A quiet symbol therefore
+   needs a clock-driven trigger, not a tick-driven one.
+4. **The Backtest Runner's close is a candle convention.** `simulate_exit()` exits at the
+   *close price of the first candle stamped at or after the regular close* (1m candles are
+   stamped at their open, so with the `1m-ext` extended-hours data the runner downloads,
+   that is the 16:00–16:01 after-hours minute), and raises `InsufficientReplayDataError`
+   rather than invent an EOD if data ends earlier. The live contract cannot reproduce that
+   (finding 1); the parity delta is recorded below.
+
+#### Proposed contract
+
+**Window.** For a position, `close_at` is the regular-session close of its *entry*
+trading day (16:00 ET; 13:00 ET on a half-day; same derivation as
+`fill_simulator.regular_session_close_utc`). `flatten_at = close_at − L`, where
+`L = execution_eod_flatten_lead_seconds` (proposed default **60**, validated `1..900`). The
+**placement window** is `[flatten_at, close_at)`, judged by the **wall clock** — the same
+clock the venue's session guard reads — not by event timestamps. Event timestamps only
+label the observation. This is a placement guard, not fill logic, so I9 is unaffected.
+
+**Trigger — one path, clock-driven.** Position Monitor gains a small poll task
+(default 1 s, injectable clock). For each open position with no latched intent, on a
+trading day the calendar covers, when the wall clock is inside the window, it emits
+`ExitIntent(exit_reason="eod_flatten")`. EOD is **removed from the tick-driven
+`_evaluate()`**; stop/target stay event-driven and unchanged. The poll evaluates stop/target
+against the last observation *before* EOD, so stop wins a same-instant tie (EX-8).
+
+**Label price/time.** `trigger_price`/`trigger_ts` are the monitor's last observation for the
+symbol (tick price or candle close, with its own timestamp), which must be from the entry
+trading day and not in the future. The monitor now records a last observation for every
+symbol's events before the held-symbol filter (a dict write, no I/O). If none exists, no
+intent is produced, an ERROR is logged, and the poll retries while the window is open;
+nothing is fabricated and `trigger_price` stays `NOT NULL`.
+
+**Execution re-checks the window.** `observe()` for an EOD intent persists only inside the
+window (wall clock); `prepare()` reserves a new EOD close only inside it, and after
+`close_at` cancels a never-sent `approved` EOD reservation (`eod_window_closed`) instead of
+retrying. `confirm_recovery_exit()` refuses an EOD reservation past the window. A submitted
+order is **not** cancelled at the close (see policy).
+
+**Late, missing and unusual cases.**
+
+| Situation | Result |
+|---|---|
+| No tick at the boundary | Poll fires within ~1 s of `flatten_at` using the last observation; no exact-boundary tick is needed |
+| Tick stamped at/after `close_at` (late or after-hours) | No EOD effect. Stop/target still evaluate. (Fixes finding 2) |
+| Tick stamped inside the window but delivered after close | No EOD effect; the wall clock decides |
+| Symbol with no observation this process | No intent; ERROR; retried while the window is open |
+| Half-day (13:00 close) | `flatten_at` = 12:59 ET at L=60 |
+| Holiday, weekend, or a year the calendar lacks | No window, no automatic EOD, ERROR logged once. `MarketClock` holds **2026 holidays only**; from 2027-01-01 half-days and holidays are unknown, so the proposal adds an additive read-only accessor (name provisional) and refuses rather than guesses |
+| Execution stalled, recovers before `close_at` | Proceeds; rejected closes retry every 5 s (about 10 attempts at L=60) |
+| Execution recovers at/after `close_at` | No new attempt; unsent reservation cancelled; position stays open |
+| Process down across the window | Restart with an open position and an empty venue book blocks startup (below); no EOD |
+| Missed window | No next-day catch-up. The position stays open and visible on `/intelligence/execution-positions`; its stop/target remain armed |
+
+#### Precedence
+
+First durable reason wins; nothing overwrites a request; one close covers the position.
+
+| State when EOD becomes due | Result | Reason kept |
+|---|---|---|
+| Nothing pending | EOD intent → `exit_requests` → reservation | `eod_flatten` |
+| Stop/target intent latched, not yet committed | Latch blocks EOD | stop/target |
+| `exit_requests` stop/target row, no order yet or `retry_after` pending | Row stands; existing `prepare()` places it; EOD adds nothing | stop/target |
+| Active close (`approved`/`submitted`/`partially_filled`/`unknown`) | Nothing new; `uq_orders_active_exit_per_position` and `prepare()`'s active-close branch | that close's reason |
+| EOD row committed, stop touched later | Latch blocks a second intent | `eod_flatten` |
+| Stop touch and EOD due in the same poll | Stop is evaluated first | stop |
+| Partly filled entry still working | `prepare()` cancels the entry, waits for receipts, then sizes from committed quantity | unchanged |
+| Position already closed / qty 0 | `observe()` returns `False`; nothing written | none |
+
+The window rule applies **only** to `eod_flatten`; stop/target requests keep decision #184's
+behaviour exactly.
+
+#### What is reused, and the exact changes
+
+| Need | Existing mechanism (unchanged) | Change |
+|---|---|---|
+| One request per position | `exit_requests` PK `position_id`; `observe()` returns `True` on an existing row without overwriting | allow `eod_flatten`; window check for EOD only |
+| Quantity | `prepare()` sizes from committed `positions.qty`, never the intent's | none |
+| Reservation and identity | `<trade_id>:exit:<n>`, `positions.exit_attempt`, `orders.position_id`, partial unique index | none |
+| Entry still working / fill receipts | `prepare()` cancel-entry and pending-receipt branches; `confirm_recovery_exit()` re-check | none (EOD refusal past window only) |
+| Retry | `retry_after` +5 s on reject/cancel | none; no new attempt after `close_at` for EOD |
+| Fill, closure, `PositionClosed` | fill ledger → `PositionFillReceipt` → Portfolio State | none |
+| Restart | fills applied before reconciliation; `_reconcile_unknown_to_venue`; position-quantity check | none (below) |
+| Order reason | `orders.exit_reason String(16)`, **no CHECK** (0012); `eod_flatten` is 11 characters | none |
+
+**The schema change is one constraint.** `ck_exit_requests_reason` is
+`exit_reason IN ('stop', 'target')` in `models/execution_ledger.py` and migration `0015`.
+Migration `0016` drops and recreates it as `IN ('stop', 'target', 'eod_flatten')`, same name.
+Downgrade refuses if any `eod_flatten` row exists (same style as `0015`), else restores the old
+constraint. No column, table, index or `orders` change. `trigger_price > 0` and `NOT NULL` stay.
+
+#### What the simulated venue can and cannot guarantee
+
+**It guarantees** (read and executed): it accepts a close only while its wall-clock session
+guard is true; it is idempotent on `client_order_id` within one process; it fills the whole
+order at the first `PriceUpdated` tick at or after acceptance, stamped with that tick's
+`exchange_ts`; commission stays `None`.
+
+**It does not guarantee:** the fill time or price; that any tick arrives (no tick, no fill —
+the order stays `submitted`); that a fill lands inside the regular session (executed: an order
+accepted at 15:59:59 filled on a 16:20 tick, because the fill path checks no session); that a
+close cannot exceed or flip the position (the venue does not know Execution's position; the
+reduce-only guarantee is Execution's ledger checks); or anything across a restart.
+
+**Remains unsafe after this proposal:**
+
+- **Lost venue position.** The book is in memory. After a restart with an open ledger position
+  and a fresh venue, `_check_positions_discrepancy` (qty mismatch) or
+  `_reconcile_unknown_to_venue` (an approved exit reservation) blocks startup. The monitor and
+  Execution stay off, so no EOD fires. The position stays open until an operator-approved
+  reconciliation exists, which this proposal does not design. Closing it from the ledger alone
+  would fabricate a fill and breach I3/I14.
+- EOD protection holds only for a position opened and held within one uninterrupted process.
+- A close placed before the bell can fill on an after-hours tick, or never fill.
+- Wall clock vs. the venue's guard: both read the same host clock, so skew shifts both and is
+  not detected.
+
+#### Diagrams
+
+Component data flow (proposed additions marked `[+]`):
+
+```
+        utc_now() [+]  ── MarketClock (holidays, half-days, calendar coverage [+])
+             │                         │
+             ▼                         ▼
+ PriceUpdated/CandleClosed ─► Position Monitor
+   (bus; last price per          ├ last-observation map [+]   (every symbol, before the held filter)
+    symbol recorded [+])         ├ stop / target: on events               (unchanged)
+                                 └ EOD poll task [+]: window open? ─ latch? ─ price known?
+                                          │ ExitIntent(stop | target | eod_flatten [+]), put_nowait
+                                          ▼
+                              Execution Engine worker (0.5 s service loop)
+                                          │
+                                          ▼
+                              PostgresExitLedger.observe / prepare / confirm_recovery_exit
+                                 (EOD window re-checked here, wall clock [+])
+                                 exit_requests (PK position_id; 'eod_flatten' allowed by 0016 [+])
+                                 orders (position_id, exit_reason, <trade_id>:exit:<n>)
+                                          │
+                                          ▼
+                              SimulatedVenue.place_order ── own wall-clock guard ──► submitted | rejected
+                                          │ first PriceUpdated tick at/after acceptance
+                                          ▼
+                              OrderUpdate ─► Execution queue ─► fills + receipt ─► Portfolio State
+                                                                                   ─► PositionClosed
+```
+
+Monitor EOD poll (internal):
+
+```
+every poll (default 1 s), now = utc_now()
+  for each open position (reader):
+    latched? ──────────────────────────────► skip
+    window = eod_flatten_window(clock, entry_day, L)  ── None (holiday/weekend/uncovered) ─► log once, skip
+    now < flatten_at ──────────────────────► skip
+    now >= close_at ───────────────────────► log ERROR once (window missed); no intent; no latch
+    stop/target touched by last observation? ─► emit stop/target (stop first)      [EX-8]
+    last observation (entry day, ts <= now)? ─ none ─► ERROR (rate-limited); retry next poll
+    ▼
+    latch + emit ExitIntent(eod_flatten, price=obs.price, ts=obs.ts)
+```
+
+Execution ledger, EOD path (internal):
+
+```
+observe(eod intent): window open (wall clock)? no ─► False, nothing written
+                     position closed/qty 0?      ─► False
+                     row exists?                 ─► True, unchanged (first reason wins)
+                     else INSERT exit_requests(eod_flatten)
+prepare(position):   entry working? ─► cancel_entry      pending receipt? ─► wait
+                     active close? ─► reuse if approved, else wait
+                     EOD and now >= close_at: cancel unsent approved reservation; return None
+                     retry_after pending? ─► wait
+                     reserve <trade>:exit:<n> for committed qty, COMMIT
+confirm_recovery_exit: existing checks + (EOD and window closed ─► False; engine skips, no raise [+])
+place ─► submitted | rejected ─► retry_after (+5 s) ─► next attempt only while the window is open
+```
+
+Timeline on the entry day (ET):
+
+```
+ ...15:58      15:59:00 = flatten_at      16:00:00 = close_at        after hours
+    │              │◄──── placement window ───►│                          │
+ stop/target: any time    poll fires ≤1 s        venue rejects place_order   fill may still land on a
+                          Execution places ≤0.5 s  no new EOD attempts        tick here (not cancelled)
+```
+
+#### The one policy to confirm — EOD-A (recommended)
+
+1. **Authorization.** A simulated EOD flatten is the same class as stop/target: reduce-only,
+   no Governor decision (EX-5 option (a)), for `execution_mode = simulated` /
+   `execution_venue = simulated` only. Paper/live remain unauthorized and unbuilt.
+2. **Trigger.** Clock-driven at `close − 60 s` on the position's entry day, placed only inside
+   `[close − 60 s, close)` by wall clock; **no** next-day catch-up; **no** cancellation of a
+   submitted close at the bell.
+
+Rejected: trigger at the exact close (the venue refuses it); catch-up at the next open (a
+deliberate overnight hold liquidated at a different price, against §5/D8); cancel-at-bell
+(leaves the position open overnight to avoid an after-hours simulated fill); a Governor decision
+for EOD (an authorization round trip at the moment it hurts, per EX-5's own evidence).
+Alternatives Saqib may prefer: a different `L`, or cancel-at-bell.
+
+#### Implementation file list (for after approval)
+
+New: `backend/app/core/session_window.py` (pure: close instant, `eod_flatten_window()`,
+window state, `utc_now()`); `backend/alembic/versions/0016_exit_requests_eod_flatten.py` (the revision number is re-checked
+against `main` at implementation; parallel OutcomeRecorder work may claim `0016` first);
+`backend/tests/test_session_window.py`; `backend/tests/test_position_monitor_eod_flatten.py`;
+`backend/tests/test_exit_ledger_eod_postgres.py`;
+`backend/tests/test_main_eod_flatten_lifespan.py`.
+
+Modified: `backend/app/position_monitor/engine.py` (poll task, last-observation map, EOD out of
+`_evaluate()`, callback forwards EOD, local close-time copy replaced by `session_window`);
+`backend/app/execution_engine/exit_ledger.py` (allow EOD, window checks, `ExitAction.exit_reason`,
+clock/now injection); `backend/app/execution_engine/engine.py` (EOD skip instead of raise when
+the window has closed); `backend/app/models/execution_ledger.py` (constraint);
+`backend/app/core/config.py` (`execution_eod_flatten_lead_seconds`);
+`backend/app/core/market_clock.py` (additive coverage accessor, no behaviour change);
+`backend/tests/test_position_monitor_engine.py` (the test asserting an EOD intent at the close
+instant is rewritten); `backend/app/api/routes/intelligence.py` (docstrings only);
+`frontend/src/services/api-client.ts` (widen the exit-request `exit_reason` type; the panel's
+label map already has `eod_flatten`); this design doc, `CHANGES.md`, `TESTING.md`, and at
+packaging the decision log (`confirmed-decisions.md`, `INDEX.md`) under a number assigned after
+re-checking `main`. `main.py` is not expected to change (constructors read settings).
+
+#### Acceptance cases (PostgreSQL 16 and the real lifespan; none run yet)
+
+*Pure (`test_session_window.py`):* regular day and the DST changes (2026-03-08, 2026-11-01)
+give the right UTC instants; half-days 2026-11-27 and 2026-12-24 close 13:00; holiday, weekend
+and a 2027 date give no window; **parity with `fill_simulator.regular_session_close_utc` for
+every date in 2026**; boundary states (`flatten_at − 1µs` before, `flatten_at` open,
+`close_at − 1µs` open, `close_at` closed); lead outside `1..900` rejected.
+
+*Monitor, fake clock and bus (DB-free):* no tick at the boundary still fires from the last
+observation; no observation → no intent, one rate-limited ERROR, fires once a tick arrives;
+stop latched first → no EOD; EOD latched → later stop touch is not a second intent; stop and
+window due together → stop; tick stamped ≥ `close_at` → no EOD **and a later stop touch still
+fires** (regression for finding 2); half-day and holiday; missed window logged once; `stop()`
+leaves no poll task.
+
+*Ledger, real PostgreSQL (`test_exit_ledger_eod_postgres.py`):* `alembic upgrade head` from a
+wiped DB; `0016` accepts `eod_flatten`, still rejects `time`; downgrade refuses with an EOD row
+and succeeds without; `observe()` inside the window persists once, a second call and a later
+stop observation leave the row and reason unchanged, before `flatten_at` and at/after `close_at`
+write nothing; `prepare()` produces `<trade>:exit:1`, `exit_reason='eod_flatten'`, quantity from
+the position (intent quantity 999 ignored); partly filled entry → cancel first; pending receipt
+→ wait; a second active close still violates the partial unique index; rejection then a second
+attempt inside the window (`:exit:2`, `retry_after` honoured); rejection or an unsent
+reservation after `close_at` → no new order and the reservation cancelled; a stop request after
+`close_at` still reserves (control); `confirm_recovery_exit()` false past the window and the
+engine does not raise; reconciliation with an approved EOD reservation and a fresh venue reports
+a discrepancy.
+
+*Real lifespan (`TestClient`, real bus, `SimulatedVenue`, Postgres, injected clocks):*
+1. Position opened through the pipeline; at `flatten_at − 5 s` nothing; at `flatten_at` one
+   `exit_requests` row (`eod_flatten`, trigger price/time = the last tick), one close order
+   `<trade>:exit:1` `submitted`, visible on `/intelligence/execution-exit-requests` and
+   `/intelligence/execution-orders`; a later tick fills it; position and trade closed,
+   `PositionClosed` published, fill on `/intelligence/execution-fills`.
+2. Same with the last tick five minutes old (timer-driven).
+3. Fill on a tick stamped after `close_at`: closes, and the fills route shows the after-close
+   `venue_ts` (documents the guarantee limit).
+4. No tick after acceptance: order stays `submitted` through the close; not cancelled.
+5. Stop tick 10 s before the window: one request (`stop`), one close, nothing added at
+   `flatten_at`.
+6. EOD first, stop tick before the fill: still one request and one order, reason `eod_flatten`.
+7. Clock jumps from before the window to after `close_at` inside one poll: no request, position
+   `open`, ERROR once, `/health/execution-startup` unchanged.
+8. Half-day 2026-11-27: fires at 12:59, not 15:59.
+9. Restart with an open position (fresh venue): startup `reconciliation_blocked`,
+   `app.state.position_monitor is None`, no order created, position `open` even after the clock
+   enters the window (documents the unsafe case).
+10. Restart with an approved unsent EOD reservation: blocked (`unreserved approved exit`).
+11. Five polls in the window: exactly one request and one order (idempotent).
+12. Lifespan exit: poll task cleared, no error logs.
+
+*Regression:* full backend suite against a wiped DB; `npx tsc -b` and `npx vite build`; the
+existing stop/target lifespan test unchanged and passing.
+
+#### Findings reported, not fixed (AGENTS.md §9)
+
+- **Stop/target retries are unbounded outside the session** (by reading, not executed — no
+  PostgreSQL here). A rejected close retries every 5 s with a new order ID; after the bell each
+  attempt is refused by the venue, so a stop hit near the close accumulates orders until the
+  next open. Related follow-up (bounded retry or session-aware backoff); it applies to
+  stop/target only, because EOD stops at `close_at`.
+- `ExecutionEngine._service_exits()` raises out of its whole pass on one position's stale
+  reservation, skipping later positions (by reading; one position today). The proposal avoids
+  it for EOD only.
+- Finding 2 (the EOD latch) is fixed by this proposal because it becomes live behaviour;
+  it is not a separate task.
+- `MarketClock`'s 2026-only calendar is a known TODO in its own docstring; this proposal
+  guards against it but does not replace it.
+
+
 **What it is (and isn't).** Only the three exit rules the Backtest Runner already models — stop, target, and `eod_flatten` at the real regular-session close — evaluated live for symbols Portfolio State reports open. It is **not** the module `trading-intelligence-architecture.md` §13 describes (is the thesis still valid, is momentum weakening, move the stop, take a partial, exit, reverse, hold); those questions, manual-position handling (`future-ideas.md` #14), and emergency actions (#16) are out of scope.
 
 - **Inputs (as built):** `PriceUpdated` and `CandleClosed` for held symbols; `MarketClock` for the EOD instant (the derivation `fill_simulator.regular_session_close_utc` uses).
@@ -1549,6 +1870,8 @@ Execution requires a committed approved trade and matching open position,
 cancels unfinished entries, waits for fill receipts, reserves at most one
 active close per position, and rechecks before venue placement. This is not
 an authorization policy for EOD, manual, paper, or live exits.
+
+**Proposed extension for EOD (unapproved; `simulated-eod-flatten-contract`).** Option (a) applied to simulated EOD flatten, with a wall-clock placement window `[close − L, close)`, is proposed in §6.6 ("Proposed — simulated EOD flatten contract") and needs Saqib's confirmation before implementation. Nothing here changes the as-built resolution above.
 
 ### EX-6 — Position accounting owner, in-flight orders, `PositionClosed` lane  · RESOLVED (decision #170)
 **Resolution.** **Portfolio State owns position accounting, in-flight orders, and daily P&L** (I5), as a cache over the authoritative ledger (I12). **`PositionClosed` may use the critical lane, but only after the position closure has been committed to the database** (I8). **Documented explicitly: the critical lane provides ordering and handler-failure isolation — not persistence, delivery guarantees, crash recovery, or failure propagation to the publisher** (F6, §6.5); recovery comes from the ledger (§6.9). Departure from `system-design.md` §4.8, which has Position Monitor emit `PositionClosed`: Position Monitor is a decision module that reads Portfolio State and issues exit intents (§6.5, §6.6).

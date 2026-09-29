@@ -1,3 +1,75 @@
+# CHANGES — `simulated-eod-flatten-contract` (PROPOSAL — NOT APPROVED, NOT IMPLEMENTED)
+
+## Current delivery
+
+Design only. `docs/architecture/execution-engine-design.md` §6.6 gains "Proposed —
+simulated EOD flatten contract (UNAPPROVED)", and EX-5 gains one pointer paragraph. No
+application code, migration, test, frontend file, decision-log entry or decision number was
+written or assigned. EX-12 and `OutcomeRecorder` (§6.7) are untouched.
+
+**Provenance.** Written against `main` at `f517834`. Decision #184 left EOD flatten as an
+in-memory observation with no authorization policy (EX-5 open for EOD). This proposal
+designs the smallest path from that observation to a simulated reduce-only close.
+
+**What the proposal says.**
+
+- **Trigger.** Clock-driven, not tick-driven: a Position Monitor poll fires inside a
+  wall-clock window `[close − L, close)` on the position's entry day (`L` proposed 60 s;
+  half-day aware). A tick at the boundary is not needed; late or after-hours ticks cannot
+  cause or block an EOD.
+- **Precedence.** First durable reason wins; `exit_requests` is one row per position, one
+  active close per position (existing partial unique index). Stop is evaluated before EOD.
+- **Reuse.** Quantity from committed `positions.qty`, `<trade_id>:exit:<n>` reservations,
+  cancel-entry and fill-receipt waits, `retry_after`, `confirm_recovery_exit()`, fill
+  ingestion, Portfolio State closure, startup reconciliation.
+- **Schema.** One constraint: `ck_exit_requests_reason` widened to allow `eod_flatten`
+  (migration `0016`, same name). `orders.exit_reason` has no CHECK and already fits.
+- **Venue.** Guarantees and non-guarantees, and what stays unsafe after a restart with a
+  lost venue position, are listed in the section.
+- Diagrams (component data flow, monitor poll, ledger path, timeline), the file list, and 12
+  real-lifespan plus pure/monitor/ledger acceptance cases are in the section.
+
+**The one confirmation needed from Saqib:** policy EOD-A — simulated EOD needs no Governor
+decision (EX-5 option (a)), triggered at `close − 60 s` by wall clock, no next-day
+catch-up, no cancellation of a submitted close at the bell.
+
+## Findings (recorded, not acted on)
+
+- **The current EOD instant cannot be acted on** (executed): the venue rejects a close at
+  exactly 16:00:00 ET.
+- **The EOD observation latches the position and silences later stops** (executed): a 16:05
+  price of 80 against a stop of 90 produced no intent after a 16:00 EOD observation.
+- **Stop/target retries are unbounded outside the session** (read, not executed): every 5 s
+  a new order is created and refused by the venue until the next open.
+- `ExecutionEngine._service_exits()` aborts its pass for later positions when one
+  reservation raises (read).
+- `MarketClock` knows 2026 holidays and half-days only; from 2027-01-01 the EOD window would
+  be wrong, so the proposal adds a coverage guard instead of trusting the calendar.
+- Backtest parity: the runner exits at the close of the first candle stamped at or after the
+  close (an after-hours minute in `1m-ext` data); live would place about a minute earlier
+  and fill on the next tick. The delta is recorded, not hidden.
+
+## Boundary
+
+Only `docs/architecture/execution-engine-design.md`, `CHANGES.md` and `TESTING.md` change.
+The design-doc change is **insertion-only** (two blocks, no existing line altered), so it
+can be integrated beside the other Claude's edit to the §6.7 `OutcomeRecorder` section:
+apply `simulated-eod-flatten-contract-design.patch` with `git apply --3way` on top of
+whichever version has landed, rather than unzipping the whole file over it. `CHANGES.md`
+and `TESTING.md` are prepended blocks; if the other delivery landed first, keep both blocks
+(newest first). `confirmed-decisions.md` and `INDEX.md` are deliberately untouched;
+assign a number only when this is approved, implemented and ready to merge, after
+re-checking `main`. A migration revision `0016` may also be wanted by parallel
+OutcomeRecorder work — re-check at implementation. Not merged, not pushed.
+
+## Package
+
+`simulated-eod-flatten-contract.zip` contains three files, root-relative:
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+A separate `simulated-eod-flatten-contract-design.patch` carries the design-doc change alone.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-panel-exit-requests`
 
 ## Current delivery

@@ -1,3 +1,58 @@
+# TESTING — `simulated-eod-flatten-contract` (PROPOSAL — design only)
+
+## Environment
+
+- Fresh `git clone` of GitHub `main` at `f517834` (`Execution panel exit requests`), local
+  branch `simulated-eod-flatten-contract`. `origin/main` was re-fetched before packaging:
+  unchanged. Nothing merged or pushed.
+- Python 3.12 virtualenv from `backend/requirements.txt`. **No PostgreSQL was available**,
+  so nothing database-backed was run and no real-lifespan case was executed.
+
+## Results
+
+Two behaviours the proposal depends on were **executed** against the real classes (scratch
+script, not committed):
+
+- `SimulatedVenue.place_order` with an injected clock: `15:59:59` → `submitted`;
+  `16:00:00` and `16:00:01` → `rejected`, reason `outside_regular_session`. An order accepted
+  at 15:59:59 then **filled** on a tick stamped 16:20 ET (`filled`, `venue_ts`
+  `2026-09-29T20:20:00+00:00`).
+- Real `PositionMonitor` on a buy position (stop 90, target 120): a 16:00 ET tick at 100
+  produced one `eod_flatten` intent with trigger price 100.0; a 16:05 tick at 80 produced no
+  second intent, and **0** intents were handed to the Execution callback.
+
+Baseline on the untouched tree: `tests/test_position_monitor_engine.py` and
+`tests/test_fill_simulator_and_gate.py` — **26 passed**.
+
+Documentation checks: the design-doc diff is insertion-only (no line removed or altered);
+every backend/frontend path named in the new section exists, except the six files it labels
+as new; every symbol it cites (`uq_orders_active_exit_per_position`,
+`ck_exit_requests_reason`, `_check_positions_discrepancy`, `_reconcile_unknown_to_venue`,
+`regular_session_close_utc`, `InsufficientReplayDataError`, `confirm_recovery_exit`,
+`on_exit_intent`, `pending_position_ids`, `_service_exits`) is present in the tree.
+
+## Not covered
+
+- **Read, not executed:** the exit-ledger transaction behaviour, the unbounded
+  stop/target retry finding, the `_service_exits()` abort finding, the reconciliation blocks
+  after a restart with a lost venue position (the code was read; the existing tests for
+  orphaned orders were not re-run without PostgreSQL), and that `orders.exit_reason` has no
+  CHECK (read from migration `0012`).
+- The acceptance cases in the design section are a specification. None has been written or run.
+- The full backend suite and the frontend build were not run; no code changed.
+
+## Manual check (recommended)
+
+Review the "The one policy to confirm — EOD-A" block and either confirm it or change the
+lead time / cancel-at-bell choice before an implementation task starts.
+
+## Package
+
+`simulated-eod-flatten-contract.zip`: `docs/architecture/execution-engine-design.md`,
+`CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-panel-exit-requests`
 
 ## Environment
