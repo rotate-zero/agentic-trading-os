@@ -1,3 +1,27 @@
+# TESTING — `simulated-eod-flatten-contract` revision (design only)
+
+Baseline: GitHub `main` fetched before design work at `67ef81d`, matching local `main`;
+initial tree clean. Final remote/state check performed before handoff.
+
+Validation for this revision:
+
+- Read AGENTS.md, decision process/index and relevant canonical decisions (#170, #175,
+  #184), archive boundaries and execution architecture.
+- Inspected Position Monitor/ports, exit ledger/model, Execution worker, SimulatedVenue,
+  MarketClock, reconciliation, and relevant monitor/ledger/venue/clock/Execution/recovery
+  tests, including the protective-exit real-lifespan test.
+- Checked request/latch/dispatch/recovery transitions against actual methods. Corrected
+  the old proposal's immutable-row dead end, timestamp guarantee and restart error claim.
+- Checked diff whitespace, balanced proposal code fences, A1–A20 coverage/uniqueness,
+  unchanged text outside the proposal, unchanged canonical decision records and docs-only
+  changed-file scope. Results: passed.
+
+No pytest, PostgreSQL, migration, runtime probe or frontend build was run: no implementation
+changed. A1–A20 are future acceptance requirements, not executed/passing tests. Earlier
+records below describe earlier deliveries and are not validation claims for this revision.
+
+---
+
 # TESTING — `outcome-recorder-contract`
 
 ## Environment

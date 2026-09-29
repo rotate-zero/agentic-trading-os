@@ -1,3 +1,27 @@
+# CHANGES — `simulated-eod-flatten-contract` revision (UNAPPROVED)
+
+Design/documentation only, requested by Saqib. Inspected and re-fetched GitHub `main`
+at `67ef81d`; reused the committed implementation and revised the existing §6.6 proposal
+in `docs/architecture/execution-engine-design.md`. No code, migration or test implementation.
+
+- Replaced permanent EOD suppression with proposed durable original-EOD/fallback slots,
+  placement expiry and explicit monitor/Execution acknowledgement behavior.
+- Specified transitions for missing requests, unsent reservations, reject/cancel, submitted
+  and partial orders, later stop/target and restart; preserved one-active-close/reduce-only.
+- Added a durable dispatch claim to distinguish proven-unsent from uncertain placement,
+  including crash/recovery and concurrent-claim acceptance cases.
+- Specified post-opening tick-only labels, monotonic cache and queue ordering, supported
+  calendar bounds, after-hours/non-fill limits and best-effort EOD wording.
+- Replaced component/internal diagrams and added acceptance matrix A1–A20.
+- Identified four unapproved policy choices: authorization/timing, fallback precedence,
+  accepted-order behavior at close and label freshness, with recommendations/alternatives.
+
+Updated this file and `TESTING.md`. Canonical decision index/log/archive remain unchanged:
+latest confirmed decision is #184; the temporary slug has no number and is not approved.
+EX-12 and its separate proposal are unchanged. Previous delivery records follow verbatim.
+
+---
+
 # CHANGES — `outcome-recorder-contract` (PROPOSAL — NOT APPROVED, NOT IMPLEMENTED)
 
 ## Current delivery
