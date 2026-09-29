@@ -1,3 +1,81 @@
+# CHANGES — `outcome-recorder-contract` (PROPOSAL — NOT APPROVED, NOT IMPLEMENTED)
+
+## Current delivery
+
+Design only. `docs/architecture/execution-engine-design.md` gains **§6.7.1 "Proposed
+`OutcomeRecorder` contract"** (between §6.7 and §6.8) and one pointer paragraph under EX-12.
+No application code, migration, test, frontend file, decision-log entry or decision number was
+written or assigned. EX-12 stays OPEN: it needs Saqib's confirmation before anything is built.
+
+**Provenance.** Written against backend code at `f517834`. `main` advanced to `3c23701`
+(`simulated-eod-flatten-contract`, documentation only) before packaging; this delivery is
+rebased on it and does not touch that proposal's text. Every "as-built" row in §6.7.1 cites a
+file and symbol, and every proposed behavior is labelled Proposed.
+
+**What §6.7.1 contains.**
+
+- **A. As-built facts (A1–A11).** Nothing calls `record_strategy_outcome()` except the Backtest
+  Runner; `trades.status = 'closed'` is already committed atomically with the closing fill; the
+  receipts hold every fill's exact inputs, so a closed position can be replayed from the ledger
+  alone; `PositionClosed` is a lossy wake-up carrying no entry facts, thesis or evidence.
+- **B. Field-by-field source map** for every `StrategyOutcome` field: persisted, derived, NULL, or
+  the exact missing source. Four gaps (M1–M4), one of which blocks: `Opportunity.evidence` is
+  never persisted, and `strategy_outcomes.evidence` is `NOT NULL`.
+- **C. Writer behavior** (C1–C8): partial reductions, commissions, missing snapshots, missing R
+  basis, duplicate closure notifications, failed writes, restart recovery, trade-to-position
+  cardinality. A trade that cannot be attributed honestly becomes `blocked` with a logged reason;
+  it is never recorded with placeholders and never dropped.
+- **D. Atomic linkage.** One transaction: lock the `trades` row, insert the outcome, set
+  `outcome_id` and `outcome_status = 'recorded'`, commit. No migration: `outcome_status` has no CHECK.
+- **E. Diagrams.** Component data flow and the recorder's internal flow, in the repository's ASCII style.
+- **F. EX-12 options against current code.** (a) recommended, refined; (b) kept only as a wake-up
+  hint; (c) rejected.
+- **G. Build footprint and acceptance criteria** (P1–P4), all proposed.
+- **H. The one decision to confirm** (below).
+
+**The decision Saqib must confirm.** Confirm EX-12 option (a) in the form §6.7.1 specifies:
+`OutcomeRecorder` is the only writer of non-backtest `strategy_outcomes` rows; the ledger drives it
+and events are wake-up hints only; `strategy_outcomes` stays strict, so an unattributable trade is
+`blocked`. That includes two footprint items outside `trading_intelligence/`: P1 (the Governor
+persists `evidence` and `confirmed_at` at acceptance) and P3 (a same-session variant of
+`record_strategy_outcome()`). Defaults unless overruled: 60 s snapshot-lag bound, 60 s sweep,
+`blocked` reasons in logs only, first opening fill defines `entry_filled_at`, the closing fill's
+order defines `exit_reason`.
+
+**Deviations from §6.7's earlier sketch (called out, not silently changed).** (1) `PositionClosed`
+enqueues a `trade_id`; it is not the data source. (2) Insert and link are one transaction rather
+than "ok then set `outcome_id`". (3) A fourth `outcome_status` value, `blocked`. (4) The exit
+snapshot is captured only within a lag bound; a later recovery pass records `NULL` plus
+`recorder_unavailable`. §6.7's text is left as written.
+
+## Findings (recorded, not acted on)
+
+- **Blocker for the build, not for this proposal:** `evidence` is not persisted anywhere durable.
+  Trades approved before P1 ships would all be `blocked` (`evidence_unavailable`).
+- **P1 risk:** `PostgresTradeLedger._record_data` serializes with `allow_nan=False`; a non-JSON-safe
+  `Opportunity.evidence` would fail the authorization commit. The build must sanitize first.
+- `strategy_outcomes` has no uniqueness on `opportunity_id` (scratch run inserted two rows for one
+  ID). The row lock prevents it in practice; a partial unique index would make it structural (a
+  migration, left as a follow-up).
+- `positions` has no uniqueness on `trade_id`; one position per trade rests on procedure
+  (cancel-entry before close), so the recorder blocks on zero or several positions.
+- `BacktestRunner` writes `schema_version = 1` while §6.8 and decision #170 say new-shape writers
+  write 2. Not touched; noted so it is not mistaken for a recorder bug.
+- `record_strategy_outcome()` builds its ORM row without `execution_mode`, `execution_venue` or
+  `snapshot_missing_reasons`; a NULL-snapshot row fails the DB CHECK today.
+- §1.3 of the design still lists `trades` and `orders` as not built; that inventory is marked
+  historical in the document header and was left alone.
+
+## Boundary
+
+No backend, migration, frontend, test or decision-log change. No decision number assigned. §6.7,
+§6.6 (including the concurrent EOD proposal), §7.1 and every other section are unchanged apart from
+the one EX-12 pointer paragraph. At merge time the build task must re-check `main` and the
+canonical decision log before assigning a number; if EX-12 is confirmed, §6.7.1 is rewritten from
+proposed to as-built in that delivery. Not merged, not pushed.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `simulated-eod-flatten-contract` (PROPOSAL — NOT APPROVED, NOT IMPLEMENTED)
 
 ## Current delivery

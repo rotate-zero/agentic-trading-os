@@ -1,3 +1,54 @@
+# TESTING — `outcome-recorder-contract`
+
+## Environment
+
+- Fresh `git clone` of GitHub `main`; code inspected at `f517834`. `origin/main` was re-fetched
+  before packaging and had advanced to `3c23701` (documentation only). The tree was fast-forwarded
+  locally and this delivery reapplied on top: no conflict, backend code unchanged. Local only;
+  nothing merged or pushed.
+- Docs-only delivery. **No repository test was run** (no code changed); the repository suite was not
+  executed.
+- Scratch environment (sandbox only, not shipped): PostgreSQL 16 installed with `apt`, a throwaway
+  database, and `alembic upgrade head` run to `0015` against the real migrations. Backend
+  requirements installed with pip. Nothing in the repo was modified by this.
+
+## Results
+
+- **Claim-to-source check (machine).** All 15 `backend/...` paths and all 14 `path:symbol` citations in
+  §6.7.1 exist in the tree; code fences are balanced.
+- **Scratch script against real PostgreSQL 16**, calling the real `record_strategy_outcome()`,
+  `StrategyOutcomeRecord`, `Trade`, `Position` and `apply_fill` (six probes, all behaved as §6.7.1 states):
+  - E1: a row with a NULL exit snapshot **and** a reasons dict is rejected by
+    `ck_strategy_outcomes_null_snapshot_has_reason`, because the current writer drops
+    `snapshot_missing_reasons` (A6b).
+  - E2: a full simulated outcome stores `execution_mode = simulated`, `execution_venue = simulated`,
+    `is_backtest = False`, `schema_version = 2`.
+  - E3: the same `opportunity_id` written twice gives **two** rows (A6c).
+  - E4: the proposed link transaction (scratch SQL, not application code): a fault between insert and
+    link rolls back to zero outcome rows; the first real attempt records one and sets the link; a
+    duplicate returns `already_recorded` and inserts nothing.
+  - E5: two `positions` rows for one `trade_id` are accepted (A9).
+  - E6: replay of 2 opens and 2 reductions, one with `commission = NULL`, through `apply_fill` gave
+    status `closed`, avg price `100.4`, entry qty 100, exit qty 100, exit VWAP `99.9`, gross `-50.0`,
+    `fees = None`, `unknown_fee_count = 1`. This confirms section B's derivations and C2's
+    NULL-commission rule.
+
+## Not covered
+
+- The proposal itself is untested by construction: no `OutcomeRecorder`, no same-session
+  `record_strategy_outcome()` variant, no entry-snapshot hook and no persisted `evidence` exist. E4
+  proves the locking and rollback mechanics with plain SQL, not the recorder.
+- Concurrent workers (two processes racing the row lock) were reasoned about, not run.
+- `SimulatedVenue` commission behavior (A10) and the exit-reason plumbing were read, not executed.
+- Nothing was checked against a running app or a live event bus.
+
+## Package
+
+`outcome-recorder-contract.zip` contains exactly three files, root-relative:
+`docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `simulated-eod-flatten-contract` (PROPOSAL — design only)
 
 ## Environment

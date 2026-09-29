@@ -1615,6 +1615,173 @@ existing stop/target lifespan test unchanged and passing.
 4. **Backtests are unchanged:** decision #128's discard-on-`None` stays for `execution_mode = backtest` rows, and the schema keeps those four columns `NOT NULL` for them (§6.8).
 5. **Capture timing is visible.** Snapshots are read at fill-handling time, not as of `fill_ts`; the market-state dict carries its `candle_ts` and the trade row stores `captured_at`, so late capture is measurable rather than hidden.
 
+### 6.7.1 Proposed `OutcomeRecorder` contract (`outcome-recorder-contract`) — PROPOSED, not built; EX-12 awaits Saqib's confirmation
+
+**Status.** Design only. No application code, migration or decision number comes with this section; the slug is the temporary identifier. Rows marked **as-built** were verified against backend code at `f517834`; `main` later advanced to `3c23701`, which changed only documentation (`simulated-eod-flatten-contract`, an unapproved proposal that does not touch EX-12 or this section). A scratch run on real PostgreSQL 16 confirmed the three writer facts in A6). Everything marked **Proposed** is neither built nor decided. §6.7's sketch above stays as written; this section refines four points where `main` disagrees with it: (1) `PositionClosed` is a wake-up hint, not the data source; (2) the outcome insert and the `trades` link commit in one transaction, not as two steps; (3) a fourth `outcome_status` value, `blocked`, exists for trades that cannot be recorded honestly; (4) `record_strategy_outcome()` needs a same-session variant before any live caller can exist.
+
+#### A. What `main` has today (as-built)
+
+| # | Fact | Evidence |
+|---|---|---|
+| A1 | No `OutcomeRecorder` exists and nothing calls `record_strategy_outcome()` except `BacktestRunner.run()`. Reconciliation names the recorder as "step 4" and leaves it to a sibling task. | `backend/app/portfolio_state/reconciliation.py` (module docstring); `backend/app/backtest_runner/runner.py` |
+| A2 | The durable closure marker already exists. `PostgresPositionLedger.commit_fill` sets `trades.status = 'closed'` in the same transaction as the closing fill's `positions` row, its `position_fill_receipts` row and the cursor advance. `PortfolioState._synchronize` publishes `PositionClosed` only after that commit and has no outbox, so a crash between commit and publish loses only the notification. | `backend/app/portfolio_state/postgres.py:PostgresPositionLedger.commit_fill`; `backend/app/portfolio_state/engine.py:PortfolioState._synchronize` |
+| A3 | `position_fill_receipts.fill_data` keeps every fill's exact inputs (order ID, side, effect, qty, price, venue timestamp, commission) per `position_id`, and `PostgresPositionLedger._state` already replays receipts through the canonical `apply_fill`. A closed position can therefore be rebuilt from the ledger alone, including entry VWAP, entry/exit quantity, exit VWAP, gross P&L and fees. | `backend/app/models/execution_ledger.py:PositionFillReceipt`; `backend/app/portfolio_state/accounting.py:apply_fill`, `PositionState` |
+| A4 | `PositionClosed` carries `exit_price` (VWAP of all reducing fills), gross `realized_pnl`, `fees`, `closed_ts`, `trade_id`, mode and venue, with `r_multiple_achieved = None`. It carries no entry price or quantity, no thesis, no evidence, no exit reason, no snapshots. | `backend/app/schemas/events/execution.py:PositionClosed` |
+| A5 | `trades.outcome_id` (FK to `strategy_outcomes.outcome_id`) and `trades.outcome_status` exist; nothing writes either. `outcome_status` has no CHECK constraint. The four `entry_*` snapshot columns on `trades` exist; nothing writes them. | `backend/app/models/execution_ledger.py:Trade`; migration `0012` |
+| A6 | `record_strategy_outcome()` has three properties a live writer cannot accept. (a) It opens its own `SessionLocal()` and commits alone, so it cannot share a transaction with the `trades` link. (b) It builds the ORM row from explicit kwargs that omit `execution_mode`, `execution_venue` and `snapshot_missing_reasons`; mode and venue land correctly only through ORM defaults, and a row with a NULL snapshot violates `ck_strategy_outcomes_null_snapshot_has_reason` (scratch run: `IntegrityError`). (c) `strategy_outcomes` has no uniqueness on `opportunity_id` (scratch run: the same `opportunity_id` recorded twice gives two rows). | `backend/app/trading_intelligence/performance.py:record_strategy_outcome`; `backend/app/models/trading_intelligence.py:StrategyOutcomeRecord`; migration `0012` |
+| A7 | The authorization commit persists strategy, version, direction, `structural_invalidation`/`structural_target` (with `final_*` equal to them), confidence, `setup_detected_at` and `decided_at` in `trades.thesis` and `trades.decision_record`. It does **not** persist `Opportunity.evidence` or `Opportunity.confirmed_at`; `TradeDecisionRecord` has no field for either. | `backend/app/governor/postgres.py:PostgresTradeLedger.commit_decision`; `backend/app/governor/ports.py:TradeDecisionRecord`; `backend/app/strategy_engine/base_strategy.py:Opportunity` |
+| A8 | `trade_reservations.reference_price` is retained after handoff and is the value the Governor publishes as `TradePlanned.entry`. | `backend/app/governor/engine.py` (`entry=result.reference_price`); `backend/app/models/execution_ledger.py:TradeReservation` |
+| A9 | `positions` has no uniqueness on `trade_id` (scratch run: two rows for one trade). Protective exits cancel an unfinished entry order before submitting a close, so a second position per trade is prevented by procedure, not by a constraint. Close orders are `<trade_id>:exit:<attempt>`, sized to the remaining position, each carrying its own `exit_reason`. | `backend/app/execution_engine/exit_ledger.py`; `backend/app/models/execution_ledger.py:Position` |
+| A10 | `SimulatedVenue` reports `commission = None` on every fill. The as-built exit path writes `exit_reason` as `stop` or `target`; EOD flatten is not built (EX-5). If the unapproved EOD proposal is later built, `eod_flatten` would flow through the same `orders.exit_reason` source with no change to this contract. | `backend/app/broker_adapters/simulated_venue.py`; `backend/app/execution_engine/exit_ledger.py` |
+| A11 | The Backtest Runner stamps `schema_version = 1`; §6.8 and decision #170 say writers of the new shape write 2. | `backend/app/backtest_runner/runner.py:_build_strategy_outcome` |
+
+#### B. Field-by-field source map for `StrategyOutcome` (Proposed)
+
+`Persisted` = read from a ledger column. `Derived` = computed from persisted values. **MISSING** = no persisted source exists on `main`. `NULL` = honest absence (I3).
+
+| Field | Proposed source | Status |
+|---|---|---|
+| `outcome_id` | `uuid4()` minted inside the linking transaction | Derived |
+| `opportunity_id` | `trades.trade_id` (equals the accepted `opportunity_id` for approvals) | Persisted |
+| `schema_version` | constant `2` | Derived |
+| `strategy_name`, `strategy_version` | `trades.strategy_name`, `trades.strategy_version` | Persisted |
+| `symbol` | `trades.symbol` | Persisted |
+| `origin` | `trades.origin` (`auto` only in this slice, EX-13) | Persisted |
+| `is_backtest` | `False` | Derived |
+| `backtest_run_id` | `NULL` | NULL |
+| `execution_mode`, `execution_venue` | `trades.execution_mode`, `trades.execution_venue`; anything other than `simulated` is refused (I6) | Persisted |
+| `trading_day` | `position_fill_receipts.trading_day` of the first opening fill; must equal that of the closing fill | Persisted |
+| `setup_detected_at` | `trades.decision_record.setup_detected_at` (ISO string, parsed to an aware UTC datetime) | Persisted |
+| `signal_confirmed_at` | `Opportunity.confirmed_at` is not persisted. `NULL` until P1 persists it; then `trades.thesis.signal_confirmed_at` | **MISSING** (soft: nullable) |
+| `decided_at` | `trades.decision_record.decided_at` | Persisted |
+| `entry_filled_at` | `venue_ts` of the first opening fill (equals `positions.opened_at`) | Persisted |
+| `exit_filled_at` | `venue_ts` of the closing fill (equals `positions.closed_at`) | Persisted |
+| `holding_seconds` | `int((exit_filled_at - entry_filled_at).total_seconds())`, as the Backtest Runner does | Derived |
+| `direction` | `trades.direction` | Persisted |
+| `entry_price` | `PositionState.avg_price` after replaying the position's receipts (VWAP of opening fills; reductions never change it) | Derived |
+| `entry_qty`, `exit_qty` | `PositionState.entry_qty`, `PositionState.exit_qty`; equal for a fully closed position | Derived |
+| `exit_price` | `PositionState.exit_price` (VWAP of all reducing fills) | Derived |
+| `commission_total` | `PositionState.fees`; `NULL` if any fill's commission is `NULL` | Derived / NULL |
+| `slippage_entry` | `entry_price - trade_reservations.reference_price` (`TradePlanned.entry`), signed as the contract states | Derived |
+| `realized_pnl` | `PositionState.realized_pnl` (gross) minus `commission_total` when it is known; gross when it is `NULL` | Derived |
+| `realized_r` | direction-aware `(exit_price - entry_price) / abs(entry_price - structural_invalidation)`; see C4 | Derived |
+| `exit_reason` | `orders.exit_reason` of the order that carries the closing fill | Persisted |
+| `structural_invalidation`, `structural_target`, `final_stop`, `final_target`, `confidence_at_signal` | `trades.thesis` (`confidence` maps to `confidence_at_signal`); checked against `trades.decision_record` | Persisted |
+| `evidence` | Not persisted anywhere. Only the in-memory `OpportunityCache` holds it, and it overwrites. Needs P1 | **MISSING** (hard: `NOT NULL`) |
+| `market_state_at_entry`, `context_at_entry` | `trades.entry_market_state`, `trades.entry_context`. Columns exist, no writer. Needs P2 | **MISSING** (writer) |
+| `market_state_at_exit`, `context_at_exit` | Captured by the recorder when it handles the closure (C3). No persisted home on `trades` | Derived / NULL |
+| `snapshot_missing_reasons` | union of `trades.entry_snapshot_missing_reasons` and the recorder's exit-side reasons, keyed by the four snapshot field names | Derived |
+| `feature_snapshot_id` | `NULL` (`feature_snapshots` does not exist) | NULL |
+
+**The exact missing sources.** (M1) `evidence`: nothing to read; a hard blocker for a `NOT NULL` column. (M2) `signal_confirmed_at`: lost at acceptance; nullable, so recording without it is legal. (M3) the entry-snapshot writer: columns exist and are empty. (M4) exit snapshots: no persisted home, so they can only be captured near the closure. Every other field has a persisted or derivable source.
+
+#### C. Writer behavior (Proposed)
+
+| Case | Proposed behavior |
+|---|---|
+| **C1 Partial reductions** | No outcome until the position is fully closed. The recorder acts only on a trade whose `trades.status = 'closed'` **and** whose replayed position ends at `qty = 0`. A `closing` position is invisible to it. Reductions and adds fold into one row: entry VWAP over all opening fills, exit VWAP over all reducing fills, `exit_filled_at` = last reduction, `entry_filled_at` = first opening fill. `exit_reason` is the closing fill's order's reason; earlier partial reductions under a different reason are not represented (`StrategyOutcome` has no field for it). |
+| **C2 Commissions** | Sum only what fills reported. If every fill carries a commission: `commission_total = fees` and `realized_pnl = gross - fees` (a negative fee, i.e. a rebate, adds). If any fill's commission is `NULL`: `commission_total = NULL` and `realized_pnl = gross`, exactly what the Backtest Runner does; nothing is estimated. Every simulated outcome is in the second case until `SimulatedVenue` reports fees. Consequence to accept: a `NULL` commission means "not surfaced", and `realized_pnl` is then gross. |
+| **C3 Missing snapshots** | Never discard, never `{}`. Entry side: read the `trades` columns; if `entry_snapshot_captured_at` and `entry_snapshot_missing_reasons` are both `NULL`, the hook never ran and the reason is `recorder_unavailable`. Exit side: capture with `capture_strategy_outcome_snapshots()` only if `now - closed_at <= outcome_snapshot_max_lag_seconds` (proposed default 60); a later recovery pass records `NULL` with `recorder_unavailable`, because a snapshot taken minutes late is a wrong snapshot, not a missing one. A capture that returns `None` records `engine_cold_start`; one that raises records `snapshot_capture_error`; `engine_state_lost_on_restart` is used only when the entry fill predates this process's start and the capture returns `None`. |
+| **C4 Missing R basis** | `realized_r` is `NOT NULL` and is never invented. The basis is the authorization-time `structural_invalidation` (checked equal in `trades.thesis` and `trades.decision_record`), never `positions.stop`; the `PositionClosed` docstring says the current stop is not that basis. If it is absent or non-finite, if the two copies disagree, or if `abs(entry_price - structural_invalidation)` quantizes to zero, the trade is `blocked` with reason `r_basis_unavailable`. Prices are quantized to 6 places (`ROUND_HALF_UP`, as the `positions` projection does) before `float` conversion. |
+| **C5 Duplicate closure notifications** | Harmless by construction. The event only enqueues `trade_id`; the worker de-duplicates the queue by `trade_id`; and the linking transaction takes `SELECT ... FOR UPDATE` on the `trades` row and returns `already_recorded` if `outcome_id` is set. A second recorder process is serialized by the same row lock. Verified in scratch: the second call inserted nothing. |
+| **C6 Failed writes** | Transient errors (connection, lock timeout) roll back, then a separate small transaction sets `outcome_status = 'pending_retry'` if `outcome_id IS NULL`; if that also fails, `NULL` already means pending. The next sweep retries. Deterministic failures set `blocked` and log at ERROR or CRITICAL with `trade_id` and a reason code: `evidence_unavailable`, `r_basis_unavailable`, `unsupported_mode`, `multi_position_trade`, `multi_day_position`, `exit_reason_unavailable`, `ledger_inconsistent` (replay disagrees with `positions`, or `entry_qty != exit_qty`), `contract_validation_failed`, `write_rejected` (an `IntegrityError`). Nothing is dropped: the ledger still holds the closure. No reason column exists, so reasons live in logs; a `blocked` trade is re-armed by setting `outcome_status` back to `NULL`. |
+| **C7 Restart recovery** | After reconciliation and `portfolio_state.refresh()` succeed, the recorder starts and runs one scan: `trades` where `decision = 'approved'`, `status = 'closed'`, `execution_mode` equals the configured mode, `outcome_id IS NULL` and `COALESCE(outcome_status, 'pending') <> 'blocked'`, oldest `positions.closed_at` first. A bounded sweep repeats it every `outcome_sweep_interval_seconds` (proposed default 60), so a lost wake-up costs latency, not the row. The recorder is not on the entry path: if it fails to start, log CRITICAL and leave `execution_startup_status` alone; outcomes stay pending until the next start. |
+| **C8 Trade-to-position cardinality** | The recorder requires exactly one `positions` row for the trade, `closed`, with no entry order still holding unfilled quantity. Zero or several, or a still-open sibling, gives `multi_position_trade`. A fill dated on a different trading day than the entry gives `multi_day_position` (`StrategyOutcome.trading_day` covers entry and exit, day trading only, D8). |
+
+#### D. Atomic linkage through `trades.outcome_id` / `outcome_status` (Proposed)
+
+`trades.outcome_status` vocabulary: `NULL` = pending (the value `pending` is never written), `pending_retry`, `recorded`, and the new `blocked`. No migration is needed: the column has no CHECK.
+
+One synchronous transaction on a fresh session, run through `asyncio.to_thread`:
+
+1. Cheap pre-read (no lock): if `trades.outcome_id` is set, stop. This avoids capturing snapshots for a duplicate.
+2. Read the closure inputs and capture the exit snapshots **outside** any lock.
+3. `SELECT outcome_id FROM trades WHERE trade_id = :t FOR UPDATE`. If `outcome_id` is set, return `already_recorded`.
+4. Re-validate the closure and build and validate the `StrategyOutcome` (Pydantic) before any write.
+5. Insert the `strategy_outcomes` row through the same-session variant of `record_strategy_outcome()` (P3), then `UPDATE trades SET outcome_id = :o, outcome_status = 'recorded'`.
+6. Commit. Either both rows change or neither does; a crash between 5 and 6 leaves nothing behind (verified in scratch: rollback left zero outcome rows).
+
+The ledger stays authoritative because every quantity, price and time in the outcome is read back from ledger tables; the bus contributes only a `trade_id` wake-up, and losing any event costs latency (and, for the entry hook only, an honestly `NULL` entry snapshot).
+
+#### E. Diagrams
+
+**Data flow between components**
+
+```
+                    LEDGER (PostgreSQL) — authoritative, I12
+   ┌──────────────────────────────────────────────────────────────────────────┐
+   │ trades ─ thesis, decision_record, entry_* snapshot cols, status,          │
+   │          outcome_id, outcome_status                                       │
+   │ trade_reservations (reference_price)   orders (exit_reason)               │
+   │ positions          position_fill_receipts (fill_data, trading_day)        │
+   └──────▲───────────────────────▲───────────────────────────▲───────────────┘
+          │ closure commit (I8)   │ reads (one tx)            │ link tx: insert + update
+          │                       │                           │
+  Portfolio State ──PositionClosed──►  Event Bus  ──hint: trade_id only──►  OutcomeRecorder
+  (commit_fill)      (after commit,   (no outbox)                          │  │   ▲
+                      no guarantee)                                        │  │   │ startup scan
+  Execution Engine ──OrderFilled(entry)──► Event Bus ──hint──► (entry hook)│  │   │ + periodic sweep
+                                                                           │  │
+     MarketState / Context engines ◄── capture_strategy_outcome_snapshots ─┘  │
+       (in-memory reads, exit side within max lag; entry side at first entry fill)
+                                                                              ▼
+                                  record_strategy_outcome(session=…)  ──►  strategy_outcomes
+                                  (P3: same-session variant, forwards mode,        (simulated rows,
+                                   venue, snapshot_missing_reasons)                 append-only)
+```
+
+**Internal flow of `OutcomeRecorder`**
+
+```
+ triggers:  PositionClosed hint │ startup scan │ periodic sweep      OrderFilled(entry) hint
+                 └──────────┬───────┘                                        │
+                            ▼                                                 ▼
+                 queue of trade_id (de-duplicated)                  entry hook: first open fill only
+                            │                                        capture snapshots ─► UPDATE trades.entry_*
+                            ▼                                        WHERE captured_at IS NULL AND reasons IS NULL
+                 worker loop (one trade at a time)                   (NULL + reason if None/raises; never blocks fills)
+                            │
+        1. outcome_id already set? ──yes──► done (already_recorded)
+                            │no
+        2. read trade, decision_record, thesis, reservation, position, receipts, exit order
+        3. eligibility: mode simulated? exactly one closed position? one trading day?  ─no─► blocked
+        4. replay receipts through apply_fill; must equal positions row, qty 0, entry_qty == exit_qty ─no─► blocked
+        5. evidence present? R basis valid and non-zero? exit_reason known?           ─no─► blocked
+        6. exit snapshots: within max lag? capture → dict | NULL + reason
+        7. build + validate StrategyOutcome (schema_version 2, mode/venue from the trade)
+                            │
+        8. BEGIN; SELECT … FOR UPDATE trades row; outcome_id set? ──► already_recorded
+           INSERT strategy_outcomes; UPDATE trades SET outcome_id, outcome_status='recorded'; COMMIT
+                 ├─ ok ───────────────────────────► recorded
+                 ├─ transient error ─► ROLLBACK ──► pending_retry (best effort; NULL = pending) ─► next sweep
+                 └─ IntegrityError / validation ──► ROLLBACK ──► blocked (+ ERROR/CRITICAL log)
+```
+
+#### F. EX-12's options against current code
+
+| Option | What `main` shows | Verdict |
+|---|---|---|
+| **(a) Dedicated `OutcomeRecorder` joining the ledger; `strategy_outcomes` strategy-attributed only** | The schema was built for it: `trades.outcome_id`/`outcome_status` exist (A5), the closure marker is durable and transactional (A2), receipts allow an exact replay (A3), and Portfolio State owns accounting only, not strategy attribution (I5). Gaps: `evidence` is not persisted (M1), no entry-snapshot writer (M3), `record_strategy_outcome()` cannot link atomically or forward three fields (A6). All three are additive and none needs a migration. | **Recommended, refined by A–D above** |
+| (b) Enrich `PositionClosed` | The event already carries exit VWAP, gross P&L and fees (A4) but still lacks entry facts, thesis, evidence and exit reason, and it has no delivery guarantee or outbox (A2). Filling it would make Portfolio State read strategy attribution (an I5 breach) and would make a lossy notification the record (an I8/I12 breach). | Rejected as the source. Kept as a wake-up hint |
+| (c) Relax the `NOT NULL` columns | `trades.strategy_name` is `NOT NULL` and EX-13 keeps this slice `auto` only, so no strategy-less trade can reach the ledger today. Relaxing `evidence` or `realized_r` would let placeholders into a table whose meaning is evidence about strategy configurations (EX-12's own consequence note), and would need a `schema_version` bump and a migration. | Rejected |
+
+#### G. Build footprint (Proposed; nothing here is implemented)
+
+- **P1: persist evidence at acceptance.** Add optional `evidence` and `signal_confirmed_at` to `TradeDecisionRecord`, populate them from `Opportunity` in `AuthorizerStub`, and copy them into `trades.thesis`. Risk to test: `_record_data` uses `json.dumps(..., allow_nan=False)`, so an `Opportunity.evidence` value that is not JSON-safe would fail the authorization commit; the build must sanitize or reject before the commit. Trades approved before P1 have no evidence and are `blocked` (`evidence_unavailable`).
+- **P2: entry snapshot hook** inside the recorder (bus subscription that only enqueues, I7).
+- **P3: same-session variant of `record_strategy_outcome()`** that forwards `execution_mode`, `execution_venue` and `snapshot_missing_reasons`. The current function becomes a thin wrapper, so backtest behavior is unchanged; a parity test proves it.
+- **P4: `trading_intelligence/outcome_recorder.py`**, started in `main.py` after reconciliation. A small pure helper for `realized_r`, with a parity test against `compute_realized_r` for equivalent inputs. Two new settings: `outcome_snapshot_max_lag_seconds`, `outcome_sweep_interval_seconds`.
+- **Docs at merge:** the confirmed decision entry (next free number, assigned only then), `INDEX.md`, this section rewritten from proposed to as-built, and §7.1 updated.
+- **Optional, not required for correctness:** a partial unique index on `strategy_outcomes(opportunity_id) WHERE NOT is_backtest` makes a duplicate structurally impossible even for a second writer. It is a migration, so it is left as a follow-up.
+
+**Acceptance criteria proposed for the build.** (1) Full close produces exactly one row and links `trades.outcome_id` with `outcome_status = 'recorded'`; (2) a duplicate `PositionClosed`, a replay and two concurrent workers all leave one row; (3) a fault injected between insert and link leaves neither; (4) partial-reduction then full-close produces one row with the correct VWAPs and gross P&L; (5) `commission_total` and `realized_pnl` follow C2 in both the all-known and any-`NULL` cases; (6) each missing-snapshot case in C3 records `NULL` plus its reason and passes the DB CHECK; (7) each `blocked` reason in C6 leaves no `strategy_outcomes` row and no retry loop; (8) a closure committed while the bus dropped `PositionClosed` is recorded by the startup scan and by the sweep; (9) `execution_mode`, `execution_venue` and `schema_version` are stored as specified; (10) no `paper` or `live` trade is ever recorded; (11) backtest output is byte-identical after P3; (12) tests run on real PostgreSQL 16.
+
+#### H. The smallest decision Saqib must confirm
+
+**Do you confirm EX-12 option (a) in the form this section specifies?** That is: `OutcomeRecorder` is the only writer of non-backtest `strategy_outcomes` rows; it is driven by the ledger (events are wake-up hints only); `strategy_outcomes` stays strict, so a trade that cannot be attributed honestly is `blocked` rather than recorded with placeholders. Confirming it includes the two footprint items that sit outside `trading_intelligence/`: P1 (the Governor persists evidence at acceptance) and P3 (the same-session `record_strategy_outcome()` variant).
+
+If you confirm, these defaults apply unless you overrule them: snapshot lag bound 60 s, sweep interval 60 s, `blocked` reasons kept in logs only (no new column), first opening fill defines `entry_filled_at`, and the closing fill's order defines `exit_reason`.
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**
@@ -1901,6 +2068,7 @@ an authorization policy for EOD, manual, paper, or live exits.
 **Options.** (a) A dedicated **`OutcomeRecorder`** joins the `trades`/`orders`/`fills` ledger with persisted snapshots; **`strategy_outcomes` holds strategy-attributed trades only** (corroborated manual trades included), while `trades` records everything. (b) **Enrich `PositionClosed`** so Performance Intelligence can build the row from the event alone. (c) **Relax the NOT NULL columns** so strategy-less manual trades fit `strategy_outcomes`.
 **Consequence.** (b) fattens an event with data the ledger already holds; (c) is a broad schema change that dilutes what `strategy_outcomes` means (evidence about strategy configurations). The `execution_mode`/`execution_venue` columns (EX-2) apply to whichever rows it holds.
 **Recommendation.** (a). The §6.7 design already assumes it.
+**Proposal awaiting confirmation (`outcome-recorder-contract`).** §6.7.1 refines (a) against the backend code at `f517834` (unchanged through `3c23701`): field-by-field source map, writer behavior, atomic linkage, diagrams and the one decision to confirm. EX-12 stays OPEN until Saqib confirms it.
 
 ### EX-13 — Manual mode in the first build  · OPEN
 **Options.** (a) **Not in scope** — the placement-mode gate (`auto|manual`, §18.5's `ExecutionMode`) exists as a seam (`auto` only); Approval Queue, Input Layer, and `TradeRequest` wait. (b) **In scope.**
