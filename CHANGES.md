@@ -1,3 +1,46 @@
+# CHANGES — `simulated-eod-ledger-handoff` (exit-ledger EOD state machine; UNWIRED)
+
+Task 2 of the parallel EOD split, built on decision #185's foundation and rebased onto `main`
+`5fc4dfb` (the merged Position Monitor half; migration head still `0015`). No new decision
+number assigned; #185 already records the policy. It implements the
+**durable half** only: the EOD request, immutable first protective fallback, reservation,
+expiry and dispatch-claim state machine in `PostgresExitLedger`, its schema, and tests.
+**No caller uses the new methods, so no EOD order can execute and the full EOD path is not
+claimed to work.** The Position Monitor sibling, Execution worker, reconciliation, `main.py`,
+readers and frontend are untouched.
+
+- `backend/app/execution_engine/exit_ledger.py`: rewritten with two surfaces over the
+  existing serialization lock. The legacy surface (`observe`, `pending_position_ids`,
+  `prepare`, `confirm_recovery_exit`, `set_status`) keeps its signatures and stop/target
+  behavior for the unchanged worker and never surfaces an EOD row. The explicit surface
+  (`observe_exit`, `prepare_exit`, `claim_dispatch`, `advance_eod_expiry`,
+  `pending_exit_position_ids`, `slot_state`) returns typed dispositions so a later
+  integration can distinguish a normal expiry from an unsafe ledger. Consumes
+  `core.session_window.eod_session_window()` to validate EOD bounds from the committed
+  `positions.opened_at`; supplied bounds and quantity are never trusted.
+- `backend/app/models/execution_ledger.py` and migration
+  `backend/alembic/versions/0016_simulated_eod_exit_state.py` (parent `0015`): `eod_flatten`
+  reason, immutable EOD bounds, durable expiry, first-wins fallback slot,
+  `orders.exit_dispatch_started_at`, field-group CHECKs, immutability triggers, and a
+  downgrade that refuses to discard EOD/fallback/dispatch evidence.
+- `docs/architecture/execution-engine-design.md` §6.6: scoped as-built description,
+  result-type table, data-flow and internal-flow diagrams; one intro sentence corrected.
+  Reconciliation's marker-blind approved-close handling is recorded as an integration gap.
+- Two existing migration tests (`test_authorization_ledger_postgres.py`,
+  `test_position_ledger_postgres.py`) asserted the head was the literal `"0015"` after a
+  refused downgrade. A new migration necessarily breaks that, so they now compare against
+  the script directory's head. Their refusal assertions are unchanged. This is the only edit
+  outside the requested file boundary.
+
+Not done (integration task): monitor timer/handoff, Execution worker wiring and venue-side
+handling of each disposition, reconciliation/marker awareness and restart hydration,
+`main.py` ordering, exit-request reader and frontend. A stale unsent reservation whose
+quantity no longer matches the position is reported `UNSAFE`, not auto-replaced.
+
+Package: `simulated-eod-ledger-handoff.zip`, root-relative, the ten files listed in `TESTING.md`.
+
+---
+
 # CHANGES — `simulated-eod-monitor-handoff` (Position Monitor half of decision #185)
 
 Scope: Position Monitor only. Started from GitHub `main` `1c927db` (re-fetched before packaging: no newer commits). No new decision number; #185 already exists.

@@ -443,10 +443,12 @@ def test_migration_downgrade_refuses_to_destroy_applied_receipts(ledger):
     source(oid)
     app = application(ledger)
     ledger.commit_fill(app)
+    config = Config()
+    config.set_main_option("script_location", "alembic")
+    from alembic.script import ScriptDirectory
+    head = ScriptDirectory.from_config(config).get_current_head()
     with pytest.raises(RuntimeError, match="Cannot downgrade"):
-        config = Config()
-        config.set_main_option("script_location", "alembic")
         command.downgrade(config, "0012")
     assert ledger.load_state("simulated").positions == (app.position,)
     with SessionLocal() as s:
-        assert s.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+        assert s.scalar(text("SELECT version_num FROM alembic_version")) == head

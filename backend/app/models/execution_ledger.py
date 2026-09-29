@@ -193,6 +193,12 @@ class Order(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="approved")
     exit_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)  # stop | target | eod_flatten
     reject_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Durable dispatch claim (simulated-eod-ledger-handoff, migration 0016).
+    # Committed BEFORE any venue call for a close in the EOD lifecycle. NULL on
+    # such a reservation proves no dispatch started under this protocol;
+    # non-NULL on an `approved` order means the send is uncertain. Immutable
+    # once set (database trigger); legacy stop/target closes never set it.
+    exit_dispatch_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -204,6 +210,16 @@ class Order(Base):
         CheckConstraint("order_type IN ('market', 'limit')", name="ck_orders_order_type"),
         CheckConstraint(f"status IN {ORDER_STATUSES!r}", name="ck_orders_status"),
         CheckConstraint(_MODE_VENUE_PAIRING, name="ck_orders_mode_venue_pairing"),
+        CheckConstraint(
+            "exit_dispatch_started_at IS NULL OR position_effect = 'close'",
+            name="ck_orders_dispatch_marker_close_only",
+        ),
+        # `eod_window_closed` is the ledger's proof-of-unsent cancellation; the
+        # database refuses it on any order that ever carried a dispatch marker.
+        CheckConstraint(
+            "NOT (reject_reason = 'eod_window_closed' AND exit_dispatch_started_at IS NOT NULL)",
+            name="ck_orders_unsent_expiry_has_no_marker",
+        ),
     )
 
 
@@ -273,7 +289,24 @@ class Position(Base):
 
 
 class ExitRequest(Base):
-    """Durable monitor observation; the position, not a bus event, owns retries."""
+    """Durable monitor observation; the position, not a bus event, owns retries.
+
+    One row per position. `exit_reason`, `trigger_price`, `trigger_ts` and
+    `created_at` are the ORIGINAL request and never change (decision #184).
+    A simulated EOD request (`exit_reason = 'eod_flatten'`, decision #185 /
+    migration 0016) additionally carries:
+
+    * `eod_flatten_at` / `eod_close_at` — the immutable UTC placement window
+      `[flatten_at, close_at)`, independently derived by the ledger from the
+      committed `positions.opened_at`;
+    * `eod_expired_at` — when placement eligibility durably ended (set once;
+      it records eligibility ending, NOT order cancellation or closure);
+    * `fallback_*` — the FIRST later stop/target observation, an immutable
+      slot that becomes actionable only after EOD placement has expired.
+
+    Field groups and immutability are enforced by CHECK constraints and a
+    BEFORE UPDATE trigger, not just by application code.
+    """
 
     __tablename__ = "exit_requests"
 
@@ -283,10 +316,32 @@ class ExitRequest(Base):
     trigger_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    eod_flatten_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    eod_close_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    eod_expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    fallback_trigger_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    fallback_trigger_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        CheckConstraint("exit_reason IN ('stop', 'target')", name="ck_exit_requests_reason"),
+        CheckConstraint("exit_reason IN ('stop', 'target', 'eod_flatten')", name="ck_exit_requests_reason"),
         CheckConstraint("trigger_price > 0", name="ck_exit_requests_price"),
+        CheckConstraint(
+            "(exit_reason = 'eod_flatten' AND eod_flatten_at IS NOT NULL AND eod_close_at IS NOT NULL"
+            " AND eod_flatten_at < eod_close_at"
+            " AND (eod_expired_at IS NULL OR eod_expired_at >= eod_close_at))"
+            " OR (exit_reason <> 'eod_flatten' AND eod_flatten_at IS NULL AND eod_close_at IS NULL"
+            " AND eod_expired_at IS NULL)",
+            name="ck_exit_requests_eod_group",
+        ),
+        CheckConstraint(
+            "(fallback_reason IS NULL AND fallback_trigger_price IS NULL AND fallback_trigger_ts IS NULL)"
+            " OR (exit_reason = 'eod_flatten' AND fallback_reason IN ('stop', 'target')"
+            " AND fallback_trigger_price IS NOT NULL AND fallback_trigger_price > 0"
+            " AND fallback_trigger_price <> CAST('NaN' AS numeric)"
+            " AND fallback_trigger_ts IS NOT NULL)",
+            name="ck_exit_requests_fallback_group",
+        ),
     )
 
 

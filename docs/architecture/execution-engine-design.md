@@ -1348,9 +1348,10 @@ the wall clock (clock skew) is rejected. EOD placement remains best-effort and u
 
 **Policy approved by Saqib on 2026-09-29 (`simulated-eod-flatten-contract`).** The
 window helper, config default, calendar coverage accessor and their tests are built against
-GitHub `main` at `3ac975d`. The monitor timer/handoff, durable exit-ledger state machine,
-migration, Execution wiring, reconciliation and frontend changes below are still a design,
-not executable EOD behavior. EOD is a **best-effort attempt to flatten**, not a guarantee
+GitHub `main` at `3ac975d`. The durable exit-ledger state machine and migration `0016` are
+now built but **unwired** (see "Exit ledger EOD state machine — as built"). The monitor
+timer/handoff, Execution wiring, reconciliation and frontend changes below are still a
+design, so no EOD order can execute. EOD is a **best-effort attempt to flatten**, not a guarantee
 of closure by the bell or of no overnight exposure. EX-12, OutcomeRecorder, paper/live exits
 and unrelated modules remain outside this contract.
 
@@ -1659,6 +1660,158 @@ Approved EOD at deadline:
   marker NULL    -> atomic cancel(eod_window_closed) + expiry
   marker present -> uncertain; reconcile, never cancel as unsent
 ```
+
+#### Exit ledger EOD state machine — as built (`simulated-eod-ledger-handoff`; unwired)
+
+**Built:** `PostgresExitLedger` (`execution_engine/exit_ledger.py`), the `ExitRequest`/`Order`
+models (`models/execution_ledger.py`) and migration `0016_simulated_eod_exit_state.py`
+(parent `0015`; no number was reserved, so re-check the head at integration). Nothing calls
+the new methods in a running system: `execution_engine/engine.py`, the Position Monitor,
+reconciliation, `main.py`, readers and the frontend are untouched. **This does not make the
+EOD path work**; it is the durable half the integration task will wire. EOD remains a
+best-effort attempt, and a submitted order can still fill after hours or never.
+
+**Schema (names as proposed above, now real).** `exit_requests` gains `eod_flatten_at`,
+`eod_close_at`, `eod_expired_at`, `fallback_reason`, `fallback_trigger_price`,
+`fallback_trigger_ts`; `orders` gains `exit_dispatch_started_at`. CHECKs: reason allows
+`eod_flatten`; EOD bounds present and ordered only for EOD rows, expiry only at/after
+`close_at`; the fallback group is all-or-none, EOD rows only, reason stop/target, finite
+positive price; the marker is close-only; `eod_window_closed` can never sit on an order that
+has a marker. A `BEFORE UPDATE` trigger makes the original request fields, bounds, expiry,
+fallback and marker immutable once written (`retry_after` stays mutable).
+`uq_orders_active_exit_per_position` and the `positions.exit_attempt` counter are unchanged.
+Downgrade refuses when any EOD row, fallback, expiry, marker or `eod_window_closed` order
+exists; otherwise it restores the 0015 shape and keeps legacy rows.
+
+**Two surfaces over one serialization barrier** (the existing all-table `SHARE ROW EXCLUSIVE`
+lock, so observe/prepare/claim/status calls never interleave):
+
+| Surface | Methods | Used by |
+|---|---|---|
+| Legacy, unchanged signatures | `observe`, `pending_position_ids`, `prepare`, `confirm_recovery_exit`, `set_status` | the unchanged Execution worker. Serves stop/target rows exactly as #184 did; `observe()` of an EOD intent returns `False` and stores nothing; EOD rows never appear in `pending_position_ids()` and `prepare()` returns `None` for them, so the worker cannot place an EOD order. |
+| Explicit (new) | `observe_exit`, `prepare_exit`, `claim_dispatch`, `advance_eod_expiry`, `pending_exit_position_ids`, `slot_state`, plus `set_status` | the later integration. Returns typed dispositions instead of booleans. |
+
+`confirm_recovery_exit()` is now `claim_dispatch(...).send`, so even a legacy caller cannot
+reach an EOD-lifecycle venue call without the durable claim.
+
+**Result types the integration must handle.**
+
+| Method | Result | Values (what the caller does) |
+|---|---|---|
+| `observe_exit(intent)` | `ObserveResult(disposition, position_id, reason, slot)`; `.acknowledged`, `.retry` | `STORED`, `ALREADY_STORED`, `FALLBACK_STORED`, `FALLBACK_ALREADY_STORED`, `SUPERSEDED` (protective request already exists) → committed, clear the slot. `WINDOW_NOT_OPEN` → keep and retry. `WINDOW_CLOSED`, `POSITION_CLOSED`, `INVALID(reason)` → resolved, drop; only the EOD slot is dropped, protective eligibility is unaffected. Identity that differs from the committed position **raises** `ExitLedgerError`. |
+| `prepare_exit(position_id)` | `PrepareResult(disposition, action, eod_expired, expired_now, cancelled_order_id, reason)` | `SUBMIT` (action to claim), `CANCEL_ENTRY` (action), `WAIT_PENDING_FILL`, `WAIT_ACTIVE_ORDER`, `WAIT_UNCERTAIN_DISPATCH`, `WAIT_RETRY_DELAY`, `WAIT_WINDOW_NOT_OPEN`, `DORMANT`, `NO_REQUEST`, `POSITION_CLOSED`. Unsafe identity/trade/mode raises. |
+| `claim_dispatch(order_id)` | `ClaimResult(disposition, action, reason)`; `.send` | **`CLAIMED` is the only value that permits a venue call.** `ALREADY_CLAIMED` (uncertain, never resend), `STALE`, `WINDOW_EXPIRED` (normal skip; unsent order already cancelled), `WAIT_WINDOW_NOT_OPEN`, `WAIT_ENTRY_ACTIVITY`, `WAIT_PENDING_FILL`, `UNSAFE(reason)` (an error, not an expiry). |
+| `advance_eod_expiry(position_id)` | `EodExpiryResult(disposition, cancelled_order_id)` | `EXPIRED`, `ALREADY_EXPIRED`, `NOT_DUE`, `NOT_EOD`, `NO_REQUEST`, `POSITION_CLOSED`. Called on restart (recover from stored bounds) and by any timer. |
+| `slot_state(position_id)` | `ExitSlotState | None` | Original reason, bounds, expiry, fallback, `retry_after`; `.dormant`. For slot hydration before subscriptions. |
+
+**Mapping to the monitor's handoff (`5fc4dfb`).** `observe_exit()` results map onto the
+monitor's slot calls as: `STORED`, `ALREADY_STORED`, `FALLBACK_STORED`,
+`FALLBACK_ALREADY_STORED`, `SUPERSEDED` → `acknowledge_observation(position_id, kind)`;
+`WINDOW_CLOSED` → `release_observation(..., WINDOW_CLOSED)` (EOD slot only);
+`POSITION_CLOSED` → `release_observation(..., POSITION_CLOSED)`;
+`INVALID` → `release_observation(..., INVALID)`; `WINDOW_NOT_OPEN` → leave the slot
+pending; an `ExitLedgerError` (database failure or unsafe identity) → leave it pending and
+surface the error. The monitor's `ExitIntent` fields already match what the ledger reads.
+
+**Independent validation.** A new EOD row is created only if, at the transaction's
+injected-clock `now`: the position is committed, simulated, open and its symbol/side match
+the intent; `position.opened_at <= trigger_ts <= now`; `trigger_ts` falls on the entry ET
+trading day; `core.session_window.eod_session_window(clock, opened_at, lead)` yields a
+window (covered holiday/weekend and unsupported years are `INVALID`); any bounds the
+intent supplies equal that window (one bound only, naive bounds or a mismatch are
+`INVALID`; absent bounds are derived); and `flatten_at <= now < close_at`. The intent's
+`qty` is never read: every close is sized from the committed `positions.qty`. Stored
+bounds are the deadline; a later config change or clock movement cannot reopen an expired
+request.
+
+**Component data flow (built part solid, unbuilt part marked).**
+
+```text
+Settings.execution_eod_flatten_lead_seconds ─┐
+positions.opened_at (committed) ─────────────┼─► core.session_window.eod_session_window ─► window
+injected ledger clock ───────────────────────┘                                              │
+                                                                                            ▼
+Position Monitor  ─ ExitIntent (+optional eod bounds) ─ ··· not wired ···►  PostgresExitLedger
+Execution worker (unchanged) ── legacy: observe/prepare/confirm/set_status ──►   │  (explicit surface:
+Integration task (later) ────── observe_exit/prepare_exit/claim_dispatch ─────►   │   observe_exit, prepare_exit,
+                                                                                  │   claim_dispatch, advance_eod_expiry,
+                                                                                  │   slot_state)
+                                     ┌────────────────────────────────────────────┴────────────┐
+                                     ▼                                                         ▼
+                             exit_requests (one row/position)                        orders (close attempts)
+                             original + EOD bounds + expiry                          exit_reason, status,
+                             + first-wins fallback + retry_after                     exit_dispatch_started_at
+                                     └──────────── positions.exit_attempt (monotonic IDs) ─────┘
+                                     fills / position_fill_receipts ── settled-fill checks
+```
+
+**`observe_exit()` internal flow.**
+
+```text
+reason/price/ts malformed ─────────────────────────────► INVALID(reason)   (nothing written)
+position unknown ──► INVALID | flat ──► POSITION_CLOSED | identity differs ──► raise
+row exists? ── yes ─► advance due expiry, then:
+      │                 EOD intent:  EOD row ─► ALREADY_STORED | protective row ─► SUPERSEDED
+      │                 stop/target: protective row ─► ALREADY_STORED (first wins)
+      │                              EOD row: fallback empty ─► FALLBACK_STORED
+      │                                       fallback set   ─► FALLBACK_ALREADY_STORED
+      no
+      ▼
+stop/target ─► insert original request ─► STORED
+EOD ─► label in [opened_at, now], entry day? ─► window (helper) ─► bounds match? ─┐ any failure ─► INVALID
+       now < flatten_at ─► WINDOW_NOT_OPEN     now >= close_at ─► WINDOW_CLOSED   │ (nothing written)
+       otherwise ─► insert EOD row with derived bounds ─► STORED
+```
+
+**`prepare_exit()` / `claim_dispatch()` internal flow and order state.**
+
+```text
+prepare_exit:  identity/trade guards (raise) ─► advance expiry FIRST ─► effective reason
+   (protective ▸ that reason | EOD in [flatten_at, close_at) ▸ eod_flatten | expired+fallback ▸ fallback
+    | expired, no fallback ▸ DORMANT | before flatten_at ▸ WAIT_WINDOW_NOT_OPEN)
+   ─► working entry? CANCEL_ENTRY ─► fill without receipt? WAIT_PENDING_FILL
+   ─► active close: submitted/partial/unknown ▸ WAIT_ACTIVE_ORDER
+                     approved + marker ▸ WAIT_UNCERTAIN_DISPATCH
+                     approved, no marker ▸ SUBMIT (reuse the same ID)
+   ─► retry_after in future? WAIT_RETRY_DELAY
+   ─► reserve <trade>:exit:<attempt+1>, qty = committed positions.qty, marker NULL ─► SUBMIT
+
+expiry at now >= close_at:  unsent (approved, marker NULL) EOD order ─► cancelled 'eod_window_closed'
+                            submitted / partial / unknown / marker set ─► left untouched
+                            eod_expired_at recorded either way (eligibility ended; nothing cancelled at the venue)
+
+claim_dispatch:  not a position close ─► UNSAFE | flat/not approved ─► STALE | marker set ─► ALREADY_CLAIMED
+   identity differs ─► UNSAFE | EOD: expiry due ─► cancel unsent ─► WINDOW_EXPIRED
+   entry working ─► WAIT_ENTRY_ACTIVITY | fill without receipt ─► WAIT_PENDING_FILL
+   qty != committed ─► UNSAFE | else write marker, COMMIT ─► CLAIMED  (only now may the venue be called)
+
+order (EOD lifecycle):  approved/marker NULL ──claim──► approved/marker set ──venue──► submitted ─► fills / terminal
+        │ deadline, proven unsent                              │ crash here = uncertain: reconcile, never resend
+        └──► cancelled 'eod_window_closed' (DB forbids this reason once a marker exists)
+```
+
+**Behaviors chosen where the design left room** (all reversible in the integration review):
+a proven-unsent expiry cancellation does not touch `retry_after`; an EOD offered after a
+protective row is `SUPERSEDED`, not silently "stored"; `set_status()` refuses a transition
+on an EOD-lifecycle close with no dispatch claim and refuses the reserved
+`eod_window_closed` reason; a terminal update at/after `close_at` records the expiry itself.
+A stale unsent reservation whose quantity no longer matches the committed position is
+reported `UNSAFE` at claim time; the ledger does not cancel and re-reserve it (no such rule
+was approved), so that state needs operator/integration handling.
+
+**Not built here, for the integration task.** Monitor timer, tick cache and ordered handoff;
+Execution worker calls to the explicit surface and venue-side handling of each disposition;
+`portfolio_state/reconciliation.py` sends every approved close that the venue does not
+know into an identity-only `approved_exits` check and does not read the dispatch marker, so
+a marker-set (uncertain) order looks the same as a proven-unsent one. The ledger keeps such
+an order exclusive (never cancelled as unsent, resent or replaced, so a second restart
+cannot make a fallback actionable), but **nothing resolves it**: the integration task must
+make reconciliation treat marker-set + venue-unknown as an unresolved block and define the
+resolution path; hydration of monitor slots from
+`slot_state`; `main.py` ordering; the exit-request reader/frontend, which would show an
+`eod_flatten` row with its raw reason until updated. A1–A20 cases that need the monitor,
+real lifespan, bus or `SimulatedVenue` (A8, A11, A12, A14, A17 and the venue halves of
+A7/A15/A16/A20) are not covered by the ledger tests.
 
 #### Approved policy (Saqib, 2026-09-29)
 

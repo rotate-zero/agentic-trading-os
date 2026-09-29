@@ -1,3 +1,56 @@
+# TESTING — `simulated-eod-ledger-handoff`
+
+Baseline: built at `1c927db`, then rebased onto GitHub `main` `5fc4dfb` (the Position
+Monitor sibling, `simulated-eod-monitor-handoff`) after Saqib reported git updated. Serial
+check: no new migration (head still `0015`, so `0016` is free), decision logs unchanged.
+File collision check: the sibling touched only `CHANGES.md`, `TESTING.md` and
+`execution-engine-design.md` among my files; the design doc merged cleanly in separate
+hunks and both entries were kept in `CHANGES.md`/`TESTING.md`. Untouched `5fc4dfb` collects
+1291 tests. Local
+PostgreSQL 16 (`trading` / `trading_workspace`), wiped and recreated, `alembic upgrade head`
+(now `0016`) before the final run.
+
+- New `backend/tests/test_exit_ledger_eod_postgres.py` — **41 tests**, real PostgreSQL,
+  injected clock. Cover: derived bounds and ignored quantity; exact `flatten_at`
+  inclusive / `close_at` exclusive; invalid label/price/timestamp/bounds/reason; holiday,
+  half-day, DST and 2025/2027 dates; identity mismatch raises; flat and unknown positions;
+  concurrent observers (one row, one first fallback); DB field-group and immutability
+  enforcement; reservation on committed quantity and unsent reuse; a single dispatch
+  claimant under 8 threads; unclaimed transitions refused; claim guards (entry activity,
+  fill without receipt, quantity/identity/flat); approved-unsent cancellation and claim
+  after the deadline; expiry despite entry/receipt delay; restart recovery, config change
+  and backward clock; reject/cancel inside and at/after close; submitted-through-close;
+  dispatch-marked uncertainty; partial fill `[3,7]` on 10 and late full closure;
+  legacy-surface compatibility; and the merged monitor's real `ExitIntent` accepted unchanged.
+- New `backend/tests/test_exit_ledger_eod_migration.py` — **3 tests** on a scratch database
+  in an alembic subprocess: legacy rows survive `0015→0016`; evidence-free downgrade
+  round-trips; downgrade is refused for an EOD row, a fallback/expiry, and a dispatch
+  marker, leaving the revision at `0016`.
+- Mutation checks (temporary, reverted): removing the dispatch marker write failed 11 tests;
+  cancelling marked orders at expiry and ignoring stored expiry each failed tests.
+- Existing: `test_exit_ledger_postgres.py`, `test_execution_exit_requests_route.py`,
+  `test_execution_engine.py`, `test_main_execution_pipeline.py`, `test_reconciliation.py`,
+  `test_session_window.py` — 75 passed unchanged before and after.
+- Full backend suite on the wiped database, after the rebase onto `5fc4dfb`: **1335 passed,
+  0 failed** (1291 on `main` + 44 new). Before the rebase, a first full run had 2 failures,
+  both the hard-coded-`"0015"` head assertions described in `CHANGES.md`; fixed, then green
+  at 1281 on the earlier base and again after the rebase.
+
+Not covered: monitor timer, real lifespan, bus and `SimulatedVenue` delivery (A8, A11, A12,
+A14, A17 and the venue halves of A7/A15/A16/A20), reconciliation against a marker-set
+order, frontend. The full EOD path is not claimed to work.
+
+Zip `simulated-eod-ledger-handoff.zip` entries: `CHANGES.md`, `TESTING.md`,
+`backend/alembic/versions/0016_simulated_eod_exit_state.py`,
+`backend/app/execution_engine/exit_ledger.py`, `backend/app/models/execution_ledger.py`,
+`backend/tests/test_exit_ledger_eod_postgres.py`,
+`backend/tests/test_exit_ledger_eod_migration.py`,
+`backend/tests/test_authorization_ledger_postgres.py`,
+`backend/tests/test_position_ledger_postgres.py`,
+`docs/architecture/execution-engine-design.md`.
+
+---
+
 # TESTING — `simulated-eod-monitor-handoff`
 
 Baseline: GitHub `main` `1c927db`, unchanged at the final fetch. Local PostgreSQL 16 (throwaway, migrated to head) was used; no live/broker/external database was touched.
