@@ -6,11 +6,12 @@ this module, same fork-1 precedent `test_execution_engine.py` and
 and an injectable `MarketClock` reading a fixed instant rather than
 wall-clock (§1.8's own restart-safety/backtest-safety invariant).
 
-Covers §6's own required list: stop, target, EOD-flatten, the
-stop-wins-tie case (EX-8), and idempotency (no second intent for an
-already-closing position) — plus held-symbol filtering (module
-docstring) and the "no stop/target configured" honest-absence case
-(ports.py's own docstring).
+Covers §6's own required list: stop, target, the stop-wins-tie case (EX-8),
+and idempotency (no second intent for an already-closing position) — plus
+held-symbol filtering (module docstring) and the "no stop/target configured"
+honest-absence case (ports.py's own docstring). EOD-flatten is now timer-driven
+and is covered by `test_position_monitor_eod.py`; the old exact-close event
+expectation was replaced here.
 """
 from __future__ import annotations
 
@@ -92,7 +93,7 @@ def _candle_envelope(symbol: str, *, o: float, h: float, low: float, c: float, t
 def test_evaluate_long_stop_touched_by_tick() -> None:
     position = _long_position()
     bar = _Bar(high=94.0, low=94.0, close=94.0, ts=_OPENED_AT)
-    intent = _evaluate(position, bar, _FIXED_CLOCK)
+    intent = _evaluate(position, bar)
     assert intent is not None
     assert intent.exit_reason == "stop"
     assert intent.trigger_price == 95.0
@@ -101,7 +102,7 @@ def test_evaluate_long_stop_touched_by_tick() -> None:
 def test_evaluate_no_stop_or_target_configured_never_exits_on_price() -> None:
     position = _long_position(stop=None, target=None)
     bar = _Bar(high=10_000.0, low=0.01, close=1.0, ts=_OPENED_AT)
-    intent = _evaluate(position, bar, _FIXED_CLOCK)
+    intent = _evaluate(position, bar)
     assert intent is None  # honest absence — no stop/target means price alone never triggers an exit
 
 
@@ -176,28 +177,22 @@ async def test_stop_wins_tie_when_one_candle_touches_both(caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_eod_flatten_triggers_at_real_session_close() -> None:
+async def test_event_at_session_close_no_longer_labels_eod() -> None:
+    """EOD moved off the event path (simulated-eod-monitor-handoff): a tick or
+    candle at/after the close never produces `eod_flatten`. The timer-driven
+    EOD path is covered by `test_position_monitor_eod.py`."""
     bus = EventBus()
     await bus.start()
-    # Wide stop/target so only EOD-flatten can fire.
-    position = _long_position(stop=1.0, target=1_000.0)
+    position = _long_position(stop=1.0, target=1_000.0)  # wide: only EOD could fire
     monitor, _ = _make_monitor(bus, [position])
     monitor.start()
     try:
-        # Before close: neither stop/target nor EOD should fire.
         await bus.publish(_tick_envelope("AAPL", 100.0, _BEFORE_CLOSE))
-        await asyncio.sleep(0.1)
-        assert monitor.get_exit_intents() == ()
-
-        # At the real regular-session close instant: EOD-flatten fires.
         await bus.publish(_tick_envelope("AAPL", 101.5, _SESSION_CLOSE_UTC))
+        await bus.publish(_candle_envelope("AAPL", o=100.0, h=102.0, low=99.0, c=101.0, ts=_SESSION_CLOSE_UTC))
         await asyncio.sleep(0.1)
 
-        intents = monitor.get_exit_intents()
-        assert len(intents) == 1
-        assert intents[0].exit_reason == "eod_flatten"
-        assert intents[0].trigger_price == 101.5  # the bar's own close/price, not a fabricated value
-        assert intents[0].trigger_ts == _SESSION_CLOSE_UTC
+        assert monitor.get_exit_intents() == ()
     finally:
         await monitor.stop()
         await bus.stop()

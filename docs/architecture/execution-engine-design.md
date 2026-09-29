@@ -1254,6 +1254,96 @@ manual Refresh ──► refreshKey++ ─► cleanup marks previous run inactive
 collapse / unmount ──► cleanup marks run inactive; a late response or late failure is ignored
 ```
 
+**As built (`simulated-eod-monitor-handoff`; decision #185 already exists, no new number).**
+Position Monitor now owns the EOD timer, a validated tick cache and a
+pending/acknowledged observation handoff. **This is the monitor half only.** No EOD
+order can be placed: nothing consumes the EOD observation, `exit_ledger.py`,
+`execution_engine/engine.py`, the migration, `main.py` and reconciliation are unchanged, and
+the exit-requests route/panel still show only stop/target. It supersedes two earlier
+statements in this section for the monitor only: `_evaluate()` no longer produces
+`eod_flatten` from an event timestamp (stop/target only), and one `ExitIntent` per position
+is no longer the control latch (two slots are; the diagnostic map is unchanged).
+
+```
+PriceUpdated ─► Event Bus ─► _on_market_event (cheap, sync)
+                               ├─ every tick: seq = next arrival number
+                               ├─ symbol NOT held ─► tick cache offer ─► drop
+                               └─ symbol held ─► queue: _QueuedEvent(seq, envelope)
+CandleClosed ─► Event Bus ─► same callback ─► held? ─► queue (never cached, never EOD)
+
+timer task (1 s, injectable/disabled) ─► enqueue_pulse() ─► SAME queue: _Pulse(seq)
+                                                         (coalesced: one queued at a time)
+                                    single worker, arrival order
+                                                │
+        ┌───────────────────────────────────────┴──────────────────────────────┐
+   _QueuedEvent                                                            _Pulse
+   cache held tick (queue order)                            wall = injected clock (aware UTC)
+   fresh PositionView read                                  fresh PositionView read
+   stop ─► target (per position,                            per position, no slot yet:
+   bar/tick; stop wins a tie)                                 eod_session_window(clock, opened_at, lead)
+        │                                                        None / unsupported year ─► skip (bounded log)
+        ▼                                                        window.contains(wall)? ─ no ─► skip
+   protective slot PENDING                                       eligible tick? ─ no ─► bounded log, retry
+        │                                                        stop/target on that tick ─► protective slot
+        │                                                        else ─► eod slot PENDING (+ window bounds)
+        └────────────────┬───────────────────────────────────────┘
+                         ▼
+   on_exit_intent (legacy, stop/target only) + on_observation (both kinds) — wake-up hints only
+                         ▼
+   pending_observations() ◄── retry source ── consumer commits ──► acknowledge_observation()
+                                                        window over ──► release_observation(WINDOW_CLOSED)
+```
+
+```
+Slots per position:   protective: ∅ ─► PENDING ─► ACKNOWLEDGED
+                      eod:        ∅ ─► PENDING ─► ACKNOWLEDGED
+                                            └────► EXPIRED (WINDOW_CLOSED, terminal)
+                      INVALID: slot discarded (EOD needs a strictly newer tick; protective re-forms on the next event)
+                      POSITION_CLOSED: both slots discarded, none created again
+
+EOD never suppresses protective evaluation.
+A protective slot (created first) suppresses EOD creation and duplicate protective slots.
+Callback/queue success and DB failure change nothing: a PENDING slot stays PENDING.
+```
+
+**Tick cache and EOD label.** `PriceUpdated` offers are validated (aware `exchange_ts`, finite
+price > 0, `exchange_ts` not after wall time at arrival) and kept per symbol by maximum
+exchange time; an older tick never moves it back, and on equal time the first received wins.
+Unheld ticks are offered before the held-symbol filter; held ticks when the worker reaches
+them in queue order. A pulse ignores a cached tick that arrived after that pulse was queued.
+An EOD label needs `position.opened_at <= tick.exchange_ts <= wall now` on the entry ET day,
+with no maximum age; otherwise nothing is created and nothing is substituted.
+`trigger_ts` is the tick's exchange time, `trigger_price` its price. Candles keep driving
+stop/target only.
+
+**`ExitIntent` (additive).** Optional `eod_flatten_at` / `eod_close_at` (UTC, ordered, both
+set) for `eod_flatten` only; a stop/target intent must leave them `None`. Existing
+positional construction is unchanged.
+
+**Handoff API for integration** (`position_monitor/handoff.py`, methods on `PositionMonitor`):
+
+| Member | Contract |
+|---|---|
+| `PositionMonitor(..., on_observation=, wall_clock=, eod_lead_seconds=, pulse_interval_seconds=)` | All optional. `wall_clock` returns aware UTC. `eod_lead_seconds=None` reads settings once and is passed explicitly to `eod_session_window`; `1..900`. `pulse_interval_seconds=None` disables the timer (tests). `on_exit_intent` keeps its meaning: stop/target only, never EOD. |
+| `on_observation(Observation)` | Called once per new slot with a `PENDING` copy: a wake-up hint. Its success is not a commit; an exception is logged and the slot stays pending. |
+| `pending_observations()` | Slots not yet acknowledged, oldest first (`sequence` = monitor creation order across kinds/positions). The retry source after a failed commit or lost ack. |
+| `get_observations(symbol=None)` | All slots with state. |
+| `acknowledge_observation(position_id, kind)` | Call only after the durable commit (or readback proving it). Idempotent; `False` if no live slot. |
+| `release_observation(position_id, kind, reason)` | `WINDOW_CLOSED` (EOD only, not after an acknowledgement) → `EXPIRED`; `POSITION_CLOSED`; `INVALID`. A DB failure needs no release. |
+| `get_exit_intents()` | Unchanged diagnostic: first intent per position, any kind, in-memory. |
+| `enqueue_pulse()` | Manual pulse on the shared queue; `False` if coalesced or not accepting. |
+
+Suggested Execution use (not built): drain `pending_observations()` in order, commit each
+through the ledger, then acknowledge; on a window-closed disposition release
+`WINDOW_CLOSED`; hydrate at startup by acknowledging committed kinds before events flow.
+Until then, in the running app the timer and slots exist but no EOD slot is ever
+acknowledged or acted on.
+
+**Limits.** Arrival ordering only, not global exchange-time ordering. Slots and cache are
+in memory and lost on restart; a fresh tick must retrigger. Retained per-process
+bookkeeping (closed-position and log-throttle maps) is not pruned. A tick stamped ahead of
+the wall clock (clock skew) is rejected. EOD placement remains best-effort and unbuilt.
+
 #### Simulated EOD flatten contract — policy approved; shared foundation built
 
 **Policy approved by Saqib on 2026-09-29 (`simulated-eod-flatten-contract`).** The

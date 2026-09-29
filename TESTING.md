@@ -1,3 +1,17 @@
+# TESTING — `simulated-eod-monitor-handoff`
+
+Baseline: GitHub `main` `1c927db`, unchanged at the final fetch. Local PostgreSQL 16 (throwaway, migrated to head) was used; no live/broker/external database was touched.
+
+- Focused: `pytest tests/test_position_monitor_eod.py tests/test_position_monitor_engine.py` — **63 passed**. Covers boundary pulses (flatten−1 s, flatten, close−1 µs, close, after; configured lead; half-day 13:00 ET), holiday/weekend/unsupported year, missing/pre-entry/exactly-at-open/five-minute-old/previous-day/future/naive/non-positive/NaN/inf ticks, reopened symbol, older and equal-time ticks (held and unheld paths), tick arriving after a queued pulse, candles never labelling or overwriting, delayed candle after EOD, stop/target precedence and same-tick tie, event-before-pulse ordering, repeated and coalesced pulses, pending/ack idempotence, callback failure, DB-failure (no release), release WINDOW_CLOSED/POSITION_CLOSED/INVALID, real timer, real EventBus, shutdown.
+- Adjacent (real PostgreSQL): `test_main_execution_pipeline`, `test_execution_engine`, `test_exit_ledger_postgres`, `test_entry_lifecycle_wiring`, `test_exit_intents_route`, `test_position_monitor_portfolio_reader`, `test_session_window` — passed together with the focused files (115 passed).
+- Full backend suite: `pytest -q` — **1291 passed**, 1 pre-existing warning (run before the docstring-only `__init__.py` edit).
+- Two test-authoring mistakes fixed during the run (a bounded-log test stepping outside its window; a cache-validity test that also tripped the unchanged event-path stop) — no assertion weakened.
+- Not covered: the frontend, the exit ledger accepting EOD, Execution consuming/acknowledging observations, restart hydration, and any real-clock timing at the actual close. Acceptance rows A1–A2, A11–A14 are covered at the monitor level only; the rest of A1–A20 remain for later tasks.
+
+Zip: `simulated-eod-monitor-handoff/` — `backend/app/position_monitor/{__init__,engine,handoff}.py`, `backend/tests/{test_position_monitor_eod,test_position_monitor_engine}.py`, `docs/architecture/execution-engine-design.md`, `CHANGES.md`, `TESTING.md`.
+
+---
+
 # TESTING — `simulated-eod-flatten-contract` shared foundation (#185)
 
 Baseline: clean local `main` and fetched GitHub `main` at `3ac975d`; fetched again

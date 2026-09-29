@@ -1,3 +1,21 @@
+# CHANGES — `simulated-eod-monitor-handoff` (Position Monitor half of decision #185)
+
+Scope: Position Monitor only. Started from GitHub `main` `1c927db` (re-fetched before packaging: no newer commits). No new decision number; #185 already exists.
+
+- `backend/app/position_monitor/engine.py`: EOD moved off the event path into a timer-driven pulse enqueued on the **same queue** as price events, with an injectable wall clock and explicit configured lead passed to `eod_session_window()` / `EodSessionWindow.contains()`. Valid `PriceUpdated` ticks are cached in monotonic exchange-time order (first equal-time tick kept) before held-symbol filtering. An EOD label needs an entry-day tick with `opened_at <= exchange_ts <= wall now`; candles never label EOD. Queued events are processed before a pulse; stop/target are checked first on the eligible tick; EOD never suppresses later protective observations.
+- `ExitIntent` gained optional `eod_flatten_at` / `eod_close_at` (UTC, EOD only); stop/target construction is unchanged.
+- New `backend/app/position_monitor/handoff.py` and monitor methods `pending_observations()`, `get_observations()`, `acknowledge_observation()`, `release_observation()`, `enqueue_pulse()`, plus optional `on_observation`. Callback/queue success is never treated as a commit; slots stay `PENDING` until acknowledged.
+- `docs/architecture/execution-engine-design.md` §6.6: scoped as-built block with data-flow and internal-state diagrams and the integration API.
+- Tests: new `test_position_monitor_eod.py`; `test_position_monitor_engine.py` updated (old exact-close EOD event expectation replaced; `_evaluate` no longer takes a clock).
+
+Not done: no EOD order, exit-ledger/migration/Execution/reconciliation/`main.py`/route/frontend change. **The full EOD path does not work yet**: nothing consumes or acknowledges an EOD observation. Note for integration: `main.py` builds the monitor with defaults, so once this merges the 1 s timer runs in the app and may create a pending EOD slot (visible as the first intent in `GET /intelligence/exit-intents`); it is inert.
+
+Merge note: `CHANGES.md`/`TESTING.md` are edited by the parallel exit-ledger task too; keep both sections.
+
+Package: `simulated-eod-monitor-handoff.zip` (folder `simulated-eod-monitor-handoff/`, root-relative contents).
+
+---
+
 # CHANGES — `simulated-eod-flatten-contract` shared foundation (#185)
 
 Saqib approved the four §6.6 policies on 2026-09-29. This delivery builds only the

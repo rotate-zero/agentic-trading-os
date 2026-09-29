@@ -1,54 +1,85 @@
 """
-`PositionMonitor` — decision slug `position-monitor-lite`. See the
-package docstring (`position_monitor/__init__.py`) for the full EX-5/
-EX-11 scoping call, and `docs/architecture/execution-engine-design.md`
-§6.6 for the design spec this implements.
+`PositionMonitor` — decision slug `position-monitor-lite`, extended by
+`simulated-eod-monitor-handoff` (decision #185's approved simulated EOD
+contract; design doc §6.6). See the package docstring
+(`position_monitor/__init__.py`) for the EX-5/EX-11 scoping call.
 
-Same subscribe -> own queue -> worker shape as every other engine in
-this codebase (decision #84's pattern, mirrored from
-`execution_engine/engine.py` and `trading_intelligence/
-level_interaction_engine.py` — this task's own §1.7). Deliberately no
-`DebounceScheduler`: LevelInteractionEngine's own docstring records the
-project's confirmed choice that noise between raw zone transitions is
-real information, not something to coalesce, and this module needs the
-same precision for the same reason — coalescing ticks would risk
-missing the exact tick/candle that actually crossed a stop or target.
+Same subscribe -> own queue -> worker shape as every other engine in this
+codebase (decision #84's pattern). Deliberately no `DebounceScheduler`:
+coalescing ticks would risk missing the exact tick/candle that crossed a stop
+or target.
 
-Held-symbol filtering, stated precisely (mirrors decision #173's own
-Portfolio State worker: "EventBus has no symbol-filtered subscriptions,
-so unheld price events are dropped before queueing and checked again at
-processing"): the subscriber callback below does one cheap
-`get_open_positions()` read to decide whether to even enqueue an
-incoming event, and `_process_event()` reads the Protocol again, fresh,
-before evaluating — so a position that closed (or a symbol that started
-being held) between enqueue and processing is never acted on with stale
-membership.
+Two observation kinds, two independent slots per position
+---------------------------------------------------------
+* **protective** (`stop` / `target`): event-driven, exactly as before. Ticks
+  and candles for held symbols are queued; stop is checked before target, so a
+  bar touching both resolves to `"stop"`.
+* **eod** (`eod_flatten`): timer-driven only. Candles never label it.
 
-EOD-flatten session-close derivation deliberately duplicates
-`backtest_runner/fill_simulator.py`'s `regular_session_close_utc()`
-rather than importing it (this task's own §1.8 reading, and EX-8's own
-recommendation (a): "reuse conventions only... write a new incremental
-model" — extracting a shared helper is EX-8's option (b), explicitly
-named as expanding the build's footprint into `backtest_runner/`, not
-this task's call to make). Same reasoning `fill_simulator.py` itself
-gives for not adding a method to `MarketClock` instead: `MarketClock`
-exposes no public "close instant for trading_day X" accessor, only
-session-membership checks, and this task's own scope discipline (no
-redesigning existing engines to make new work easier) applies to
-`MarketClock` exactly as it did there.
+Each slot is `PENDING` when created and `ACKNOWLEDGED` only after the consumer
+calls `acknowledge_observation()` following its own durable commit (see
+`handoff.py`). An EOD slot never suppresses protective evaluation. A protective
+slot suppresses duplicate protective observations and, if it was created first,
+EOD creation. Closing the EOD window without a commit is reported with
+`release_observation(..., WINDOW_CLOSED)`, which ends only the EOD slot.
+
+Timer pulses
+------------
+A background task enqueues a `_Pulse` on the SAME queue as market events (a
+pulse is coalesced while one is already queued). The single worker processes
+every event queued before a pulse before it handles that pulse, so this is
+arrival ordering, not global exchange-time ordering. On a pulse, for each open
+position whose EOD window (`core.session_window.eod_session_window`, lead
+passed explicitly) contains the injected wall clock's `now`, and that has no
+slot yet: take the eligible cached tick, check stop/target against it first,
+otherwise emit EOD. A position on a covered holiday/weekend has no window; an
+unsupported entry year is skipped with a bounded-rate log. Neither stops
+event-driven stop/target evaluation.
+
+Tick cache and EOD eligibility
+------------------------------
+Every valid `PriceUpdated` (aware `exchange_ts`, finite positive price, not
+later than wall time at ingest) is offered to a per-symbol cache that keeps
+the maximum exchange timestamp; on an equal timestamp the first received tick
+wins, and an older tick can never move it backwards. Ticks for symbols that
+are not held at arrival are cached in the subscriber callback (before the
+held-symbol filter); ticks for held symbols are cached when the worker reaches
+them in queue order, so a tick that arrives after a pulse is queued is later
+work. Each tick carries an arrival sequence; a pulse ignores a cached tick
+whose sequence is newer than its own and retries at the next pulse.
+
+An EOD label needs a tick for the position's symbol with
+`position.opened_at <= exchange_ts <= wall now` on the position's entry ET
+trading day. There is no additional maximum age. With no such tick no slot is
+created; the miss is logged at a bounded rate and retried each pulse. Nothing
+is substituted (no entry price, wall time or candle).
+
+Held-symbol filtering mirrors decision #173's Portfolio State worker: one
+cheap `get_open_positions()` read in the subscriber callback decides whether to
+enqueue, and processing reads it again, fresh.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
+from pydantic import ValidationError
+
+from app.core.config import get_settings
 from app.core.market_clock import MarketClock, get_market_clock
+from app.core.session_window import UnsupportedEodCalendarError, eod_session_window
 from app.event_bus.bus import EventBus
+from app.position_monitor.handoff import (
+    Observation,
+    ObservationKind,
+    ObservationState,
+    ReleaseReason,
+)
 from app.position_monitor.ports import PositionReader, PositionView
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.market_data import CandleClosed, PriceUpdated
@@ -56,27 +87,18 @@ from app.schemas.events.market_data import CandleClosed, PriceUpdated
 logger = logging.getLogger(__name__)
 
 _STOP_SENTINEL = object()
-
-# Same ET zone / close-time constants core/market_clock.py itself uses —
-# see module docstring above re: why this is a local copy, not an import
-# from fill_simulator.py or a new market_clock.py method.
-_ET = ZoneInfo("America/New_York")
-_REGULAR_CLOSE = time(16, 0)
-_HALF_DAY_CLOSE = time(13, 0)
-
-
-def _regular_session_close_utc(clock: MarketClock, trading_day: date) -> datetime:
-    """Field-for-field mirror of `fill_simulator.regular_session_close_utc`
-    (§1.8), so a future parity test between the backtest and live exit
-    paths (Slice A's AC #2, not this task's own scope) has a chance of
-    ever passing."""
-    close_time = _HALF_DAY_CLOSE if clock.is_half_day(trading_day) else _REGULAR_CLOSE
-    return datetime.combine(trading_day, close_time, tzinfo=_ET).astimezone(timezone.utc)
+_LOG_INTERVAL = timedelta(seconds=60)
+_DEFAULT_PULSE_INTERVAL_SECONDS = 1.0  # a scheduling target, not a latency promise
 
 
 @dataclass(frozen=True)
 class ExitIntent:
-    """A market observation; Execution owns durable order identity and placement."""
+    """A market observation; Execution owns durable order identity and placement.
+
+    `eod_flatten_at` / `eod_close_at` are UTC and set for `eod_flatten` only
+    (both, ordered); they are the placement window the monitor evaluated, not a
+    fill deadline. Stop/target intents leave both `None`.
+    """
 
     position_id: UUID
     symbol: str
@@ -85,20 +107,58 @@ class ExitIntent:
     exit_reason: Literal["stop", "target", "eod_flatten"]
     trigger_price: float
     trigger_ts: datetime  # the exchange/candle timestamp that produced this intent — never wall-clock
+    eod_flatten_at: datetime | None = None
+    eod_close_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        bounds = (self.eod_flatten_at, self.eod_close_at)
+        if self.exit_reason != "eod_flatten":
+            if any(b is not None for b in bounds):
+                raise ValueError("eod_flatten_at/eod_close_at are for eod_flatten intents only")
+            return
+        if any(b is None for b in bounds):
+            raise ValueError("eod_flatten intents require eod_flatten_at and eod_close_at")
+        for bound in bounds:
+            if bound.tzinfo is None or bound.utcoffset() != timedelta(0):  # type: ignore[union-attr]
+                raise ValueError("EOD bounds must be timezone-aware UTC")
+        if not self.eod_flatten_at < self.eod_close_at:  # type: ignore[operator]
+            raise ValueError("eod_flatten_at must be before eod_close_at")
 
 
 @dataclass(frozen=True)
 class _Bar:
     """One evaluatable price observation — either a single tick
-    (`high == low == close == price`) or a closed candle. Unifying the
-    two into one shape lets `_evaluate()` below run the identical
-    precedence check `fill_simulator.simulate_exit()` uses against
-    either kind of input."""
+    (`high == low == close == price`) or a closed candle."""
 
     high: float
     low: float
     close: float
     ts: datetime
+
+
+@dataclass(frozen=True)
+class _CachedTick:
+    price: float
+    ts: datetime
+    seq: int  # arrival order; lower wins an equal-timestamp tie
+
+
+@dataclass(frozen=True)
+class _QueuedEvent:
+    seq: int
+    envelope: EventEnvelope
+
+
+@dataclass(frozen=True)
+class _Pulse:
+    seq: int
+
+
+@dataclass
+class _Slot:
+    sequence: int
+    intent: ExitIntent
+    state: ObservationState
 
 
 def _bar_from_envelope(envelope: EventEnvelope) -> _Bar | None:
@@ -127,15 +187,10 @@ def _target_touched(position: PositionView, bar: _Bar) -> bool:
     return bar.low <= position.target
 
 
-def _evaluate(position: PositionView, bar: _Bar, clock: MarketClock) -> ExitIntent | None:
-    """Precedence, exactly matching `fill_simulator`'s own convention
-    (§1.8/EX-8): stop checked first, so a single bar crossing both stop
-    and target resolves to `"stop"` (stop-wins-tie) without a separate
-    branch. EOD-flatten is keyed to the POSITION's own entry day
-    (`clock.trading_day(position.opened_at)`), the same way
-    `fill_simulator.simulate_exit()` keys off `entry_fill.entry_ts` —
-    not "today" generically — since this system holds no positions
-    overnight (§5/D8) that entry day is always the relevant one."""
+def _evaluate(position: PositionView, bar: _Bar) -> ExitIntent | None:
+    """Stop/target only. Stop is checked first, so a single bar crossing both
+    resolves to `"stop"` (stop-wins-tie, `fill_simulator`'s convention, EX-8).
+    EOD is timer-driven and lives in `PositionMonitor._process_pulse`."""
     if _stop_touched(position, bar):
         return ExitIntent(
             position_id=position.position_id,
@@ -156,19 +211,11 @@ def _evaluate(position: PositionView, bar: _Bar, clock: MarketClock) -> ExitInte
             trigger_price=position.target,  # type: ignore[arg-type]  # not None — _target_touched guarantees it
             trigger_ts=bar.ts,
         )
-    entry_day = clock.trading_day(position.opened_at)
-    session_close = _regular_session_close_utc(clock, entry_day)
-    if bar.ts >= session_close:
-        return ExitIntent(
-            position_id=position.position_id,
-            symbol=position.symbol,
-            side=position.side,
-            qty=position.qty,
-            exit_reason="eod_flatten",
-            trigger_price=bar.close,
-            trigger_ts=bar.ts,
-        )
     return None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class PositionMonitor:
@@ -179,32 +226,80 @@ class PositionMonitor:
         *,
         clock: MarketClock | None = None,
         on_exit_intent: Callable[[ExitIntent], None] | None = None,
+        on_observation: Callable[[Observation], None] | None = None,
+        wall_clock: Callable[[], datetime] | None = None,
+        eod_lead_seconds: int | None = None,
+        pulse_interval_seconds: float | None = _DEFAULT_PULSE_INTERVAL_SECONDS,
     ) -> None:
+        """
+        `on_exit_intent`: legacy, fire-and-forget, stop/target ONLY, unchanged
+        (today's `main.py` wiring). It is never called for EOD.
+        `on_observation`: optional wake-up for BOTH kinds, called once per new
+        slot with a `PENDING` `Observation`. It is a hint, not a commit
+        signal; the authoritative retry source is `pending_observations()`.
+        `wall_clock`: injectable aware-UTC "now" (default real time).
+        `eod_lead_seconds`: the configured lead, passed explicitly to
+        `eod_session_window`; `None` reads
+        `settings.execution_eod_flatten_lead_seconds` once, here.
+        `pulse_interval_seconds`: timer period; `None` disables the timer
+        (tests and manual `enqueue_pulse()` only).
+        """
+        if eod_lead_seconds is None:
+            eod_lead_seconds = get_settings().execution_eod_flatten_lead_seconds
+        if isinstance(eod_lead_seconds, bool) or not isinstance(eod_lead_seconds, int) or not 1 <= eod_lead_seconds <= 900:
+            raise ValueError("eod_lead_seconds must be an integer from 1 through 900")
+        if pulse_interval_seconds is not None and pulse_interval_seconds <= 0:
+            raise ValueError("pulse_interval_seconds must be positive or None")
+
         self._bus = bus
         self._position_reader = position_reader
         self._clock = clock or get_market_clock()
         self._on_exit_intent = on_exit_intent
-        self._queue: asyncio.Queue[EventEnvelope | object] = asyncio.Queue()
+        self._on_observation = on_observation
+        self._wall_clock = wall_clock or _utc_now
+        self._eod_lead_seconds = eod_lead_seconds
+        self._pulse_interval = pulse_interval_seconds
+        self._queue: asyncio.Queue[_QueuedEvent | _Pulse | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        self._timer_task: asyncio.Task | None = None
         self._accepting = False
-        # Idempotency latch (§4 item 4): a position_id in this dict has
-        # already had its one ExitIntent produced — "moved to closing"
-        # in this module's own in-process sense only (see engine's own
-        # docstring above re: this NOT being accounting.PositionState's
-        # persisted "closing" status, a different, unrelated field of
-        # the same name). No second intent is ever produced for it.
+        self._seq = 0
+        self._pulse_queued = False
+
+        self._tick_cache: dict[str, _CachedTick] = {}
+        # Control slots, one per (position, kind). A slot's existence is the
+        # dedupe latch; only ACKNOWLEDGED proves a consumer commit.
+        self._slots: dict[tuple[UUID, ObservationKind], _Slot] = {}
+        self._slot_sequence = 0
+        self._closed_positions: set[UUID] = set()
+        # After an INVALID EOD release, only a strictly newer tick may retry.
+        self._eod_tick_floor: dict[UUID, datetime] = {}
+        # Diagnostic record (GET /intelligence/exit-intents): the FIRST intent
+        # per position of any kind, as before. Not a control latch.
         self._exit_intents: dict[UUID, ExitIntent] = {}
+        self._last_logged: dict[tuple[UUID, str], datetime] = {}
+
+    # --- lifecycle -------------------------------------------------------------
 
     def start(self) -> None:
         self._accepting = True
         self._bus.subscribe(EventType.PRICE_UPDATED, self._on_market_event)
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_market_event)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="position-monitor")
+        if self._pulse_interval is not None:
+            self._timer_task = asyncio.create_task(self._timer_loop(), name="position-monitor-timer")
 
     async def stop(self) -> None:
         self._accepting = False
         self._bus.unsubscribe(EventType.PRICE_UPDATED, self._on_market_event)
         self._bus.unsubscribe(EventType.CANDLE_CLOSED, self._on_market_event)
+        if self._timer_task is not None:
+            self._timer_task.cancel()
+            try:
+                await self._timer_task
+            except asyncio.CancelledError:
+                pass
+            self._timer_task = None
         if self._worker_task is not None and not self._worker_task.done():
             await self._queue.put(_STOP_SENTINEL)
             try:
@@ -212,26 +307,123 @@ class PositionMonitor:
             except asyncio.CancelledError:
                 pass
         self._worker_task = None
+        # Nothing is decided after stop(); drop anything still queued.
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+        self._pulse_queued = False
+
+    def enqueue_pulse(self) -> bool:
+        """Put one timer pulse on the same queue as market events. Coalesced:
+        returns False (and enqueues nothing) while one is already queued or the
+        monitor is not accepting work."""
+        if not self._accepting or self._pulse_queued:
+            return False
+        self._pulse_queued = True
+        self._queue.put_nowait(_Pulse(seq=self._next_seq()))
+        return True
+
+    async def _timer_loop(self) -> None:
+        assert self._pulse_interval is not None
+        while True:
+            await asyncio.sleep(self._pulse_interval)
+            self.enqueue_pulse()
+
+    # --- read surfaces ---------------------------------------------------------
 
     def get_exit_intents(self, symbol: str | None = None) -> tuple[ExitIntent, ...]:
-        """Synchronous, point-in-time read surface — same convention as
-        `get_snapshot()` everywhere else in this codebase (§4 item 5).
-        `symbol=None` returns every intent produced so far, in no
-        particular order."""
+        """Diagnostic, point-in-time read (§4 item 5): the first intent per
+        position, any kind. Same shape/semantics as before EOD timing existed,
+        so the exit-intents route and its one-row-per-position UI keys are
+        unaffected. Use `get_observations()` for both slots."""
         values = self._exit_intents.values()
         if symbol is not None:
             values = (intent for intent in values if intent.symbol == symbol)
         return tuple(values)
 
-    # --- EventBus subscriber (must stay cheap — no awaiting here) ---------
+    def get_observations(self, symbol: str | None = None) -> tuple[Observation, ...]:
+        """Every slot (pending, acknowledged, expired) in creation order."""
+        slots = sorted(self._slots.items(), key=lambda item: item[1].sequence)
+        return tuple(
+            Observation(sequence=slot.sequence, kind=key[1], state=slot.state, intent=slot.intent)
+            for key, slot in slots
+            if symbol is None or slot.intent.symbol == symbol
+        )
+
+    def pending_observations(self) -> tuple[Observation, ...]:
+        """Slots not yet proven committed, oldest first. This — not a
+        callback — is the retry source after a failed commit or lost ack."""
+        return tuple(o for o in self.get_observations() if o.state is ObservationState.PENDING)
+
+    # --- handoff: consumer -> monitor --------------------------------------------
+
+    def acknowledge_observation(self, position_id: UUID, kind: ObservationKind) -> bool:
+        """Call ONLY after the observation's durable commit (or a readback
+        proving it). Idempotent: True if the slot is now acknowledged, False
+        if there is no such live slot (never created, released, or expired)."""
+        slot = self._slots.get((position_id, kind))
+        if slot is None or slot.state is ObservationState.EXPIRED:
+            return False
+        slot.state = ObservationState.ACKNOWLEDGED
+        return True
+
+    def release_observation(self, position_id: UUID, kind: ObservationKind, reason: ReleaseReason) -> bool:
+        """Hand a slot back without a commit. Returns whether anything changed.
+
+        WINDOW_CLOSED (EOD only): the slot becomes terminal EXPIRED; no new
+        EOD for this position; protective slot untouched. A protective slot is
+        never window-restricted, so WINDOW_CLOSED on it is refused (False).
+        POSITION_CLOSED: the position's slots are discarded and none is
+        created again. INVALID: the slot is discarded; a new EOD needs a
+        strictly newer tick than the rejected one; a protective slot can
+        re-form on the next stop/target event.
+        A DB failure or lost ack needs NO release — leave the slot pending."""
+        key = (position_id, kind)
+        slot = self._slots.get(key)
+        if reason is ReleaseReason.POSITION_CLOSED:
+            changed = position_id not in self._closed_positions
+            self._closed_positions.add(position_id)
+            for slot_kind in ("eod", "protective"):
+                if self._slots.pop((position_id, slot_kind), None) is not None:
+                    changed = True
+            return changed
+        if slot is None:
+            return False
+        if reason is ReleaseReason.WINDOW_CLOSED:
+            if kind != "eod":
+                logger.warning("PositionMonitor: WINDOW_CLOSED refused for protective slot position_id=%s", position_id)
+                return False
+            if slot.state is ObservationState.ACKNOWLEDGED:
+                return False  # committed work is not un-committed by a late expiry report
+            slot.state = ObservationState.EXPIRED
+            return True
+        # INVALID
+        if kind == "eod":
+            self._eod_tick_floor[position_id] = slot.intent.trigger_ts
+        del self._slots[key]
+        return True
+
+    # --- EventBus subscriber (must stay cheap — no awaiting here) ---------------
 
     def _on_market_event(self, envelope: EventEnvelope) -> None:
         if not self._accepting or envelope.symbol is None:
             return
-        held_symbols = {p.symbol for p in self._position_reader.get_open_positions()}
+        seq = self._next_seq()
+        is_tick = envelope.event_type == EventType.PRICE_UPDATED
+        try:
+            held_symbols = {p.symbol for p in self._position_reader.get_open_positions()}
+        except Exception:  # noqa: BLE001 — e.g. snapshot unavailable; never lose a tick's cache offer
+            logger.exception("PositionMonitor: positions unavailable in subscriber; event dropped")
+            if is_tick:
+                self._cache_tick(envelope, seq)
+            return
         if envelope.symbol not in held_symbols:
-            return  # cheap early drop, rechecked at processing time — see module docstring
-        self._queue.put_nowait(envelope.model_copy(deep=True))
+            if is_tick:
+                # Cached before the held-symbol filter drops it, so a position
+                # opened just after can still be labelled from this tick.
+                self._cache_tick(envelope, seq)
+            return  # cheap early drop, rechecked at processing time
+        self._queue.put_nowait(_QueuedEvent(seq=seq, envelope=envelope.model_copy(deep=True)))
 
     # --- worker -------------------------------------------------------------
 
@@ -243,32 +435,155 @@ class PositionMonitor:
                     self._queue.task_done()
                     break
                 try:
-                    self._process_event(item)  # type: ignore[arg-type]
+                    if isinstance(item, _Pulse):
+                        self._pulse_queued = False
+                        self._process_pulse(item)
+                    else:
+                        self._process_event(item)  # type: ignore[arg-type]
                 except Exception:  # noqa: BLE001 — one bad event must not kill the worker
-                    logger.exception("PositionMonitor: unhandled error processing event")
+                    logger.exception("PositionMonitor: unhandled error processing queued item")
                 finally:
                     self._queue.task_done()
         except asyncio.CancelledError:
             pass
 
-    def _process_event(self, envelope: EventEnvelope) -> None:
+    def _process_event(self, queued: _QueuedEvent) -> None:
+        envelope = queued.envelope
+        if envelope.event_type == EventType.PRICE_UPDATED:
+            self._cache_tick(envelope, queued.seq)  # in queue order for held symbols
         bar = _bar_from_envelope(envelope)
         if bar is None:
             return
         positions = [p for p in self._position_reader.get_open_positions() if p.symbol == envelope.symbol]
         for position in positions:
-            if position.position_id in self._exit_intents:
-                continue  # already latched — no second intent, ever
-            intent = _evaluate(position, bar, self._clock)
+            if not self._protective_open(position.position_id):
+                continue
+            intent = _evaluate(position, bar)
             if intent is not None:
-                self._exit_intents[position.position_id] = intent
-                if self._on_exit_intent is not None and intent.exit_reason in {"stop", "target"}:
-                    # The execution worker owns commit/retry. EOD stays observed-only.
-                    self._on_exit_intent(intent)
-                logger.info(
-                    "PositionMonitor: ExitIntent produced position_id=%s symbol=%s reason=%s trigger_price=%s",
-                    position.position_id,
-                    position.symbol,
-                    intent.exit_reason,
-                    intent.trigger_price,
+                self._register("protective", intent)
+
+    def _process_pulse(self, pulse: _Pulse) -> None:
+        now = self._wall_clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            logger.error("PositionMonitor: wall clock returned a naive datetime; pulse skipped")
+            return
+        try:
+            positions = self._position_reader.get_open_positions()
+        except Exception:  # noqa: BLE001 — e.g. snapshot unavailable; retry next pulse
+            logger.exception("PositionMonitor: positions unavailable for pulse")
+            return
+        for position in positions:
+            pid = position.position_id
+            if pid in self._closed_positions:
+                continue
+            if (pid, "eod") in self._slots or (pid, "protective") in self._slots:
+                continue  # EOD once per position; a protective slot created first wins
+            try:
+                window = eod_session_window(self._clock, position.opened_at, self._eod_lead_seconds)
+            except UnsupportedEodCalendarError:
+                self._log_throttled(pid, "calendar", now, logging.WARNING,
+                                    "PositionMonitor: no EOD calendar coverage for position_id=%s; no EOD observation", pid)
+                continue
+            except ValueError:
+                self._log_throttled(pid, "opened_at", now, logging.ERROR,
+                                    "PositionMonitor: position_id=%s has an unusable opened_at; no EOD observation", pid)
+                continue
+            if window is None or not window.contains(now):
+                continue
+            tick = self._eligible_tick(position, now, pulse.seq)
+            if tick is None:
+                self._log_throttled(pid, "no_tick", now, logging.WARNING,
+                                    "PositionMonitor: no eligible post-opening tick for position_id=%s symbol=%s inside EOD window",
+                                    pid, position.symbol)
+                continue
+            bar = _Bar(high=tick.price, low=tick.price, close=tick.price, ts=tick.ts)
+            protective = _evaluate(position, bar)  # stop/target first, then EOD
+            if protective is not None:
+                self._register("protective", protective)
+                continue
+            self._register(
+                "eod",
+                ExitIntent(
+                    position_id=pid,
+                    symbol=position.symbol,
+                    side=position.side,
+                    qty=position.qty,
+                    exit_reason="eod_flatten",
+                    trigger_price=tick.price,
+                    trigger_ts=tick.ts,
+                    eod_flatten_at=window.flatten_at,
+                    eod_close_at=window.close_at,
+                ),
+            )
+
+    # --- helpers ---------------------------------------------------------------
+
+    def _next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def _protective_open(self, position_id: UUID) -> bool:
+        return position_id not in self._closed_positions and (position_id, "protective") not in self._slots
+
+    def _cache_tick(self, envelope: EventEnvelope, seq: int) -> None:
+        assert envelope.symbol is not None
+        try:
+            tick = PriceUpdated.model_validate(envelope.payload)
+        except ValidationError:
+            return
+        ts = tick.exchange_ts
+        if ts.tzinfo is None or ts.utcoffset() is None:
+            return
+        if not math.isfinite(tick.price) or tick.price <= 0:
+            return
+        now = self._wall_clock()
+        if now.tzinfo is None or ts > now:
+            return  # future-stamped ticks can never displace a valid tick
+        current = self._tick_cache.get(envelope.symbol)
+        if current is None or ts > current.ts or (ts == current.ts and seq < current.seq):
+            self._tick_cache[envelope.symbol] = _CachedTick(price=tick.price, ts=ts, seq=seq)
+
+    def _eligible_tick(self, position: PositionView, now: datetime, pulse_seq: int) -> _CachedTick | None:
+        tick = self._tick_cache.get(position.symbol)
+        if tick is None or tick.seq > pulse_seq:
+            return None  # arrived after this pulse was queued: later work
+        if not position.opened_at <= tick.ts <= now:
+            return None
+        if self._clock.trading_day(tick.ts) != self._clock.trading_day(position.opened_at):
+            return None
+        floor = self._eod_tick_floor.get(position.position_id)
+        if floor is not None and tick.ts <= floor:
+            return None
+        return tick
+
+    def _register(self, kind: ObservationKind, intent: ExitIntent) -> None:
+        """Create the pending slot, then notify. The slot is retained whether
+        or not any callback succeeds; only acknowledgement advances it."""
+        self._slot_sequence += 1
+        slot = _Slot(sequence=self._slot_sequence, intent=intent, state=ObservationState.PENDING)
+        self._slots[(intent.position_id, kind)] = slot
+        self._exit_intents.setdefault(intent.position_id, intent)
+        logger.info(
+            "PositionMonitor: ExitIntent produced position_id=%s symbol=%s reason=%s trigger_price=%s",
+            intent.position_id, intent.symbol, intent.exit_reason, intent.trigger_price,
+        )
+        if kind == "protective" and self._on_exit_intent is not None:
+            try:
+                self._on_exit_intent(intent)  # legacy; Execution owns commit/retry. Never EOD.
+            except Exception:  # noqa: BLE001
+                logger.exception("PositionMonitor: on_exit_intent failed; slot stays pending")
+        if self._on_observation is not None:
+            try:
+                self._on_observation(
+                    Observation(sequence=slot.sequence, kind=kind, state=slot.state, intent=intent)
                 )
+            except Exception:  # noqa: BLE001
+                logger.exception("PositionMonitor: on_observation failed; slot stays pending")
+
+    def _log_throttled(self, position_id: UUID, cause: str, now: datetime, level: int, msg: str, *args: object) -> None:
+        key = (position_id, cause)
+        last = self._last_logged.get(key)
+        if last is not None and timedelta(0) <= now - last < _LOG_INTERVAL:
+            return
+        self._last_logged[key] = now
+        logger.log(level, msg, *args)

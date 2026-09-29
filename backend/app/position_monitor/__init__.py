@@ -8,6 +8,9 @@ this package is that extension point's consumer, named directly there as
 The original scope paragraph below describes decision #175's delivery.
 The later `simulated-protective-exits` delivery wires stop/target intents
 to Execution Engine through an optional callback; EOD remains observation only.
+The later `simulated-eod-monitor-handoff` delivery adds the timer-driven EOD
+observation, a validated tick cache and a pending/acknowledged handoff
+(`handoff.py`); it is monitor-side only and places no order.
 
 Scope, restated precisely (this task's own §3 judgment call): decide WHEN
 and WHY a held position should exit — stop, target, or end-of-day flatten
