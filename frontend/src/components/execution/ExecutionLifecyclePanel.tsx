@@ -7,6 +7,7 @@ import {
   fetchExecutionPositions,
   fetchExecutionStartupStatus,
   fetchExitIntents,
+  type ExecutionExitRequestWireShape,
   type ExecutionExitRequestsWireShape,
   type ExecutionFillsWireShape,
   type ExecutionOrdersWireShape,
@@ -657,6 +658,53 @@ function ObservedExitTriggers() {
   );
 }
 
+// Stored EOD placement window, expiry and first fallback of one `eod_flatten`
+// request (decision #185). Renders only what the row stores: no clock is read, so
+// a missing `eod_expired_at` is never turned into "open" or "expired" (Execution
+// records expiry lazily), and no order status is implied. A null field from an
+// older backend renders as "not recorded" rather than being guessed.
+function EodRequestDetail({ request }: { request: ExecutionExitRequestWireShape }) {
+  const fallbackLabel = request.fallback_reason
+    ? (EXIT_REASON_LABEL[request.fallback_reason] ?? request.fallback_reason)
+    : null;
+  return (
+    <div className="mt-0.5 border-l border-base-border pl-1.5" data-testid="execution-exit-request-eod">
+      <div className="text-text-muted">
+        EOD placement window{" "}
+        {request.eod_flatten_at && request.eod_close_at ? (
+          <>
+            <time dateTime={request.eod_flatten_at}>{formatTriggerTime(request.eod_flatten_at)}</time>
+            {" → "}
+            <time dateTime={request.eod_close_at}>{formatTriggerTime(request.eod_close_at)}</time>
+          </>
+        ) : (
+          "not recorded"
+        )}
+      </div>
+      <div className="text-text-muted" data-testid="execution-exit-request-eod-expiry">
+        {request.eod_expired_at ? (
+          <>
+            Placement eligibility ended{" "}
+            <time dateTime={request.eod_expired_at}>{formatTriggerTime(request.eod_expired_at)}</time>
+          </>
+        ) : (
+          "No expiry recorded"
+        )}
+      </div>
+      <div className="text-text-muted" data-testid="execution-exit-request-fallback">
+        {fallbackLabel && request.fallback_trigger_price && request.fallback_trigger_ts ? (
+          <>
+            First {fallbackLabel.toLowerCase()} observation stored: price {request.fallback_trigger_price} at{" "}
+            <time dateTime={request.fallback_trigger_ts}>{formatTriggerTime(request.fallback_trigger_ts)}</time>
+          </>
+        ) : (
+          "No stop or target fallback stored"
+        )}
+      </div>
+    </div>
+  );
+}
+
 type ExitRequestsLoad =
   | { kind: "loading" }
   | { kind: "error"; message: string }
@@ -700,7 +748,9 @@ function RecordedExitRequests() {
       </div>
       <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
         A recorded request does not prove an order was placed or that the position is protected. Position status and
-        remaining quantity are current, not as of the trigger.
+        remaining quantity are current, not as of the trigger. For an EOD request, a recorded expiry only ends
+        placement eligibility; it does not show an order was cancelled or the position closed. A stored stop or target
+        fallback is an observation, not a working protective order. Order status and fills are on their own views.
       </p>
       {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading recorded exit requests…</p>}
       {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch recorded exit requests: {load.message}</p>}
@@ -721,6 +771,7 @@ function RecordedExitRequests() {
               </div>
               <div className="text-text-muted">Trigger price {request.trigger_price}</div>
               <div className="text-text-muted">Position {request.position_status} · remaining qty {request.remaining_qty}</div>
+              {request.exit_reason === "eod_flatten" && <EodRequestDetail request={request} />}
               {request.retry_after !== null && (
                 <div className="text-text-muted">
                   Retry after <time dateTime={request.retry_after}>{formatTriggerTime(request.retry_after)}</time>

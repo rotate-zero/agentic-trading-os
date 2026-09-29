@@ -1413,6 +1413,20 @@ def _fetch_execution_exit_requests(symbol: str | None, limit: int) -> list[dict[
     position's `symbol`; and the position's **current** `status` and `qty`
     as `position_status` / `remaining_qty`. Nothing is derived: no order
     status, no protection claim, no retry outcome.
+
+    **EOD and fallback state (decision #185, migration 0016).** A request's
+    ORIGINAL reason may be `eod_flatten`; its stored placement window is
+    `eod_flatten_at`..`eod_close_at` (UTC) and `eod_expired_at` is when
+    placement ELIGIBILITY durably ended. It is set lazily when Execution next
+    touches the request, so NULL does not mean the window is still open, and a
+    value does not mean an order was cancelled or the position closed. An EOD
+    request may also carry the FIRST later stop/target observation as
+    `fallback_reason` / `fallback_trigger_price` (exact decimal string) /
+    `fallback_trigger_ts`; that is a stored observation, not a working
+    protective order. `trigger_price` / `trigger_ts` stay the ORIGINAL
+    request's, which is why the ordering below is unchanged. On a stop/target
+    request all six fields are `None`; the schema's CHECK constraints make the
+    fallback triple all-or-none and EOD-only.
     """
     from sqlalchemy import select
 
@@ -1442,6 +1456,18 @@ def _fetch_execution_exit_requests(symbol: str | None, limit: int) -> list[dict[
                 "created_at": request.created_at,
                 "position_status": position.status,
                 "remaining_qty": position.qty,
+                # Migration 0016 (decision #185 / `simulated-eod-ledger-handoff`)
+                # columns, passed through exactly as stored. All six are NULL on a
+                # legacy stop/target row; `fallback_*` is NULL on an EOD row until a
+                # first stop/target observation is stored. Nothing here is derived.
+                "eod_flatten_at": request.eod_flatten_at,
+                "eod_close_at": request.eod_close_at,
+                "eod_expired_at": request.eod_expired_at,
+                "fallback_reason": request.fallback_reason,
+                "fallback_trigger_price": (
+                    None if request.fallback_trigger_price is None else str(request.fallback_trigger_price)
+                ),
+                "fallback_trigger_ts": request.fallback_trigger_ts,
             }
             for request, position in rows
         ]
@@ -1476,16 +1502,22 @@ async def get_execution_exit_requests(
     why the tie-break is stable but not chronological.
 
     **Curated fields:** `position_id`, `symbol`, `exit_reason` (`stop` |
-    `target`), `trigger_price` (exact decimal string), `trigger_ts`,
-    `retry_after` (null when unset), `created_at`, plus the position's
-    *current* `position_status` (`open` | `closing` | `closed`) and
-    `remaining_qty`. The last two are read at request time, not as of the
-    trigger.
+    `target` | `eod_flatten`, the ORIGINAL request's reason), `trigger_price`
+    (exact decimal string), `trigger_ts`, `retry_after` (null when unset),
+    `created_at`, plus the position's *current* `position_status` (`open` |
+    `closing` | `closed`) and `remaining_qty`. The last two are read at request
+    time, not as of the trigger. Six nullable EOD/fallback fields
+    (`eod_flatten_at`, `eod_close_at`, `eod_expired_at`, `fallback_reason`,
+    `fallback_trigger_price` as an exact decimal string, `fallback_trigger_ts`)
+    are always present and null on stop/target rows; see
+    `_fetch_execution_exit_requests` for what they do and do not mean.
 
     **What this does not say.** No order status, no claim that the position
     is protected, and no retry outcome are returned or inferred:
     `retry_after` is the stored timestamp, not proof a retry happened or
-    succeeded. Orders and fills stay on their own routes.
+    succeeded. A recorded `eod_expired_at` ends placement eligibility only, and
+    a stored fallback is an observation only. Orders and fills stay on their
+    own routes.
 
     Off the event loop via `asyncio.to_thread`, the same
     `scanner-route-db-offload` convention as the siblings; the helper opens

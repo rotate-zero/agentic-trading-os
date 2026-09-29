@@ -484,16 +484,34 @@ export async function fetchExecutionPositions(): Promise<ExecutionPositionsWireS
 // from "no retry needed"). `position_status` and `remaining_qty` are read at
 // request time from the position, not as of the trigger. No `symbol`/`limit`
 // arguments: the panel's only caller wants the default unfiltered 50 rows.
+//
+// EOD and fallback state (decision #185, migration 0016; added by
+// `simulated-eod-exit-request-visibility`): `exit_reason` is the ORIGINAL
+// request's reason and may now be "eod_flatten"; `trigger_price`/`trigger_ts`
+// stay that original request's. An EOD row stores its placement window
+// (`eod_flatten_at`..`eod_close_at`, UTC) and `eod_expired_at`, when placement
+// ELIGIBILITY durably ended — recorded lazily, so null does not mean the window
+// is still open, and a value is NOT proof an order was cancelled or the position
+// closed. `fallback_*` is the FIRST later stop/target observation an EOD row
+// stored (all three set together, or all null): an observation, NOT a working
+// protective order. All six fields are always present and null on stop/target
+// rows. `fallback_trigger_price` is an exact decimal string like `trigger_price`.
 export interface ExecutionExitRequestWireShape {
   position_id: string;
   symbol: string;
-  exit_reason: "stop" | "target";
+  exit_reason: "stop" | "target" | "eod_flatten";
   trigger_price: string;
   trigger_ts: string;
   retry_after: string | null;
   created_at: string;
   position_status: "open" | "closing" | "closed";
   remaining_qty: number;
+  eod_flatten_at: string | null;
+  eod_close_at: string | null;
+  eod_expired_at: string | null;
+  fallback_reason: "stop" | "target" | null;
+  fallback_trigger_price: string | null;
+  fallback_trigger_ts: string | null;
 }
 
 export interface ExecutionExitRequestsWireShape {

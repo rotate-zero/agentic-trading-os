@@ -1115,7 +1115,7 @@ and never share a source:
 | Source | the running Position Monitor's in-memory intents | PostgreSQL `exit_requests`, joined to `positions` |
 | Survives restart | no | yes |
 | Depends on the monitor | yes (`monitor_status` running / unavailable) | no — works with no monitor, and does not read it |
-| Includes EOD observations | yes (diagnostic only) | no — only `stop` / `target` are ever persisted |
+| Includes EOD observations | yes (diagnostic only) | only as a durable *original* `eod_flatten` request with its stored window, expiry and optional fallback (`simulated-eod-exit-request-visibility`). The ledger that writes those rows is not wired (`simulated-eod-ledger-handoff`), so a running system has none yet |
 | Row means | "the monitor saw a trigger this process" | "Execution durably recorded a stop/target observation for this position" |
 | Envelope | `monitor_status`, `intent_status: observed_only`, `exit_intents` | `exit_requests` only |
 
@@ -1129,19 +1129,22 @@ default 50. Ordered by `trigger_ts` descending, then `position_id` descending �
 **not chronological** (random `uuid4`).
 
 **Curated fields:** from the request — `position_id`, `exit_reason` (`stop` |
-`target`), `trigger_price` (exact decimal string, the `Numeric(18, 6)` value),
-`trigger_ts`, `retry_after` (JSON `null` when unset), `created_at`; from the
-position — `symbol`, and the position's **current** `position_status` (`open` |
-`closing` | `closed`) and `remaining_qty`. Status and quantity are read at
-request time, not as of the trigger.
+`target` | `eod_flatten`, always the ORIGINAL request's reason), `trigger_price`
+(exact decimal string, the `Numeric(18, 6)` value), `trigger_ts`, `retry_after`
+(JSON `null` when unset), `created_at`; from the position — `symbol`, and the
+position's **current** `position_status` (`open` | `closing` | `closed`) and
+`remaining_qty`. Status and quantity are read at request time, not as of the
+trigger. Six EOD/fallback fields (added by `simulated-eod-exit-request-visibility`,
+below) are always present and are `null` on `stop` / `target` rows.
 
 **What the route does not claim.** It returns no order status, no
 "protected" flag and no retry outcome, and infers none: a request row is a
 recovery record (see above), `retry_after` is only the stored timestamp set
 when a close was rejected or cancelled (it does not show a retry happened or
 succeeded), and a position's status does not say which order closed it.
-Orders and fills remain on their own routes. An empty table or non-matching
-symbol returns `{"exit_requests": []}`, 200.
+`eod_expired_at` ends EOD placement eligibility only, and a stored fallback is an
+observation only (details below). Orders and fills remain on their own routes.
+An empty table or non-matching symbol returns `{"exit_requests": []}`, 200.
 
 ```
 Position Monitor ──► stop/target ExitIntent (in memory) ──► GET /intelligence/exit-intents
@@ -1179,6 +1182,9 @@ _fetch_execution_exit_requests()  [worker thread — opens AND closes its own Se
                            trigger_price : str(Decimal)
                            retry_after : native datetime or None
                            position_status / remaining_qty : positions.status / positions.qty
+                           eod_flatten_at / eod_close_at / eod_expired_at : native datetime or None
+                           fallback_reason : str or None ; fallback_trigger_ts : native datetime or None
+                           fallback_trigger_price : str(Decimal) or None
                      ──► session.close()  (finally — always)
        ▼  list[dict] crosses back to the event loop
 {"exit_requests": [...]}   200 always; [] for an empty table or a non-matching symbol
@@ -1198,7 +1204,7 @@ bare route, so the server's default 50 rows, and the section fetches on mount
 order (`trigger_ts` descending, `position_id` tie-break) and are keyed by
 `position_id`; the panel never re-sorts them.
 
-Each row shows the symbol and the reason ("Stop" / "Target"), the trigger time,
+Each row shows the symbol and the reason ("Stop" / "Target" / "EOD"), the trigger time,
 the exact trigger price, the position's *current* status (`open`, `closing`,
 `closed`) and remaining quantity, and — only when the stored value is non-null —
 `Retry after <time>`. `trigger_price` stays the server's exact decimal string
@@ -1220,7 +1226,8 @@ triggers" reads `GET /intelligence/exit-intents` (the running monitor's in-memor
 `observed_only` view, empty after a restart); this section reads only the durable
 `exit_requests` rows and never the monitor. It reads no orders or fills, so it
 cannot show which order closed a position or at what price; those stay in their
-own sections. Refreshing it refetches no sibling section, and it is not merged
+own sections. An `eod_flatten` row additionally shows its stored window, expiry and
+fallback (see `simulated-eod-exit-request-visibility` below). Refreshing it refetches no sibling section, and it is not merged
 into the WebSocket activity feed. No backend, migration, ledger-write, exit-policy
 or trading-control change.
 
@@ -1247,11 +1254,84 @@ manual Refresh ──► refreshKey++ ─► cleanup marks previous run inactive
        ├─ request error ──► error line ("Could not fetch recorded exit requests: ...")
        └─ 200 ──► exit_requests: [] ──► "No exit requests recorded yet."
                   └─ rows ──► render in server order, keyed by position_id
-                       per row: symbol · Stop|Target · trigger time · Trigger price <exact string>
-                                · Position <status> · remaining qty <n> · [Retry after <time> if non-null]
+                       per row: symbol · Stop|Target|EOD · trigger time · Trigger price <exact string>
+                                · Position <status> · remaining qty <n>
+                                · [EOD block if exit_reason = eod_flatten — see below]
+                                · [Retry after <time> if non-null]
                        header note: a recorded request does not prove an order was placed
                                     or that the position is protected
 collapse / unmount ──► cleanup marks run inactive; a late response or late failure is ignored
+```
+
+**As built (`simulated-eod-exit-request-visibility`; decision #185 already exists, no new
+number).** The existing route and "Recorded exit requests" section now show a durable
+original `eod_flatten` request, its stored placement window and expiry, and the optional
+first stop/target fallback, using the columns of migration `0016` exactly
+(`simulated-eod-ledger-handoff`, verified against `main` `c1d09e4`). Read path only: no
+model, migration, ledger, worker, monitor or trading-control change, and no new route.
+Query, filters, ordering, `limit` bounds, exact-decimal strings and the
+`asyncio.to_thread` read are unchanged. **The ledger that writes these rows is still not
+wired into a running system**, so today the new fields are `null` and no `eod_flatten` row
+exists outside tests; the read path is verified against hand-inserted rows only.
+
+| Field (all always present) | Type | Meaning when non-null | Null means |
+|---|---|---|---|
+| `exit_reason` | `stop` \| `target` \| `eod_flatten` | the ORIGINAL request's reason; never replaced by a fallback | (never null) |
+| `eod_flatten_at`, `eod_close_at` | UTC timestamp | the stored placement window `[flatten_at, close_at)`, ledger-derived and immutable | not an EOD request |
+| `eod_expired_at` | UTC timestamp | when placement **eligibility** durably ended | no expiry recorded (see below) |
+| `fallback_reason` | `stop` \| `target` | the FIRST later protective observation, immutable | no fallback stored (the three fallback fields move together) |
+| `fallback_trigger_price` | exact decimal string | that observation's price | as above |
+| `fallback_trigger_ts` | UTC timestamp | that observation's time | as above |
+
+**What these fields do not say.** `eod_expired_at` is recorded lazily, when the ledger next
+touches the request, so `null` does **not** mean the window is still open and the route
+never compares the window with a clock. A recorded expiry means only that EOD *placement
+eligibility* ended: it is not proof an order was cancelled, that any order existed or that
+the position closed (`position_status` / `remaining_qty` stay the position's current
+state, and orders/fills stay on their own routes). A stored fallback is an observation, not
+proof of a working protective order. `trigger_price` / `trigger_ts` (and therefore the
+ordering) remain the original request's; a later fallback never reorders a row.
+
+**UI.** For an `eod_flatten` row the section adds a small block: "EOD placement window
+`<flatten>` → `<close>`"; either "Placement eligibility ended `<time>`" or "No expiry
+recorded"; and either "First stop|target observation stored: price `<exact string>` at
+`<time>`" or "No stop or target fallback stored". A missing field from an older backend
+renders as "not recorded" rather than being guessed. Stop/target rows render exactly as
+before, and the section's note now states the expiry and fallback caveats above. Still no
+polling and no control besides the existing Refresh.
+
+```text
+exit_requests (migration 0016)         positions
+  original reason / trigger_*            execution_mode, symbol, status, qty
+  eod_flatten_at, eod_close_at,               │
+  eod_expired_at, fallback_*                  │  INNER JOIN on position_id, simulated only
+        └──────────────────────┬──────────────┘
+                               ▼
+        GET /intelligence/execution-exit-requests   (same query, order, bounds, worker thread)
+          + 6 nullable EOD/fallback fields, passed through as stored, nothing derived
+                               ▼
+        fetchExecutionExitRequests() ──► ExecutionLifecyclePanel ► "Recorded exit requests"
+                                            stop/target row: unchanged
+                                            eod_flatten row: + window / expiry / fallback block
+
+written by (NOT wired today): PostgresExitLedger.observe_exit() / advance_eod_expiry()
+not read here: orders · fills · Position Monitor · any clock
+```
+
+```text
+row build (worker thread):  request, position ─► existing 9 fields (unchanged)
+   ├─ eod_flatten_at / eod_close_at / eod_expired_at ─► native datetime or None
+   ├─ fallback_reason ─► str or None
+   ├─ fallback_trigger_price ─► None, else str(Decimal)     (never float)
+   └─ fallback_trigger_ts ─► native datetime or None
+
+panel row:  exit_reason != eod_flatten ─► stop/target row exactly as before
+            exit_reason  = eod_flatten ─► EodRequestDetail
+                 window       : both bounds set ─► "flatten → close"   else "not recorded"
+                 expiry       : eod_expired_at set ─► "Placement eligibility ended <t>"
+                                else ─► "No expiry recorded"           (no clock consulted)
+                 fallback     : reason+price+ts set ─► "First <stop|target> observation stored: ..."
+                                else ─► "No stop or target fallback stored"
 ```
 
 **As built (`simulated-eod-monitor-handoff`; decision #185 already exists, no new number).**
@@ -2117,7 +2197,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 | `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order. Exposed over HTTP by `GET /intelligence/execution-fills` (decision #183, §6.3) — curated, joined to `orders` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]` | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
 | `positions` | Position accounting (owner: Portfolio State), a deterministic function of `fills`. Exposed over HTTP by `GET /intelligence/execution-positions` (`execution-positions-route`, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]`, newest `opened_at` first (ties: `position_id` descending) | `position_id`, `trade_id`, `execution_mode`, `execution_venue`, `symbol`, `side`, `qty`, `avg_price`, `stop`, `target`, `opened_at`, `closed_at`, `status`, `realized_pnl`, `exit_attempt` |
-| `exit_requests` (decision #184) | Durable first stop/target observation per position and its retry delay; a recovery record, not a protection guarantee. Exposed over HTTP by `GET /intelligence/execution-exit-requests` (`execution-exit-requests-route`, §6.6) — joined to `positions` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]`, newest `trigger_ts` first (ties: `position_id` descending). Distinct from the in-memory `GET /intelligence/exit-intents`. Displayed read-only by the Execution panel's "Recorded exit requests" section (`execution-panel-exit-requests`, §6.6) | `position_id` PK/FK, `exit_reason` (`stop` \| `target`), `trigger_price` (> 0), `trigger_ts`, `retry_after` (nullable), `created_at` |
+| `exit_requests` (decision #184) | Durable first stop/target observation per position and its retry delay; a recovery record, not a protection guarantee. Exposed over HTTP by `GET /intelligence/execution-exit-requests` (`execution-exit-requests-route`, §6.6) — joined to `positions` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]`, newest `trigger_ts` first (ties: `position_id` descending). Distinct from the in-memory `GET /intelligence/exit-intents`. Displayed read-only by the Execution panel's "Recorded exit requests" section (`execution-panel-exit-requests`, §6.6), which also shows an `eod_flatten` row's stored window, expiry and fallback (`simulated-eod-exit-request-visibility`, §6.6) | `position_id` PK/FK, `exit_reason` (`stop` \| `target` \| `eod_flatten`), `trigger_price` (> 0), `trigger_ts`, `retry_after` (nullable), `created_at`; EOD/fallback columns per migration 0016 (`simulated-eod-ledger-handoff`) |
 | `portfolio_state_cursor` | Where Portfolio State's replay resumes | `execution_mode`, `last_applied_ledger_seq` |
 | `position_fill_receipts` (entry-lifecycle-wiring — mislabeled "#174" in an earlier edit of this row; #174 was frontend-only, "no backend logic changed" per its own decision entry, and never built this table) | Durable fill application and exact replay inputs | `ledger_seq` PK/FK, unique `(execution_venue, venue_fill_id)`, `execution_mode`, `position_id` FK, `fill_data` JSONB, `trading_day`, `gross_pnl` |
 

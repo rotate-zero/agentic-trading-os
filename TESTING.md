@@ -1,3 +1,47 @@
+# TESTING — `simulated-eod-exit-request-visibility`
+
+**Verified against Task 2:** GitHub `main` `c1d09e4` ("Simulated eod ledger handoff",
+`simulated-eod-ledger-handoff`, migration `0016`, parent `0015`). Its model, migration and
+exit ledger are byte-identical to the Task 2 zip that was delivered. `main` had no newer
+commit at packaging. Separate worktree; untouched `c1d09e4` collects 1335 backend tests.
+Local PostgreSQL 16, wiped and recreated, `alembic upgrade head` (`0016`) before the run.
+
+- `backend/tests/test_execution_exit_requests_route.py` (real PostgreSQL, ORM-inserted rows
+  through Task 2's model so a wrong column name or CHECK fails here): **25 → 37 tests**.
+  The two exact-key-set assertions now include the six new fields; the legacy target-row
+  test also asserts all six are JSON `null`. New tests cover: legacy stop row unchanged with
+  all-null EOD fields; original EOD request (no expiry, no fallback); expired EOD without
+  fallback; EOD with a stored `stop` and `target` fallback before expiry; expired EOD with
+  fallback (every field set); fallback price exact decimal strings (`12345678901.123456`,
+  `0.100000`); an ended window with no recorded expiry stays `eod_expired_at: null` (no
+  clock); ordering follows the original `trigger_ts` then `position_id`, not the fallback;
+  mode, exact-symbol and `limit` apply to EOD rows; mixed legacy and EOD rows share one
+  shape; a closed position keeps its stored EOD state. The existing worker-thread and
+  event-loop test still passes unchanged.
+- Mutation checks (temporary, reverted): forcing `eod_expired_at` to `None` failed 3 tests;
+  converting the fallback price to `float` failed 4.
+- Frontend: repo has no test runner, so behaviour was checked with a scratch jsdom harness
+  (not shipped) rendering the real panel with a mocked `fetch`: **28/28** — legacy rows and
+  order preserved, every EOD/fallback/null combination, exact prices, older-backend rows
+  with missing keys, loading/empty/error, one request on expand and none while idle, only
+  the Refresh button, stale Refresh response discarded, caveat text present. Mutations
+  (EOD block on every row; unrecorded expiry shown as expired) failed 2 and 3 checks.
+- `npx tsc -b`: clean. `npx vite build`: succeeds, 103 modules (same as baseline).
+  `frontend/tsconfig.tsbuildinfo` is rewritten by `tsc -b`; it was reverted and is not in
+  the package.
+- Full backend suite on the wiped database: **1347 passed, 0 failed, 0 skipped** (1335 on `c1d09e4` + 12 new).
+
+Not covered: no running system writes EOD rows yet (ledger unwired), so nothing here shows
+the panel against live EOD data; no browser/visual check; no frontend test runner exists.
+
+Zip `simulated-eod-exit-request-visibility.zip` entries: `CHANGES.md`, `TESTING.md`,
+`backend/app/api/routes/intelligence.py`,
+`backend/tests/test_execution_exit_requests_route.py`, `frontend/src/services/api-client.ts`,
+`frontend/src/components/execution/ExecutionLifecyclePanel.tsx`,
+`docs/architecture/execution-engine-design.md`.
+
+---
+
 # TESTING — `simulated-eod-ledger-handoff`
 
 Baseline: built at `1c927db`, then rebased onto GitHub `main` `5fc4dfb` (the Position

@@ -1,3 +1,49 @@
+# CHANGES — `simulated-eod-exit-request-visibility` (read path only)
+
+Shows the durable EOD request state Task 2 introduced in the existing
+`GET /intelligence/execution-exit-requests` route and the Execution panel's "Recorded exit
+requests" section. Built on `main` `c1d09e4` (Task 2, `simulated-eod-ledger-handoff`,
+migration `0016`); column names and nullability come from that model and migration, not
+from the §6.6 proposal. No decision number assigned (#185 records the policy).
+
+- `backend/app/api/routes/intelligence.py`: each row gains six always-present nullable
+  fields passed through as stored: `eod_flatten_at`, `eod_close_at`, `eod_expired_at`,
+  `fallback_reason`, `fallback_trigger_price` (exact decimal string) and
+  `fallback_trigger_ts`. `exit_reason` may now be `eod_flatten`. Query, `simulated`
+  scoping, exact `symbol`, `limit` bounds, `trigger_ts`/`position_id` ordering, exact
+  decimals and the worker-thread read are unchanged; nothing is derived and no clock is read.
+- `frontend/src/services/api-client.ts`: wire type extended (`eod_flatten` reason, six
+  nullable fields).
+- `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`: an `eod_flatten` row
+  shows its stored window, "Placement eligibility ended <time>" or "No expiry recorded",
+  and either the first stored stop/target observation (exact price and time) or "No stop or
+  target fallback stored". Stop/target rows are unchanged. The section note now says an
+  expiry only ends placement eligibility (not proof an order was cancelled or the position
+  closed), a fallback is an observation (not a working protective order), and orders/fills
+  are on their own views. No polling, no controls, existing Refresh unchanged.
+- `docs/architecture/execution-engine-design.md` §6.6: as-built block with a field table
+  and data-flow/internal-flow diagrams; the route/UI text and diagrams that said only
+  stop/target are persisted or shown were corrected in place; the §6.8 `exit_requests` row
+  was updated.
+
+**Not true yet:** the ledger that writes `eod_flatten` rows is not wired into a running
+system, so today these fields are `null` and no EOD row exists outside tests. The read path
+is verified against hand-inserted rows only.
+
+**Shared documentation the final integrator must merge** (all in
+`docs/architecture/execution-engine-design.md`, plus this file and `TESTING.md`):
+the new as-built block placed directly above the `simulated-eod-monitor-handoff` block;
+in-place edits in the earlier `execution-exit-requests-route` /
+`execution-panel-exit-requests` text (comparison-table "Includes EOD observations" cell,
+"Curated fields" paragraph, "does not claim" paragraph, the route internal-flow diagram,
+the frontend "Each row shows" sentence, the panel internal-flow diagram); and the §6.8
+`exit_requests` row. Keep every other task's entries.
+
+Package: `simulated-eod-exit-request-visibility.zip`, root-relative, seven files listed in
+`TESTING.md`.
+
+---
+
 # CHANGES — `simulated-eod-ledger-handoff` (exit-ledger EOD state machine; UNWIRED)
 
 Task 2 of the parallel EOD split, built on decision #185's foundation and rebased onto `main`

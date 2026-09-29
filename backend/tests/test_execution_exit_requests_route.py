@@ -55,7 +55,25 @@ _EXPECTED_FIELDS = {
     "created_at",
     "position_status",
     "remaining_qty",
+    # Migration 0016 (decision #185): always present, null on stop/target rows.
+    "eod_flatten_at",
+    "eod_close_at",
+    "eod_expired_at",
+    "fallback_reason",
+    "fallback_trigger_price",
+    "fallback_trigger_ts",
 }
+_EOD_FIELDS = (
+    "eod_flatten_at",
+    "eod_close_at",
+    "eod_expired_at",
+    "fallback_reason",
+    "fallback_trigger_price",
+    "fallback_trigger_ts",
+)
+# A valid stored EOD placement window (flatten_at < close_at) on a 2026 regular day.
+_EOD_FLATTEN_AT = datetime(2026, 9, 16, 19, 59, tzinfo=timezone.utc)
+_EOD_CLOSE_AT = datetime(2026, 9, 16, 20, 0, tzinfo=timezone.utc)
 
 
 def _db_available() -> bool:
@@ -410,6 +428,9 @@ async def test_route_unretried_request_serializes_curated_fields_with_null_retry
     # Unset retry_after is JSON null — never omitted and never a zero/epoch value.
     assert row["retry_after"] is None
 
+    # A legacy target row carries the six EOD/fallback keys, all JSON null.
+    assert all(row[name] is None for name in _EOD_FIELDS)
+
     trigger_ts = datetime.fromisoformat(row["trigger_ts"])
     assert trigger_ts.tzinfo is not None and trigger_ts == request.trigger_ts
     created_at = datetime.fromisoformat(row["created_at"])
@@ -545,3 +566,198 @@ async def test_blocked_exit_requests_read_does_not_block_an_unrelated_route(_blo
 
     assert response.status_code == 200
     assert response.json() == {"exit_requests": []}
+
+
+# --- EOD request and fallback state (decision #185, migration 0016) ---
+#
+# Rows are hand-inserted through the real ORM model, so a column name or CHECK
+# that differs from Task 2's migration fails here rather than in production.
+# Nothing is derived by the route: every assertion is "exactly what is stored".
+
+def _eod(**overrides) -> dict:
+    fields = dict(
+        exit_reason="eod_flatten",
+        trigger_price=Decimal("101.500000"),
+        trigger_ts=_BASE_TS + timedelta(hours=5),
+        eod_flatten_at=_EOD_FLATTEN_AT,
+        eod_close_at=_EOD_CLOSE_AT,
+    )
+    fields.update(overrides)
+    return fields
+
+
+async def _only_row(symbol: str) -> dict:
+    body = (await _get(symbol=symbol)).json()["exit_requests"]
+    assert len(body) == 1
+    return body[0]
+
+
+async def test_route_legacy_stop_row_keeps_its_shape_with_all_eod_fields_null():
+    _insert_exit_request(position_overrides={"symbol": "ZZXR30"}, exit_reason="stop")
+
+    row = await _only_row("ZZXR30")
+
+    assert set(row) == _EXPECTED_FIELDS
+    assert row["exit_reason"] == "stop" and row["trigger_price"] == "185.500000"
+    assert {name: row[name] for name in _EOD_FIELDS} == {name: None for name in _EOD_FIELDS}
+
+
+async def test_route_original_eod_request_without_expiry_or_fallback():
+    position, request = _insert_exit_request(position_overrides={"symbol": "ZZXR31"}, **_eod())
+
+    row = await _only_row("ZZXR31")
+
+    assert set(row) == _EXPECTED_FIELDS
+    assert row["position_id"] == str(position.position_id)
+    assert row["exit_reason"] == "eod_flatten"
+    assert row["trigger_price"] == "101.500000" and isinstance(row["trigger_price"], str)
+    for name, expected in (("eod_flatten_at", _EOD_FLATTEN_AT), ("eod_close_at", _EOD_CLOSE_AT)):
+        parsed = datetime.fromisoformat(row[name])
+        assert parsed.tzinfo is not None and parsed == expected == getattr(request, name)
+    assert row["eod_expired_at"] is None
+    assert row["fallback_reason"] is None
+    assert row["fallback_trigger_price"] is None and row["fallback_trigger_ts"] is None
+
+
+async def test_route_expired_eod_request_without_fallback_is_reported_as_stored_only():
+    expired_at = _EOD_CLOSE_AT + timedelta(seconds=7)
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR32", "status": "open", "qty": 10},
+        **_eod(eod_expired_at=expired_at),
+    )
+
+    row = await _only_row("ZZXR32")
+
+    assert datetime.fromisoformat(row["eod_expired_at"]) == expired_at
+    assert row["fallback_reason"] is None and row["fallback_trigger_price"] is None
+    # Expiry ends placement eligibility only: the position and its quantity are untouched
+    # and no order or protection claim appears anywhere in the row.
+    assert row["position_status"] == "open" and row["remaining_qty"] == 10
+    assert set(row) == _EXPECTED_FIELDS
+
+
+@pytest.mark.parametrize("reason", ["stop", "target"])
+async def test_route_eod_request_with_a_stored_fallback_before_expiry(reason):
+    fallback_ts = _BASE_TS + timedelta(hours=5, minutes=58)
+    _insert_exit_request(
+        position_overrides={"symbol": f"ZZXR33{reason[0].upper()}"},
+        **_eod(fallback_reason=reason, fallback_trigger_price=Decimal("88.250000"), fallback_trigger_ts=fallback_ts),
+    )
+
+    row = await _only_row(f"ZZXR33{reason[0].upper()}")
+
+    # The fallback is present while the original stays EOD and unexpired: not a replacement.
+    assert row["exit_reason"] == "eod_flatten" and row["trigger_price"] == "101.500000"
+    assert row["eod_expired_at"] is None
+    assert row["fallback_reason"] == reason
+    assert row["fallback_trigger_price"] == "88.250000" and isinstance(row["fallback_trigger_price"], str)
+    assert datetime.fromisoformat(row["fallback_trigger_ts"]) == fallback_ts
+
+
+async def test_route_expired_eod_request_with_a_fallback_carries_every_field():
+    expired_at = _EOD_CLOSE_AT + timedelta(seconds=1)
+    fallback_ts = _EOD_CLOSE_AT + timedelta(seconds=30)
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR34"},
+        **_eod(
+            eod_expired_at=expired_at, fallback_reason="target",
+            fallback_trigger_price=Decimal("120.000000"), fallback_trigger_ts=fallback_ts,
+        ),
+    )
+
+    row = await _only_row("ZZXR34")
+
+    assert row["exit_reason"] == "eod_flatten"
+    assert datetime.fromisoformat(row["eod_expired_at"]) == expired_at
+    assert row["fallback_reason"] == "target" and row["fallback_trigger_price"] == "120.000000"
+    assert datetime.fromisoformat(row["fallback_trigger_ts"]) == fallback_ts
+    assert set(row) == _EXPECTED_FIELDS  # still no order status, fill, or protection flag
+
+
+async def test_route_fallback_price_is_an_exact_decimal_string():
+    fallback_ts = _BASE_TS + timedelta(hours=5, minutes=58)
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR35A"},
+        **_eod(fallback_reason="stop", fallback_trigger_price=Decimal("12345678901.123456"), fallback_trigger_ts=fallback_ts),
+    )
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR35B"},
+        **_eod(fallback_reason="stop", fallback_trigger_price=Decimal("0.100000"), fallback_trigger_ts=fallback_ts),
+    )
+
+    assert (await _only_row("ZZXR35A"))["fallback_trigger_price"] == "12345678901.123456"
+    assert (await _only_row("ZZXR35B"))["fallback_trigger_price"] == "0.100000"
+
+
+async def test_route_reports_stored_values_and_never_derives_expiry_from_the_clock():
+    """A window that ended long ago with no `eod_expired_at` recorded (Execution
+    records expiry lazily) is still returned with `eod_expired_at: null`."""
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR36"},
+        **_eod(eod_flatten_at=datetime(2020, 1, 2, 20, 59, tzinfo=timezone.utc),
+               eod_close_at=datetime(2020, 1, 2, 21, 0, tzinfo=timezone.utc)),
+    )
+
+    row = await _only_row("ZZXR36")
+
+    assert row["eod_expired_at"] is None
+    assert datetime.fromisoformat(row["eod_close_at"]) == datetime(2020, 1, 2, 21, 0, tzinfo=timezone.utc)
+
+
+async def test_route_eod_rows_follow_the_same_ordering_by_original_trigger_not_fallback():
+    """Ordering stays `trigger_ts` (the ORIGINAL request's) then `position_id`
+    descending. A later fallback timestamp must not move a row."""
+    old_with_late_fallback, _ = _insert_exit_request(
+        position_overrides={"symbol": "ZZXR37"},
+        **_eod(trigger_ts=_BASE_TS + timedelta(minutes=1), fallback_reason="stop",
+               fallback_trigger_price=Decimal("80.000000"), fallback_trigger_ts=_BASE_TS + timedelta(days=30)),
+    )
+    newer_stop, _ = _insert_exit_request(
+        position_overrides={"symbol": "ZZXR37"}, exit_reason="stop", trigger_ts=_BASE_TS + timedelta(minutes=2),
+    )
+    tie_eod, _ = _insert_exit_request(
+        position_overrides={"symbol": "ZZXR37"}, **_eod(trigger_ts=_BASE_TS + timedelta(minutes=2)),
+    )
+
+    ids = _ids(await _get(symbol="ZZXR37"))
+
+    tied = sorted([str(newer_stop.position_id), str(tie_eod.position_id)], reverse=True)
+    assert ids == tied + [str(old_with_late_fallback.position_id)]
+    assert ids == _ids(await _get(symbol="ZZXR37"))  # stable on repeat
+
+
+async def test_route_mode_symbol_and_limit_apply_to_eod_rows_like_any_other():
+    _insert_exit_request(position_overrides={"symbol": "ZZXR38", "execution_mode": "paper", "execution_venue": "ibkr"}, **_eod())
+    _insert_exit_request(position_overrides={"symbol": "ZZXR38"}, **_eod(trigger_ts=_BASE_TS + timedelta(hours=6)))
+    _insert_exit_request(position_overrides={"symbol": "ZZXR38"}, **_eod(trigger_ts=_BASE_TS + timedelta(hours=7)))
+    _insert_exit_request(position_overrides={"symbol": "ZZXR38X"}, **_eod())
+
+    rows = (await _get(symbol="ZZXR38")).json()["exit_requests"]
+    assert [r["symbol"] for r in rows] == ["ZZXR38", "ZZXR38"]  # other mode and other symbol excluded
+    assert len((await _get(symbol="ZZXR38", limit=1)).json()["exit_requests"]) == 1
+    assert (await _get(symbol="ZZXR38", limit=1)).json()["exit_requests"][0]["trigger_ts"] == rows[0]["trigger_ts"]
+
+
+async def test_route_mixed_legacy_and_eod_rows_share_one_uniform_shape():
+    _insert_exit_request(position_overrides={"symbol": "ZZXR39"}, exit_reason="stop", trigger_ts=_BASE_TS + timedelta(hours=1))
+    _insert_exit_request(position_overrides={"symbol": "ZZXR39"}, exit_reason="target", trigger_ts=_BASE_TS + timedelta(hours=2))
+    _insert_exit_request(position_overrides={"symbol": "ZZXR39"}, **_eod(trigger_ts=_BASE_TS + timedelta(hours=3)))
+
+    rows = (await _get(symbol="ZZXR39")).json()["exit_requests"]
+
+    assert [r["exit_reason"] for r in rows] == ["eod_flatten", "target", "stop"]
+    assert all(set(r) == _EXPECTED_FIELDS for r in rows)
+    assert rows[0]["eod_flatten_at"] is not None
+    assert all(r[name] is None for r in rows[1:] for name in _EOD_FIELDS)
+
+
+async def test_route_closed_position_with_an_eod_request_still_reports_stored_state():
+    _insert_exit_request(
+        position_overrides={"symbol": "ZZXR40", "status": "closed", "qty": 0},
+        **_eod(eod_expired_at=_EOD_CLOSE_AT + timedelta(seconds=2)),
+    )
+
+    row = await _only_row("ZZXR40")
+
+    assert row["position_status"] == "closed" and row["remaining_qty"] == 0
+    assert row["eod_expired_at"] is not None  # stored expiry is not reinterpreted by position state
