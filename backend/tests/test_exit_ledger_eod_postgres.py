@@ -206,7 +206,7 @@ def test_entry_day_label_holiday_and_unsupported_calendar_are_invalid():
     r = ledger.observe_exit(EodIntent(pid2, trigger_ts=opened))
     assert r.reason == "no_eod_session_on_entry_day"
     # uncovered years
-    for year in (2025, 2027):
+    for year in (2025, 2029):
         opened = datetime(year, 3, 3, 15, 0, tzinfo=UTC)
         _, p, _ = seeded(opened_at=opened)
         clock.now = datetime(year, 3, 3, 20, 59, 30, tzinfo=UTC)

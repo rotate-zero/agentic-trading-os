@@ -1,3 +1,35 @@
+# TESTING — `market-clock-2027-2028-coverage`
+
+Baseline: clean GitHub `main` `0390ef1` (unchanged at packaging). Tests ran on a scratch
+PostgreSQL 16 (`trading_workspace`, timezone UTC) migrated with `alembic upgrade head`
+through `0016`; no external database was contacted.
+
+New/extended pure tests (no database): `test_market_clock.py` carries an independent copy of
+the NYSE schedule and asserts `is_holiday`/`is_half_day` for **every day** of 2026–2028; checks
+internal consistency (weekday-only, holidays and early closes disjoint);
+`has_calendar_for_year` true for exactly 2026–2028 over 2000–2099; session membership across
+2027 closures, the ordinary 2027-07-02/12-23 days, the 2027-11-26 and 2028-07-03/11-24 13:00
+closes (12:59 open, 13:00 closed, bounds/`is_regular_session`), no 2028 New Year's holiday,
+DST from UTC instants (2027-03-14, 2028-11-05), and `next_session_boundary` over the observed
+holidays and the 2027→2028 year end. `test_session_window.py` adds hand-written UTC
+close/flatten instants for 18 days (EST/EDT either side of every 2027/2028 DST shift, early
+closes, Dec 31 2027, Jan 3 2028, Dec 29 2028), `None` for all 19 covered holidays plus
+weekends, exact inclusive/exclusive microsecond boundaries on the three early-close days,
+ET-entry-day year-boundary cases (both directions), fail-closed for 2025, 2029 and 2030 (the
+2025-12-31 22:00 ET / 2026-01-01 03:00Z case included), and Backtest Runner
+`regular_session_close_utc` parity plus 13:00/16:00 ET check on every trading day of 2026,
+2027 and 2028 (251 each).
+
+Regression guard: with the pre-change `market_clock.py` restored, these two files fail
+(53 failed, 38 passed); with this change, 91 passed.
+
+Full backend suite: 1361 collected on clean `main`, 1421 with this change (+60 net), **1421
+passed**, zero regressions. Directly affected pre-existing tests
+(`test_position_monitor_eod.py`, `test_exit_ledger_eod_postgres.py`) pass with 2029 as the
+unsupported year. No frontend, migration, Execution Engine or exit-ledger code changed.
+
+---
+
 # TESTING — `simulated-eod-flatten-integration`
 
 Baseline: clean GitHub `main` `f9b6d77`; decision #185 and migration `0016` were

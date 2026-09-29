@@ -1481,20 +1481,31 @@ EOD attempt. Persist both bounds with the request: restart/config changes cannot
 deadline. No next-day EOD catch-up. A one-second poll is a scheduling target, not a latency
 guarantee; backlog, downtime or a clock jump can miss the window.
 
-**2026-only coverage.** MarketClock's holiday/half-day tables cover only 2026; its membership
-methods do not reject other years. The built EOD helper rejects an uncovered **entry year**
-(including 2025 and 2027), and returns no window for covered holidays/weekends. A current
-instant in another year is necessarily outside the stored 2026 entry-day window. Do not
-guess a 16:00 close in an uncovered year. Future callers should log missing entry-year
-coverage once per relevant position; a covered non-trading day simply has no window. This
-does not replace the calendar or change other MarketClock consumers.
+**Verified 2026-2028 coverage** (`market-clock-2027-2028-coverage`; originally 2026 only).
+MarketClock's holiday and 13:00 ET early-close tables are checked against NYSE's official
+"Holidays & Trading Hours" page (https://www.nyse.com/trade/hours-calendars) for exactly
+2026, 2027 and 2028, and `has_calendar_for_year(year)` is true for exactly those years. Its
+membership methods (`is_holiday`, `is_half_day`, `current_session`, ...) still do not
+reject other years: outside 2026-2028 they simply know no holidays or early closes. The
+built EOD helper rejects an uncovered **entry year** (for example 2025 and 2029), and
+returns no window for covered holidays/weekends. A current instant in another year is
+necessarily outside the stored entry-day window. Do not guess a 16:00 close in an
+uncovered year. Future callers should log missing entry-year coverage once per relevant
+position; a covered non-trading day simply has no window. Notable dates: 2027 observes
+Friday Jan 1, Friday Jun 18 (Juneteenth observed), Monday Jul 5 (Independence Day
+observed) and Friday Dec 24 (Christmas observed), with one early close (Fri Nov 26);
+2028 has **no** New Year's Day holiday (Sat Jan 1 is not observed on Fri Dec 31, 2027),
+and early closes on Mon Jul 3 and Fri Nov 24. The page lists no early close on Fri
+2027-07-02 or Thu 2027-12-23. The options 1:15 p.m. close and other venues' 5:00 p.m. late
+sessions are not modelled. Adding a year is a data change (two sets plus one entry in the
+verified-years set); it does not change the helper or any other MarketClock consumer.
 
 **Shared foundation as built.** `backend/app/core/session_window.py` exports
 `eod_session_window(clock: MarketClock, opened_at: datetime, lead_seconds: int = 60)
 -> EodSessionWindow | None`. `opened_at` must be timezone-aware; the injected clock's
 `trading_day(opened_at)` supplies the ET entry date. The helper validates integer lead
 `1..900`, asks `clock.has_calendar_for_year(entry_day.year)`, then asks that clock about
-holiday/half-day membership. For a supported 2026 trading day it returns frozen
+holiday/half-day membership. For a supported (2026-2028) trading day it returns frozen
 `EodSessionWindow(flatten_at, close_at)` with both instants UTC. `window.contains(now)`
 requires an aware, caller-supplied instant and is true exactly on
 `[flatten_at, close_at)`. A covered holiday/weekend returns `None`; an unsupported year
@@ -1503,7 +1514,7 @@ invalid lead values raise `ValueError`. The caller must pass the configured lead
 if it differs from the helper's default. Neither the helper nor its `contains` method reads
 wall time or places an order. The accessor is read-only and leaves all other MarketClock
 session behavior unchanged. Backtest Runner is not imported by this live helper; its close
-derivation is checked for parity in tests over all supported 2026 trading days.
+derivation is checked for parity in tests over all supported 2026-2028 trading days.
 
 Component data flow for the shared window helper and its running callers:
 
@@ -1519,6 +1530,28 @@ MarketClock.trading_day / has_calendar_for_year / is_holiday / is_half_day
                           / UnsupportedEodCalendarError
                                     |
                    Position Monitor pulse and PostgresExitLedger guards
+```
+
+Calendar data flow (verified years only; data, not interface, changes per year):
+
+```text
+NYSE "Holidays & Trading Hours" page (2026, 2027, 2028 columns + footnotes)
+        |  transcribed by hand, cross-checked by tests against an independent copy
+        v
+market_clock.py  _HOLIDAYS_<year> / _HALF_DAYS_<year>   _VERIFIED_CALENDAR_YEARS
+        |                        \                              |
+        |  union                  \                             v
+        v                          \               has_calendar_for_year(year)
+is_holiday(d) / is_half_day(d)      \                            |
+        |                            \                           |
+        +--> current_session, is_market_open, session_bounds,    |
+        |    next_session_boundary (unchanged; unverified year = |
+        |    no holidays/early closes, never raises)             |
+        +--> Backtest Runner regular_session_close_utc           |
+        +--> core.session_window.eod_session_window <------------+
+                       |  unverified entry year -> UnsupportedEodCalendarError
+                       v
+              EodSessionWindow [flatten_at, close_at) in UTC
 ```
 
 Internal window flow (no implicit clock read):
@@ -1985,7 +2018,7 @@ not only final reasons. Each case below is required.
 | A15 | Crash after marker before call; crash after acceptance before ack commit | Both exclusive until reconciliation; retained venue report/fills resolve same ID. No blind resend/replacement. Missing uncertain order blocks through repeated restart. |
 | A16 | Clean retained-venue recovery: no row, dormant EOD, fallback, unsent inside/outside window, submitted/partial | Correct hydrated slots before subscriptions; recover expiry from bounds. Revalidate eligible unsent, cancel expired unsent, retain active close, size fallback from reconciled remainder. |
 | A17 | Actual fresh SimulatedVenue restart with open position, including unsent EOD | Lost-position reconciliation blocks activation; no orphaned close. Do not require obsolete `unreserved approved exit` message. Flat restart produces no fallback. |
-| A18 | Regular/half-day bounds, DST-season UTC, holiday/weekend, 2025/2027 | Parity with close helper on all supported 2026 trading days, Nov 27/Dec 24 at 13:00; no unsupported-date EOD. Exact bounds/invalid lead checked. Config changes/backward clock jumps never reopen expired request. |
+| A18 | Regular/half-day bounds, DST-season UTC, holiday/weekend, year boundaries, unsupported 2025/2029 | Parity with close helper on all supported 2026-2028 trading days, 2026 Nov 27/Dec 24, 2027 Nov 26 and 2028 Jul 3/Nov 24 at 13:00; no unsupported-date EOD. Exact bounds/invalid lead checked. Config changes/backward clock jumps never reopen expired request. |
 | A19 | Concurrent observe/prepare/claim, stale qty, wrong identity/mode/side, entry/pending fill | One row/first fallback/active close, monotonic IDs, one dispatch claimant, qty from ledger. Unsafe guard is error; expiry is skip; later positions still serviced. |
 | A20 | Migration and reader/lifespan integration | Existing rows preserved, new field-group constraints enforced, lossy downgrade refused. Readers show original/expiry/fallback honestly; shutdown removes timer and handoff callbacks. |
 

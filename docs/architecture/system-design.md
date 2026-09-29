@@ -286,7 +286,7 @@ class MarketClock:
     def next_session_boundary(self) -> datetime: ...
     def session_bounds(self, ts: datetime = None) -> tuple[datetime, datetime] | None: ...
 ```
-Handles exchange holidays, half-days, and DST in one place. The Scanner's cadence schedule (§4.7) and the Strategy Scheduler (§4.8) both key off `current_session()` rather than raw wall-clock math.
+Handles exchange holidays, half-days, and DST in one place. Its holiday and 13:00 ET early-close tables are verified against the official NYSE calendar for 2026-2028 only (`has_calendar_for_year()` reports exactly those years); outside them the session methods know no holidays or early closes rather than raising, so callers that must fail closed (the EOD window, `core.session_window`) check `has_calendar_for_year()` themselves. The Scanner's cadence schedule (§4.7) and the Strategy Scheduler (§4.8) both key off `current_session()` rather than raw wall-clock math.
 
 `session_bounds()` (decision #44) is the anchor candle aggregation buckets off of (§4.2) — `open`/`lunch`/`power_hour` collapse to one continuous "regular session" domain for this purpose (same bounds for all three), so a bucket only ever resets at a genuine session-type change (pre-market → regular, regular → after-hours), never at the lunch/power-hour sub-boundaries `current_session()` still distinguishes for other callers.
 

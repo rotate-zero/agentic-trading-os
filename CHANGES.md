@@ -1,3 +1,51 @@
+# CHANGES — `market-clock-2027-2028-coverage`
+
+Extends `MarketClock`'s verified NYSE equity calendar from 2026 to 2026–2028. GitHub `main`
+was `0390ef1` at start and at packaging; no new decision, migration or dependency was needed
+(the coverage extension is the data-only change the module's own scope note anticipated, and
+decision #185's helper contract is unchanged; #185's "2026 coverage" sentence is history).
+
+**Official schedule checked:** NYSE "Holidays & Trading Hours",
+https://www.nyse.com/trade/hours-calendars (fetched 2026-09-30; its table lists 2026, 2027
+and 2028 with footnotes for early closes).
+
+- Full-day closures. 2026 (unchanged): Jan 1, Jan 19, Feb 16, Apr 3, May 25, Jun 19, Jul 3
+  (observed), Sep 7, Nov 26, Dec 25. **2027**: Fri Jan 1, Mon Jan 18, Mon Feb 15, Fri Mar 26
+  (Good Friday), Mon May 31, Fri Jun 18 (Juneteenth observed), Mon Jul 5 (Independence Day
+  observed), Mon Sep 6, Thu Nov 25, Fri Dec 24 (Christmas observed). **2028**: Mon Jan 17,
+  Mon Feb 21, Fri Apr 14 (Good Friday), Mon May 29, Mon Jun 19, Tue Jul 4, Mon Sep 4,
+  Thu Nov 23, Mon Dec 25. **2028 has no New Year's Day holiday** (footnote: Saturday
+  Jan 1, 2028 is not observed).
+- 1:00 p.m. ET equity early closes. 2026 (unchanged): Nov 27, Dec 24. **2027**: Fri Nov 26.
+  **2028**: Mon Jul 3 and Fri Nov 24. The page lists no early close on Fri 2027-07-02 or
+  Thu 2027-12-23, and none was added. The options 1:15 p.m. close and other venues' 5:00 p.m.
+  late sessions are not modelled.
+- `backend/app/core/market_clock.py`: added `_HOLIDAYS_2027/2028` and `_HALF_DAYS_2027/2028`
+  beside the untouched 2026 sets, their unions `_HOLIDAYS`/`_HALF_DAYS` (what `is_holiday()`
+  and `is_half_day()` now read) and `_VERIFIED_CALENDAR_YEARS = {2026, 2027, 2028}`, the single
+  source for `has_calendar_for_year()`, which now reports exactly those years. Session methods
+  keep their behavior outside them (no holidays or early closes, no exception). The module
+  docstring and TODO were corrected to say what is and is not verified.
+- `backend/app/core/session_window.py` is **unchanged**: with the calendar extended it already
+  yields `[flatten_at, close_at)` for 2027–2028 trading days, `None` on covered
+  holidays/weekends, and `UnsupportedEodCalendarError` for any other entry year. The
+  inclusive/exclusive contract and lead validation are untouched. Backtest Runner's
+  `regular_session_close_utc` also reads `is_half_day()`, so parity is inherent and tested.
+- Tests that legitimately assumed 2027 was unsupported now use 2029 (only the year changed,
+  assertions intact): `test_exit_ledger_eod_postgres.py` (`unsupported_eod_calendar` reason)
+  and `test_position_monitor_eod.py` (bounded warning + protective exit still works).
+  `test_session_window.py`'s unsupported-year parametrization dropped 2027 for 2029.
+- Docs: `docs/architecture/execution-engine-design.md` (replaced the "2026-only coverage"
+  paragraph, added a calendar data-flow diagram next to the existing window diagrams, updated
+  the A18 row) and `system-design.md` §4.3.
+
+Known limits: 2029 onward is unverified and fails closed for EOD; `next_session_boundary()`
+walking past 2028-12-31 treats unverified 2029-01-01 as an ordinary weekday. Not changed here:
+`CalendarProvider`'s 2026-only FOMC dates and the "2026" comments in files this task does not
+own (the `_HOLIDAYS_2026`/`_HALF_DAYS_2026` names are kept, so they remain accurate).
+
+---
+
 # CHANGES — `simulated-eod-flatten-integration`
 
 Connects decision #185's already-built monitor handoff, PostgreSQL exit state machine,

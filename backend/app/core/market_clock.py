@@ -3,14 +3,17 @@ Market Clock — the single source of truth for anything time/session-related.
 See docs/architecture/system-design.md §4.3. Every other module asks the
 Market Clock rather than computing session/holiday/DST logic itself.
 
-Scope note (Phase 2 honesty, not silently glossed over): the holiday
-calendar below is a small hardcoded set for 2026 only, and session
-boundaries (pre_market/open/lunch/power_hour) are a reasonable first
-approximation, not exchange-verified constants. Both are fine for
-scaffolding the interface everything else depends on. Before this touches
-real trading decisions (Phase 5+), swap `_HOLIDAYS_2026` for a real,
-multi-year exchange calendar source — that's a data problem, not an
-interface change, so nothing downstream needs to change when it happens.
+Scope note (honesty, not silently glossed over): the holiday and early-close
+calendar below is a hardcoded set, verified against the official NYSE
+"Holidays & Trading Hours" page (https://www.nyse.com/trade/hours-calendars)
+for 2026, 2027 and 2028 ONLY. `has_calendar_for_year()` reports exactly those
+years; outside them `is_holiday()`/`is_half_day()` simply answer False (they
+do not raise), so anything that must fail closed on an unverified year (the
+EOD window, `core.session_window`) has to ask `has_calendar_for_year()`
+itself. Session boundaries (pre_market/open/lunch/power_hour) are a
+reasonable first approximation, not exchange-verified constants. Extending
+coverage to another year is a data change (a new holiday set, a new early-close
+set and one entry in `_VERIFIED_CALENDAR_YEARS`), not an interface change.
 """
 from __future__ import annotations
 
@@ -60,8 +63,13 @@ _REGULAR_SESSION_LABELS = {Session.OPEN, Session.LUNCH, Session.POWER_HOUR}
 _MARKET_OPEN = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
 
-# 2026 NYSE holidays (full-day closures only; half-days handled separately).
-# TODO(Phase 3+): replace with a real, multi-year exchange calendar.
+# NYSE full-day equity closures and 13:00 ET equity early closes, verified
+# against https://www.nyse.com/trade/hours-calendars (checked 2026-09-30, which
+# lists 2026, 2027 and 2028). Early closes are the page's 1:00 p.m. ET
+# equity closes; the options 1:15 p.m. close and the 5:00 p.m. late-session
+# closes of other venues are not modelled.
+# TODO: extend with each further year NYSE publishes, and add it to
+# _VERIFIED_CALENDAR_YEARS in the same change.
 _HOLIDAYS_2026: set[date] = {
     date(2026, 1, 1),   # New Year's Day
     date(2026, 1, 19),  # MLK Day
@@ -81,6 +89,50 @@ _HALF_DAYS_2026: set[date] = {
     date(2026, 12, 24),  # Christmas Eve
 }
 
+_HOLIDAYS_2027: set[date] = {
+    date(2027, 1, 1),   # New Year's Day (Friday)
+    date(2027, 1, 18),  # MLK Day
+    date(2027, 2, 15),  # Washington's Birthday
+    date(2027, 3, 26),  # Good Friday
+    date(2027, 5, 31),  # Memorial Day
+    date(2027, 6, 18),  # Juneteenth (observed; the 19th is a Saturday)
+    date(2027, 7, 5),   # Independence Day (observed; the 4th is a Sunday)
+    date(2027, 9, 6),   # Labor Day
+    date(2027, 11, 25), # Thanksgiving
+    date(2027, 12, 24), # Christmas Day (observed; the 25th is a Saturday)
+}
+
+_HALF_DAYS_2027: set[date] = {
+    date(2027, 11, 26),  # day after Thanksgiving
+    # NYSE lists no early close on Fri 2027-07-02 or Thu 2027-12-23.
+}
+
+_HOLIDAYS_2028: set[date] = {
+    # No New Year's Day: Saturday 2028-01-01 is not observed on Friday 2027-12-31.
+    date(2028, 1, 17),  # MLK Day
+    date(2028, 2, 21),  # Washington's Birthday
+    date(2028, 4, 14),  # Good Friday
+    date(2028, 5, 29),  # Memorial Day
+    date(2028, 6, 19),  # Juneteenth (Monday)
+    date(2028, 7, 4),   # Independence Day (Tuesday)
+    date(2028, 9, 4),   # Labor Day
+    date(2028, 11, 23), # Thanksgiving
+    date(2028, 12, 25), # Christmas Day (Monday)
+}
+
+_HALF_DAYS_2028: set[date] = {
+    date(2028, 7, 3),    # day before Independence Day
+    date(2028, 11, 24),  # day after Thanksgiving
+}
+
+# The years whose holiday AND early-close data above were verified. The
+# single source for has_calendar_for_year(); a year is listed here only
+# together with its two sets.
+_VERIFIED_CALENDAR_YEARS: frozenset[int] = frozenset({2026, 2027, 2028})
+
+_HOLIDAYS: frozenset[date] = frozenset(_HOLIDAYS_2026 | _HOLIDAYS_2027 | _HOLIDAYS_2028)
+_HALF_DAYS: frozenset[date] = frozenset(_HALF_DAYS_2026 | _HALF_DAYS_2027 | _HALF_DAYS_2028)
+
 
 class MarketClock:
     """See docs/architecture/system-design.md §4.3 for the full interface contract."""
@@ -98,18 +150,21 @@ class MarketClock:
         return ts
 
     def is_holiday(self, d: date) -> bool:
-        return d in _HOLIDAYS_2026
+        return d in _HOLIDAYS
 
     def has_calendar_for_year(self, year: int) -> bool:
-        """Whether holiday and half-day data cover `year` for EOD decisions.
+        """Whether verified holiday AND early-close data cover `year`.
 
-        This is informational: existing session methods retain their current
-        behavior outside the covered year.
+        True for exactly the years in `_VERIFIED_CALENDAR_YEARS` (2026-2028).
+        This is informational: the session methods keep their behavior
+        outside the covered years (an unverified year has no holidays or
+        early closes, it does not raise), so a caller that must not guess
+        an unverified session asks this first.
         """
-        return year == 2026
+        return year in _VERIFIED_CALENDAR_YEARS
 
     def is_half_day(self, d: date) -> bool:
-        return d in _HALF_DAYS_2026
+        return d in _HALF_DAYS
 
     def is_market_open(self, ts: datetime | None = None) -> bool:
         now = self._now(ts)

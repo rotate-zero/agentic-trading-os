@@ -230,7 +230,7 @@ async def test_holiday_and_weekend_have_no_window_but_protective_still_works(mak
 
 
 async def test_unsupported_entry_year_skips_eod_logs_bounded_and_keeps_protective(make, caplog) -> None:
-    opened = datetime(2027, 3, 2, 15, 0, tzinfo=UTC)
+    opened = datetime(2029, 3, 6, 15, 0, tzinfo=UTC)
     pos = position(opened_at=opened, stop=95.0)
     monitor, _, wall = make([pos], now=opened + timedelta(minutes=1))
     with caplog.at_level(logging.WARNING, logger="app.position_monitor.engine"):
