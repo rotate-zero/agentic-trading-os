@@ -6,6 +6,8 @@
 
 ---
 
+**D17 current status (EX-12):** The long D17 row below preserves its decision #158 historical audit. Its “live path still open” status has been superseded for simulated auto trades: the built `OutcomeRecorder` writes nullable snapshots with machine-readable reasons under the existing EX-7 contract, while Backtest Runner still discards trades lacking any required snapshot. Paper/live and manual outcome writing remain outside EX-12's delivered slice. See `execution-engine-design.md` §6.7.1.
+
 ## 10. Open decisions — still genuinely open
 
 | # | Decision needed | Status |

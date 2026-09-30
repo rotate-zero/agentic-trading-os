@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from app.db.session import SessionLocal
 from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
 from app.schemas.performance import BacktestRun, StrategyOutcome
-from app.trading_intelligence.performance import record_strategy_outcome
+from app.trading_intelligence.performance import record_strategy_outcome, record_strategy_outcome_in_session
 
 _STRATEGY_NAME = "TEST_PERF_INTEL_STRATEGY"
 
@@ -159,6 +159,62 @@ def test_valid_backtest_run_construction_succeeds():
 
 
 # --- record_strategy_outcome() write-time invariant --------------------------
+
+def test_same_session_writer_forwards_nullable_snapshot_fields_and_obeys_outer_rollback():
+    reasons = {"market_state_at_exit": "recorder_unavailable"}
+    outcome = _make_outcome(market_state_at_exit=None, snapshot_missing_reasons=reasons)
+    with SessionLocal() as session:
+        with session.begin():
+            record_strategy_outcome_in_session(session, outcome)
+            session.flush()  # real ck_strategy_outcomes_null_snapshot_has_reason
+            row = session.get(StrategyOutcomeRecord, outcome.outcome_id)
+            assert row.execution_mode == "simulated"
+            assert row.execution_venue == "simulated"
+            assert row.market_state_at_exit is None
+            assert row.snapshot_missing_reasons == reasons
+            session.rollback()
+    with SessionLocal() as session:
+        assert session.get(StrategyOutcomeRecord, outcome.outcome_id) is None
+
+
+def test_same_session_writer_refuses_null_snapshot_without_reason_at_database():
+    outcome = _make_outcome()
+    with SessionLocal() as session:
+        with pytest.raises(IntegrityError, match="ck_strategy_outcomes_null_snapshot_has_reason"):
+            with session.begin():
+                record_strategy_outcome_in_session(session, outcome)
+                session.flush()
+                row = session.get(StrategyOutcomeRecord, outcome.outcome_id)
+                row.market_state_at_exit = None
+                row.snapshot_missing_reasons = None
+                session.flush()
+
+
+def test_wrapper_and_same_session_writer_persist_identical_backtest_fields():
+    first = _make_outcome(is_backtest=True, execution_mode="backtest")
+    second = first.model_copy(update={"outcome_id": uuid.uuid4()})
+    with SessionLocal.begin() as session:
+        run = BacktestRunRecord(
+            run_id=uuid.uuid4(), sweep_id=uuid.uuid4(), strategy_name=_STRATEGY_NAME,
+            strategy_version="orb_v1", config_hash="same_session_parity", symbol_universe=["AAPL"],
+            date_range_start=date(2026, 9, 10), date_range_end=date(2026, 9, 10),
+            data_version="fixture", feature_version="fixture", walk_forward_fold=1,
+            is_holdout=False, created_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
+        )
+        session.add(run)
+        session.flush()
+        first.backtest_run_id = second.backtest_run_id = run.run_id
+    record_strategy_outcome(first)
+    with SessionLocal.begin() as session:
+        record_strategy_outcome_in_session(session, second)
+    with SessionLocal() as session:
+        a = session.get(StrategyOutcomeRecord, first.outcome_id)
+        b = session.get(StrategyOutcomeRecord, second.outcome_id)
+        assert a is not None and b is not None
+        for column in StrategyOutcomeRecord.__table__.columns:
+            if column.name not in {"outcome_id", "created_at"}:
+                assert getattr(a, column.name) == getattr(b, column.name)
+
 
 def test_entry_qty_not_equal_exit_qty_is_rejected_and_never_written():
     outcome = _make_outcome(entry_qty=100, exit_qty=60)

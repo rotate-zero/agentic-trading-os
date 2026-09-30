@@ -47,7 +47,8 @@ accommodate it (see the discrepancy note below).
 **A real discrepancy between this schema and `state_snapshot.py`'s
 current capture behavior — recorded here, not silently patched. As of
 decision #128, resolved for the Backtest Runner path; the live path
-remains unresolved (see below).** §5 (decision #89) locks `market_state_at_entry`,
+was later resolved for simulated auto trades by EX-12's nullable-plus-reason
+OutcomeRecorder; the following paragraph records the earlier D17 history.** §5 (decision #89) locks `market_state_at_entry`,
 `market_state_at_exit`, `context_at_entry`, and `context_at_exit` as
 REQUIRED `dict` fields (no `| None`) on `StrategyOutcome`. But
 `state_snapshot.py`'s own `capture_market_state_snapshot()`/

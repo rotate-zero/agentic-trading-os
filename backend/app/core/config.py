@@ -289,6 +289,15 @@ class Settings(BaseSettings):
     # paper/live wiring is a later decision (design doc §8), not a typo
     # away from working.
     execution_mode: str = "simulated"
+    outcome_snapshot_max_lag_seconds: int = 60
+    outcome_sweep_interval_seconds: int = 60
+
+    @field_validator("outcome_snapshot_max_lag_seconds", "outcome_sweep_interval_seconds")
+    @classmethod
+    def _positive_outcome_interval(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("outcome intervals must be positive")
+        return value
 
     @field_validator("execution_mode")
     @classmethod

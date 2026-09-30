@@ -217,6 +217,7 @@ async def lifespan(app: FastAPI):
     from app.portfolio_state.engine import PortfolioState
     from app.portfolio_state.postgres import PostgresPositionLedger
     from app.portfolio_state.reconciliation import reconcile_with_venue
+    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
     from app.position_monitor.engine import ExitIntent, PositionMonitor
     from app.position_monitor.handoff import ObservationState
     from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
@@ -227,6 +228,7 @@ async def lifespan(app: FastAPI):
     execution_engine = None
     portfolio_state = None
     position_monitor = None
+    outcome_recorder = None
     execution_venue = None
     app.state.world_view_portfolio_reader = None
     app.state.position_monitor = None
@@ -360,6 +362,18 @@ async def lifespan(app: FastAPI):
             # workers) already completed without raising.
             app.state.execution_startup_status = _execution_startup_status("ready")
 
+            # Recorder failure cannot change an otherwise ready execution pipeline.
+            try:
+                outcome_recorder = OutcomeRecorder(
+                    bus, SessionLocal,
+                    snapshot_max_lag_seconds=settings.outcome_snapshot_max_lag_seconds,
+                    sweep_interval_seconds=settings.outcome_sweep_interval_seconds,
+                )
+                await outcome_recorder.start()
+            except Exception:
+                logger.critical("OutcomeRecorder failed to start; closed outcomes remain recoverable", exc_info=True)
+                outcome_recorder = None
+
             logger.info(
                 "Execution pipeline started (mode=%s, venue=%s) — reconciliation: %d advanced, "
                 "%d expired, %d cancelled stale entries, %d resubmitted exits",
@@ -402,6 +416,8 @@ async def lifespan(app: FastAPI):
             await execution_engine.stop()
         if portfolio_state is not None:
             await portfolio_state.stop()
+        if outcome_recorder is not None:
+            await outcome_recorder.stop()
         if execution_venue is not None:
             await execution_venue.disconnect()
         authorizer_stub = execution_engine = portfolio_state = position_monitor = execution_venue = None
@@ -496,6 +512,8 @@ async def lifespan(app: FastAPI):
             await execution_engine.stop()
         if portfolio_state is not None:
             await portfolio_state.stop()
+        if outcome_recorder is not None:
+            await outcome_recorder.stop()
         if execution_venue is not None:
             await execution_venue.disconnect()
             broker_registry.clear_execution_venue()

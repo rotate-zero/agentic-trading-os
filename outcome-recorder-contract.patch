@@ -1,0 +1,1670 @@
+diff --git a/CHANGES.md b/CHANGES.md
+index b3bfed1..f9354b8 100644
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,3 +1,26 @@
++# CHANGES — decision #186, `outcome-recorder-contract` (EX-12 option a)
++
++Saqib approved the dedicated, ledger-driven `OutcomeRecorder` for simulated,
++strategy-attributed auto trades. The Governor's strict evidence persistence
++was already merged at `79650ad` and is reused here.
++
++- Added `record_strategy_outcome_in_session()` to stage the complete outcome
++  without committing or closing its caller's session. Backtest Runner retains
++  its existing own-session wrapper and persisted behavior.
++- Added the best-effort first-entry-fill snapshot hook and the recorder's
++  position-scoped receipt replay, 60-second exit-snapshot bound, startup scan,
++  60-second bounded recovery sweep, and atomic outcome insert/trade link.
++  Missing required evidence, R basis or exit reason blocks the trade with a
++  reason-coded log; recoverable database failures remain retryable.
++- Wired the recorder after successful execution reconciliation. Recorder
++  startup failure logs CRITICAL while execution readiness stays `ready`, and
++  shutdown stops it after Portfolio State.
++- Added PostgreSQL integration tests and updated the execution architecture,
++  related status documents, decision log and `TESTING.md`. No migration,
++  paper/live writer, manual writer or backtest policy change is included.
++
++<!-- Previous delivery record retained below. -->
++
+ # CHANGES — `execution-status-doc-sync`
+ 
+ Documentation correction plus two small follow-ups. The first pass (the claim table below) was
+diff --git a/TESTING.md b/TESTING.md
+index 6c93323..dd52470 100644
+--- a/TESTING.md
++++ b/TESTING.md
+@@ -1,3 +1,27 @@
++# TESTING — decision #186, `outcome-recorder-contract` (EX-12 option a)
++
++Database target: isolated local PostgreSQL 18.6 in `/tmp/atos_pg2`, port 5545,
++database `trading_workspace`, migrated through Alembic `0016`. Only test
++fixtures and migration records were written there. The project worktree's
++configured production or broker accounts were not used.
++
++- Focused writer/recorder/startup tests: 33 passed against real PostgreSQL.
++  They exercise the NULL-snapshot CHECK and outer rollback; entry capture and
++  failure; partial fills/reductions, VWAPs, known and unknown commissions,
++  closing-order exit reason, missing evidence/R/exit reason, duplicate and
++  concurrent recorders, injected insert-before-link failure and retry, missed
++  event recovery by startup scan and sweep, late snapshots, and execution
++  startup isolation. The full suite also covers Backtest Runner persistence.
++- Full backend suite with the database session timezone inherited from the
++  local Asia/Dhaka server: 1,525 passed, 2 failed. Both existing failures
++  compare UTC test timestamps to PostgreSQL-returned `+06:00` timestamps.
++  Rerunning those two with `PGTZ=UTC` passed without changing assertions.
++- Full backend suite with `PGTZ=UTC` after the final recorder validation and
++  test additions: 1,534 passed, 0 failed, 186,731 deprecation warnings
++  (106.31 s). PostgreSQL schema and contract assertions were not weakened.
++
++<!-- Previous delivery record retained below. -->
++
+ # TESTING — `execution-status-doc-sync`
+ 
+ Documentation delivery plus a test-only fix. The first pass changed no code or test and was
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 8e16801..6388fd3 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -289,6 +289,15 @@ class Settings(BaseSettings):
+     # paper/live wiring is a later decision (design doc §8), not a typo
+     # away from working.
+     execution_mode: str = "simulated"
++    outcome_snapshot_max_lag_seconds: int = 60
++    outcome_sweep_interval_seconds: int = 60
++
++    @field_validator("outcome_snapshot_max_lag_seconds", "outcome_sweep_interval_seconds")
++    @classmethod
++    def _positive_outcome_interval(cls, value: int) -> int:
++        if value <= 0:
++            raise ValueError("outcome intervals must be positive")
++        return value
+ 
+     @field_validator("execution_mode")
+     @classmethod
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 46ab9a3..4002142 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -217,6 +217,7 @@ async def lifespan(app: FastAPI):
+     from app.portfolio_state.engine import PortfolioState
+     from app.portfolio_state.postgres import PostgresPositionLedger
+     from app.portfolio_state.reconciliation import reconcile_with_venue
++    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
+     from app.position_monitor.engine import ExitIntent, PositionMonitor
+     from app.position_monitor.handoff import ObservationState
+     from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
+@@ -227,6 +228,7 @@ async def lifespan(app: FastAPI):
+     execution_engine = None
+     portfolio_state = None
+     position_monitor = None
++    outcome_recorder = None
+     execution_venue = None
+     app.state.world_view_portfolio_reader = None
+     app.state.position_monitor = None
+@@ -360,6 +362,18 @@ async def lifespan(app: FastAPI):
+             # workers) already completed without raising.
+             app.state.execution_startup_status = _execution_startup_status("ready")
+ 
++            # Recorder failure cannot change an otherwise ready execution pipeline.
++            try:
++                outcome_recorder = OutcomeRecorder(
++                    bus, SessionLocal,
++                    snapshot_max_lag_seconds=settings.outcome_snapshot_max_lag_seconds,
++                    sweep_interval_seconds=settings.outcome_sweep_interval_seconds,
++                )
++                await outcome_recorder.start()
++            except Exception:
++                logger.critical("OutcomeRecorder failed to start; closed outcomes remain recoverable", exc_info=True)
++                outcome_recorder = None
++
+             logger.info(
+                 "Execution pipeline started (mode=%s, venue=%s) — reconciliation: %d advanced, "
+                 "%d expired, %d cancelled stale entries, %d resubmitted exits",
+@@ -402,6 +416,8 @@ async def lifespan(app: FastAPI):
+             await execution_engine.stop()
+         if portfolio_state is not None:
+             await portfolio_state.stop()
++        if outcome_recorder is not None:
++            await outcome_recorder.stop()
+         if execution_venue is not None:
+             await execution_venue.disconnect()
+         authorizer_stub = execution_engine = portfolio_state = position_monitor = execution_venue = None
+@@ -496,6 +512,8 @@ async def lifespan(app: FastAPI):
+             await execution_engine.stop()
+         if portfolio_state is not None:
+             await portfolio_state.stop()
++        if outcome_recorder is not None:
++            await outcome_recorder.stop()
+         if execution_venue is not None:
+             await execution_venue.disconnect()
+             broker_registry.clear_execution_venue()
+diff --git a/backend/app/models/trading_intelligence.py b/backend/app/models/trading_intelligence.py
+index 0971460..49fc43c 100644
+--- a/backend/app/models/trading_intelligence.py
++++ b/backend/app/models/trading_intelligence.py
+@@ -325,18 +325,9 @@ class StrategyOutcomeRecord(Base):
+     backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
+         UUID(as_uuid=True), ForeignKey("backtests.run_id"), nullable=True
+     )
+-    # EX-2 (decision #170, #172, migration 0012).
+-    # record_strategy_outcome() (app/trading_intelligence/performance.py — out of this
+-    # delivery's file boundary, decision #172 §5) constructs this ORM
+-    # row by explicit kwargs and does not (yet) forward outcome.execution_mode/
+-    # execution_venue, so a STATIC default here would ignore is_backtest entirely — wrong for
+-    # the population-isolation tests, which construct a synthetic is_backtest=False row (see
+-    # _default_execution_mode below). Context-sensitive defaults (SQLAlchemy's
+-    # get_current_parameters()) read the row's OWN is_backtest value at insert time instead,
+-    # so the two real callers today (Backtest Runner, always is_backtest=True; these tests,
+-    # sometimes False) both land on the correct, CHECK-satisfying value without
+-    # record_strategy_outcome() needing to change. This is a fallback for callers that don't
+-    # set the column explicitly — NOT a license for a future live caller to skip it.
++    # EX-2 (decision #170, #172, migration 0012). The performance writer now
++    # forwards both labels explicitly. The context-sensitive default remains
++    # for older direct ORM callers; it derives mode from this row's is_backtest.
+     execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, default=_default_execution_mode)
+     execution_venue: Mapped[str] = mapped_column(String(32), nullable=False, default="simulated")
+ 
+@@ -349,7 +340,7 @@ class StrategyOutcomeRecord(Base):
+     exit_filled_at: Mapped[datetime] = mapped_column(nullable=False)
+     holding_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+ 
+-    # --- C. Ledger --- entry_qty == exit_qty enforced by record_strategy_outcome(), not this table
++    # --- C. Ledger --- entry_qty == exit_qty is enforced by both performance writer entry points
+     direction: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY | SELL
+     entry_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+     entry_qty: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
+diff --git a/backend/app/schemas/performance.py b/backend/app/schemas/performance.py
+index b13b01c..de916b5 100644
+--- a/backend/app/schemas/performance.py
++++ b/backend/app/schemas/performance.py
+@@ -47,7 +47,8 @@ accommodate it (see the discrepancy note below).
+ **A real discrepancy between this schema and `state_snapshot.py`'s
+ current capture behavior — recorded here, not silently patched. As of
+ decision #128, resolved for the Backtest Runner path; the live path
+-remains unresolved (see below).** §5 (decision #89) locks `market_state_at_entry`,
++was later resolved for simulated auto trades by EX-12's nullable-plus-reason
++OutcomeRecorder; the following paragraph records the earlier D17 history.** §5 (decision #89) locks `market_state_at_entry`,
+ `market_state_at_exit`, `context_at_entry`, and `context_at_exit` as
+ REQUIRED `dict` fields (no `| None`) on `StrategyOutcome`. But
+ `state_snapshot.py`'s own `capture_market_state_snapshot()`/
+diff --git a/backend/app/trading_intelligence/performance.py b/backend/app/trading_intelligence/performance.py
+index af5297a..b357c94 100644
+--- a/backend/app/trading_intelligence/performance.py
++++ b/backend/app/trading_intelligence/performance.py
+@@ -5,110 +5,50 @@ app/schemas/performance.py (the `StrategyOutcome`/`BacktestRun`
+ Pydantic contracts) and app/models/trading_intelligence.py (the
+ `StrategyOutcomeRecord`/`BacktestRunRecord` ORM tables).
+ 
+-This module has no LIVE caller wired into it — Execution Engine and
+-Position Monitor don't exist yet. As of decision #128, it has a real,
+-non-live caller: Backtest Runner's `BacktestRunner.run()`
+-(`app/backtest_runner/runner.py`) calls this directly, once both
+-`capture_strategy_outcome_snapshots()` snapshots are confirmed
+-non-`None`, to persist a real `StrategyOutcome` for every completed
+-backtest fill. This task's own test suite
+-(test_performance_intelligence.py) remains a second, separate caller,
+-constructing a synthetic `StrategyOutcome` directly — same "prove the
+-contract, don't fabricate the caller" precedent
+-app/trading_intelligence/state_snapshot.py (decision #98) already
+-established for the read side. Do NOT wire this into any LIVE pipeline
+-as part of this or a future task without a real Execution Engine/Position
+-Monitor to drive it.
++Backtest Runner retains the original own-session wrapper. The simulated
++OutcomeRecorder calls the same-session variant so its outcome insert and
++trades link commit together. Both paths stage the complete StrategyOutcome
++shape, including execution mode, venue and missing-snapshot reasons.
+ """
+ from __future__ import annotations
+ 
++from sqlalchemy.orm import Session
++
+ from app.db.session import SessionLocal
+ from app.models.trading_intelligence import StrategyOutcomeRecord
+ from app.schemas.performance import StrategyOutcome
+ 
+ 
+ def record_strategy_outcome(outcome: StrategyOutcome) -> None:
+-    """Persists one closed-trade `StrategyOutcome` to `strategy_outcomes`.
+-
+-    **Deliberately does NOT follow `MarketStateEngine._persist`'s
+-    catch-log-rollback-and-swallow pattern**
+-    (app/market_state_engine/engine.py) for the `entry_qty == exit_qty`
+-    invariant below, even though that function is this project's only
+-    other example of a write-time assertion guarding a persisted row.
+-    That pattern is the right posture for an unattended background
+-    worker that must never crash a live, debounced pipeline over one
+-    bad write. It is the wrong posture here: §5/§11 (decision #120)
+-    require this invariant to raise, not silently vanish into a log
+-    line, because (a) this function has no live caller yet to protect
+-    from crashing, and (b) a future caller that DOES exist (Execution
+-    Engine/Position Monitor) needs to learn synchronously that its own
+-    accounting is inconsistent, not have that fact swallowed on its
+-    behalf. Do not "fix" this back to the soft-fail pattern by copying
+-    `MarketStateEngine._persist` — the divergence here is intentional,
+-    not an oversight.
++    """Persist one outcome in an owned transaction, preserving Backtest Runner's API.
+ 
+-    The `entry_qty == exit_qty` check runs BEFORE `SessionLocal()` is
+-    even opened — no session, no transaction, and no partial write are
+-    ever attempted for an inconsistent outcome; the check is not caught
+-    by anything downstream. A genuine DB-layer error during the write
+-    itself (e.g. `backtest_run_id` referencing a `backtests` row that
+-    doesn't exist) is rolled back, then re-raised — not swallowed, same
+-    reasoning as above.
++    Quantity validation precedes session creation. Database errors roll back
++    and propagate; neither invariant nor write failures are swallowed.
+     """
+-    if outcome.entry_qty != outcome.exit_qty:
+-        raise ValueError(
+-            f"StrategyOutcome invariant violated: entry_qty ({outcome.entry_qty}) != "
+-            f"exit_qty ({outcome.exit_qty}) for outcome_id={outcome.outcome_id} — refusing to "
+-            "persist. A closed trade's StrategyOutcome must record equal entry and exit "
+-            "quantity (§5/§11)."
+-        )
+-
+-    row = StrategyOutcomeRecord(
+-        outcome_id=outcome.outcome_id,
+-        opportunity_id=outcome.opportunity_id,
+-        schema_version=outcome.schema_version,
+-        strategy_name=outcome.strategy_name,
+-        strategy_version=outcome.strategy_version,
+-        symbol=outcome.symbol,
+-        origin=outcome.origin,
+-        is_backtest=outcome.is_backtest,
+-        backtest_run_id=outcome.backtest_run_id,
+-        trading_day=outcome.trading_day,
+-        setup_detected_at=outcome.setup_detected_at,
+-        signal_confirmed_at=outcome.signal_confirmed_at,
+-        decided_at=outcome.decided_at,
+-        entry_filled_at=outcome.entry_filled_at,
+-        exit_filled_at=outcome.exit_filled_at,
+-        holding_seconds=outcome.holding_seconds,
+-        direction=outcome.direction,
+-        entry_price=outcome.entry_price,
+-        entry_qty=outcome.entry_qty,
+-        exit_price=outcome.exit_price,
+-        exit_qty=outcome.exit_qty,
+-        commission_total=outcome.commission_total,
+-        slippage_entry=outcome.slippage_entry,
+-        realized_pnl=outcome.realized_pnl,
+-        realized_r=outcome.realized_r,
+-        exit_reason=outcome.exit_reason,
+-        structural_invalidation=outcome.structural_invalidation,
+-        structural_target=outcome.structural_target,
+-        final_stop=outcome.final_stop,
+-        final_target=outcome.final_target,
+-        confidence_at_signal=outcome.confidence_at_signal,
+-        evidence=outcome.evidence,
+-        market_state_at_entry=outcome.market_state_at_entry,
+-        context_at_entry=outcome.context_at_entry,
+-        market_state_at_exit=outcome.market_state_at_exit,
+-        context_at_exit=outcome.context_at_exit,
+-        feature_snapshot_id=outcome.feature_snapshot_id,
+-    )
+-
++    _validate_quantities(outcome)
+     session = SessionLocal()
+     try:
+-        session.add(row)
++        record_strategy_outcome_in_session(session, outcome)
+         session.commit()
+     except Exception:
+         session.rollback()
+         raise
+     finally:
+         session.close()
++
++
++def record_strategy_outcome_in_session(session: Session, outcome: StrategyOutcome) -> None:
++    """Stage an outcome in the caller's transaction; never commit or close it."""
++    _validate_quantities(outcome)
++    row = StrategyOutcomeRecord(**outcome.model_dump())
++    session.add(row)
++
++
++def _validate_quantities(outcome: StrategyOutcome) -> None:
++    if outcome.entry_qty != outcome.exit_qty:
++        raise ValueError(
++            f"StrategyOutcome invariant violated: entry_qty ({outcome.entry_qty}) != "
++            f"exit_qty ({outcome.exit_qty}) for outcome_id={outcome.outcome_id} — refusing to "
++            "persist. A closed trade's StrategyOutcome must record equal entry and exit "
++            "quantity (§5/§11)."
++        )
+diff --git a/backend/app/trading_intelligence/state_snapshot.py b/backend/app/trading_intelligence/state_snapshot.py
+index 3e6c1b4..f5f013a 100644
+--- a/backend/app/trading_intelligence/state_snapshot.py
++++ b/backend/app/trading_intelligence/state_snapshot.py
+@@ -1,9 +1,7 @@
+ """
+-Snapshot capture — the read-side CONTRACT a future Execution/Position
+-Monitor will call at `entry_filled_at`/`exit_filled_at` to populate
+-`StrategyOutcome.market_state_at_entry`/`_at_exit` and
+-`context_at_entry`/`_at_exit` (decision #89's locked shape,
+-strategy-engine-design.md §5). Confirmed decision #98, M4.
++Snapshot capture — the read-side contract used by Backtest Runner and the
++simulated OutcomeRecorder for StrategyOutcome entry and exit fields
++(decision #98, strategy-engine-design.md §5).
+ 
+ **What this is, and isn't.** This module is the CAPTURE MECHANISM only —
+ a pure read of whatever MarketStateEngine/ContextEngine currently know
+@@ -14,22 +12,11 @@ fields. It does not:
+     docstring originally carried is stale as of #120 and corrected
+     here),
+   - write anything, ever (no session, no persistence),
+-  - know what "entry" or "exit" means (no Execution Engine, no Position
+-    Monitor, no fill event exists yet to call this from).
+-The actual production call sites are real, later work — building them
+-now just to exercise this function would be exactly the scope this
+-build (M4) was deliberately kept narrow to avoid; see
+-strategy-engine-design.md §10's own staged plan. What matters today is
+-that the CONTRACT is real and tested against real MarketState/Context
+-data, not a stub — so whichever module calls this has a stable,
+-already-proven function to call rather than reinventing this read
+-against two engines' internals itself. As of decision #128, Backtest
+-Runner is exactly that real caller: `BacktestRunner.run()`
+-(`app/backtest_runner/runner.py`) calls `capture_strategy_outcome_snapshots()`
+-directly at its own entry/exit-fill equivalents — the "a Backtest
+-Runner" framing above originally listed this as a hypothetical future
+-caller; it's a real one now. Execution Engine and Position Monitor
+-remain the genuinely hypothetical, still-nonexistent LIVE-path callers.
++  - know what "entry" or "exit" means; the caller chooses capture time.
++Backtest Runner captures both halves for its own completed fill path. The
++simulated OutcomeRecorder captures at the first entry fill and near closure,
++using NULL with a reason if a half is unavailable. This module remains a
++read-only mechanism shared by those callers.
+ 
+ **Why this lives here, not inside context_engine/ or
+ market_state_engine/.** This module reads BOTH engines' public
+diff --git a/backend/tests/test_execution_startup_status_route.py b/backend/tests/test_execution_startup_status_route.py
+index f929200..346b7cd 100644
+--- a/backend/tests/test_execution_startup_status_route.py
++++ b/backend/tests/test_execution_startup_status_route.py
+@@ -60,8 +60,28 @@ def test_successful_startup_reports_ready():
+     assert fastapi_app.state.execution_startup_status is None
+ 
+ 
++def test_recorder_startup_failure_does_not_change_ready_execution_status(monkeypatch, caplog):
++    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
++
++    async def fail(self):
++        raise RuntimeError("injected recorder startup failure")
++
++    monkeypatch.setattr(OutcomeRecorder, "start", fail)
++    with TestClient(fastapi_app) as client:
++        assert client.get("/health/execution-startup").json() == {
++            "status": "ready", "reason_code": None, "discrepancy_count": None,
++        }
++    assert "OutcomeRecorder failed to start" in caplog.text
++
++
+ def test_reconciliation_discrepancy_reports_blocked_with_a_safe_count(monkeypatch):
+     from app.portfolio_state.reconciliation import ReconciliationReport
++    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
++
++    starts = []
++    async def recorder_start(self):
++        starts.append(True)
++    monkeypatch.setattr(OutcomeRecorder, "start", recorder_start)
+ 
+     async def discrepant_reconciliation(*args):
+         return ReconciliationReport(discrepancies=["mismatch A", "mismatch B", "mismatch C"])
+@@ -81,6 +101,7 @@ def test_reconciliation_discrepancy_reports_blocked_with_a_safe_count(monkeypatc
+     # The raw discrepancy text (which could name a specific symbol, order,
+     # or ledger row) never reaches this route — only a plain count of it.
+     assert "mismatch" not in response.text
++    assert starts == []
+     assert fastapi_app.state.execution_startup_status is None
+ 
+ 
+diff --git a/backend/tests/test_performance_intelligence.py b/backend/tests/test_performance_intelligence.py
+index 281b8eb..5f8cdcd 100644
+--- a/backend/tests/test_performance_intelligence.py
++++ b/backend/tests/test_performance_intelligence.py
+@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
+ from app.db.session import SessionLocal
+ from app.models.trading_intelligence import BacktestRunRecord, StrategyOutcomeRecord
+ from app.schemas.performance import BacktestRun, StrategyOutcome
+-from app.trading_intelligence.performance import record_strategy_outcome
++from app.trading_intelligence.performance import record_strategy_outcome, record_strategy_outcome_in_session
+ 
+ _STRATEGY_NAME = "TEST_PERF_INTEL_STRATEGY"
+ 
+@@ -160,6 +160,62 @@ def test_valid_backtest_run_construction_succeeds():
+ 
+ # --- record_strategy_outcome() write-time invariant --------------------------
+ 
++def test_same_session_writer_forwards_nullable_snapshot_fields_and_obeys_outer_rollback():
++    reasons = {"market_state_at_exit": "recorder_unavailable"}
++    outcome = _make_outcome(market_state_at_exit=None, snapshot_missing_reasons=reasons)
++    with SessionLocal() as session:
++        with session.begin():
++            record_strategy_outcome_in_session(session, outcome)
++            session.flush()  # real ck_strategy_outcomes_null_snapshot_has_reason
++            row = session.get(StrategyOutcomeRecord, outcome.outcome_id)
++            assert row.execution_mode == "simulated"
++            assert row.execution_venue == "simulated"
++            assert row.market_state_at_exit is None
++            assert row.snapshot_missing_reasons == reasons
++            session.rollback()
++    with SessionLocal() as session:
++        assert session.get(StrategyOutcomeRecord, outcome.outcome_id) is None
++
++
++def test_same_session_writer_refuses_null_snapshot_without_reason_at_database():
++    outcome = _make_outcome()
++    with SessionLocal() as session:
++        with pytest.raises(IntegrityError, match="ck_strategy_outcomes_null_snapshot_has_reason"):
++            with session.begin():
++                record_strategy_outcome_in_session(session, outcome)
++                session.flush()
++                row = session.get(StrategyOutcomeRecord, outcome.outcome_id)
++                row.market_state_at_exit = None
++                row.snapshot_missing_reasons = None
++                session.flush()
++
++
++def test_wrapper_and_same_session_writer_persist_identical_backtest_fields():
++    first = _make_outcome(is_backtest=True, execution_mode="backtest")
++    second = first.model_copy(update={"outcome_id": uuid.uuid4()})
++    with SessionLocal.begin() as session:
++        run = BacktestRunRecord(
++            run_id=uuid.uuid4(), sweep_id=uuid.uuid4(), strategy_name=_STRATEGY_NAME,
++            strategy_version="orb_v1", config_hash="same_session_parity", symbol_universe=["AAPL"],
++            date_range_start=date(2026, 9, 10), date_range_end=date(2026, 9, 10),
++            data_version="fixture", feature_version="fixture", walk_forward_fold=1,
++            is_holdout=False, created_at=datetime(2026, 9, 10, tzinfo=timezone.utc),
++        )
++        session.add(run)
++        session.flush()
++        first.backtest_run_id = second.backtest_run_id = run.run_id
++    record_strategy_outcome(first)
++    with SessionLocal.begin() as session:
++        record_strategy_outcome_in_session(session, second)
++    with SessionLocal() as session:
++        a = session.get(StrategyOutcomeRecord, first.outcome_id)
++        b = session.get(StrategyOutcomeRecord, second.outcome_id)
++        assert a is not None and b is not None
++        for column in StrategyOutcomeRecord.__table__.columns:
++            if column.name not in {"outcome_id", "created_at"}:
++                assert getattr(a, column.name) == getattr(b, column.name)
++
++
+ def test_entry_qty_not_equal_exit_qty_is_rejected_and_never_written():
+     outcome = _make_outcome(entry_qty=100, exit_qty=60)
+     with pytest.raises(ValueError, match="entry_qty"):
+diff --git a/docs/architecture/execution-engine-design.md b/docs/architecture/execution-engine-design.md
+index 008c455..2d10ce5 100644
+--- a/docs/architecture/execution-engine-design.md
++++ b/docs/architecture/execution-engine-design.md
+@@ -1,6 +1,6 @@
+ # Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
+ **Owner:** Saqib
+-**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#185 and the simulated protective/EOD deliveries implement the simulated entry and exit paths described in §§6.2–6.6. The original inventory in §§1–2 and build prerequisites in §7.1 are historical. Decision #185 governs the executable simulated EOD path; EX-12 remains open. **Present-tense status was re-verified against `main` at `eca3573` by `execution-status-doc-sync`:** the simulated entry, stop/target exit, EOD flatten (calendar verified for 2026–2028 only) and session-aware protective-retry paths are **built**; the `OutcomeRecorder` (§6.7, §6.7.1, EX-12) is **proposed, not built**; paper/live venues, manual mode and the Decision/Planning/Governor stages are not built. Sections labelled historical keep their original text. Baseline of the original design: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
++**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#185 and the simulated protective/EOD deliveries implement the simulated entry and exit paths described in §§6.2–6.6. This delivery implements EX-12 option (a), the simulated auto-trade `OutcomeRecorder` in §6.7.1. The original inventory in §§1–2 and build prerequisites in §7.1 are historical. Decision #185 governs the executable simulated EOD path. Paper/live venues, manual mode and the Decision/Planning/Governor stages are not built. Sections labelled historical keep their original text. Baseline of the original design: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
+ **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
+ 
+ **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
+@@ -20,7 +20,7 @@
+ 3. **"Only the Governor can place orders" needs one reconciliation, not a new rule** (§3, I2): the Governor is the only *authorizer*; the Execution Engine is the only *placer*; manual mode adds a human confirmation *after* the Governor, it does not replace it. The task brief's shorthand "human as Governor" for manual-first was imprecise — §18.5 keeps the Governor in the path even for manual, sized requests.
+ 4. **Approved first slice (§5, Slice A; decision #170):** a simulated venue, the auto path, and one deliberately thin, clearly-labelled authorizer stub in place of the unbuilt Decision/Planning/Governor stages — **technically restricted to simulated execution and failing closed for `paper`/`live`** (§6.2) — with fixed sizing, protective exits monitored in-process, and an `OutcomeRecorder` that writes the outcome. It inverts the roadmap's stage order (Execution before its Phase 5 predecessors); Saqib approved that inversion (EX-1).
+ 5. **Six forks are resolved and six requirements are added by #170 (§7, §3):** `execution_mode` and `execution_venue` are separate columns (EX-2); the venue seam is a new narrow `OrderVenue` port and an `execution` registry role, and `BrokerAdapter` is not enlarged (EX-3); Portfolio State owns accounting and `PositionClosed` is published only after its commit (EX-6); the snapshot requirement is a pre-trade gate and a reported fill is never discarded (EX-7); and every order has a stable client-order ID, fills and updates are deduplicated, restart recovery reconciles non-terminal orders with the venue, the database ledger is authoritative, persist-before-publish covers fills and closures, and the daily-loss gate counts unrealized loss and open risk (§3 I10–I15, §6.9). Initial limits: 1 concurrent position, $1,000 notional per trade, $100 daily loss cap — all configurable (§6.10).
+-6. **Current status (`main` at `eca3573`; items 1–5 are the original design summary and describe the plan as written).** *Built, `execution_mode = simulated` only:* the authorizer stub, entry-order Execution Engine, execution ledger, `SimulatedVenue`, Portfolio State, restart reconciliation and `main.py` wiring (#171–#178, #179–#180); Position Monitor-lite stop/target observation (#175, #178); durable position-bound stop/target closes (#184); simulated EOD flatten — monitor timer, exit-ledger state machine (migration `0016`), Execution worker, startup restore and read-only panel (#185 and its slug-only deliveries); `MarketClock` holiday/early-close coverage for 2026–2028 only, with EOD failing closed for other entry years; and session-aware protective retries (`simulated-protective-session-retry`). *Proposed, not built:* the `OutcomeRecorder` (§6.7.1; EX-12 open), so `record_strategy_outcome()` still has no live caller and `strategy_outcomes` has no live rows. *Not built:* a paper/live venue (`IBKRAdapter.place_order()` still raises `NotImplementedError`), broker-side protective orders, manual mode, Decision/Planning/Opportunity ranking and a real Governor rule engine.
++6. **Current status (items 1–5 are the original design summary).** *Built, `execution_mode = simulated` only:* the authorizer stub, entry-order Execution Engine, execution ledger, `SimulatedVenue`, Portfolio State, restart reconciliation and `main.py` wiring (#171–#178, #179–#180); Position Monitor-lite stop/target observation (#175, #178); durable position-bound stop/target closes (#184); simulated EOD flatten — monitor timer, exit-ledger state machine (migration `0016`), Execution worker, startup restore and read-only panel (#185 and its slug-only deliveries); `MarketClock` holiday/early-close coverage for 2026–2028 only; session-aware protective retries; and the EX-12 `OutcomeRecorder` for closed, strategy-attributed simulated auto trades (§6.7.1). *Not built:* a paper/live venue (`IBKRAdapter.place_order()` still raises `NotImplementedError`), broker-side protective orders, manual mode, Decision/Planning/Opportunity ranking and a real Governor rule engine.
+ 
+ ---
+ 
+@@ -1082,7 +1082,7 @@ Execution panel expands and on manual refresh, in a section separate from its
+ existing order-lifecycle event list; it does not poll or subscribe to another
+ WebSocket channel. The `observed_only` label describes the route's own read
+ surface, not whether an observation was handed to Execution.
+-EOD observations also reach the durable handoff; EX-12 remains open.
++EOD observations also reach the durable handoff; EX-12 is implemented for simulated auto trades in §6.7.1.
+ 
+ **As built (`simulated-protective-exits`).** A stop or target observation is
+ handed to Execution Engine's queue. `PostgresExitLedger` commits one durable
+@@ -1467,7 +1467,7 @@ the wall clock (clock skew) is rejected. EOD placement remains best-effort.
+ window helper, config default, calendar coverage accessor, monitor handoff,
+ durable exit-ledger state machine, migration `0016`, reader/frontend and
+ Execution/startup integration are built. EOD is a **best-effort attempt to flatten**, not a guarantee
+-of closure by the bell or of no overnight exposure. EX-12, OutcomeRecorder, paper/live exits
++of closure by the bell or of no overnight exposure. Paper/live exits
+ and unrelated modules remain outside this contract.
+ 
+ #### Historical baseline before decision #185 integration
+@@ -2152,7 +2152,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
+ 
+ ### 6.7 `OutcomeRecorder` and D17's live half (`trading_intelligence/`)
+ 
+-**Status: design sketch — NOT BUILT.** No `OutcomeRecorder` module exists at `eca3573`, `record_strategy_outcome()` has no live caller (`BacktestRunner` is its only one), and EX-12 is open. The diagram and policy below are the original proposal; §6.7.1 refines it and is itself Proposed. What this component would consume — fills, position closure, `PositionClosed`, and `orders.exit_reason` values `stop`, `target` and `eod_flatten` — is built.
++**Status: historical sketch.** The diagram below predates the EX-12 implementation. §6.7.1 is the as-built contract: `PositionClosed` is only a wake-up hint, and the insert and trade link commit together through the same-session writer.
+ 
+ **What it is.** The one place that turns a closed position into a `StrategyOutcome` and calls `record_strategy_outcome()` — the live-path caller D17 says does not exist.
+ 
+@@ -2186,31 +2186,31 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
+ 4. **Backtests are unchanged:** decision #128's discard-on-`None` stays for `execution_mode = backtest` rows, and the schema keeps those four columns `NOT NULL` for them (§6.8).
+ 5. **Capture timing is visible.** Snapshots are read at fill-handling time, not as of `fill_ts`; the market-state dict carries its `candle_ts` and the trade row stores `captured_at`, so late capture is measurable rather than hidden.
+ 
+-### 6.7.1 Proposed `OutcomeRecorder` contract (`outcome-recorder-contract`) — PROPOSED, not built; EX-12 awaits Saqib's confirmation
++### 6.7.1 `OutcomeRecorder` contract (`outcome-recorder-contract`) — EX-12 option (a) built for simulated auto trades
+ 
+-**Status.** Design only. *Re-verified at `eca3573` (`execution-status-doc-sync`): A1 and A5 still hold; A10 was corrected for the built EOD path; the other rows were not re-audited and remain as verified at `f517834`.* No application code, migration or decision number comes with this section; the slug is the temporary identifier. Rows marked **as-built** were verified against backend code at `f517834`; `main` later advanced to `3c23701`, which changed only documentation (`simulated-eod-flatten-contract`, an unapproved proposal that does not touch EX-12 or this section). A scratch run on real PostgreSQL 16 confirmed the three writer facts in A6). Everything marked **Proposed** is neither built nor decided. §6.7's sketch above stays as written; this section refines four points where `main` disagrees with it: (1) `PositionClosed` is a wake-up hint, not the data source; (2) the outcome insert and the `trades` link commit in one transaction, not as two steps; (3) a fourth `outcome_status` value, `blocked`, exists for trades that cannot be recorded honestly; (4) `record_strategy_outcome()` needs a same-session variant before any live caller can exist.
++**Status.** Saqib approved option (a). The Governor evidence writer was already merged at `79650ad`; this delivery reuses it and adds the same-session performance writer, entry hook, recorder, and lifespan wiring. No migration is needed. `PositionClosed` wakes the recorder but supplies no outcome facts; the target position's durable receipts, trade, reservation and closing order do. `trades.outcome_status = blocked` records an unrecordable closure without fabricating evidence or R; a reason code is logged. The historical baseline findings below are retained where useful, with A1/A6/A7 and missing-source statements updated to the delivered state.
+ 
+-#### A. What `main` has today (as-built)
++#### A. As-built inventory in this delivery
+ 
+ | # | Fact | Evidence |
+ |---|---|---|
+-| A1 | No `OutcomeRecorder` exists and nothing calls `record_strategy_outcome()` except `BacktestRunner.run()`. Reconciliation names the recorder as "step 4" and leaves it to a sibling task. | `backend/app/portfolio_state/reconciliation.py` (module docstring); `backend/app/backtest_runner/runner.py` |
++| A1 | `OutcomeRecorder` is the sole non-backtest writer, using `record_strategy_outcome_in_session()`; `BacktestRunner.run()` retains its existing `record_strategy_outcome()` wrapper. | `backend/app/trading_intelligence/outcome_recorder.py`; `backend/app/backtest_runner/runner.py` |
+ | A2 | The durable closure marker already exists. `PostgresPositionLedger.commit_fill` sets `trades.status = 'closed'` in the same transaction as the closing fill's `positions` row, its `position_fill_receipts` row and the cursor advance. `PortfolioState._synchronize` publishes `PositionClosed` only after that commit and has no outbox, so a crash between commit and publish loses only the notification. | `backend/app/portfolio_state/postgres.py:PostgresPositionLedger.commit_fill`; `backend/app/portfolio_state/engine.py:PortfolioState._synchronize` |
+-| A3 | `position_fill_receipts.fill_data` keeps every fill's exact inputs (order ID, side, effect, qty, price, venue timestamp, commission) per `position_id`, and `PostgresPositionLedger._state` already replays receipts through the canonical `apply_fill`. A closed position can therefore be rebuilt from the ledger alone, including entry VWAP, entry/exit quantity, exit VWAP, gross P&L and fees. | `backend/app/models/execution_ledger.py:PositionFillReceipt`; `backend/app/portfolio_state/accounting.py:apply_fill`, `PositionState` |
++| A3 | `position_fill_receipts.fill_data` keeps every fill's exact inputs (order ID, side, effect, qty, price, venue timestamp, commission) per `position_id`. The recorder replays only that position's receipts through canonical `apply_fill`, checking each against its source fill/order and the stored position projection. It never calls the all-position `PostgresPositionLedger._state` replay. | `backend/app/models/execution_ledger.py:PositionFillReceipt`; `backend/app/portfolio_state/accounting.py:apply_fill`, `PositionState`; `backend/app/trading_intelligence/outcome_recorder.py` |
+ | A4 | `PositionClosed` carries `exit_price` (VWAP of all reducing fills), gross `realized_pnl`, `fees`, `closed_ts`, `trade_id`, mode and venue, with `r_multiple_achieved = None`. It carries no entry price or quantity, no thesis, no evidence, no exit reason, no snapshots. | `backend/app/schemas/events/execution.py:PositionClosed` |
+-| A5 | `trades.outcome_id` (FK to `strategy_outcomes.outcome_id`) and `trades.outcome_status` exist; nothing writes either. `outcome_status` has no CHECK constraint. The four `entry_*` snapshot columns on `trades` exist; nothing writes them. | `backend/app/models/execution_ledger.py:Trade`; migration `0012` |
+-| A6 | `record_strategy_outcome()` has three properties a live writer cannot accept. (a) It opens its own `SessionLocal()` and commits alone, so it cannot share a transaction with the `trades` link. (b) It builds the ORM row from explicit kwargs that omit `execution_mode`, `execution_venue` and `snapshot_missing_reasons`; mode and venue land correctly only through ORM defaults, and a row with a NULL snapshot violates `ck_strategy_outcomes_null_snapshot_has_reason` (scratch run: `IntegrityError`). (c) `strategy_outcomes` has no uniqueness on `opportunity_id` (scratch run: the same `opportunity_id` recorded twice gives two rows). | `backend/app/trading_intelligence/performance.py:record_strategy_outcome`; `backend/app/models/trading_intelligence.py:StrategyOutcomeRecord`; migration `0012` |
+-| A7 | The authorization commit persists strategy, version, direction, `structural_invalidation`/`structural_target` (with `final_*` equal to them), confidence, `setup_detected_at` and `decided_at` in `trades.thesis` and `trades.decision_record`. It does **not** persist `Opportunity.evidence` or `Opportunity.confirmed_at`; `TradeDecisionRecord` has no field for either. | `backend/app/governor/postgres.py:PostgresTradeLedger.commit_decision`; `backend/app/governor/ports.py:TradeDecisionRecord`; `backend/app/strategy_engine/base_strategy.py:Opportunity` |
++| A5 | `trades.outcome_id` (FK to `strategy_outcomes.outcome_id`) and `trades.outcome_status` are written by `OutcomeRecorder`. `outcome_status` has no CHECK constraint. The four `entry_*` snapshot columns are written by its first-fill hook, or remain NULL if the hook was missed. | `backend/app/models/execution_ledger.py:Trade`; `backend/app/trading_intelligence/outcome_recorder.py`; migration `0012` |
++| A6 | `record_strategy_outcome_in_session()` validates equal quantities and stages all outcome fields, including execution mode, venue and missing-snapshot reasons, without committing or closing the caller's session. The original wrapper retains its own session and commit for Backtest Runner. The database has no uniqueness on `opportunity_id`; the recorder's trade lock and recheck enforce one linked outcome among recorder workers. | `backend/app/trading_intelligence/performance.py`; migration `0012` |
++| A7 | The merged Governor persists accepted, strictly plain finite JSON `Opportunity.evidence` in `trades.thesis["evidence"]` with the trade and reservation. It rejects non-JSON values without coercion. It does not persist `Opportunity.confirmed_at`; no current strategy produces it, so `signal_confirmed_at` remains NULL. Older approvals without evidence stay unchanged and block on closure. | `backend/app/governor/postgres.py`; `backend/app/governor/evidence.py` |
+ | A8 | `trade_reservations.reference_price` is retained after handoff and is the value the Governor publishes as `TradePlanned.entry`. | `backend/app/governor/engine.py` (`entry=result.reference_price`); `backend/app/models/execution_ledger.py:TradeReservation` |
+ | A9 | `positions` has no uniqueness on `trade_id` (scratch run: two rows for one trade). Protective exits cancel an unfinished entry order before submitting a close, so a second position per trade is prevented by procedure, not by a constraint. Close orders are `<trade_id>:exit:<attempt>`, sized to the remaining position, each carrying its own `exit_reason`. | `backend/app/execution_engine/exit_ledger.py`; `backend/app/models/execution_ledger.py:Position` |
+ | A10 | `SimulatedVenue` reports `commission = None` on every fill. The as-built exit path writes `orders.exit_reason` as `stop`, `target` or `eod_flatten` (EOD is built and integrated; `exit_ledger.py` reserves and claims EOD closes, and `test_simulated_eod_integration.py` asserts `eod_flatten` orders). `eod_flatten` therefore flows through the same `orders.exit_reason` source with no change to this contract. | `backend/app/broker_adapters/simulated_venue.py`; `backend/app/execution_engine/exit_ledger.py` |
+ | A11 | The Backtest Runner stamps `schema_version = 1`; §6.8 and decision #170 say writers of the new shape write 2. | `backend/app/backtest_runner/runner.py:_build_strategy_outcome` |
+ 
+-#### B. Field-by-field source map for `StrategyOutcome` (Proposed)
++#### B. Field-by-field source map for `StrategyOutcome` (as built)
+ 
+-`Persisted` = read from a ledger column. `Derived` = computed from persisted values. **MISSING** = no persisted source exists on `main`. `NULL` = honest absence (I3).
++`Persisted` = read from a ledger column. `Derived` = computed from persisted values. `NULL` = honest absence (I3).
+ 
+-| Field | Proposed source | Status |
++| Field | Source | Status |
+ |---|---|---|
+ | `outcome_id` | `uuid4()` minted inside the linking transaction | Derived |
+ | `opportunity_id` | `trades.trade_id` (equals the accepted `opportunity_id` for approvals) | Persisted |
+@@ -2223,7 +2223,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
+ | `execution_mode`, `execution_venue` | `trades.execution_mode`, `trades.execution_venue`; anything other than `simulated` is refused (I6) | Persisted |
+ | `trading_day` | `position_fill_receipts.trading_day` of the first opening fill; must equal that of the closing fill | Persisted |
+ | `setup_detected_at` | `trades.decision_record.setup_detected_at` (ISO string, parsed to an aware UTC datetime) | Persisted |
+-| `signal_confirmed_at` | `Opportunity.confirmed_at` is not persisted. `NULL` until P1 persists it; then `trades.thesis.signal_confirmed_at` | **MISSING** (soft: nullable) |
++| `signal_confirmed_at` | No producer sets `Opportunity.confirmed_at` today; stored as `NULL` | NULL |
+ | `decided_at` | `trades.decision_record.decided_at` | Persisted |
+ | `entry_filled_at` | `venue_ts` of the first opening fill (equals `positions.opened_at`) | Persisted |
+ | `exit_filled_at` | `venue_ts` of the closing fill (equals `positions.closed_at`) | Persisted |
+@@ -2238,17 +2238,17 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
+ | `realized_r` | direction-aware `(exit_price - entry_price) / abs(entry_price - structural_invalidation)`; see C4 | Derived |
+ | `exit_reason` | `orders.exit_reason` of the order that carries the closing fill | Persisted |
+ | `structural_invalidation`, `structural_target`, `final_stop`, `final_target`, `confidence_at_signal` | `trades.thesis` (`confidence` maps to `confidence_at_signal`); checked against `trades.decision_record` | Persisted |
+-| `evidence` | Not persisted anywhere. Only the in-memory `OpportunityCache` holds it, and it overwrites. Needs P1 | **MISSING** (hard: `NOT NULL`) |
+-| `market_state_at_entry`, `context_at_entry` | `trades.entry_market_state`, `trades.entry_context`. Columns exist, no writer. Needs P2 | **MISSING** (writer) |
++| `evidence` | `trades.thesis["evidence"]`, persisted by the merged Governor approval path; an older approval without it blocks as `evidence_unavailable` | Persisted or blocked |
++| `market_state_at_entry`, `context_at_entry` | First-entry-fill recorder hook writes `trades.entry_market_state`, `trades.entry_context` and capture time or missing reasons | Persisted / NULL |
+ | `market_state_at_exit`, `context_at_exit` | Captured by the recorder when it handles the closure (C3). No persisted home on `trades` | Derived / NULL |
+ | `snapshot_missing_reasons` | union of `trades.entry_snapshot_missing_reasons` and the recorder's exit-side reasons, keyed by the four snapshot field names | Derived |
+ | `feature_snapshot_id` | `NULL` (`feature_snapshots` does not exist) | NULL |
+ 
+-**The exact missing sources.** (M1) `evidence`: nothing to read; a hard blocker for a `NOT NULL` column. (M2) `signal_confirmed_at`: lost at acceptance; nullable, so recording without it is legal. (M3) the entry-snapshot writer: columns exist and are empty. (M4) exit snapshots: no persisted home, so they can only be captured near the closure. Every other field has a persisted or derivable source.
++**Source resolution.** M1 is closed by the merged Governor evidence delivery. M2 remains honestly NULL because no strategy sets `confirmed_at`. M3 is closed by the best-effort first-fill hook; if missed, the outcome uses NULL with `recorder_unavailable`. M4 is captured by the recorder within 60 seconds of closure, or stored as NULL with a reason. Authorization-time snapshots are never relabelled as entry snapshots.
+ 
+-#### C. Writer behavior (Proposed)
++#### C. Writer behavior (as built)
+ 
+-| Case | Proposed behavior |
++| Case | As-built behavior |
+ |---|---|
+ | **C1 Partial reductions** | No outcome until the position is fully closed. The recorder acts only on a trade whose `trades.status = 'closed'` **and** whose replayed position ends at `qty = 0`. A `closing` position is invisible to it. Reductions and adds fold into one row: entry VWAP over all opening fills, exit VWAP over all reducing fills, `exit_filled_at` = last reduction, `entry_filled_at` = first opening fill. `exit_reason` is the closing fill's order's reason; earlier partial reductions under a different reason are not represented (`StrategyOutcome` has no field for it). |
+ | **C2 Commissions** | Sum only what fills reported. If every fill carries a commission: `commission_total = fees` and `realized_pnl = gross - fees` (a negative fee, i.e. a rebate, adds). If any fill's commission is `NULL`: `commission_total = NULL` and `realized_pnl = gross`, exactly what the Backtest Runner does; nothing is estimated. Every simulated outcome is in the second case until `SimulatedVenue` reports fees. Consequence to accept: a `NULL` commission means "not surfaced", and `realized_pnl` is then gross. |
+@@ -2256,27 +2256,27 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
+ | **C4 Missing R basis** | `realized_r` is `NOT NULL` and is never invented. The basis is the authorization-time `structural_invalidation` (checked equal in `trades.thesis` and `trades.decision_record`), never `positions.stop`; the `PositionClosed` docstring says the current stop is not that basis. If it is absent or non-finite, if the two copies disagree, or if `abs(entry_price - structural_invalidation)` quantizes to zero, the trade is `blocked` with reason `r_basis_unavailable`. Prices are quantized to 6 places (`ROUND_HALF_UP`, as the `positions` projection does) before `float` conversion. |
+ | **C5 Duplicate closure notifications** | Harmless by construction. The event only enqueues `trade_id`; the worker de-duplicates the queue by `trade_id`; and the linking transaction takes `SELECT ... FOR UPDATE` on the `trades` row and returns `already_recorded` if `outcome_id` is set. A second recorder process is serialized by the same row lock. Verified in scratch: the second call inserted nothing. |
+ | **C6 Failed writes** | Transient errors (connection, lock timeout) roll back, then a separate small transaction sets `outcome_status = 'pending_retry'` if `outcome_id IS NULL`; if that also fails, `NULL` already means pending. The next sweep retries. Deterministic failures set `blocked` and log at ERROR or CRITICAL with `trade_id` and a reason code: `evidence_unavailable`, `r_basis_unavailable`, `unsupported_mode`, `multi_position_trade`, `multi_day_position`, `exit_reason_unavailable`, `ledger_inconsistent` (replay disagrees with `positions`, or `entry_qty != exit_qty`), `contract_validation_failed`, `write_rejected` (an `IntegrityError`). Nothing is dropped: the ledger still holds the closure. No reason column exists, so reasons live in logs; a `blocked` trade is re-armed by setting `outcome_status` back to `NULL`. |
+-| **C7 Restart recovery** | After reconciliation and `portfolio_state.refresh()` succeed, the recorder starts and runs one scan: `trades` where `decision = 'approved'`, `status = 'closed'`, `execution_mode` equals the configured mode, `outcome_id IS NULL` and `COALESCE(outcome_status, 'pending') <> 'blocked'`, oldest `positions.closed_at` first. A bounded sweep repeats it every `outcome_sweep_interval_seconds` (proposed default 60), so a lost wake-up costs latency, not the row. The recorder is not on the entry path: if it fails to start, log CRITICAL and leave `execution_startup_status` alone; outcomes stay pending until the next start. |
++| **C7 Restart recovery** | After reconciliation and `portfolio_state.refresh()` succeed, the recorder subscribes and scans approved, closed, simulated auto trades without a linked outcome, oldest `positions.closed_at` first, excluding `blocked`. Startup walks bounded pages; the periodic sweep visits one bounded page every `outcome_sweep_interval_seconds` (default 60), rotating its cursor. This covers fills applied by `portfolio_state.start()` before recorder subscription and lost `PositionClosed` events. Startup failure logs CRITICAL without changing an otherwise `ready` execution status. Reconciliation-blocked startup never starts the recorder. |
+ | **C8 Trade-to-position cardinality** | The recorder requires exactly one `positions` row for the trade, `closed`, with no entry order still holding unfilled quantity. Zero or several, or a still-open sibling, gives `multi_position_trade`. A fill dated on a different trading day than the entry gives `multi_day_position` (`StrategyOutcome.trading_day` covers entry and exit, day trading only, D8). |
+ 
+-#### D. Atomic linkage through `trades.outcome_id` / `outcome_status` (Proposed)
++#### D. Atomic linkage through `trades.outcome_id` / `outcome_status` (as built)
+ 
+ `trades.outcome_status` vocabulary: `NULL` = pending (the value `pending` is never written), `pending_retry`, `recorded`, and the new `blocked`. No migration is needed: the column has no CHECK.
+ 
+ One synchronous transaction on a fresh session, run through `asyncio.to_thread`:
+ 
+ 1. Cheap pre-read (no lock): if `trades.outcome_id` is set, stop. This avoids capturing snapshots for a duplicate.
+-2. Read the closure inputs and capture the exit snapshots **outside** any lock.
+-3. `SELECT outcome_id FROM trades WHERE trade_id = :t FOR UPDATE`. If `outcome_id` is set, return `already_recorded`.
+-4. Re-validate the closure and build and validate the `StrategyOutcome` (Pydantic) before any write.
+-5. Insert the `strategy_outcomes` row through the same-session variant of `record_strategy_outcome()` (P3), then `UPDATE trades SET outcome_id = :o, outcome_status = 'recorded'`.
++2. Read the trade symbol and closure timestamp, then capture exit snapshots **outside** any lock and only within the 60-second lag bound.
++3. Acquire `trades, orders, trade_reservations` table locks in the same order as `ledger_transaction` and Portfolio State, then `SELECT ... FOR UPDATE` on the trade. If `outcome_id` is set, return without writing.
++4. Read and replay only the target position's receipts, validate the closure and attribution, then build and validate `StrategyOutcome` (Pydantic) before any insert.
++5. Insert the `strategy_outcomes` row through `record_strategy_outcome_in_session()`, then set `trades.outcome_id = :o` and `outcome_status = 'recorded'`.
+ 6. Commit. Either both rows change or neither does; a crash between 5 and 6 leaves nothing behind (verified in scratch: rollback left zero outcome rows).
+ 
+ The ledger stays authoritative because every quantity, price and time in the outcome is read back from ledger tables; the bus contributes only a `trade_id` wake-up, and losing any event costs latency (and, for the entry hook only, an honestly `NULL` entry snapshot).
+ 
+ #### E. Diagrams
+ 
+-**Data flow between components**
++**Data flow between components (as built)**
+ 
+ ```
+                     LEDGER (PostgreSQL) — authoritative, I12
+@@ -2296,12 +2296,12 @@ The ledger stays authoritative because every quantity, price and time in the out
+      MarketState / Context engines ◄── capture_strategy_outcome_snapshots ─┘  │
+        (in-memory reads, exit side within max lag; entry side at first entry fill)
+                                                                               ▼
+-                                  record_strategy_outcome(session=…)  ──►  strategy_outcomes
+-                                  (P3: same-session variant, forwards mode,        (simulated rows,
+-                                   venue, snapshot_missing_reasons)                 append-only)
++                                  record_strategy_outcome_in_session() ──► strategy_outcomes
++                                  (forwards mode, venue, missing reasons)      (simulated rows,
++                                                                              append-only)
+ ```
+ 
+-**Internal flow of `OutcomeRecorder`**
++**Internal flow of `OutcomeRecorder` (as built)**
+ 
+ ```
+  triggers:  PositionClosed hint │ startup scan │ periodic sweep      OrderFilled(entry) hint
+@@ -2312,46 +2312,42 @@ The ledger stays authoritative because every quantity, price and time in the out
+                             ▼                                        WHERE captured_at IS NULL AND reasons IS NULL
+                  worker loop (one trade at a time)                   (NULL + reason if None/raises; never blocks fills)
+                             │
+-        1. outcome_id already set? ──yes──► done (already_recorded)
+-                            │no
+-        2. read trade, decision_record, thesis, reservation, position, receipts, exit order
+-        3. eligibility: mode simulated? exactly one closed position? one trading day?  ─no─► blocked
+-        4. replay receipts through apply_fill; must equal positions row, qty 0, entry_qty == exit_qty ─no─► blocked
+-        5. evidence present? R basis valid and non-zero? exit_reason known?           ─no─► blocked
+-        6. exit snapshots: within max lag? capture → dict | NULL + reason
+-        7. build + validate StrategyOutcome (schema_version 2, mode/venue from the trade)
+-                            │
+-        8. BEGIN; SELECT … FOR UPDATE trades row; outcome_id set? ──► already_recorded
+-           INSERT strategy_outcomes; UPDATE trades SET outcome_id, outcome_status='recorded'; COMMIT
++        1. Cheap pre-read: outcome linked/blocked or trade not closed? ──yes──► done
++        2. Exit capture outside locks, only within 60 s; otherwise NULL + reason
++        3. BEGIN; acquire ledger table locks, then SELECT trade FOR UPDATE
++           Recheck linked/blocked/closed ──not eligible──► done
++        4. Read this trade, reservation, position, receipts and closing order
++           Replay ONLY this position's receipts through apply_fill
++           Validate closed projection, one day, evidence, structural R basis,
++           closing-order reason and all required fields ──invalid──► blocked + reason log
++        5. Build StrategyOutcome, stage through same-session writer,
++           INSERT strategy_outcomes; UPDATE trades.outcome_id/status; COMMIT
+                  ├─ ok ───────────────────────────► recorded
+                  ├─ transient error ─► ROLLBACK ──► pending_retry (best effort; NULL = pending) ─► next sweep
+                  └─ IntegrityError / validation ──► ROLLBACK ──► blocked (+ ERROR/CRITICAL log)
+ ```
+ 
+-#### F. EX-12's options against current code
++#### F. EX-12 option selected
+ 
+-| Option | What `main` shows | Verdict |
++| Option | Evidence / implementation | Verdict |
+ |---|---|---|
+-| **(a) Dedicated `OutcomeRecorder` joining the ledger; `strategy_outcomes` strategy-attributed only** | The schema was built for it: `trades.outcome_id`/`outcome_status` exist (A5), the closure marker is durable and transactional (A2), receipts allow an exact replay (A3), and Portfolio State owns accounting only, not strategy attribution (I5). Gaps: `evidence` is not persisted (M1), no entry-snapshot writer (M3), `record_strategy_outcome()` cannot link atomically or forward three fields (A6). All three are additive and none needs a migration. | **Recommended, refined by A–D above** |
++| **(a) Dedicated `OutcomeRecorder` joining the ledger; `strategy_outcomes` strategy-attributed only** | Saqib approved this option. The merged Governor supplies evidence; this delivery adds the first-fill snapshot hook and same-session writer. The recorder uses target-position receipts and a locked atomic link. No migration is needed. | **Built for simulated auto trades** |
+ | (b) Enrich `PositionClosed` | The event already carries exit VWAP, gross P&L and fees (A4) but still lacks entry facts, thesis, evidence and exit reason, and it has no delivery guarantee or outbox (A2). Filling it would make Portfolio State read strategy attribution (an I5 breach) and would make a lossy notification the record (an I8/I12 breach). | Rejected as the source. Kept as a wake-up hint |
+ | (c) Relax the `NOT NULL` columns | `trades.strategy_name` is `NOT NULL` and EX-13 keeps this slice `auto` only, so no strategy-less trade can reach the ledger today. Relaxing `evidence` or `realized_r` would let placeholders into a table whose meaning is evidence about strategy configurations (EX-12's own consequence note), and would need a `schema_version` bump and a migration. | Rejected |
+ 
+-#### G. Build footprint (Proposed; nothing here is implemented)
++#### G. Delivered footprint
+ 
+-- **P1: persist evidence at acceptance.** Add optional `evidence` and `signal_confirmed_at` to `TradeDecisionRecord`, populate them from `Opportunity` in `AuthorizerStub`, and copy them into `trades.thesis`. Risk to test: `_record_data` uses `json.dumps(..., allow_nan=False)`, so an `Opportunity.evidence` value that is not JSON-safe would fail the authorization commit; the build must sanitize or reject before the commit. Trades approved before P1 have no evidence and are `blocked` (`evidence_unavailable`).
+-- **P2: entry snapshot hook** inside the recorder (bus subscription that only enqueues, I7).
+-- **P3: same-session variant of `record_strategy_outcome()`** that forwards `execution_mode`, `execution_venue` and `snapshot_missing_reasons`. The current function becomes a thin wrapper, so backtest behavior is unchanged; a parity test proves it.
+-- **P4: `trading_intelligence/outcome_recorder.py`**, started in `main.py` after reconciliation. A small pure helper for `realized_r`, with a parity test against `compute_realized_r` for equivalent inputs. Two new settings: `outcome_snapshot_max_lag_seconds`, `outcome_sweep_interval_seconds`.
+-- **Docs at merge:** the confirmed decision entry (next free number, assigned only then), `INDEX.md`, this section rewritten from proposed to as-built, and §7.1 updated.
++- **P1 was merged earlier (`governor-approval-evidence`).** Approval evidence is strictly JSON validated and persisted in `trades.thesis`; neither datetimes nor other non-JSON values are coerced. `signal_confirmed_at` remains NULL.
++- **P2:** `OutcomeRecorder` subscribes to `OrderFilled`, queues the order ID, and captures at the first opening fill only. Fill persistence never waits for this hook. A missed hook leaves NULL entry snapshots with `recorder_unavailable` in the outcome.
++- **P3:** `record_strategy_outcome_in_session()` stages the full row in its caller's session and does not commit or close it; `record_strategy_outcome()` remains the Backtest Runner wrapper.
++- **P4:** `trading_intelligence/outcome_recorder.py` starts only after successful reconciliation, replays the target position's receipts through `apply_fill`, and links the outcome atomically. Its startup failure is isolated. Settings default to 60 seconds for both maximum exit-snapshot lag and recovery sweep.
+ - **Optional, not required for correctness:** a partial unique index on `strategy_outcomes(opportunity_id) WHERE NOT is_backtest` makes a duplicate structurally impossible even for a second writer. It is a migration, so it is left as a follow-up.
+ 
+-**Acceptance criteria proposed for the build.** (1) Full close produces exactly one row and links `trades.outcome_id` with `outcome_status = 'recorded'`; (2) a duplicate `PositionClosed`, a replay and two concurrent workers all leave one row; (3) a fault injected between insert and link leaves neither; (4) partial-reduction then full-close produces one row with the correct VWAPs and gross P&L; (5) `commission_total` and `realized_pnl` follow C2 in both the all-known and any-`NULL` cases; (6) each missing-snapshot case in C3 records `NULL` plus its reason and passes the DB CHECK; (7) each `blocked` reason in C6 leaves no `strategy_outcomes` row and no retry loop; (8) a closure committed while the bus dropped `PositionClosed` is recorded by the startup scan and by the sweep; (9) `execution_mode`, `execution_venue` and `schema_version` are stored as specified; (10) no `paper` or `live` trade is ever recorded; (11) backtest output is byte-identical after P3; (12) tests run on real PostgreSQL 16.
+-
+-#### H. The smallest decision Saqib must confirm
++**Verification.** The focused tests cover same-session rollback and the PostgreSQL NULL-snapshot CHECK, replayed partial fills and reductions, known/unknown commissions, duplicate and concurrent writers, blocked evidence/R/exit reason, injected failure between insert and link, entry snapshot capture and failure, delayed exit capture, startup scan, sweep, and startup failure isolation. Backtest wrapper regression is included in the full backend suite. See `TESTING.md` for exact commands and results.
+ 
+-**Do you confirm EX-12 option (a) in the form this section specifies?** That is: `OutcomeRecorder` is the only writer of non-backtest `strategy_outcomes` rows; it is driven by the ledger (events are wake-up hints only); `strategy_outcomes` stays strict, so a trade that cannot be attributed honestly is `blocked` rather than recorded with placeholders. Confirming it includes the two footprint items that sit outside `trading_intelligence/`: P1 (the Governor persists evidence at acceptance) and P3 (the same-session `record_strategy_outcome()` variant).
++#### H. Approved policy
+ 
+-If you confirm, these defaults apply unless you overrule them: snapshot lag bound 60 s, sweep interval 60 s, `blocked` reasons kept in logs only (no new column), first opening fill defines `entry_filled_at`, and the closing fill's order defines `exit_reason`.
++Saqib confirmed EX-12 option (a): `OutcomeRecorder` is the only writer of non-backtest `strategy_outcomes`; the ledger supplies facts and events only wake it. The table remains strict: missing required attribution blocks the trade and logs a reason code. The delivered scope is simulated, strategy-attributed auto trades. Snapshot lag and sweep default to 60 seconds; the first opening fill defines `entry_filled_at`, the closing fill's order defines `exit_reason`, and blocked reasons remain in logs only.
+ 
+ ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
+ 
+@@ -2560,7 +2556,7 @@ All values live in `core/config.py`'s `Settings` (the repository's single source
+ 
+ ## 7. Forks — six resolved by decision #170, the rest still open
+ 
+-Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29 (decision #185), and the simulated EOD path is now built end to end (`simulated-eod-flatten-foundation` through `simulated-eod-flatten-integration`), with session-aware protective retries added by `simulated-protective-session-retry`. EX-12 remains open: the `OutcomeRecorder` is proposed in §6.7.1, not built.
++Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29 (decision #185), and the simulated EOD path is now built end to end (`simulated-eod-flatten-foundation` through `simulated-eod-flatten-integration`), with session-aware protective retries added by `simulated-protective-session-retry`. EX-12 option (a) is built for simulated auto trades in §6.7.1.
+ 
+ | Fork | Question | Status | Outcome / recommendation |
+ |---|---|---|---|
+@@ -2575,7 +2571,7 @@ Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2,
+ | EX-9 | Identity and payloads | OPEN in part — proceed on recommendation | the client-order-ID part is settled by I10; `opportunity_id` minting, new models, venue-level rejection event remain |
+ | EX-10 | Durability | **Settled by I12** | ledger-first; `market_events` stays independent future work |
+ | EX-11 | Exit enforcement | OPEN — proceed on recommendation | in-process for simulated; broker-side mandatory before any real venue |
+-| EX-12 | Who writes `StrategyOutcome`; what belongs in it | OPEN — needs confirmation | `OutcomeRecorder`; strategy-attributed trades only (contract proposed in §6.7.1; **not built**) |
++| EX-12 | Who writes `StrategyOutcome`; what belongs in it | RESOLVED for simulated auto trades | Dedicated ledger-driven `OutcomeRecorder`; strategy-attributed trades only (§6.7.1) |
+ | EX-13 | Manual mode in the first build | OPEN — proceed on recommendation | no — keep the placement-mode seam |
+ | EX-14 | `BUY/SELL` vs `long/short`; position effect | OPEN — proceed on recommendation | keep `BUY/SELL` on orders + explicit `position_effect` |
+ 
+@@ -2647,12 +2643,12 @@ authorization policy here.
+ **Options.** (a) **In-process monitoring** (Position Monitor-lite) — the only option for a simulated venue. (b) **Broker-side protective orders** (bracket/OCO) — required for any real venue because a process crash must not leave an unprotected position; the venue port's instruction has no stop fields yet.
+ **Recommendation.** (a) for slice A; **(b) recorded as a hard prerequisite** for any real-money venue (§8).
+ 
+-### EX-12 — Who writes `StrategyOutcome`; what belongs in it  · OPEN · needs Saqib's confirmation
++### EX-12 — Who writes `StrategyOutcome`; what belongs in it  · RESOLVED for simulated auto trades
+ **Question.** F10a and F13: `PositionClosed{position_id, exit_price, realized_pnl, r_multiple_achieved, closed_ts}` (prose) cannot build a `StrategyOutcome`, and a strategy-less manual trade cannot be one at all.
+ **Options.** (a) A dedicated **`OutcomeRecorder`** joins the `trades`/`orders`/`fills` ledger with persisted snapshots; **`strategy_outcomes` holds strategy-attributed trades only** (corroborated manual trades included), while `trades` records everything. (b) **Enrich `PositionClosed`** so Performance Intelligence can build the row from the event alone. (c) **Relax the NOT NULL columns** so strategy-less manual trades fit `strategy_outcomes`.
+ **Consequence.** (b) fattens an event with data the ledger already holds; (c) is a broad schema change that dilutes what `strategy_outcomes` means (evidence about strategy configurations). The `execution_mode`/`execution_venue` columns (EX-2) apply to whichever rows it holds.
+ **Recommendation.** (a). The §6.7 design already assumes it.
+-**Proposal awaiting confirmation (`outcome-recorder-contract`).** §6.7.1 refines (a) against the backend code at `f517834` (unchanged through `3c23701`): field-by-field source map, writer behavior, atomic linkage, diagrams and the one decision to confirm. EX-12 stays OPEN until Saqib confirms it.
++**Approved and built (`outcome-recorder-contract`).** §6.7.1 records option (a)'s as-built field map, writer behavior, atomic linkage and diagrams. Manual and paper/live paths remain outside this delivery.
+ 
+ ### EX-13 — Manual mode in the first build  · OPEN
+ **Options.** (a) **Not in scope** — the placement-mode gate (`auto|manual`, §18.5's `ExecutionMode`) exists as a seam (`auto` only); Approval Queue, Input Layer, and `TradeRequest` wait. (b) **In scope.**
+@@ -2667,7 +2663,7 @@ authorization policy here.
+ ### 7.1 Historical build prerequisites and remaining choices
+ 
+ 1. **EX-5 (historical prerequisite)** — simulated stop/target is implemented by `simulated-protective-exits`. Simulated EOD policy was approved on 2026-09-29 and is now implemented (window helper, monitor timer, exit ledger, Execution worker, startup restore; §6.6). No EX-5 prerequisite remains open for the simulated slice.
+-2. **EX-12** — confirm that `strategy_outcomes` holds strategy-attributed trades only, with `trades` recording everything and `OutcomeRecorder` as the writer.
++2. **EX-12** — resolved for simulated auto trades; manual and paper/live attribution remain future work.
+ 3. **Judgment calls made in this revision — confirm or overrule:**
+    - **J1 — naming.** `trading-intelligence-architecture.md` §18.5's `ExecutionMode` (`auto|manual`) is called *placement mode* here, so that `execution_mode` means the capital mode and nothing else (§10, R7).
+    - **J2 — the daily-loss gate also counts the candidate trade's own stop-out loss** ("open risk"), so at the initial values a $1,000 trade whose stop is more than 10% away is refused even on a clean day.
+@@ -2696,7 +2692,7 @@ These are recorded so they are not rediscovered; none is recommended for now.
+ 
+ ## 9. Acceptance criteria proposed for the eventual build task
+ 
+-*Historical proposal, not a status checklist, and not audited by `execution-status-doc-sync`. Criteria that depend on the `OutcomeRecorder` (1, 2, 14, 21 and part of 9) cannot be met while EX-12 is open; the tests actually shipped are listed in `TESTING.md`.*
++*Historical proposal, not a status checklist. EX-12's recorder is now built for simulated auto trades; the tests actually shipped are listed in `TESTING.md`.*
+ 
+ **Lifecycle**
+ 1. **End-to-end fixture:** a scripted `OpportunityCreated` produces exactly one `strategy_outcomes` row — `execution_mode = 'simulated'`, `execution_venue = 'simulated'`, `is_backtest = false`, `origin = 'auto'`, every field per §4 — via the real Execution Engine, `SimulatedVenue`, Portfolio State, Position Monitor-lite, and `OutcomeRecorder`, against real PostgreSQL 16.
+diff --git a/docs/architecture/strategy-engine-open-decisions.md b/docs/architecture/strategy-engine-open-decisions.md
+index 134de52..29980f0 100644
+--- a/docs/architecture/strategy-engine-open-decisions.md
++++ b/docs/architecture/strategy-engine-open-decisions.md
+@@ -6,6 +6,8 @@
+ 
+ ---
+ 
++**D17 current status (EX-12):** The long D17 row below preserves its decision #158 historical audit. Its “live path still open” status has been superseded for simulated auto trades: the built `OutcomeRecorder` writes nullable snapshots with machine-readable reasons under the existing EX-7 contract, while Backtest Runner still discards trades lacking any required snapshot. Paper/live and manual outcome writing remain outside EX-12's delivered slice. See `execution-engine-design.md` §6.7.1.
++
+ ## 10. Open decisions — still genuinely open
+ 
+ | # | Decision needed | Status |
+diff --git a/docs/architecture/system-design.md b/docs/architecture/system-design.md
+index 718ffca..c84dd9f 100644
+--- a/docs/architecture/system-design.md
++++ b/docs/architecture/system-design.md
+@@ -2,7 +2,7 @@
+ **Version:** 2.11 (Pre-Implementation) — §1, §4.5, §4.11 updated for the chart→Feature Engine migration (`confirmed-decisions.md` #50–51; full plan: `feature-engine-chart-migration.md`); §4.5 also notes the Daily Levels direction lock (`confirmed-decisions.md` #59; full plan: `daily-levels-design.md`); §4.5/§4.8 also note the Strategy Engine direction lock (`confirmed-decisions.md` #87–88; full plan: `strategy-engine-design.md`)
+ **Status:** Phase 2 kickoff — Event Bus dispatch lanes and shared update-policy utility added
+ **Owner:** Saqib
+-**Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) — how the system thinks (market state, context, strategy, decision logic). [`feature-engine-chart-migration.md`](./feature-engine-chart-migration.md) — the stage-by-stage plan moving chart-drawn indicators onto Feature Engine as their single source (confirmed decision #50), tracked there rather than re-derived from this doc each session. [`daily-levels-design.md`](./daily-levels-design.md) — the stage-by-stage plan for the Daily Levels support/resistance clustering indicator (confirmed decision #59), all four stages built (decisions #60–#65). [`feature-engine-indicator-expansion.md`](./feature-engine-indicator-expansion.md) — the stage-by-stage plan for ATR/Session Change/Gap/Regression/KAMA (confirmed decision #67), all five families built (decisions #67–#71). [`strategy-engine-design.md`](./strategy-engine-design.md) — Strategy Engine internals, versioned `StrategyConfig`, and the `Opportunity` schema extension below (confirmed decisions #87, #99), ORB (Stage 1's first strategy) built. As of `split-strategy-engine-design-doc` (decision #142), three parts of that plan live in their own sibling files: [`backtest-runner-design.md`](./backtest-runner-design.md) (formerly its §7), [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (formerly its §10), [`strategy-engine-build-history.md`](./strategy-engine-build-history.md) (formerly its §14–§18). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) — concepts raised and deliberately deferred, with reasoning intact, so they aren't lost or re-argued from scratch. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) — the running settled-decisions log. [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) — phased delivery plan and exit criteria. [`execution-engine-design.md`](./execution-engine-design.md) — design for the Execution Engine and Portfolio State — approved in principle (simulated-venue automatic path first) and amended by decision #170; verified as-built inventory, the implementation specification for that slice, and the forks still open (EX-8, EX-9, EX-11–EX-14; EX-12's `OutcomeRecorder` is proposed, not built). This doc explains how the system is built. Read all of them; they're deliberately kept separate. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
++**Companion documents:** [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) — how the system thinks (market state, context, strategy, decision logic). [`feature-engine-chart-migration.md`](./feature-engine-chart-migration.md) — the stage-by-stage plan moving chart-drawn indicators onto Feature Engine as their single source (confirmed decision #50), tracked there rather than re-derived from this doc each session. [`daily-levels-design.md`](./daily-levels-design.md) — the stage-by-stage plan for the Daily Levels support/resistance clustering indicator (confirmed decision #59), all four stages built (decisions #60–#65). [`feature-engine-indicator-expansion.md`](./feature-engine-indicator-expansion.md) — the stage-by-stage plan for ATR/Session Change/Gap/Regression/KAMA (confirmed decision #67), all five families built (decisions #67–#71). [`strategy-engine-design.md`](./strategy-engine-design.md) — Strategy Engine internals, versioned `StrategyConfig`, and the `Opportunity` schema extension below (confirmed decisions #87, #99), ORB (Stage 1's first strategy) built. As of `split-strategy-engine-design-doc` (decision #142), three parts of that plan live in their own sibling files: [`backtest-runner-design.md`](./backtest-runner-design.md) (formerly its §7), [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (formerly its §10), [`strategy-engine-build-history.md`](./strategy-engine-build-history.md) (formerly its §14–§18). [`../decisions/future-ideas.md`](../decisions/future-ideas.md) — concepts raised and deliberately deferred, with reasoning intact, so they aren't lost or re-argued from scratch. [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) — the running settled-decisions log. [`../roadmap/phase-roadmap.md`](../roadmap/phase-roadmap.md) — phased delivery plan and exit criteria. [`execution-engine-design.md`](./execution-engine-design.md) — design for the Execution Engine and Portfolio State — approved in principle (simulated-venue automatic path first) and amended by decision #170; verified as-built inventory, the implementation specification for that slice, and the forks still open (EX-8, EX-9, EX-11, EX-13 and EX-14; EX-12's simulated auto-trade `OutcomeRecorder` is built). This doc explains how the system is built. Read all of them; they're deliberately kept separate. See [`../README.md`](../README.md) for how the whole `docs/` tree is organized.
+ 
+ ---
+ 
+@@ -85,7 +85,7 @@ execution_mode = simulated           live/paper — not built]
+      └───────────────┘        └──────────────────────┘
+ ```
+ 
+-The Position Monitor → Performance Intelligence edge above is target shape: the writer that would carry it (`OutcomeRecorder`, EX-12) is proposed, not built, and Position Monitor-lite hands exit intents to the Execution Engine rather than to Performance Intelligence.
++The Position Monitor → Performance Intelligence edge above is mediated by the ledger: Position Monitor-lite hands exit intents to Execution, Portfolio State commits closures, and the built `OutcomeRecorder` reads those durable facts after a `PositionClosed` hint or recovery scan (§6.7.1). It records simulated strategy-attributed auto trades only.
+ 
+ All cross-module traffic flows through interfaces or the Event Bus — no module reaches into another's internals. The WebSocket Gateway is just one Event Bus subscriber among several; it exists to re-publish a subset of internal events to the frontend, not to define the internal communication pattern.
+ 
+@@ -405,9 +405,9 @@ closed. EOD is a best-effort placement in the entry day's `[close − lead, clos
+ not a guarantee of closure by the bell, and the holiday/early-close calendar it relies on is
+ verified for 2026–2028 only (EOD fails closed for any other entry year). The order and fill
+ ledger remain authoritative. Not built: paper/live protection, broker-side protective
+-orders, manual exits, and the `OutcomeRecorder` that would record live outcomes (proposed in
+-`execution-engine-design.md` §6.7.1; EX-12 open). See `execution-engine-design.md` §6.6 for
+-the data and internal flows.
++orders and manual exits. The `OutcomeRecorder` records closed simulated auto trades from
++the ledger, with `PositionClosed` used only as a hint (`execution-engine-design.md` §6.7.1).
++See `execution-engine-design.md` §§6.6–6.7.1 for the data and internal flows.
+ 
+ ### 4.10 Visualization Engine / Chart Overlay Protocol
+ The backend is the only source of chart truth. It pushes typed **chart objects** over WebSocket; the frontend (TradingView Lightweight Charts as a renderer only) draws whatever it receives — it computes nothing.
+@@ -557,7 +557,7 @@ Single multiplexed connection, topic-tagged envelopes — a thin re-publisher si
+ Frontend subscribes/unsubscribes to channels per symbol as widgets mount/unmount. This avoids one-socket-per-widget sprawl.
+ 
+ ### 4.13 Database (PostgreSQL)
+-Core tables: `symbols`, `candles` (natively partitioned by month, sub-partitioned by timeframe), `trades` (gains an `origin: auto|manual` column and a `pending_confirmation` status once manual trading lands — `trading-intelligence-architecture.md` §18), `orders`, `positions`, `ai_decisions`, `strategy_outcomes` (renamed from `strategy_performance` — decision #89, one row per closed trade; full shape in `strategy-engine-design.md` §5; **built — migration 0008, decision #120**, this clause previously read "no migration yet — the table itself is still not built," true when originally written, stale since decision #120 landed; corrected here — real backtest-derived rows exist since decision #128, zero live-trading rows since no live writer exists — the Execution Engine and Position Monitor-lite are built (simulated only), but the `OutcomeRecorder` that would write one is proposed, not built (`execution-engine-design.md` §6.7.1, EX-12); decision #98's `app/trading_intelligence/state_snapshot.py` provides the real read contract its `market_state_at_entry/_at_exit`/`context_at_entry/_at_exit` fields draw from), `workspace_layouts`, `watchlists`. Alembic manages migrations from day one so schema drift never becomes a manual-SQL problem.
++Core tables: `symbols`, `candles` (natively partitioned by month, sub-partitioned by timeframe), `trades` (gains an `origin: auto|manual` column and a `pending_confirmation` status once manual trading lands — `trading-intelligence-architecture.md` §18), `orders`, `positions`, `ai_decisions`, `strategy_outcomes` (renamed from `strategy_performance` — decision #89, one row per closed trade; full shape in `strategy-engine-design.md` §5; **built — migration 0008, decision #120**, this clause previously read "no migration yet — the table itself is still not built," true when originally written, stale since decision #120 landed; corrected here — real backtest-derived rows exist since decision #128, the simulated auto-trade writer is built via `OutcomeRecorder` (`execution-engine-design.md` §6.7.1, EX-12), while paper/live and manual outcome writing remain unbuilt; decision #98's `app/trading_intelligence/state_snapshot.py` provides the real read contract its `market_state_at_entry/_at_exit`/`context_at_entry/_at_exit` fields draw from), `workspace_layouts`, `watchlists`. Alembic manages migrations from day one so schema drift never becomes a manual-SQL problem.
+ 
+ New in this revision, added to support explainability and Market State's temporal memory (see companion doc):
+ - **`feature_snapshots`** — the exact `FeatureSet` values at the moment a strategy produced an opportunity. Answers "why did the AI say this" by query, not by recomputation.
+diff --git a/docs/decisions/INDEX.md b/docs/decisions/INDEX.md
+index 5ebce8f..53022c4 100644
+--- a/docs/decisions/INDEX.md
++++ b/docs/decisions/INDEX.md
+@@ -190,3 +190,4 @@ One line per confirmed decision across every file in this directory. Read this f
+ | 183 | `GET /intelligence/execution-fills` — first HTTP route over the `fills` ledger (decision #172). `fills` is joined to `orders` (`Fill` has no `execution_mode`/`symbol` column) and hard-scoped to `Order.execution_mode == "simulated"` (not a parameter); optional exact `symbol`; `limit` bounded `[1, 100]` default 50; ordered by `fills.ledger_seq` descending. Curated fields only; `price`/`commission` returned as exact decimal strings, unknown `commission` as `null`. Sync read in `_fetch_execution_fills()` via `asyncio.to_thread`, session opened and closed inside the worker. Read-only — no write, migration, trading control, or UI. Findings: `TestClient` boot reconciles hand-inserted fills into positions/receipts; overfill is flagged retroactively; a double `TestClient` boot in one test fails at bus shutdown (unchanged, tests split). | `archive/161-184.md` |
+ | 184 | Simulated stop/target observations now create durable position-bound exit requests and close-order reservations. Execution cancels unfinished entries, waits for fill receipts, rechecks reduce-only facts before placement, and retries failed closes with new attempt IDs. Fresh simulated-venue position loss blocks startup; EOD, paper/live exits, and live outcome writing remain outside this resolution. | `archive/161-184.md` |
+ | 185 | Saqib approved simulated EOD's reduce-only entry-day placement window, durable first stop/target fallback, working accepted order after close, and post-opening tick-only label. Built the shared covered-calendar UTC window helper, read-only MarketClock coverage accessor and 1–900-second config; EOD timer, ledger, orders, recovery and UI remain unbuilt. | `confirmed-decisions.md` |
++| 186 | EX-12 option (a): the dedicated simulated `OutcomeRecorder` owns non-backtest strategy-attributed outcomes, replays target-position receipts, captures fill-time snapshots best-effort, blocks missing attribution, and atomically links the strict outcome row. Startup scan and 60-second sweep recover lost closure events; Backtest Runner behavior stays unchanged. | `confirmed-decisions.md` |
+diff --git a/docs/decisions/confirmed-decisions.md b/docs/decisions/confirmed-decisions.md
+index cb57ece..c019f7a 100644
+--- a/docs/decisions/confirmed-decisions.md
++++ b/docs/decisions/confirmed-decisions.md
+@@ -16,3 +16,9 @@ the index and rollover protocol.
+ Saqib approved four simulated EOD policies on 2026-09-29: (1) a position-bound reduce-only close needs no new Governor decision and may be attempted only on the entry trading day within `[regular close - 60 seconds, regular close)`, with no next-day EOD catch-up; (2) the first later stop/target observation is a durable fallback, actionable only after EOD placement expires and prior orders/fills are safely settled; (3) an accepted order remains working at the bell, so an after-hours/later fill or indefinite non-fill is possible; and (4) EOD is labelled by a valid post-opening, entry-day tick, with no extra maximum age and no candle label. This is a best-effort flatten attempt, never a guarantee of closure. It extends EX-5 option (a) to simulated EOD policy only; paper/live and EX-12 remain unresolved.
+ 
+ This delivery implements only the shared foundation: `core.session_window.eod_session_window(clock, opened_at, lead_seconds=60)` returns UTC `EodSessionWindow(flatten_at, close_at)` for a covered trading day; `contains(now)` implements the exact inclusive/exclusive bounds. A covered holiday/weekend returns `None`; a year without calendar coverage raises `UnsupportedEodCalendarError`. `MarketClock.has_calendar_for_year()` exposes read-only 2026 coverage without changing existing session methods. Settings validates the configured lead in `1..900`. The new tests cover both half-days, DST, exact boundaries, invalid inputs, unsupported years and parity with Backtest Runner's close derivation on every supported 2026 trading day. The 78 relevant focused and existing tests passed. Position Monitor timing/handoff, durable exit request and dispatch transitions, migration, Execution wiring, reconciliation and frontend are subsequent tasks; no EOD order can execute from this foundation alone. §6.6 contains the approved contract, diagrams and remaining acceptance cases.
++
++### 186. Simulated OutcomeRecorder owns strategy-attributed non-backtest outcomes (`outcome-recorder-contract`)
++
++Saqib approved EX-12 option (a): a dedicated `OutcomeRecorder` is the sole writer of non-backtest `strategy_outcomes`; the ledger supplies every outcome fact and `PositionClosed` only wakes the worker. This delivery covers closed, strategy-attributed simulated auto trades. The strict outcome schema stays unchanged. Missing required evidence, a valid structural R basis, exit reason, or consistent ledger attribution marks `trades.outcome_status = blocked` and logs a reason code; it never invents evidence, a snapshot, commission, or R. An earlier approval without `trades.thesis["evidence"]` is not backfilled and blocks as `evidence_unavailable`. The Governor's strict JSON evidence persistence was merged earlier at `79650ad` and is reused unchanged; `signal_confirmed_at` stays NULL because no producer sets it.
++
++The recorder captures entry snapshots best-effort at the first entry fill, without holding up fill persistence, and exit snapshots only within 60 seconds of closure; unavailable snapshots use NULL with machine-readable reasons. It replays only the target position's durable receipts through canonical `apply_fill`, preserves partial-fill VWAPs, gross/known-fee rules and the closing order's `exit_reason`, and computes direction-aware R from the authorization-time structural invalidation. A same-session performance writer stages all fields without owning the caller's commit; the Backtest Runner's existing wrapper remains. The recorder acquires ledger table locks before the trade row lock, rechecks closure and outcome linkage, then inserts the outcome and links `trades.outcome_id` atomically. Startup scan and a bounded 60-second sweep recover lost events and closures applied before recorder subscription. Recorder startup failure logs CRITICAL without changing an otherwise ready execution startup; reconciliation-blocked startup does not run it, and shutdown stops it after Portfolio State. No migration or paper/live/manual path is included. §6.7.1 contains the as-built source map and diagrams; `TESTING.md` records real PostgreSQL verification and the full backend suite.
+diff --git a/docs/roadmap/phase-roadmap.md b/docs/roadmap/phase-roadmap.md
+index 5b850ad..fa4e081 100644
+--- a/docs/roadmap/phase-roadmap.md
++++ b/docs/roadmap/phase-roadmap.md
+@@ -30,7 +30,7 @@ Status as of decision #164 (baseline `main` through decision #163) for Phases 1
+   - *Calendar.* `MarketClock` holds verified holidays and early closes for 2026, 2027 and 2028 only; the EOD window fails closed (`UnsupportedEodCalendarError`) for any other entry year.
+   - *Session-aware protective retries.* A stop/target close, including the fallback after an expired EOD row, is neither reserved nor sent while `MarketClock.is_regular_session()` is false, so a rejected after-hours close no longer mints a new attempt every five seconds; it resumes at the next regular open.
+   - *Read surfaces.* `GET /intelligence/exit-intents`, `execution-orders`, `execution-fills`, `execution-positions` and `execution-exit-requests` feed the Execution panel (`ExecutionLifecyclePanel.tsx`), and the World View Portfolio State slot reads the running, restored Portfolio State (decision #177).
+-  **Still not built:** the `OutcomeRecorder` and any live writer to `strategy_outcomes` (`record_strategy_outcome()` has no live caller; the contract in `execution-engine-design.md` §6.7.1 is a proposal and EX-12 remains open); Opportunity ranking, Decision Engine and Trade Planning (the stub stands in for them); a real Governor rule engine; any paper or live venue (`IBKRAdapter.place_order()` still raises `NotImplementedError`, and there is no IBKR order venue or broker-side protective order); manual mode and the Approval Queue; and Position Monitor's thesis, weakening, stop-management and partial-exit logic. The Phase 6 exit criteria are therefore not met as written: the built path produces simulated orders, not paper orders, and Position Monitor-lite does not flag positions as "weakening". Performance Intelligence is partial but substantial: persistence (#120), queries and corrections (#122/#124), routes and UI (#123, #127, #133, #137–#139, #162), and the Backtest Runner writer (#128) exist, while the live half stays empty. Backtest Runner is built for fixture replay, isolated IBKR acquisition, and sweeps (decisions #128, #131, #145, #159, and #163). The World View read facade and frontend surface are built (decisions #150, #154 and #177); its Portfolio State slot returns `null` when the execution pipeline did not start or the snapshot is unavailable (decision #177).
++  **Still not built:** paper/live and manual outcome writing (the simulated auto-trade `OutcomeRecorder` is built per `execution-engine-design.md` §6.7.1); Opportunity ranking, Decision Engine and Trade Planning (the stub stands in for them); a real Governor rule engine; any paper or live venue (`IBKRAdapter.place_order()` still raises `NotImplementedError`, and there is no IBKR order venue or broker-side protective order); manual mode and the Approval Queue; and Position Monitor's thesis, weakening, stop-management and partial-exit logic. The Phase 6 exit criteria are therefore not met as written: the built path produces simulated orders, not paper orders, and Position Monitor-lite does not flag positions as "weakening". Performance Intelligence is partial but substantial: persistence (#120), queries and corrections (#122/#124), routes and UI (#123, #127, #133, #137–#139, #162), and the Backtest Runner writer (#128) exist, while the simulated auto-trade writer is built and paper/live outcome writing remains open. Backtest Runner is built for fixture replay, isolated IBKR acquisition, and sweeps (decisions #128, #131, #145, #159, and #163). The World View read facade and frontend surface are built (decisions #150, #154 and #177); its Portfolio State slot returns `null` when the execution pipeline did not start or the snapshot is unavailable (decision #177).
+ 
+ ```
+ Market data / Feature Engine [built]
+@@ -58,8 +58,8 @@ SimulatedVenue [built]        Position Monitor-lite [built: stop/target/EOD time
+ IBKR order venue [not built]
+               |
+               v
+-OutcomeRecorder / EX-12 [PROPOSED, not built] ---> Performance Intelligence
+-                                                    [partial: backtest writer built; no live writer]
++OutcomeRecorder / EX-12 [simulated auto built] ---> Performance Intelligence
++                                                    [backtest and simulated auto-trade writers built]
+               |
+               v
+ World View facade [built; Portfolio State slot is null when the pipeline is not running]
+diff --git a/backend/app/trading_intelligence/outcome_recorder.py b/backend/app/trading_intelligence/outcome_recorder.py
+new file mode 100644
+index 0000000..aa9b838
+--- /dev/null
++++ b/backend/app/trading_intelligence/outcome_recorder.py
+@@ -0,0 +1,407 @@
++"""Simulated outcome writer. Events wake this worker; applied receipts supply facts."""
++from __future__ import annotations
++
++import asyncio
++import logging
++from datetime import datetime, timezone
++from decimal import Decimal, ROUND_HALF_UP
++from uuid import UUID, uuid4
++
++from pydantic import ValidationError
++from sqlalchemy import func, select, tuple_
++from sqlalchemy.exc import IntegrityError, SQLAlchemyError
++
++from app.db.ledger_transaction import ledger_transaction
++from app.models.execution_ledger import Fill, Order, Position, PositionFillReceipt, Trade, TradeReservation
++from app.portfolio_state.accounting import apply_fill, decimal
++from app.portfolio_state.postgres import _decode
++from app.schemas.events.envelope import EventType
++from app.schemas.events.execution import OrderFilled, PositionClosed
++from app.schemas.performance import StrategyOutcome
++from app.trading_intelligence.performance import record_strategy_outcome_in_session
++from app.trading_intelligence.state_snapshot import capture_strategy_outcome_snapshots
++
++logger = logging.getLogger(__name__)
++_STOP = object()
++_CENT = Decimal("0.000001")
++
++
++class OutcomeBlocked(Exception):
++    """The durable ledger cannot support a truthful outcome without repair."""
++
++
++def _price(value):
++    result = decimal(value).quantize(_CENT, rounding=ROUND_HALF_UP)
++    if result <= 0:
++        raise ValueError("price must be positive")
++    return result
++
++
++def realized_r(entry, exit, basis, direction):
++    """Direction-aware planned-risk R, using the immutable structural basis."""
++    entry, exit, basis = _price(entry), _price(exit), _price(basis)
++    risk = abs(entry - basis)
++    if not risk or direction not in {"BUY", "SELL"}:
++        raise ValueError("R basis is unavailable")
++    return float(((exit - entry) * (1 if direction == "BUY" else -1)) / risk)
++
++
++def _capture(symbol: str, suffix: str, *, missing_reason: str = "engine_cold_start"):
++    market = context = None
++    reasons = {}
++    try:
++        snapshots = capture_strategy_outcome_snapshots(symbol)
++        market, context = snapshots.market_state, snapshots.context
++    except Exception:
++        logger.exception("Outcome snapshot capture failed for %s", symbol)
++        missing_reason = "snapshot_capture_error"
++    for key, value in ((f"market_state_at_{suffix}", market), (f"context_at_{suffix}", context)):
++        if value is None:
++            reasons[key] = missing_reason
++    return market, context, reasons
++
++
++class OutcomeRecorder:
++    def __init__(self, bus, session_factory, *, snapshot_max_lag_seconds=60, sweep_interval_seconds=60,
++                 batch_size=100):
++        self._bus = bus
++        self._sessions = session_factory
++        self._lag = snapshot_max_lag_seconds
++        self._interval = sweep_interval_seconds
++        self._batch_size = batch_size
++        self._queue = asyncio.Queue()
++        self._queued = set()
++        self._worker = None
++        self._sweeper = None
++        self._started_at = datetime.now(timezone.utc)
++        self._subscribed = False
++        self._scan_cursor = None
++
++    async def start(self):
++        if self._worker is not None:
++            return
++        self._started_at = datetime.now(timezone.utc)
++        self._bus.subscribe(EventType.ORDER_FILLED, self._on_fill)
++        self._bus.subscribe(EventType.POSITION_CLOSED, self._on_close)
++        self._subscribed = True
++        try:
++            self._worker = asyncio.create_task(self._work(), name="outcome-recorder")
++            await self._startup_scan()
++            self._sweeper = asyncio.create_task(self._sweep(), name="outcome-recorder-sweep")
++        except Exception:
++            await self.stop()
++            raise
++
++    async def stop(self):
++        if self._subscribed:
++            self._bus.unsubscribe(EventType.ORDER_FILLED, self._on_fill)
++            self._bus.unsubscribe(EventType.POSITION_CLOSED, self._on_close)
++            self._subscribed = False
++        if self._sweeper is not None:
++            self._sweeper.cancel()
++            try:
++                await self._sweeper
++            except asyncio.CancelledError:
++                pass
++            self._sweeper = None
++        if self._worker is not None:
++            await self._queue.join()
++            self._queue.put_nowait(_STOP)
++            await self._worker
++            self._worker = None
++
++    def _enqueue(self, kind, identity):
++        key = kind, identity
++        if key not in self._queued:
++            self._queued.add(key)
++            self._queue.put_nowait(key)
++
++    def _on_fill(self, envelope):
++        payload = OrderFilled.model_validate(envelope.payload)
++        self._enqueue("entry", payload.order_id)
++
++    def _on_close(self, envelope):
++        payload = PositionClosed.model_validate(envelope.payload)
++        if payload.trade_id:
++            self._enqueue("close", UUID(payload.trade_id))
++
++    async def _startup_scan(self):
++        cursor = None
++        while True:
++            rows = await asyncio.to_thread(self._pending_rows, cursor)
++            for closed_at, trade_id in rows:
++                self._enqueue("close", trade_id)
++            if len(rows) < self._batch_size:
++                return
++            cursor = rows[-1]
++            await asyncio.sleep(0)
++
++    async def scan(self):
++        """Enqueue one bounded page, rotating through older pending closures."""
++        rows = await asyncio.to_thread(self._pending_rows, self._scan_cursor)
++        if not rows and self._scan_cursor is not None:
++            self._scan_cursor = None
++            rows = await asyncio.to_thread(self._pending_rows, None)
++        for closed_at, trade_id in rows:
++            self._enqueue("close", trade_id)
++        if rows:
++            self._scan_cursor = rows[-1]
++
++    def _pending_rows(self, after):
++        with self._sessions() as session:
++            query = (select(Position.closed_at, Trade.trade_id).join(Trade, Position.trade_id == Trade.trade_id)
++                .where(Trade.decision == "approved", Trade.status == "closed", Trade.execution_mode == "simulated",
++                       Trade.origin == "auto", Trade.outcome_id.is_(None),
++                       func.coalesce(Trade.outcome_status, "pending") != "blocked")
++                .order_by(Position.closed_at, Trade.trade_id).limit(self._batch_size))
++            if after is not None:
++                query = query.where(tuple_(Position.closed_at, Trade.trade_id) > after)
++            return session.execute(query).all()
++
++    async def _sweep(self):
++        while True:
++            await asyncio.sleep(self._interval)
++            try:
++                await self.scan()
++            except Exception:
++                logger.exception("OutcomeRecorder sweep failed; next sweep will retry")
++
++    async def _work(self):
++        while True:
++            item = await self._queue.get()
++            try:
++                if item is _STOP:
++                    return
++                kind, identity = item
++                if kind == "entry":
++                    await self.capture_entry(identity)
++                else:
++                    await self.record_trade(identity)
++            except Exception:
++                logger.exception("OutcomeRecorder work item failed: %s", item)
++            finally:
++                self._queued.discard(item)
++                self._queue.task_done()
++
++    async def capture_entry(self, order_id):
++        details = await asyncio.to_thread(self._entry_candidate, order_id)
++        if details is None:
++            return
++        trade_id, symbol, first_ts = details
++        reason = "engine_state_lost_on_restart" if first_ts < self._started_at else "engine_cold_start"
++        market, context, reasons = _capture(symbol, "entry", missing_reason=reason)
++        try:
++            await asyncio.to_thread(self._store_entry, trade_id, market, context, reasons)
++        except Exception:
++            logger.exception("Entry snapshot unavailable for trade_id=%s; outcome will record NULL + reason", trade_id)
++
++    def _entry_candidate(self, order_id):
++        with self._sessions() as session:
++            order = session.scalar(select(Order).where(Order.client_order_id == order_id))
++            if order is None or order.position_effect != "open":
++                return None
++            trade = session.get(Trade, order.trade_id)
++            if trade is None or trade.status == "closed" or (trade.execution_mode, trade.execution_venue, trade.origin, trade.decision) != (
++                "simulated", "simulated", "auto", "approved") or trade.entry_snapshot_captured_at is not None or trade.entry_snapshot_missing_reasons is not None:
++                return None
++            fills = session.scalars(select(Fill).join(Order, Fill.client_order_id == Order.client_order_id)
++                                    .where(Order.trade_id == trade.trade_id, Order.position_effect == "open")
++                                    .order_by(Fill.ledger_seq).limit(2)).all()
++            if len(fills) != 1:  # a later fill must never be labelled the entry snapshot
++                return None
++            return trade.trade_id, trade.symbol, fills[0].venue_ts
++
++    def _store_entry(self, trade_id, market, context, reasons):
++        # Same table-before-row order as ledger_transaction and commit_fill.
++        with ledger_transaction(self._sessions, SQLAlchemyError) as session:
++            trade = session.scalar(select(Trade).where(Trade.trade_id == trade_id).with_for_update())
++            if trade is None or trade.status == "closed" or trade.entry_snapshot_captured_at is not None or trade.entry_snapshot_missing_reasons is not None:
++                return
++            trade.entry_market_state = market
++            trade.entry_context = context
++            trade.entry_snapshot_missing_reasons = reasons or None
++            trade.entry_snapshot_captured_at = datetime.now(timezone.utc)
++
++    async def record_trade(self, trade_id):
++        details = await asyncio.to_thread(self._close_candidate, trade_id)
++        if details is None:
++            return "skipped"
++        symbol, closed_at = details
++        now = datetime.now(timezone.utc)
++        if closed_at is None or (now - closed_at).total_seconds() > self._lag:
++            market = context = None
++            reasons = {"market_state_at_exit": "recorder_unavailable", "context_at_exit": "recorder_unavailable"}
++        else:
++            market, context, reasons = _capture(symbol, "exit")
++        try:
++            return await asyncio.to_thread(self._record_locked, trade_id, market, context, reasons)
++        except SQLAlchemyError:
++            logger.exception("OutcomeRecorder transient failure trade_id=%s", trade_id)
++            try:
++                await asyncio.to_thread(self._mark_retry, trade_id)
++            except Exception:
++                logger.exception("OutcomeRecorder could not mark pending_retry trade_id=%s", trade_id)
++            return "pending_retry"
++
++    def _close_candidate(self, trade_id):
++        with self._sessions() as session:
++            trade = session.get(Trade, trade_id)
++            if trade is None or trade.outcome_id is not None or trade.outcome_status == "blocked" or trade.status != "closed":
++                return None
++            position = session.scalar(select(Position).where(Position.trade_id == trade_id))
++            closed_at = position.closed_at if position is not None else None
++            return trade.symbol, closed_at
++
++    def _record_locked(self, trade_id, market, context, exit_reasons):
++        try:
++            with ledger_transaction(self._sessions, SQLAlchemyError) as session:
++                trade = session.scalar(select(Trade).where(Trade.trade_id == trade_id).with_for_update())
++                if trade is None or trade.outcome_id is not None or trade.outcome_status == "blocked" or trade.status != "closed":
++                    return "skipped"
++                try:
++                    outcome = self._build(session, trade, market, context, exit_reasons)
++                except OutcomeBlocked as exc:
++                    trade.outcome_status = "blocked"
++                    logger.error("OutcomeRecorder blocked trade_id=%s reason=%s", trade_id, exc)
++                    return "blocked"
++                except (ValidationError, ValueError, TypeError, KeyError) as exc:
++                    trade.outcome_status = "blocked"
++                    logger.error("OutcomeRecorder blocked trade_id=%s reason=contract_validation_failed: %s", trade_id, exc)
++                    return "blocked"
++                record_strategy_outcome_in_session(session, outcome)
++                session.flush()
++                trade.outcome_id = outcome.outcome_id
++                trade.outcome_status = "recorded"
++            return "recorded"
++        except (ValidationError, ValueError, TypeError, KeyError) as exc:
++            return self._block_after_failure(trade_id, "contract_validation_failed", exc)
++        except IntegrityError as exc:
++            return self._block_after_failure(trade_id, "write_rejected", exc)
++
++    def _block_after_failure(self, trade_id, reason, exc):
++        logger.error("OutcomeRecorder blocked trade_id=%s reason=%s: %s", trade_id, reason, exc)
++        with ledger_transaction(self._sessions, SQLAlchemyError) as session:
++            trade = session.scalar(select(Trade).where(Trade.trade_id == trade_id).with_for_update())
++            if trade is not None and trade.outcome_id is None:
++                trade.outcome_status = "blocked"
++        return "blocked"
++
++    def _mark_retry(self, trade_id):
++        with ledger_transaction(self._sessions, SQLAlchemyError) as session:
++            trade = session.scalar(select(Trade).where(Trade.trade_id == trade_id).with_for_update())
++            if trade is not None and trade.outcome_id is None and trade.outcome_status != "blocked":
++                trade.outcome_status = "pending_retry"
++
++    def _build(self, session, trade, market, context, exit_reasons):
++        if (trade.decision, trade.origin, trade.execution_mode, trade.execution_venue) != (
++            "approved", "auto", "simulated", "simulated"):
++            raise OutcomeBlocked("unsupported_mode")
++        positions = session.scalars(select(Position).where(Position.trade_id == trade.trade_id)).all()
++        if len(positions) != 1 or positions[0].status != "closed":
++            raise OutcomeBlocked("multi_position_trade")
++        projection = positions[0]
++        receipts = session.scalars(select(PositionFillReceipt).where(
++            PositionFillReceipt.position_id == projection.position_id).order_by(PositionFillReceipt.ledger_seq)).all()
++        if not receipts:
++            raise OutcomeBlocked("ledger_inconsistent")
++        days = {receipt.trading_day for receipt in receipts}
++        if len(days) != 1:
++            raise OutcomeBlocked("multi_day_position")
++        state = None
++        first = last = None
++        for receipt in receipts:
++            try:
++                fill = _decode(receipt.fill_data)
++                if (fill.trade_id, fill.execution_mode, fill.execution_venue, fill.symbol) != (
++                    trade.trade_id, "simulated", "simulated", trade.symbol):
++                    raise OutcomeBlocked("ledger_inconsistent")
++                source_fill = session.get(Fill, receipt.ledger_seq)
++                source_order = session.scalar(select(Order).where(Order.client_order_id == fill.client_order_id))
++                if source_fill is None or source_order is None or source_fill.anomaly or (
++                    source_fill.client_order_id, source_fill.execution_venue, source_fill.venue_fill_id,
++                    source_fill.qty, decimal(source_fill.price), source_fill.venue_ts,
++                    None if source_fill.commission is None else decimal(source_fill.commission),
++                ) != (
++                    fill.client_order_id, fill.execution_venue, fill.venue_fill_id,
++                    fill.qty, fill.price, fill.venue_ts, fill.commission,
++                ) or (
++                    source_order.trade_id, source_order.execution_mode, source_order.execution_venue,
++                    source_order.symbol, source_order.side, source_order.position_effect,
++                ) != (
++                    fill.trade_id, fill.execution_mode, fill.execution_venue,
++                    fill.symbol, fill.side, fill.position_effect,
++                ):
++                    raise OutcomeBlocked("ledger_inconsistent")
++                state = apply_fill(state, fill, new_position_id=projection.position_id if state is None else None).position
++            except (ValueError, TypeError, KeyError, ArithmeticError):
++                raise OutcomeBlocked("ledger_inconsistent") from None
++            if first is None:
++                first = fill
++            last = fill
++        if state.status != "closed" or state.qty != 0 or state.entry_qty != state.exit_qty or (
++            (state.trade_id, state.execution_mode, state.execution_venue, state.symbol, state.side) !=
++            (projection.trade_id, projection.execution_mode, projection.execution_venue, projection.symbol, projection.side) or
++            state.opened_at != projection.opened_at or state.closed_at != projection.closed_at or
++            state.avg_price.quantize(_CENT, rounding=ROUND_HALF_UP) != projection.avg_price or
++            state.realized_pnl.quantize(_CENT, rounding=ROUND_HALF_UP) != projection.realized_pnl):
++            raise OutcomeBlocked("ledger_inconsistent")
++        if first.position_effect != "open" or last.position_effect != "close":
++            raise OutcomeBlocked("ledger_inconsistent")
++        order = session.scalar(select(Order).where(Order.client_order_id == last.client_order_id))
++        if order is None or order.trade_id != trade.trade_id or order.position_effect != "close" or not order.exit_reason:
++            raise OutcomeBlocked("exit_reason_unavailable")
++        open_orders = session.scalars(select(Order).where(Order.trade_id == trade.trade_id, Order.position_effect == "open")).all()
++        filled_by_order = {o.client_order_id: 0 for o in open_orders}
++        for receipt in receipts:
++            data = receipt.fill_data
++            if data["client_order_id"] in filled_by_order:
++                filled_by_order[data["client_order_id"]] += data["qty"]
++        if any((o.status not in {"cancelled", "rejected"} and filled_by_order[o.client_order_id] < o.qty)
++               or filled_by_order[o.client_order_id] > o.qty for o in open_orders):
++            raise OutcomeBlocked("multi_position_trade")
++        thesis = trade.thesis or {}
++        evidence = thesis.get("evidence")
++        if not isinstance(evidence, dict):
++            raise OutcomeBlocked("evidence_unavailable")
++        decision = trade.decision_record or {}
++        try:
++            basis = _price(thesis["structural_invalidation"])
++            if basis != _price(decision["structural_invalidation"]):
++                raise ValueError("basis differs")
++            r = realized_r(state.avg_price, state.exit_price, basis, trade.direction)
++        except (KeyError, ValueError, TypeError, ArithmeticError):
++            raise OutcomeBlocked("r_basis_unavailable") from None
++        reservation = session.get(TradeReservation, trade.trade_id)
++        if reservation is None:
++            raise OutcomeBlocked("ledger_inconsistent")
++        entry_reasons = dict(trade.entry_snapshot_missing_reasons or {})
++        if trade.entry_snapshot_captured_at is None and not entry_reasons:
++            entry_reasons = {"market_state_at_entry": "recorder_unavailable", "context_at_entry": "recorder_unavailable"}
++        for key, value in (("market_state_at_entry", trade.entry_market_state), ("context_at_entry", trade.entry_context)):
++            if value is None:
++                entry_reasons.setdefault(key, "recorder_unavailable")
++        setup = datetime.fromisoformat(decision["setup_detected_at"])
++        decided = datetime.fromisoformat(decision["decided_at"])
++        commission = state.fees
++        return StrategyOutcome(
++            outcome_id=uuid4(), opportunity_id=trade.trade_id, schema_version=2,
++            strategy_name=trade.strategy_name, strategy_version=trade.strategy_version,
++            symbol=trade.symbol, origin=trade.origin, is_backtest=False, backtest_run_id=None,
++            execution_mode=trade.execution_mode, execution_venue=trade.execution_venue,
++            trading_day=next(iter(days)), setup_detected_at=setup, signal_confirmed_at=None,
++            decided_at=decided, entry_filled_at=first.venue_ts, exit_filled_at=last.venue_ts,
++            holding_seconds=int((last.venue_ts - first.venue_ts).total_seconds()),
++            direction=trade.direction, entry_price=float(_price(state.avg_price)), entry_qty=state.entry_qty,
++            exit_price=float(_price(state.exit_price)), exit_qty=state.exit_qty,
++            commission_total=None if commission is None else float(commission),
++            slippage_entry=float(_price(state.avg_price) - _price(reservation.reference_price)),
++            realized_pnl=float(state.realized_pnl - commission if commission is not None else state.realized_pnl),
++            realized_r=r, exit_reason=order.exit_reason,
++            structural_invalidation=float(basis), structural_target=float(_price(thesis["structural_target"])),
++            final_stop=float(_price(thesis["final_stop"])), final_target=float(_price(thesis["final_target"])),
++            confidence_at_signal=float(decimal(thesis["confidence"])), evidence=evidence,
++            market_state_at_entry=trade.entry_market_state, context_at_entry=trade.entry_context,
++            market_state_at_exit=market, context_at_exit=context,
++            snapshot_missing_reasons={**entry_reasons, **exit_reasons} or None,
++            feature_snapshot_id=None,
++        )
+diff --git a/backend/tests/test_outcome_recorder.py b/backend/tests/test_outcome_recorder.py
+new file mode 100644
+index 0000000..591cc2c
+--- /dev/null
++++ b/backend/tests/test_outcome_recorder.py
+@@ -0,0 +1,359 @@
++"""OutcomeRecorder integration checks against the real execution ledger schema."""
++from __future__ import annotations
++
++import asyncio
++from datetime import datetime, timedelta, timezone
++from decimal import Decimal
++from uuid import uuid4
++
++import pytest
++from sqlalchemy import select, text
++from sqlalchemy.exc import SQLAlchemyError
++from sqlalchemy.exc import IntegrityError
++
++from app.db.session import SessionLocal
++from app.event_bus.bus import EventBus
++from app.models.execution_ledger import Fill, Order, Position, PositionFillReceipt, Trade, TradeReservation
++from app.models.trading_intelligence import StrategyOutcomeRecord
++from app.portfolio_state.accounting import LedgerFill, apply_fill
++from app.portfolio_state.postgres import _encode
++from app.trading_intelligence import outcome_recorder as module
++from app.trading_intelligence.outcome_recorder import OutcomeRecorder
++from app.trading_intelligence.state_snapshot import StrategyOutcomeSnapshots
++
++NAME = "TEST_OUTCOME_RECORDER"
++
++
++def _db_available():
++    try:
++        with SessionLocal() as session:
++            session.execute(text("SELECT 1"))
++        return True
++    except Exception:
++        return False
++
++
++pytestmark = pytest.mark.skipif(not _db_available(), reason="real PostgreSQL unavailable")
++
++
++@pytest.fixture(autouse=True)
++def _cleanup():
++    def clean():
++        with SessionLocal.begin() as session:
++            session.execute(text("UPDATE trades SET outcome_id = NULL WHERE strategy_name = :n"), {"n": NAME})
++            session.execute(text("DELETE FROM strategy_outcomes WHERE strategy_name = :n"), {"n": NAME})
++            session.execute(text("DELETE FROM position_fill_receipts WHERE position_id IN "
++                                 "(SELECT position_id FROM positions WHERE trade_id IN "
++                                 "(SELECT trade_id FROM trades WHERE strategy_name = :n))"), {"n": NAME})
++            session.execute(text("DELETE FROM fills WHERE client_order_id IN "
++                                 "(SELECT client_order_id FROM orders WHERE trade_id IN "
++                                 "(SELECT trade_id FROM trades WHERE strategy_name = :n))"), {"n": NAME})
++            session.execute(text("DELETE FROM orders WHERE trade_id IN "
++                                 "(SELECT trade_id FROM trades WHERE strategy_name = :n)"), {"n": NAME})
++            session.execute(text("DELETE FROM trade_reservations WHERE trade_id IN "
++                                 "(SELECT trade_id FROM trades WHERE strategy_name = :n)"), {"n": NAME})
++            session.execute(text("DELETE FROM positions WHERE trade_id IN "
++                                 "(SELECT trade_id FROM trades WHERE strategy_name = :n)"), {"n": NAME})
++            session.execute(text("DELETE FROM trades WHERE strategy_name = :n"), {"n": NAME})
++    clean()
++    yield
++    clean()
++
++
++def _seed(*, evidence=True, basis=98, fees=(None, None, None, None), reason="target"):
++    trade_id, position_id = uuid4(), uuid4()
++    ts = datetime.now(timezone.utc) - timedelta(seconds=20)
++    thesis = {"structural_invalidation": basis, "structural_target": 110,
++              "final_stop": basis, "final_target": 110, "confidence": 0.7}
++    if evidence:
++        thesis["evidence"] = {"signal": "observed"}
++    with SessionLocal.begin() as session:
++        trade = Trade(trade_id=trade_id, execution_mode="simulated", execution_venue="simulated",
++                      origin="auto", strategy_name=NAME, strategy_version="v1", direction="BUY",
++                      symbol="AAPL", thesis=thesis, decision="approved", limits_snapshot={},
++                      decision_record={"structural_invalidation": basis,
++                                       "setup_detected_at": ts.isoformat(), "decided_at": ts.isoformat()},
++                      status="closed")
++        session.add(trade)
++        session.flush()
++        session.add(TradeReservation(trade_id=trade_id, client_order_id=f"{trade_id}:entry",
++                                     qty=10, reference_price=Decimal("100")))
++        entry_id = f"{trade_id}:entry"
++        first_exit_id = f"{trade_id}:exit:1"
++        last_exit_id = f"{trade_id}:exit:2"
++        for order_id, effect, qty, exit_reason in (
++            (entry_id, "open", 10, None), (first_exit_id, "close", 3, "stop"),
++            (last_exit_id, "close", 7, reason),
++        ):
++            session.add(Order(client_order_id=order_id, trade_id=trade_id,
++                              execution_mode="simulated", execution_venue="simulated", symbol="AAPL",
++                              side="BUY" if effect == "open" else "SELL", position_effect=effect,
++                              qty=qty, status="filled", exit_reason=exit_reason))
++        session.flush()
++        state = None
++        receipts = []
++        for index, (order_id, effect, qty, price) in enumerate((
++            (entry_id, "open", 4, 100), (entry_id, "open", 6, 102),
++            (first_exit_id, "close", 3, 104), (last_exit_id, "close", 7, 106),
++        )):
++            stamp = ts + timedelta(seconds=index)
++            db_fill = Fill(client_order_id=order_id, execution_venue="simulated",
++                           venue_fill_id=f"{trade_id}:f{index}", qty=qty, price=price,
++                           venue_ts=stamp, commission=fees[index])
++            session.add(db_fill)
++            session.flush()
++            fill = LedgerFill(db_fill.ledger_seq, db_fill.venue_fill_id, order_id, trade_id,
++                              "simulated", "simulated", "AAPL", "BUY" if effect == "open" else "SELL",
++                              effect, qty, Decimal(price), stamp,
++                              None if fees[index] is None else Decimal(str(fees[index])))
++            result = apply_fill(state, fill, new_position_id=position_id if state is None else None)
++            state = result.position
++            receipts.append((db_fill.ledger_seq, fill, result.realized_delta))
++        session.add(Position(position_id=position_id, trade_id=trade_id, execution_mode="simulated",
++                             execution_venue="simulated", symbol="AAPL", side="BUY", qty=0,
++                             avg_price=state.avg_price, opened_at=state.opened_at, closed_at=state.closed_at,
++                             status="closed", realized_pnl=state.realized_pnl))
++        session.flush()
++        for seq, fill, delta in receipts:
++            session.add(PositionFillReceipt(ledger_seq=seq, execution_mode="simulated",
++                                            execution_venue="simulated", venue_fill_id=fill.venue_fill_id,
++                                            position_id=position_id, fill_data=_encode(fill),
++                                            trading_day=ts.date(), gross_pnl=delta))
++    return trade_id, entry_id
++
++
++def _result(trade_id):
++    with SessionLocal() as session:
++        trade = session.get(Trade, trade_id)
++        rows = session.scalars(select(StrategyOutcomeRecord).where(
++            StrategyOutcomeRecord.opportunity_id == trade_id)).all()
++        return trade.outcome_status, trade.outcome_id, rows
++
++
++def _seed_first_entry():
++    trade_id = uuid4()
++    stamp = datetime.now(timezone.utc)
++    order_id = f"{trade_id}:entry"
++    with SessionLocal.begin() as session:
++        session.add(Trade(trade_id=trade_id, execution_mode="simulated", execution_venue="simulated",
++                          origin="auto", strategy_name=NAME, strategy_version="v1", direction="BUY",
++                          symbol="AAPL", thesis={"evidence": {"signal": "observed"}}, decision="approved",
++                          limits_snapshot={}, status="open"))
++        session.flush()
++        session.add(Order(client_order_id=order_id, trade_id=trade_id, execution_mode="simulated",
++                          execution_venue="simulated", symbol="AAPL", side="BUY", position_effect="open",
++                          qty=10, status="partially_filled"))
++        session.flush()
++        session.add(Fill(client_order_id=order_id, execution_venue="simulated",
++                         venue_fill_id=f"{trade_id}:first", qty=4, price=100, venue_ts=stamp))
++    return trade_id, order_id
++
++
++@pytest.mark.asyncio
++async def test_partial_fills_and_reductions_record_one_outcome_with_missing_snapshots(monkeypatch):
++    trade_id, _ = _seed()
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots(None, None))
++    recorder = OutcomeRecorder(EventBus(), SessionLocal)
++    assert await recorder.record_trade(trade_id) == "recorded"
++    assert await recorder.record_trade(trade_id) == "skipped"
++    status, linked, rows = _result(trade_id)
++    assert status == "recorded" and linked == rows[0].outcome_id and len(rows) == 1
++    row = rows[0]
++    assert row.entry_qty == row.exit_qty == 10
++    assert row.entry_price == Decimal("101.200000")
++    assert row.exit_price == Decimal("105.400000")
++    assert row.realized_pnl == Decimal("42.000000")
++    assert row.realized_r == Decimal("1.3125")
++    assert row.commission_total is None
++    assert row.exit_reason == "target"
++    assert row.market_state_at_entry is None and row.market_state_at_exit is None
++    assert row.snapshot_missing_reasons == {
++        "market_state_at_entry": "recorder_unavailable", "context_at_entry": "recorder_unavailable",
++        "market_state_at_exit": "engine_cold_start", "context_at_exit": "engine_cold_start",
++    }
++    assert row.schema_version == 2 and row.execution_mode == row.execution_venue == "simulated"
++    assert row.signal_confirmed_at is None
++
++
++@pytest.mark.asyncio
++async def test_known_fees_and_concurrent_wakeups(monkeypatch):
++    trade_id, _ = _seed(fees=(1, 2, 3, -1))
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots({"m": 1}, {"c": 1}))
++    a = OutcomeRecorder(EventBus(), SessionLocal)
++    b = OutcomeRecorder(EventBus(), SessionLocal)
++    assert sorted(await asyncio.gather(a.record_trade(trade_id), b.record_trade(trade_id))) == ["recorded", "skipped"]
++    status, linked, rows = _result(trade_id)
++    assert status == "recorded" and linked == rows[0].outcome_id and len(rows) == 1
++    assert rows[0].commission_total == Decimal("5.000000")
++    assert rows[0].realized_pnl == Decimal("37.000000")
++
++
++@pytest.mark.asyncio
++async def test_partial_reduction_waits_for_closed_trade_marker():
++    trade_id, _ = _seed()
++    with SessionLocal.begin() as session:
++        session.get(Trade, trade_id).status = "closing"
++    recorder = OutcomeRecorder(EventBus(), SessionLocal)
++    assert await recorder.record_trade(trade_id) == "skipped"
++    assert _result(trade_id) == (None, None, [])
++    with SessionLocal.begin() as session:
++        session.get(Trade, trade_id).status = "closed"
++    assert await recorder.record_trade(trade_id) == "recorded"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("kwargs,reason", [
++    ({"evidence": False}, "evidence_unavailable"),
++    ({"basis": 101.2}, "r_basis_unavailable"),
++    ({"reason": None}, "exit_reason_unavailable"),
++])
++async def test_missing_attribution_blocks_without_outcome(kwargs, reason, caplog):
++    trade_id, _ = _seed(**kwargs)
++    recorder = OutcomeRecorder(EventBus(), SessionLocal)
++    assert await recorder.record_trade(trade_id) == "blocked"
++    assert reason in caplog.text
++    assert _result(trade_id) == ("blocked", None, [])
++    assert await recorder.record_trade(trade_id) == "skipped"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode,venue", [("paper", "ibkr"), ("live", "ibkr")])
++async def test_unsupported_mode_is_blocked_without_outcome(mode, venue, caplog):
++    trade_id, _ = _seed()
++    with SessionLocal.begin() as session:
++        trade = session.get(Trade, trade_id)
++        trade.execution_mode = mode
++        trade.execution_venue = venue
++    assert await OutcomeRecorder(EventBus(), SessionLocal).record_trade(trade_id) == "blocked"
++    assert "unsupported_mode" in caplog.text
++    assert _result(trade_id) == ("blocked", None, [])
++
++
++@pytest.mark.asyncio
++async def test_multi_day_receipt_blocks_without_outcome(caplog):
++    trade_id, _ = _seed()
++    with SessionLocal.begin() as session:
++        receipt = session.scalar(select(PositionFillReceipt).join(
++            Position, PositionFillReceipt.position_id == Position.position_id)
++            .where(Position.trade_id == trade_id).order_by(PositionFillReceipt.ledger_seq.desc()))
++        receipt.trading_day += timedelta(days=1)
++    assert await OutcomeRecorder(EventBus(), SessionLocal).record_trade(trade_id) == "blocked"
++    assert "multi_day_position" in caplog.text
++    assert _result(trade_id) == ("blocked", None, [])
++
++
++@pytest.mark.asyncio
++async def test_failed_link_rolls_back_insert_and_retries(monkeypatch):
++    trade_id, _ = _seed()
++    real_writer = module.record_strategy_outcome_in_session
++    def fail_after_insert(session, outcome):
++        real_writer(session, outcome)
++        session.flush()
++        raise SQLAlchemyError("injected fault before trade link")
++    monkeypatch.setattr(module, "record_strategy_outcome_in_session", fail_after_insert)
++    recorder = OutcomeRecorder(EventBus(), SessionLocal)
++    assert await recorder.record_trade(trade_id) == "pending_retry"
++    assert _result(trade_id) == ("pending_retry", None, [])
++    monkeypatch.setattr(module, "record_strategy_outcome_in_session", real_writer)
++    assert await recorder.record_trade(trade_id) == "recorded"
++
++
++@pytest.mark.asyncio
++async def test_rejected_insert_blocks_without_orphan_row(monkeypatch, caplog):
++    trade_id, _ = _seed()
++    def reject(session, outcome):
++        raise IntegrityError("INSERT strategy_outcomes", {}, Exception("rejected"))
++    monkeypatch.setattr(module, "record_strategy_outcome_in_session", reject)
++    assert await OutcomeRecorder(EventBus(), SessionLocal).record_trade(trade_id) == "blocked"
++    assert "write_rejected" in caplog.text
++    assert _result(trade_id) == ("blocked", None, [])
++
++
++@pytest.mark.asyncio
++async def test_startup_scan_and_sweep_recover_lost_events(monkeypatch):
++    first, _ = _seed()
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots(None, None))
++    recorder = OutcomeRecorder(EventBus(), SessionLocal, sweep_interval_seconds=60)
++    await recorder.start()
++    await recorder._queue.join()
++    assert _result(first)[0] == "recorded"
++    second, _ = _seed()
++    await recorder.scan()  # the bounded sweep uses this same path
++    await recorder._queue.join()
++    assert _result(second)[0] == "recorded"
++    await recorder.stop()
++
++
++@pytest.mark.asyncio
++async def test_startup_scan_pages_through_more_than_one_bounded_batch(monkeypatch):
++    first, _ = _seed()
++    second, _ = _seed()
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots(None, None))
++    recorder = OutcomeRecorder(EventBus(), SessionLocal, batch_size=1)
++    await recorder.start()
++    await recorder._queue.join()
++    assert _result(first)[0] == _result(second)[0] == "recorded"
++    await recorder.stop()
++
++
++@pytest.mark.asyncio
++async def test_entry_hook_captures_only_first_fill_and_preserves_missing_reason(monkeypatch):
++    trade_id, order_id = _seed_first_entry()
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots",
++                        lambda symbol: StrategyOutcomeSnapshots({"market": 1}, None))
++    recorder = OutcomeRecorder(EventBus(), SessionLocal)
++    await recorder.capture_entry(order_id)
++    with SessionLocal() as session:
++        trade = session.get(Trade, trade_id)
++        assert trade.entry_market_state == {"market": 1}
++        assert trade.entry_context is None
++        assert trade.entry_snapshot_missing_reasons == {"context_at_entry": "engine_state_lost_on_restart"}
++        captured_at = trade.entry_snapshot_captured_at
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots",
++                        lambda symbol: StrategyOutcomeSnapshots({"market": 2}, {"context": 2}))
++    await recorder.capture_entry(order_id)
++    with SessionLocal() as session:
++        trade = session.get(Trade, trade_id)
++        assert trade.entry_snapshot_captured_at == captured_at
++        assert trade.entry_market_state == {"market": 1}
++
++
++@pytest.mark.asyncio
++async def test_entry_snapshot_error_does_not_discard_fill(monkeypatch):
++    trade_id, order_id = _seed_first_entry()
++    def fail(symbol):
++        raise RuntimeError("capture failed")
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", fail)
++    await OutcomeRecorder(EventBus(), SessionLocal).capture_entry(order_id)
++    with SessionLocal() as session:
++        trade = session.get(Trade, trade_id)
++        assert trade.entry_snapshot_missing_reasons == {
++            "market_state_at_entry": "snapshot_capture_error", "context_at_entry": "snapshot_capture_error"}
++        assert session.scalar(select(Fill).where(Fill.client_order_id == order_id)) is not None
++
++
++@pytest.mark.asyncio
++async def test_late_exit_snapshot_is_null_with_reason(monkeypatch):
++    trade_id, _ = _seed()
++    def should_not_capture(symbol):
++        raise AssertionError("late snapshot must not be relabelled as exit")
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", should_not_capture)
++    recorder = OutcomeRecorder(EventBus(), SessionLocal, snapshot_max_lag_seconds=1)
++    assert await recorder.record_trade(trade_id) == "recorded"
++    row = _result(trade_id)[2][0]
++    assert row.market_state_at_exit is None and row.context_at_exit is None
++    assert row.snapshot_missing_reasons["market_state_at_exit"] == "recorder_unavailable"
++
++
++@pytest.mark.asyncio
++async def test_periodic_sweep_recovers_closure_without_event(monkeypatch):
++    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots(None, None))
++    recorder = OutcomeRecorder(EventBus(), SessionLocal, sweep_interval_seconds=0.02)
++    await recorder.start()
++    trade_id, _ = _seed()
++    for _ in range(100):
++        if _result(trade_id)[0] == "recorded":
++            break
++        await asyncio.sleep(0.02)
++    assert _result(trade_id)[0] == "recorded"
++    await recorder.stop()

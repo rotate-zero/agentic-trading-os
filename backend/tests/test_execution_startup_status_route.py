@@ -60,8 +60,28 @@ def test_successful_startup_reports_ready():
     assert fastapi_app.state.execution_startup_status is None
 
 
+def test_recorder_startup_failure_does_not_change_ready_execution_status(monkeypatch, caplog):
+    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
+
+    async def fail(self):
+        raise RuntimeError("injected recorder startup failure")
+
+    monkeypatch.setattr(OutcomeRecorder, "start", fail)
+    with TestClient(fastapi_app) as client:
+        assert client.get("/health/execution-startup").json() == {
+            "status": "ready", "reason_code": None, "discrepancy_count": None,
+        }
+    assert "OutcomeRecorder failed to start" in caplog.text
+
+
 def test_reconciliation_discrepancy_reports_blocked_with_a_safe_count(monkeypatch):
     from app.portfolio_state.reconciliation import ReconciliationReport
+    from app.trading_intelligence.outcome_recorder import OutcomeRecorder
+
+    starts = []
+    async def recorder_start(self):
+        starts.append(True)
+    monkeypatch.setattr(OutcomeRecorder, "start", recorder_start)
 
     async def discrepant_reconciliation(*args):
         return ReconciliationReport(discrepancies=["mismatch A", "mismatch B", "mismatch C"])
@@ -81,6 +101,7 @@ def test_reconciliation_discrepancy_reports_blocked_with_a_safe_count(monkeypatc
     # The raw discrepancy text (which could name a specific symbol, order,
     # or ledger row) never reaches this route — only a plain count of it.
     assert "mismatch" not in response.text
+    assert starts == []
     assert fastapi_app.state.execution_startup_status is None
 
 

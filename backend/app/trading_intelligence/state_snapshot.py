@@ -1,9 +1,7 @@
 """
-Snapshot capture — the read-side CONTRACT a future Execution/Position
-Monitor will call at `entry_filled_at`/`exit_filled_at` to populate
-`StrategyOutcome.market_state_at_entry`/`_at_exit` and
-`context_at_entry`/`_at_exit` (decision #89's locked shape,
-strategy-engine-design.md §5). Confirmed decision #98, M4.
+Snapshot capture — the read-side contract used by Backtest Runner and the
+simulated OutcomeRecorder for StrategyOutcome entry and exit fields
+(decision #98, strategy-engine-design.md §5).
 
 **What this is, and isn't.** This module is the CAPTURE MECHANISM only —
 a pure read of whatever MarketStateEngine/ContextEngine currently know
@@ -14,22 +12,11 @@ fields. It does not:
     docstring originally carried is stale as of #120 and corrected
     here),
   - write anything, ever (no session, no persistence),
-  - know what "entry" or "exit" means (no Execution Engine, no Position
-    Monitor, no fill event exists yet to call this from).
-The actual production call sites are real, later work — building them
-now just to exercise this function would be exactly the scope this
-build (M4) was deliberately kept narrow to avoid; see
-strategy-engine-design.md §10's own staged plan. What matters today is
-that the CONTRACT is real and tested against real MarketState/Context
-data, not a stub — so whichever module calls this has a stable,
-already-proven function to call rather than reinventing this read
-against two engines' internals itself. As of decision #128, Backtest
-Runner is exactly that real caller: `BacktestRunner.run()`
-(`app/backtest_runner/runner.py`) calls `capture_strategy_outcome_snapshots()`
-directly at its own entry/exit-fill equivalents — the "a Backtest
-Runner" framing above originally listed this as a hypothetical future
-caller; it's a real one now. Execution Engine and Position Monitor
-remain the genuinely hypothetical, still-nonexistent LIVE-path callers.
+  - know what "entry" or "exit" means; the caller chooses capture time.
+Backtest Runner captures both halves for its own completed fill path. The
+simulated OutcomeRecorder captures at the first entry fill and near closure,
+using NULL with a reason if a half is unavailable. This module remains a
+read-only mechanism shared by those callers.
 
 **Why this lives here, not inside context_engine/ or
 market_state_engine/.** This module reads BOTH engines' public

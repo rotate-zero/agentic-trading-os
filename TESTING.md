@@ -1,3 +1,27 @@
+# TESTING — decision #186, `outcome-recorder-contract` (EX-12 option a)
+
+Database target: isolated local PostgreSQL 18.6 in `/tmp/atos_pg2`, port 5545,
+database `trading_workspace`, migrated through Alembic `0016`. Only test
+fixtures and migration records were written there. The project worktree's
+configured production or broker accounts were not used.
+
+- Focused writer/recorder/startup tests: 33 passed against real PostgreSQL.
+  They exercise the NULL-snapshot CHECK and outer rollback; entry capture and
+  failure; partial fills/reductions, VWAPs, known and unknown commissions,
+  closing-order exit reason, missing evidence/R/exit reason, duplicate and
+  concurrent recorders, injected insert-before-link failure and retry, missed
+  event recovery by startup scan and sweep, late snapshots, and execution
+  startup isolation. The full suite also covers Backtest Runner persistence.
+- Full backend suite with the database session timezone inherited from the
+  local Asia/Dhaka server: 1,525 passed, 2 failed. Both existing failures
+  compare UTC test timestamps to PostgreSQL-returned `+06:00` timestamps.
+  Rerunning those two with `PGTZ=UTC` passed without changing assertions.
+- Full backend suite with `PGTZ=UTC` after the final recorder validation and
+  test additions: 1,534 passed, 0 failed, 186,731 deprecation warnings
+  (106.31 s). PostgreSQL schema and contract assertions were not weakened.
+
+<!-- Previous delivery record retained below. -->
+
 # TESTING — `execution-status-doc-sync`
 
 Documentation delivery plus a test-only fix. The first pass changed no code or test and was

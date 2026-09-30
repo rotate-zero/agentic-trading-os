@@ -325,18 +325,9 @@ class StrategyOutcomeRecord(Base):
     backtest_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("backtests.run_id"), nullable=True
     )
-    # EX-2 (decision #170, #172, migration 0012).
-    # record_strategy_outcome() (app/trading_intelligence/performance.py — out of this
-    # delivery's file boundary, decision #172 §5) constructs this ORM
-    # row by explicit kwargs and does not (yet) forward outcome.execution_mode/
-    # execution_venue, so a STATIC default here would ignore is_backtest entirely — wrong for
-    # the population-isolation tests, which construct a synthetic is_backtest=False row (see
-    # _default_execution_mode below). Context-sensitive defaults (SQLAlchemy's
-    # get_current_parameters()) read the row's OWN is_backtest value at insert time instead,
-    # so the two real callers today (Backtest Runner, always is_backtest=True; these tests,
-    # sometimes False) both land on the correct, CHECK-satisfying value without
-    # record_strategy_outcome() needing to change. This is a fallback for callers that don't
-    # set the column explicitly — NOT a license for a future live caller to skip it.
+    # EX-2 (decision #170, #172, migration 0012). The performance writer now
+    # forwards both labels explicitly. The context-sensitive default remains
+    # for older direct ORM callers; it derives mode from this row's is_backtest.
     execution_mode: Mapped[str] = mapped_column(String(16), nullable=False, default=_default_execution_mode)
     execution_venue: Mapped[str] = mapped_column(String(32), nullable=False, default="simulated")
 
@@ -349,7 +340,7 @@ class StrategyOutcomeRecord(Base):
     exit_filled_at: Mapped[datetime] = mapped_column(nullable=False)
     holding_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # --- C. Ledger --- entry_qty == exit_qty enforced by record_strategy_outcome(), not this table
+    # --- C. Ledger --- entry_qty == exit_qty is enforced by both performance writer entry points
     direction: Mapped[str] = mapped_column(String(4), nullable=False)  # BUY | SELL
     entry_price: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
     entry_qty: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)

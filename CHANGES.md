@@ -1,3 +1,26 @@
+# CHANGES — decision #186, `outcome-recorder-contract` (EX-12 option a)
+
+Saqib approved the dedicated, ledger-driven `OutcomeRecorder` for simulated,
+strategy-attributed auto trades. The Governor's strict evidence persistence
+was already merged at `79650ad` and is reused here.
+
+- Added `record_strategy_outcome_in_session()` to stage the complete outcome
+  without committing or closing its caller's session. Backtest Runner retains
+  its existing own-session wrapper and persisted behavior.
+- Added the best-effort first-entry-fill snapshot hook and the recorder's
+  position-scoped receipt replay, 60-second exit-snapshot bound, startup scan,
+  60-second bounded recovery sweep, and atomic outcome insert/trade link.
+  Missing required evidence, R basis or exit reason blocks the trade with a
+  reason-coded log; recoverable database failures remain retryable.
+- Wired the recorder after successful execution reconciliation. Recorder
+  startup failure logs CRITICAL while execution readiness stays `ready`, and
+  shutdown stops it after Portfolio State.
+- Added PostgreSQL integration tests and updated the execution architecture,
+  related status documents, decision log and `TESTING.md`. No migration,
+  paper/live writer, manual writer or backtest policy change is included.
+
+<!-- Previous delivery record retained below. -->
+
 # CHANGES — `execution-status-doc-sync`
 
 Documentation correction plus two small follow-ups. The first pass (the claim table below) was
