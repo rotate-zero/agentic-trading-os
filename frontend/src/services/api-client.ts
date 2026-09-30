@@ -526,6 +526,52 @@ export async function fetchExecutionExitRequests(): Promise<ExecutionExitRequest
   return (await res.json()) as ExecutionExitRequestsWireShape;
 }
 
+// GET /intelligence/execution-outcome-status?limit=N — read-only view of how far
+// the simulated OutcomeRecorder (decision #186) has got over closed simulated
+// AUTO trades (approved, closed, execution_mode "simulated", origin "auto";
+// fixed server-side, not parameters). `counts` cover EVERY such trade regardless
+// of `limit`; `trades` is the bounded recent list (updated_at descending, then
+// trade_id descending; limit 1-100, server default 50).
+//   - `outcome_status` is the stored value: SQL NULL arrives as JSON null and is
+//     counted under `pending`; "pending_retry" | "blocked" | "recorded" are their
+//     own buckets; ANY other non-null string (including the literal "pending",
+//     which the recorder never writes) is counted under `other` and returned
+//     verbatim, so it is typed `string | null`, not a closed union.
+//   - `outcome_id` is the linked strategy_outcomes id or null, reported as stored
+//     (not cross-checked against `outcome_status`).
+//   - No blocked reason is exposed; #186 keeps reason codes in server logs.
+//   - `updated_at` is when the trade row last changed (UTC), NOT a close time or
+//     an outcome time.
+export interface ExecutionOutcomeStatusCountsWireShape {
+  pending: number;
+  pending_retry: number;
+  blocked: number;
+  recorded: number;
+  other: number;
+}
+
+export interface ExecutionOutcomeStatusTradeWireShape {
+  trade_id: string;
+  symbol: string;
+  strategy_name: string;
+  outcome_status: string | null;
+  outcome_id: string | null;
+  updated_at: string;
+}
+
+export interface ExecutionOutcomeStatusWireShape {
+  counts: ExecutionOutcomeStatusCountsWireShape;
+  trades: ExecutionOutcomeStatusTradeWireShape[];
+}
+
+export async function fetchExecutionOutcomeStatus(limit = 50): Promise<ExecutionOutcomeStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-outcome-status?limit=${limit}`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionOutcomeStatusWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's contents at

@@ -1,3 +1,36 @@
+<!-- BEGIN DELIVERY SECTION: execution-panel-outcome-status (frontend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `execution-panel-outcome-status`
+
+Verified on `main` `4e40a79`, Node v22.22.2, `npm ci` in `frontend/`. Frontend and docs only: no backend, database or
+broker was touched, so no pytest or PostgreSQL run applies.
+
+- `npm run build` (`tsc -b && vite build`): clean on the untouched base and clean after the change, 103 modules
+  transformed; only the existing Vite chunk-size (>500 kB) advisory appeared.
+- **Behavior check (not committed).** The repo has no frontend test runner and none was added; the section was
+  exercised with a throwaway jsdom + React `act` script kept outside the repository (esbuild bundle of the real panel,
+  controllable mocked `fetch`, stub `WebSocket`): **29 checks passed**. It covered: no request while collapsed; the
+  request URL `/intelligence/execution-outcome-status?limit=50` on expansion; loading state; the explanatory wording
+  (closed simulated auto trades, not a live portfolio or real-money result, recovery, logs-not-API, not a live feed);
+  server row order preserved; `null` → "Pending" with "no outcome link"; "Pending retry", "Blocked"; "Recorded" with
+  "outcome linked" and the id not printed; the literal `"pending"` and `""` shown as `Unexpected status ...` and not
+  as recorded; the exact counts line; the "Showing the N most recently changed of M" note only when the list is
+  shorter than the population; Refresh refetching and showing loading; empty state and no counts block; HTTP-500 and
+  rejected-fetch errors, neither shown as empty; an older success after a newer Refresh ignored; an older failure
+  after a newer success ignored; an older success not masking a newer failure; a response after collapse harmless;
+  and no React `console.error`.
+- **Mutation checks** (each reverted; tree restored and re-run 29/29): removing the `active` guards in the new
+  section (3 failed: the three stale-response checks); folding unexpected statuses into "Recorded" (2 failed);
+  labelling `null` something other than "Pending" (1 failed).
+- **Not covered:** no real browser, no visual/Tailwind review, and no run against a live backend with real
+  `OutcomeRecorder` rows (fixtures are hand-built from §K's documented response). The wire shape was checked by
+  reading `_fetch_execution_outcome_status` and §K, not by a call. A malformed response (missing `counts` or
+  `trades`) is not guarded and would throw in render, like the sibling sections. Manual check for reviewers: with the
+  backend up, expand the Execution panel, confirm the counts add up to the list size when under 50, press Refresh,
+  then stop the backend and press Refresh to see the error line.
+- **Housekeeping:** `tsc -b` rewrites the tracked `frontend/tsconfig.tsbuildinfo`; it is not part of this delivery and
+  was restored before packaging.
+<!-- END DELIVERY SECTION: execution-panel-outcome-status -->
+
 <!-- BEGIN DELIVERY SECTION: execution-outcome-status-route (backend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-outcome-status-route`
 

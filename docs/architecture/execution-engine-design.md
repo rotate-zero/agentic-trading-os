@@ -2514,6 +2514,63 @@ lifespan): population isolation, every bucket incl. unexpected values, SQL NULL,
 order/tie/limit behaviour, an empty population (scratch-schema `trades`), serialization, read-only, and event-loop
 offload. See `TESTING.md`.
 
+#### L. Frontend reader — "Simulated outcome recording" (`execution-panel-outcome-status`; decision #186 is the writer, no new decision number)
+
+**As built (frontend only).** The Execution panel mounts a compact "Simulated outcome recording" section
+when expanded, after "Recent simulated positions" and before the lifecycle event feed. It is the first
+consumer of §K's `GET /intelligence/execution-outcome-status`, through a typed
+`fetchExecutionOutcomeStatus(limit = 50)` (`api-client.ts`; wire types
+`ExecutionOutcomeStatusCountsWireShape`, `ExecutionOutcomeStatusTradeWireShape`,
+`ExecutionOutcomeStatusWireShape`). No backend file, route, migration, dependency, polling or control was
+added. It compiles against §K as it stands on `main`.
+
+What it answers: *how far has the simulated `OutcomeRecorder` got over closed simulated auto trades?* It is
+not a portfolio, not a real-money result, and not the Info tab's "Recent Closed Trades" (§I), which reads
+the outcome rows themselves; this section reads the recording status on the `trades` row.
+
+| Rule | As built |
+|---|---|
+| Request | `?limit=50` (explicit) on panel expansion and on the section's own manual Refresh. No `limit` control, no polling. |
+| Counts | `Pending`, `Pending retry`, `Blocked`, `Recorded`, `Other`, exactly as the server returns them (whole population, independent of `limit`). The UI derives only the total (sum of the five) to decide empty vs populated and to print "Showing the N most recently changed of M" when the list is shorter than the population. |
+| List | The server's order is preserved (`updated_at` descending, `trade_id` tie-break), keyed by `trade_id`, never re-sorted. Each row: symbol · strategy, the time the trade record last changed, the status label and "outcome linked" / "no outcome link". The `outcome_id` value itself is not printed. |
+| Status display | `null` → "Pending". `pending_retry` → "Pending retry". `blocked` → "Blocked". `recorded` → "Recorded". **Anything else is shown verbatim as `Unexpected status "<value>"`** (error tone) and is never called recorded; this includes the literal `"pending"`, which the recorder never writes and the server counts under `Other`, so the list and the counts agree. |
+| Blocked reason | Not shown and not invented; the section states that it is in the server logs, not this API. |
+| Wording | States that the section covers closed simulated auto trades only, is not a live portfolio or a real-money result, that pending may still be recovered by the recorder, that the time is when the trade record last changed (not a close or outcome time), and that it loads on expansion and Refresh and is not a live feed. |
+| States | Loading, error (a failed request is never shown as empty), empty ("No closed simulated auto trades yet."), populated. Same Refresh convention as "Recorded exit requests": Refresh stays enabled mid-flight, and the effect cleanup discards a superseded, late or post-collapse response, success or failure. |
+
+```text
+OutcomeRecorder (#186) ──writes──► trades.outcome_status / outcome_id / updated_at   [unchanged]
+                                         │ SELECT only (§K)
+                                         ▼
+              GET /intelligence/execution-outcome-status?limit=50
+                                         │ {counts, trades}
+                                         ▼
+   fetchExecutionOutcomeStatus() ──► ExecutionLifecyclePanel ► "Simulated outcome recording"
+                                         (own load state, own Refresh; not merged into the WebSocket feed)
+
+ not read here: strategy_outcomes rows (Info tab §I) · orders · fills · positions · logs (blocked reasons)
+```
+
+```text
+expand panel / Refresh ──► load = loading ──► fetch(limit=50)
+   ├─ failure  ──► "Could not fetch outcome recording status: <message>"   (not the empty state)
+   └─ success  ──► total = pending + pending_retry + blocked + recorded + other
+         ├─ total = 0 ──► "No closed simulated auto trades yet."
+         └─ total > 0 ──► counts line (Other highlighted when > 0)
+                          [if trades.length < total] "Showing the N most recently changed of M"
+                          rows in server order:
+                            outcome_status ─► describeOutcomeStatus()
+                               null | pending_retry | blocked | recorded ─► fixed label
+                               anything else ─► Unexpected status "<value>"
+                            outcome_id !== null ─► "outcome linked", else "no outcome link"
+collapse / unmount / newer Refresh ──► cleanup marks the run inactive; a late response or failure is ignored
+```
+
+**Limits.** The row time is `trades.updated_at` (last ORM change), so it is neither a close time nor an
+outcome time. `outcome_id` and `outcome_status` are reported as stored and are not cross-checked (a
+"Recorded" row with "no outcome link" is shown as stored). A `limit` of 50 bounds the list only; there is no
+paging. Not verified against a running backend with real recorder rows (see `TESTING.md`).
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**

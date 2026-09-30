@@ -1,3 +1,41 @@
+<!-- BEGIN DELIVERY SECTION: execution-panel-outcome-status (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-panel-outcome-status`
+
+Based on `main` `4e40a79` (re-checked against `origin/main` before packaging: no newer commits). Frontend and docs
+only. **No new decision number:** a read-only consumer of the `execution-outcome-status-route` backend and decision
+#186's recorder; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched and the latest number is
+still 186. **Dependency:** this branch compiles against the agreed contract; the route itself is already on `main`
+(`execution-outcome-status-route`, §6.7.1 K) and this delivery was checked against its as-built response, but it
+was not run against a live backend (see `TESTING.md`). No backend file was edited.
+
+- **New "Simulated outcome recording" section in the Execution panel** (`ExecutionLifecyclePanel.tsx`,
+  `SimulatedOutcomeRecording`), mounted when expanded after "Recent simulated positions" and before the event feed.
+  It shows the five counts (Pending, Pending retry, Blocked, Recorded, Other) and a bounded recent list of up to 50
+  trades, each with symbol · strategy, the time the trade record last changed, a status label and "outcome linked" /
+  "no outcome link" (the outcome id is not printed).
+  - **Status display:** `null` → "Pending"; `pending_retry`, `blocked`, `recorded` → their labels; **any other value
+    is shown verbatim as `Unexpected status "<value>"`** in the error tone and is never called recorded (this
+    includes the literal `"pending"`, which the server counts under Other, so list and counts agree).
+  - **Wording:** closed simulated auto trades only, not a live portfolio or a real-money result; pending may still
+    be recovered; a blocked reason is in the server logs, not this API; counts cover every such trade while the list
+    is the most recently changed; loaded on expansion and Refresh, not a live feed. When the list is shorter than
+    the population it prints "Showing the N most recently changed of M".
+  - **States and Refresh** follow "Recorded exit requests": loading, error (never shown as empty), empty, populated;
+    manual Refresh stays enabled mid-flight; the effect cleanup discards a superseded, late or post-collapse
+    response. No polling, no control, no WebSocket merge.
+- **`api-client.ts`:** `fetchExecutionOutcomeStatus(limit = 50)` plus wire types
+  `ExecutionOutcomeStatusCountsWireShape`, `ExecutionOutcomeStatusTradeWireShape`,
+  `ExecutionOutcomeStatusWireShape` (`outcome_status: string | null`, deliberately not a closed union).
+- **Panel header comment** updated to list the new snapshot.
+- **Docs:** `docs/architecture/execution-engine-design.md` gains §6.7.1 subsection **L** (as-built frontend reader,
+  data-flow and internal-flow diagrams, limits). Subsection K (another delivery's text) is untouched.
+- **Shared-doc follow-up at merge (not edited here):** `docs/roadmap/phase-roadmap.md` "Read surfaces" bullet and the
+  execution-engine-design read-route table can name the route and this section; §K still says "a UI is built
+  separately" and "separate parallel task" and can point at §L once both are merged.
+- **Known limits:** the row time is `trades.updated_at` (last change), not a close or outcome time; `outcome_id` and
+  `outcome_status` are shown as stored and not cross-checked; no paging beyond 50; no per-trade detail.
+<!-- END DELIVERY SECTION: execution-panel-outcome-status -->
+
 <!-- BEGIN DELIVERY SECTION: execution-outcome-status-route (backend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `execution-outcome-status-route`
 

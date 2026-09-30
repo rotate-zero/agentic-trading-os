@@ -4,6 +4,7 @@ import {
   fetchExecutionExitRequests,
   fetchExecutionFills,
   fetchExecutionOrders,
+  fetchExecutionOutcomeStatus,
   fetchExecutionPositions,
   fetchExecutionStartupStatus,
   fetchExitIntents,
@@ -11,6 +12,8 @@ import {
   type ExecutionExitRequestsWireShape,
   type ExecutionFillsWireShape,
   type ExecutionOrdersWireShape,
+  type ExecutionOutcomeStatusTradeWireShape,
+  type ExecutionOutcomeStatusWireShape,
   type ExecutionPositionWireShape,
   type ExecutionPositionsWireShape,
   type ExecutionStartupStatusWireShape,
@@ -29,8 +32,8 @@ const DEFAULT_WIDTH = 300;
 // through WorkspaceContext.tsx — same reasoning BacktestResultsPanel.tsx's
 // own header comment gives for itself. The event list is transient; the
 // separate exit-intent, persisted-order, and persisted-fill snapshots are
-// fetched again when this panel opens (the persisted-position and recorded
-// exit-request snapshots too). None is merged into the WebSocket feed, and
+// fetched again when this panel opens (the persisted-position, recorded
+// exit-request and simulated outcome-recording status snapshots too). None is merged into the WebSocket feed, and
 // none is the live World View portfolio.
 
 // Time-only, like InfoTab.tsx's formatExitTime/AIAnalysisPanel.tsx's
@@ -785,6 +788,131 @@ function RecordedExitRequests() {
   );
 }
 
+type OutcomeStatusLoad =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; data: ExecutionOutcomeStatusWireShape };
+
+const OUTCOME_STATUS_LIMIT = 50;
+
+// Display classification of a stored `trades.outcome_status`. Mirrors the
+// server's own bucketing so the list never disagrees with the counts: SQL NULL
+// is "pending"; pending_retry / blocked / recorded are known; ANYTHING else —
+// including the literal "pending", which the recorder never writes — is
+// surfaced verbatim as unexpected instead of being folded into a known bucket
+// (and never called "recorded").
+function describeOutcomeStatus(status: string | null): { label: string; tone: Tone } {
+  switch (status) {
+    case null:
+      return { label: "Pending", tone: "muted" };
+    case "pending_retry":
+      return { label: "Pending retry", tone: "signal" };
+    case "blocked":
+      return { label: "Blocked", tone: "bear" };
+    case "recorded":
+      return { label: "Recorded", tone: "bull" };
+    default:
+      return { label: `Unexpected status ${JSON.stringify(status)}`, tone: "bear" };
+  }
+}
+
+function OutcomeStatusRow({ trade }: { trade: ExecutionOutcomeStatusTradeWireShape }) {
+  const { label, tone } = describeOutcomeStatus(trade.outcome_status);
+  return (
+    <div
+      className="border-b border-base-border px-2 py-1.5 font-mono text-[10px] last:border-b-0"
+      data-testid="execution-outcome-status-row"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-1">
+        <span className="text-text-primary">{trade.symbol} · {trade.strategy_name}</span>
+        <time className="text-text-muted" dateTime={trade.updated_at}>{formatTriggerTime(trade.updated_at)}</time>
+      </div>
+      <div className="text-text-muted">
+        <span className={TONE_CLASS[tone]}>{label}</span>
+        {" · "}
+        {trade.outcome_id !== null ? "outcome linked" : "no outcome link"}
+      </div>
+    </div>
+  );
+}
+
+// Progress of the simulated OutcomeRecorder (decision #186) over closed
+// simulated AUTO trades (GET /intelligence/execution-outcome-status). Not a
+// portfolio, not a real-money result, and NOT the Info tab's "Recent Closed
+// Trades" (that reads the outcome rows themselves; this reads recording status
+// on the trade). Same manual-Refresh shape as RecordedExitRequests: Refresh
+// stays enabled while a request is in flight so a slow or hung request can be
+// superseded, and the effect cleanup discards the superseded response either
+// way (as it does after collapse/unmount). No polling, no action buttons.
+function SimulatedOutcomeRecording() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [load, setLoad] = useState<OutcomeStatusLoad>({ kind: "loading" });
+
+  useEffect(() => {
+    let active = true;
+    setLoad({ kind: "loading" });
+    fetchExecutionOutcomeStatus(OUTCOME_STATUS_LIMIT)
+      .then((data) => {
+        if (active) setLoad({ kind: "ready", data });
+      })
+      .catch((error: unknown) => {
+        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+      });
+    return () => { active = false; };
+  }, [refreshKey]);
+
+  const ready = load.kind === "ready" ? load.data : null;
+  const total = ready
+    ? ready.counts.pending + ready.counts.pending_retry + ready.counts.blocked + ready.counts.recorded + ready.counts.other
+    : 0;
+
+  return (
+    <section className="border-b border-base-border" aria-label="Simulated outcome recording">
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <h2 className="font-mono text-[11px] font-semibold text-text-primary">Simulated outcome recording</h2>
+        <button
+          onClick={() => setRefreshKey((key) => key + 1)}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
+        >
+          Refresh
+        </button>
+      </div>
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+        Closed simulated auto trades only — not a live portfolio or a real-money result. Pending may still be
+        recovered by the recorder. A blocked reason is in the server logs, not this API. Counts cover every such
+        trade; the list shows the most recently changed. Time is when the trade record last changed. Loaded on
+        expansion and Refresh, not a live feed.
+      </p>
+      {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading outcome recording status…</p>}
+      {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch outcome recording status: {load.message}</p>}
+      {ready && total === 0 && (
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">No closed simulated auto trades yet.</p>
+      )}
+      {ready && total > 0 && (
+        <>
+          <div className="flex flex-wrap gap-x-3 gap-y-0.5 px-2 pb-1.5 font-mono text-[10px]" data-testid="execution-outcome-status-counts">
+            <span className={TONE_CLASS.muted}>Pending {ready.counts.pending}</span>
+            <span className={TONE_CLASS.signal}>Pending retry {ready.counts.pending_retry}</span>
+            <span className={TONE_CLASS.bear}>Blocked {ready.counts.blocked}</span>
+            <span className={TONE_CLASS.bull}>Recorded {ready.counts.recorded}</span>
+            <span className={ready.counts.other > 0 ? TONE_CLASS.bear : TONE_CLASS.muted}>Other {ready.counts.other}</span>
+          </div>
+          {ready.trades.length < total && (
+            <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
+              Showing the {ready.trades.length} most recently changed of {total}.
+            </p>
+          )}
+          <div className="max-h-48 overflow-y-auto border-t border-base-border">
+            {ready.trades.map((trade) => (
+              <OutcomeStatusRow key={trade.trade_id} trade={trade} />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 export function ExecutionLifecyclePanel() {
   const [collapsed, setCollapsed] = useState(true); // starts collapsed, same reasoning every other sibling panel here already uses
   const [widthPx, setWidthPx] = useState(DEFAULT_WIDTH);
@@ -836,6 +964,7 @@ export function ExecutionLifecyclePanel() {
         {!collapsed && <RecentSimulatedOrders />}
         {!collapsed && <RecentSimulatedFills />}
         {!collapsed && <RecentSimulatedPositions />}
+        {!collapsed && <SimulatedOutcomeRecording />}
         {!collapsed && <ExecutionLifecycleBody />}
       </div>
     </div>
