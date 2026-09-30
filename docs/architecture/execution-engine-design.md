@@ -348,6 +348,27 @@ Committed reservation -> PostgresPositionLedger -> Portfolio State restore
                     \-> PostgresOrderLedger -> committed order -> venue
 ```
 
+**As built (governor-approval-evidence — slug only, no decision number reserved).** An approval now also stores the accepted `Opportunity.evidence` in `trades.thesis["evidence"]`, inside the same transaction as the trade and its reservation. Nothing else persisted it before: `OpportunityCache` overwrites in memory and `TradeDecisionRecord` had no field for it. Scope is exactly that. It does not write entry snapshots, does not persist `Opportunity.confirmed_at` (no strategy sets it today), changes no authorization rule, and is not the `OutcomeRecorder` or an EX-12 decision.
+
+* **Carry.** `AuthorizerStub` sets `TradeDecisionRecord.evidence = opportunity.evidence` only when the rule result is `approved`. A rejection never carries evidence, so a bad payload cannot change a rule outcome or stop a rejection from being audited.
+* **Validation (`governor/evidence.py`, pure).** `detach_evidence()` returns a deep, detached copy or raises `EvidenceError`. It accepts a dict of `str` keys holding `str`/`int`/`float`/`bool`/`None`/`list`/`dict`. It refuses NaN and ±Infinity, non-`str` keys (JSON would silently turn `1` into `"1"`), tuples, sets, datetimes, Decimals, bytes, any other object, and nesting deeper than 32 levels (which also refuses reference cycles). Nothing is coerced, dropped, truncated or replaced with `{}`; an empty dict from a strategy is stored as given. By reading their source, all seven strategies build `evidence` from nested dicts of plain scalars (floats, ints, strings, `None`), so the strictness should cost nothing on the production path; a strategy that starts emitting anything else will have its approvals refused and logged, not silently repaired.
+* **Where it is stored.** `trades.thesis["evidence"]`, next to `structural_*`/`final_*`/`confidence`/`setup_detected_at`. It is deliberately kept out of `decision_record`, whose shape and replay comparison are unchanged. An approval committed without evidence (`evidence=None`, i.e. any row written before this delivery) has no `"evidence"` key at all; it is never back-filled and never a stand-in `{}`. No migration: `thesis` is already JSONB.
+* **Refusal.** `PostgresTradeLedger.commit_decision()` validates before opening its transaction. A bad payload raises `LedgerCommitError`, so no trade and no reservation exist, and because the engine publishes only after a successful commit, no `TradePlanned`/`GovernorDecision`/`OrderApproved` is emitted (the pre-existing "commit failed, publish nothing" path). A rejected record that carries evidence is also refused.
+* **Replay.** An identical approval returns the existing identity (evidence compared structurally; `True` is not `1`, an int/float of equal value is the same number). Different, added or missing evidence on a replay raises `LedgerCommitError("conflicting evidence …")` and the stored evidence is untouched, including evidence offered against a legacy approval that has none.
+
+```
+OpportunityCreated ─► AuthorizerStub ─ rules 0-6 ─┬─ rejected ─► TradeDecisionRecord(evidence=None) ─► audit row, PlanRejected
+                                                  └─ approved ─► TradeDecisionRecord(evidence=opportunity.evidence)
+                                                                        │
+                                             PostgresTradeLedger.commit_decision
+                                                                        │
+             detach_evidence()  ── EvidenceError ─► LedgerCommitError ─► nothing written, nothing published
+                    │ ok (detached, JSON-safe copy)
+                    ▼
+      one transaction: trades(thesis{…, evidence}) + trade_reservations ─ COMMIT ─► TradePlanned ─► GovernorDecision ─► OrderApproved
+      replay of the same accepted id: stored evidence equal? ─ yes ─► existing identity │ no ─► LedgerCommitError("conflicting evidence")
+```
+
 ### 6.3 Execution Engine (`execution_engine/`)
 
 **What it is.** The only module that talks to a venue (I1). It turns an authorization (or a reduce-only exit intent) into a durable, idempotent order, sends it, and turns every venue update into ledger state and an `OrderFilled` — deduplicated, persisted first, published second.

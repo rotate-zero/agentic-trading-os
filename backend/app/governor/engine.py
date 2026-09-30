@@ -244,6 +244,10 @@ class AuthorizerStub:
             client_order_id=client_order_id,
             qty=result.qty,
             reference_price=result.reference_price,
+            # Carried only on an approval. Validation is the ledger's job and
+            # a refusal surfaces as LedgerCommitError below: no trade, no
+            # reservation, no event. Never replaced with {} here.
+            evidence=opportunity.evidence if result.decision == "approved" else None,
         )
 
         try:

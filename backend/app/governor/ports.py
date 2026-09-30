@@ -112,6 +112,12 @@ class TradeDecisionRecord:
     client_order_id: str | None = None
     qty: int | None = None
     reference_price: float | None = None
+    # The accepted Opportunity's own `evidence` dict, carried ONLY on an
+    # approval (never on a rejection). The ledger validates it strictly and
+    # stores a detached copy in `trades.thesis["evidence"]`; it is NOT part of
+    # `decision_record`. None means "not carried" (records written before this
+    # field existed) -- never a stand-in for an empty dict.
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)

@@ -7,11 +7,15 @@ from uuid import UUID, uuid4
 
 from app.db.ledger_transaction import ledger_transaction
 from app.models.execution_ledger import Trade, TradeReservation
+from .evidence import EvidenceError, detach_evidence, evidence_equal
 from .ports import LedgerCommitError, TradeDecisionCommitResult
 
 
 def _record_data(record):
     data = asdict(record)
+    # Evidence lives in trades.thesis["evidence"], not in decision_record, so
+    # the decision_record shape (and its replay comparison) is unchanged.
+    data.pop("evidence")
     for name in ("setup_detected_at", "decided_at"):
         ts = data[name]
         if ts.tzinfo is None or ts.utcoffset() is None:
@@ -25,7 +29,24 @@ class PostgresTradeLedger:
     def __init__(self, session_factory):
         self._sessions = session_factory
 
+    @staticmethod
+    def _validated_evidence(record):
+        """Detached JSON-safe copy for an approval; None when none was carried."""
+        if record.evidence is None:
+            return None
+        if record.decision != "approved":
+            raise LedgerCommitError("only an approved decision may carry evidence")
+        try:
+            return detach_evidence(record.evidence)
+        except EvidenceError as exc:
+            raise LedgerCommitError(f"approval evidence is not plain finite JSON: {exc}") from exc
+
     def commit_decision(self, record):
+        # Validate BEFORE opening the transaction: a bad payload is refused
+        # explicitly (never repaired) and takes no table lock, leaving no trade,
+        # no reservation and -- because the engine publishes only after a
+        # successful commit -- no approval event.
+        evidence = self._validated_evidence(record)
         with ledger_transaction(self._sessions, LedgerCommitError) as session:
             data = _record_data(record)
             if record.decision not in {"approved", "rejected"} or record.direction not in {"BUY", "SELL"}:
@@ -55,6 +76,12 @@ class PostgresTradeLedger:
                         reservation.client_order_id, reservation.qty, reservation.reference_price
                     ) != (record.client_order_id, record.qty, price):
                         raise LedgerCommitError("conflicting or incomplete committed approval")
+                    stored = existing.thesis.get("evidence") if isinstance(existing.thesis, dict) else None
+                    has_stored = isinstance(existing.thesis, dict) and "evidence" in existing.thesis
+                    if has_stored != (evidence is not None) or (
+                        has_stored and not evidence_equal(stored, evidence)
+                    ):
+                        raise LedgerCommitError("conflicting evidence for committed approval")
                     return TradeDecisionCommitResult(existing.created_at, str(trade_id))
             else:
                 if any(value is not None for value in (record.opportunity_id, record.client_order_id, record.qty, record.reference_price)):
@@ -69,7 +96,8 @@ class PostgresTradeLedger:
                         "structural_target": record.structural_target,
                         "final_stop": record.structural_invalidation, "final_target": record.structural_target,
                         "confidence": record.confidence_at_signal,
-                        "setup_detected_at": data["setup_detected_at"]},
+                        "setup_detected_at": data["setup_detected_at"],
+                        **({"evidence": evidence} if evidence is not None else {})},
                 status="open" if record.decision == "approved" else None)
             session.add(trade)
             session.flush()
