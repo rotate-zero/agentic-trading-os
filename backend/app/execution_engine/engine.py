@@ -265,6 +265,9 @@ class ExecutionEngine:
             PrepareDisposition.WAIT_PENDING_FILL, PrepareDisposition.WAIT_ACTIVE_ORDER,
             PrepareDisposition.WAIT_UNCERTAIN_DISPATCH, PrepareDisposition.WAIT_RETRY_DELAY,
             PrepareDisposition.WAIT_WINDOW_NOT_OPEN, PrepareDisposition.DORMANT,
+            # Stop/target/fallback outside regular hours: request retained, nothing reserved,
+            # no venue call. The next pass in regular hours resumes it (no timer of its own).
+            PrepareDisposition.WAIT_OUTSIDE_REGULAR_SESSION,
         }:
             return
         action = prepared.action
@@ -292,6 +295,7 @@ class ExecutionEngine:
             ClaimDisposition.ALREADY_CLAIMED, ClaimDisposition.STALE,
             ClaimDisposition.WINDOW_EXPIRED, ClaimDisposition.WAIT_WINDOW_NOT_OPEN,
             ClaimDisposition.WAIT_ENTRY_ACTIVITY, ClaimDisposition.WAIT_PENDING_FILL,
+            ClaimDisposition.WAIT_OUTSIDE_REGULAR_SESSION,  # boundary passed after prepare: unsent, unmarked
         }:
             return
         if claim.disposition is ClaimDisposition.UNSAFE:

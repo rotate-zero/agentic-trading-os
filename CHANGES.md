@@ -1,3 +1,48 @@
+# CHANGES — `simulated-protective-session-retry`
+
+Stops a simulated stop/target close from minting a new attempt every five seconds while the
+venue is closed. GitHub `main` was `b6d1e57` at start and at the final fetch (no newer
+commits). No decision number was assigned (slug only), no migration, no dependency. Not
+touched: `MarketClock`, `core/session_window.py`, their tests, calendar data, frontend.
+
+**Defect reproduced first.** `SimulatedVenue` rejects every order outside regular hours; the
+ledger answered any rejected close with `retry_after = now + 5 s`, and `prepare_exit()` had
+no session check. Ledger-level reproduction (real PostgreSQL, injected clock, rejecting
+stand-in venue): 400 service passes over 40 minutes -> 400 venue calls, 400 distinct
+`<trade>:exit:N` IDs, all but five after 16:00 ET. The same loop applied to an original
+stop/target observed after hours and to the fallback of an expired EOD row (a fallback is
+first actionable at or after the bell).
+
+- `execution_engine/exit_ledger.py`: a stop/target close (original request or EOD fallback)
+  is neither reserved nor dispatched while `MarketClock.is_regular_session(now)` is false,
+  using the ledger's injected clock. New `PrepareDisposition.WAIT_OUTSIDE_REGULAR_SESSION`
+  and `ClaimDisposition.WAIT_OUTSIDE_REGULAR_SESSION`. The durable request, `exit_attempt`,
+  order rows and rejection history are untouched, so IDs stay monotonic. The guard sits
+  after the active/uncertain-close, pending-fill and retry-delay checks (they keep their
+  behavior; a submitted or dispatch-marked close stays exclusive) and replaces only a new
+  reservation or a `SUBMIT`. An unsent approved reservation is held and reused (same ID)
+  at the open. `claim_dispatch` re-checks before writing any dispatch marker. `eod_flatten`
+  and its `[flatten_at, close_at)` placement rule are not affected.
+- `execution_engine/engine.py`: the worker treats both new dispositions as a quiet return
+  (no error log, no venue call). Resumption is the existing worker pass; there is no new timer.
+- Docs: `docs/architecture/execution-engine-design.md` (new §6.6 subsection with component
+  data-flow diagram, prepare/claim internal-flow diagram and timeline, consequences/limits;
+  updated summary, transition table, result-type table and the existing flow diagram).
+- Tests: new `test_simulated_protective_session_retry.py` (32). Five cases in four existing
+  tests in `test_exit_ledger_eod_postgres.py` placed an EOD fallback at 16:00:30 ET; only that
+  placement step moved to the next open (`NEXT_OPEN`, 2026-09-17 13:30Z) and a wait
+  assertion was added. Their other assertions are unchanged.
+
+**Behavior consequences to review.** (1) An EOD fallback cannot place on the entry day; its
+first chance is the next regular open, adding a regular-hours condition to decision #185's
+wording (no numbered entry written; add one at merge if you treat this as a policy change).
+(2) Working-entry cancellation is not a close and is not gated. (3) A legacy #184 unsent
+reservation with no dispatch marker is also held outside hours. (4) No fork arose about an
+already-submitted order; its existing handling is preserved. (5) The two clocks (ledger vs
+venue) can disagree at the boundary; the cost is one venue rejection under the existing delay.
+
+---
+
 # CHANGES — `market-clock-2027-2028-coverage`
 
 Extends `MarketClock`'s verified NYSE equity calendar from 2026 to 2026–2028. GitHub `main`

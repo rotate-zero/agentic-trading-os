@@ -17,6 +17,16 @@ Nothing here reads the market, the venue or a timer. Every wall-clock
 comparison uses the injected `clock`; every EOD window is derived from the
 committed `positions.opened_at` through `core.session_window`, never from the
 monitor's supplied bounds.
+
+Session guard (`simulated-protective-session-retry`). The simulated venue only
+accepts orders during regular hours, so a stop/target close (original request
+or the fallback captured on an expired EOD row) is neither reserved nor
+dispatched while `MarketClock.is_regular_session(now)` is false. The durable
+request is retained, `positions.exit_attempt` and rejection history are left
+untouched, and the existing worker resumes the request when regular hours
+return, through the same committed-position / entry / pending-fill / retry
+checks. An active or dispatch-uncertain close is checked first and stays
+exclusive. EOD's own `[flatten_at, close_at)` placement rule is not touched.
 """
 from __future__ import annotations
 
@@ -135,6 +145,7 @@ class PrepareDisposition(str, Enum):
     WAIT_UNCERTAIN_DISPATCH = "wait_uncertain_dispatch"  # approved close carries a dispatch marker
     WAIT_RETRY_DELAY = "wait_retry_delay"
     WAIT_WINDOW_NOT_OPEN = "wait_window_not_open"    # EOD row, wall clock before flatten_at
+    WAIT_OUTSIDE_REGULAR_SESSION = "wait_outside_regular_session"  # stop/target/fallback: retained, no new attempt
     DORMANT = "dormant"                              # expired EOD, no fallback
 
 
@@ -155,6 +166,7 @@ class ClaimDisposition(str, Enum):
     STALE = "stale"                              # order not sendable (terminal/progressed/position flat)
     WINDOW_EXPIRED = "window_expired"            # EOD placement ended; unsent order cancelled (normal skip)
     WAIT_WINDOW_NOT_OPEN = "wait_window_not_open"
+    WAIT_OUTSIDE_REGULAR_SESSION = "wait_outside_regular_session"  # stop/target/fallback: no marker, no venue call
     WAIT_ENTRY_ACTIVITY = "wait_entry_activity"  # an entry can still change the position
     WAIT_PENDING_FILL = "wait_pending_fill"
     UNSAFE = "unsafe"                            # identity/quantity/reason mismatch: an error, not an expiry
@@ -314,6 +326,16 @@ class PostgresExitLedger:
         if request.fallback_reason is not None:
             return request.fallback_reason, "fallback"
         return None, "dormant"
+
+    def _protective_outside_session(self, reason: str | None, now: datetime) -> bool:
+        """True when a stop/target close must wait for regular hours.
+
+        Only a protective reason (an original stop/target or an EOD row's
+        fallback) is held; `eod_flatten` keeps its own `[flatten_at, close_at)`
+        rule. Uses the ledger's injected clock, not the venue's, so boundaries
+        are deterministic in tests.
+        """
+        return reason in PROTECTIVE and not self._market_clock.is_regular_session(now)
 
     # ------------------------------------------------------------------
     # Observation
@@ -500,6 +522,7 @@ class PostgresExitLedger:
             if state == "not_open":
                 return PrepareResult(PrepareDisposition.WAIT_WINDOW_NOT_OPEN, position_id, **common)
             lifecycle = request.exit_reason == EOD_FLATTEN
+            outside_session = self._protective_outside_session(reason, now)
 
             orders = session.scalars(select(Order).where(Order.trade_id == trade.trade_id).order_by(Order.id)).all()
             for order in orders:
@@ -528,12 +551,19 @@ class PostgresExitLedger:
                         return PrepareResult(PrepareDisposition.WAIT_UNCERTAIN_DISPATCH, position_id, **common)
                     if lifecycle and order.exit_reason != reason:
                         raise ExitLedgerError("unsent reservation reason differs from the effective exit reason")
+                    if outside_session:
+                        # Retained unsent reservation: reused, same ID, when regular hours return.
+                        return PrepareResult(PrepareDisposition.WAIT_OUTSIDE_REGULAR_SESSION, position_id, **common)
                     return PrepareResult(PrepareDisposition.SUBMIT, position_id, ExitAction(
                         "submit", order.client_order_id, order.symbol, order.side, order.qty, order.exit_reason or ""
                     ), **common)
 
             if request.retry_after is not None and request.retry_after > now:
                 return PrepareResult(PrepareDisposition.WAIT_RETRY_DELAY, position_id, **common)
+            if outside_session:
+                # No new attempt: exit_attempt, rejection history and the durable request stay as they are.
+                # Checked last so this wait only ever replaces what would have been a new reservation.
+                return PrepareResult(PrepareDisposition.WAIT_OUTSIDE_REGULAR_SESSION, position_id, **common)
             attempt = position.exit_attempt + 1
             order_id = f"{trade.trade_id}:exit:{attempt}"
             side = "SELL" if position.side == "BUY" else "BUY"
@@ -603,6 +633,10 @@ class PostgresExitLedger:
                         return result(ClaimDisposition.WAIT_WINDOW_NOT_OPEN, "before_flatten_at")
                 elif not (state == "fallback" and order.exit_reason == reason):
                     return result(ClaimDisposition.UNSAFE, "fallback_not_actionable")
+
+            if self._protective_outside_session(order.exit_reason, now):
+                # The boundary passed between prepare() and here: no marker, no venue call.
+                return result(ClaimDisposition.WAIT_OUTSIDE_REGULAR_SESSION, "outside_regular_session")
 
             # A fill can arrive after prepare() but before placement. Never send a
             # close while an entry can still change the position or while

@@ -1069,7 +1069,10 @@ waits for committed fill receipts, then reserves one position-linked close
 order for the committed remaining quantity. The order ID is
 `<trade_id>:exit:<attempt>`; `positions.exit_attempt` advances in the same
 transaction. Rejected or cancelled closes retry after a bounded delay with
-a new ID and the remaining quantity. The existing fill ledger and Portfolio
+a new ID and the remaining quantity, but only while `MarketClock` says regular
+hours are open: outside them a stop/target close (including an EOD row's fallback)
+is retained and neither reserved nor dispatched until the next regular open
+(`simulated-protective-session-retry`, below). The existing fill ledger and Portfolio
 State worker apply fills; full closure marks the trade closed. EOD flatten
 uses the same position-bound close path with stored window, fallback and
 dispatch claim. Paper/live execution is unaffected.
@@ -1637,11 +1640,12 @@ acknowledgement or lost venue book is not terminal proof.
 | EOD row, no order at close | Persist expiry even if entry cancellation or receipts delayed reservation. Dormant without fallback; with fallback, protective guards and retry delay apply. |
 | Approved EOD reservation, proven unsent at close | Atomically cancel order with `eod_window_closed` and expire EOD eligibility. Keep row/history/counter. Never reuse ID. Fallback may reserve a new ID only after all guards. |
 | Rejected or cancelled EOD inside window | Commit terminal status/delay and settle fills. Retry EOD on a new ID only inside window; captured fallback waits. |
-| Rejected or cancelled EOD at/after close | Expire EOD; no new EOD attempt. Dormant without fallback. A stored or later protective observation enables guarded residual close after settlement/delay. |
+| Rejected or cancelled EOD at/after close | Expire EOD; no new EOD attempt. Dormant without fallback. A stored or later protective observation enables guarded residual close after settlement/delay **and only in regular hours** (`simulated-protective-session-retry`): the bell that expires EOD is the bell that closes the venue, so a fallback places no earlier than the next regular open. |
 | Submitted, unfilled at close | Expire placement eligibility but leave order working under recommended policy. No replacement/cancel-at-bell. Fallback may be recorded but cannot place. A later tick can fill after hours; no tick can mean indefinite non-fill. |
 | Partially filled at close | Apply only actual fills; retain same active order for its leaves quantity. No second close for remainder. If later terminal and settled with quantity remaining, stored/new fallback may close only committed remainder. Without fallback, dormant. |
 | Approved with dispatch marker, or unknown | Reconcile same ID and fills; preserve exclusivity. Never locally cancel as unsent, reset marker, blindly resend, or mint replacement without resolution. |
-| Later stop/target on EOD row | Store first fallback even while EOD active/retrying. Observation alone cannot authorize second order. Action requires EOD expiry and no active/uncertain close. Flat positions reject/no-op. |
+| Later stop/target on EOD row | Store first fallback even while EOD active/retrying. Observation alone cannot authorize second order. Action requires EOD expiry, no active/uncertain close, and regular hours. Flat positions reject/no-op. |
+| Stop/target (original or fallback) outside regular hours | Request retained; no reservation, no `exit_attempt` increment, no venue call. An unsent approved reservation is held, not sent. Prior active/uncertain close stays exclusive (checked first). Resumes through the same worker at the next regular open with the full fresh checks; see the session-guard subsection. |
 | Protective request before EOD | Original row/retry behavior wins; EOD adds nothing. |
 | Full closure | Only fills/receipts close position/trade; fallback cannot reopen/reverse. |
 | Restart | Rebuild, reconcile and restore durable slots/deadlines before workers. Recover missed expiry from stored bounds. Uncertain dispatch/lost position state blocks; never fabricate closure. |
@@ -1816,8 +1820,8 @@ reach an EOD-lifecycle venue call without the durable claim.
 | Method | Result | Values (what the caller does) |
 |---|---|---|
 | `observe_exit(intent)` | `ObserveResult(disposition, position_id, reason, slot)`; `.acknowledged`, `.retry` | `STORED`, `ALREADY_STORED`, `FALLBACK_STORED`, `FALLBACK_ALREADY_STORED`, `SUPERSEDED` (protective request already exists) → committed, clear the slot. `WINDOW_NOT_OPEN` → keep and retry. `WINDOW_CLOSED`, `POSITION_CLOSED`, `INVALID(reason)` → resolved, drop; only the EOD slot is dropped, protective eligibility is unaffected. Identity that differs from the committed position **raises** `ExitLedgerError`. |
-| `prepare_exit(position_id)` | `PrepareResult(disposition, action, eod_expired, expired_now, cancelled_order_id, reason)` | `SUBMIT` (action to claim), `CANCEL_ENTRY` (action), `WAIT_PENDING_FILL`, `WAIT_ACTIVE_ORDER`, `WAIT_UNCERTAIN_DISPATCH`, `WAIT_RETRY_DELAY`, `WAIT_WINDOW_NOT_OPEN`, `DORMANT`, `NO_REQUEST`, `POSITION_CLOSED`. Unsafe identity/trade/mode raises. |
-| `claim_dispatch(order_id)` | `ClaimResult(disposition, action, reason)`; `.send` | **`CLAIMED` is the only value that permits a venue call.** `ALREADY_CLAIMED` (uncertain, never resend), `STALE`, `WINDOW_EXPIRED` (normal skip; unsent order already cancelled), `WAIT_WINDOW_NOT_OPEN`, `WAIT_ENTRY_ACTIVITY`, `WAIT_PENDING_FILL`, `UNSAFE(reason)` (an error, not an expiry). |
+| `prepare_exit(position_id)` | `PrepareResult(disposition, action, eod_expired, expired_now, cancelled_order_id, reason)` | `SUBMIT` (action to claim), `CANCEL_ENTRY` (action), `WAIT_PENDING_FILL`, `WAIT_ACTIVE_ORDER`, `WAIT_UNCERTAIN_DISPATCH`, `WAIT_RETRY_DELAY`, `WAIT_WINDOW_NOT_OPEN`, `WAIT_OUTSIDE_REGULAR_SESSION` (stop/target/fallback held until regular hours; only ever replaces what would have been `SUBMIT`), `DORMANT`, `NO_REQUEST`, `POSITION_CLOSED`. Unsafe identity/trade/mode raises. |
+| `claim_dispatch(order_id)` | `ClaimResult(disposition, action, reason)`; `.send` | **`CLAIMED` is the only value that permits a venue call.** `ALREADY_CLAIMED` (uncertain, never resend), `STALE`, `WINDOW_EXPIRED` (normal skip; unsent order already cancelled), `WAIT_WINDOW_NOT_OPEN`, `WAIT_OUTSIDE_REGULAR_SESSION` (the boundary passed between `prepare_exit` and here: no marker, no venue call, reservation kept), `WAIT_ENTRY_ACTIVITY`, `WAIT_PENDING_FILL`, `UNSAFE(reason)` (an error, not an expiry). |
 | `advance_eod_expiry(position_id)` | `EodExpiryResult(disposition, cancelled_order_id)` | `EXPIRED`, `ALREADY_EXPIRED`, `NOT_DUE`, `NOT_EOD`, `NO_REQUEST`, `POSITION_CLOSED`. Called on restart (recover from stored bounds) and by any timer. |
 | `slot_state(position_id)` | `ExitSlotState | None` | Original reason, bounds, expiry, fallback, `retry_after`; `.dormant`. For slot hydration before subscriptions. |
 
@@ -1900,7 +1904,9 @@ prepare_exit:  identity/trade guards (raise) ─► advance expiry FIRST ─► 
    ─► active close: submitted/partial/unknown ▸ WAIT_ACTIVE_ORDER
                      approved + marker ▸ WAIT_UNCERTAIN_DISPATCH
                      approved, no marker ▸ SUBMIT (reuse the same ID)
+                                           [stop/target/fallback and NOT regular session ▸ WAIT_OUTSIDE_REGULAR_SESSION]
    ─► retry_after in future? WAIT_RETRY_DELAY
+   ─► stop/target/fallback and NOT MarketClock.is_regular_session(now)? WAIT_OUTSIDE_REGULAR_SESSION (nothing reserved)
    ─► reserve <trade>:exit:<attempt+1>, qty = committed positions.qty, marker NULL ─► SUBMIT
 
 expiry at now >= close_at:  unsent (approved, marker NULL) EOD order ─► cancelled 'eod_window_closed'
@@ -1909,6 +1915,7 @@ expiry at now >= close_at:  unsent (approved, marker NULL) EOD order ─► canc
 
 claim_dispatch:  not a position close ─► UNSAFE | flat/not approved ─► STALE | marker set ─► ALREADY_CLAIMED
    identity differs ─► UNSAFE | EOD: expiry due ─► cancel unsent ─► WINDOW_EXPIRED
+   stop/target/fallback and NOT regular session ─► WAIT_OUTSIDE_REGULAR_SESSION (no marker)
    entry working ─► WAIT_ENTRY_ACTIVITY | fill without receipt ─► WAIT_PENDING_FILL
    qty != committed ─► UNSAFE | else write marker, COMMIT ─► CLAIMED  (only now may the venue be called)
 
@@ -1950,6 +1957,83 @@ for `ExitIntent`; the persisted instant is unchanged. Shutdown stops the monitor
 Execution so no new observation enters its draining queue. The read-only request panel
 continues to distinguish the original reason, expiry and fallback; orders and fills are
 separate evidence. Acceptance-case test mapping and limits are in `TESTING.md`.
+
+#### Session-aware protective close (`simulated-protective-session-retry`)
+
+**Defect found on `main` (`b6d1e57`).** `SimulatedVenue` rejects every order outside regular
+hours (`outside_regular_session`), and `set_status()` answers any rejected close with
+`retry_after = now + 5 s`. `prepare_exit()` had no session check, so after the bell each
+service pass (the worker polls every 0.5 s) reserved a **new** attempt every five seconds,
+called the venue, was rejected, and repeated all night. Reproduced at ledger level (real
+PostgreSQL, injected clock, a stand-in venue that rejects every order as the real one does
+after the bell): 400 service passes over 40 minutes produced 400 venue calls and 400 distinct
+`<trade>:exit:N` IDs, all but the first five after 16:00 ET. The same loop applied to an original stop/target observed after hours and to the
+fallback of an expired EOD row (the fallback is, by construction, first actionable at or after
+the regular close).
+
+**Rule.** A stop/target close is neither reserved nor dispatched while
+`MarketClock.is_regular_session(now)` is false, `now` being the ledger's injected clock. The
+durable `exit_requests` row is kept; `positions.exit_attempt`, order rows and rejection history
+are untouched, so IDs stay monotonic and the real `outside_regular_session` reasons remain.
+When regular hours return the same worker pass resumes the request through the unchanged checks
+(committed position quantity, working entry, fill without receipt, retry delay). The venue is
+called at most once per permitted attempt. `eod_flatten` keeps its own `[flatten_at, close_at)`
+rule (that interval always lies inside regular hours); the guard never applies to it. Nothing
+here invents a fill or promises overnight protection: a stop/target that fires after the bell
+is an observation until the next open.
+
+```text
+                       wall clock (injected in tests)
+                              │ now
+Position Monitor ──observe──► Execution worker ──prepare_exit()/claim_dispatch()──► PostgresExitLedger
+ (stop/target/EOD)            _service_exits()   ▲   dispositions                    │  │ is_regular_session(now)
+                              (every 0.5 s)      │                                  │  ▼
+                                                 │                                  │ MarketClock (read-only; unchanged)
+                                   SUBMIT / CLAIMED only                            ▼
+                                                 │                       exit_requests · orders · positions.exit_attempt
+                                                 ▼                                  (retained; no new row/ID outside hours)
+                                        SimulatedVenue.place_order()
+                                        (its own session check stays as the second line of defence)
+```
+
+```text
+prepare_exit() / claim_dispatch() with the session guard (only the new branches shown)
+
+ protective row or EOD fallback ─► effective reason = stop | target
+   working entry ▸ CANCEL_ENTRY (unchanged; not a close)     fill w/o receipt ▸ WAIT_PENDING_FILL
+   active close: submitted/partial/unknown ▸ WAIT_ACTIVE_ORDER          } exclusivity is checked FIRST
+                 approved + marker         ▸ WAIT_UNCERTAIN_DISPATCH    } and wins over the session wait
+                 approved, unsent          ▸ regular hours ? SUBMIT (same ID) : WAIT_OUTSIDE_REGULAR_SESSION
+   retry_after in future ▸ WAIT_RETRY_DELAY
+   no close:                regular hours ? reserve <trade>:exit:<attempt+1> ▸ SUBMIT
+                                          : WAIT_OUTSIDE_REGULAR_SESSION  (no order, no counter change)
+ claim_dispatch: ... identity/lifecycle checks ─► not regular hours ▸ WAIT_OUTSIDE_REGULAR_SESSION
+                 (before the dispatch marker is written) ─► entry/fill/quantity guards ─► CLAIMED
+
+timeline, entry day 2026-09-16 (EDT):
+ 19:59:30Z  stop observed, reserve :exit:1 ─► venue rejects (bell) ─► retry_after +5 s
+ 20:00:00Z  16:00 ET closed ───┐
+   ... service passes ...      │ WAIT_OUTSIDE_REGULAR_SESSION every pass: 0 orders, 0 venue calls, exit_attempt = 1
+ 13:29:59Z  still closed ──────┘
+ 13:30:00Z  09:30 ET open ─► one permitted attempt :exit:2 ─► claim ─► venue ─► (normal retry delay applies again)
+ half-day 2026-11-27: closed from 13:00 ET (18:00Z); next open Mon 2026-11-30 09:30 ET (14:30Z)
+```
+
+**Consequences and limits.** (1) A fallback after EOD expiry cannot place on the entry day;
+its first chance is the next regular open, after which the ordinary safety checks decide. The
+EOD approved-policy wording "actionable only after EOD placement expires and prior
+orders/fills are safely settled" therefore gains a regular-hours condition. (2) An already
+`submitted`/`partially_filled`/`unknown` close, and an approved close carrying a dispatch
+marker, keep their existing exclusive handling; this change does not cancel, replace or
+resolve them. (3) An unsent approved reservation found outside hours is held rather than
+sent, including a legacy #184 reservation that has no dispatch marker. (4) Working-entry
+cancellation is not a close and is not gated. (5) The worker still polls and calls
+`prepare_exit()` (one short transaction per waiting position) while waiting; there is no
+next-open timer, so resumption is the first worker pass at or after 09:30 ET. (6) The ledger
+judges `is_regular_session(now)` with its own injected clock; the venue's own check remains the
+second line of defence, and a disagreement between the two clocks only costs one venue
+rejection under the existing retry delay. (7) `MarketClock` covers 2026-2028 holidays and
+early closes; outside them a year has no holidays, so weekdays 09:30-16:00 ET count as regular.
 
 #### Approved policy (Saqib, 2026-09-29)
 

@@ -1,3 +1,41 @@
+# TESTING — `simulated-protective-session-retry`
+
+Baseline: GitHub `main` `b6d1e57`, unchanged at the final fetch. Local PostgreSQL 16
+(`trading_workspace`, timezone UTC) created for this run and migrated with
+`alembic upgrade head` through `0016`; no external, broker or production database was
+contacted. Reproduction rows were deleted afterwards.
+
+New `backend/tests/test_simulated_protective_session_retry.py` — **32 tests**, real
+PostgreSQL and injected clocks; the last three use the real `ExecutionEngine`,
+`PostgresExitLedger`, Portfolio State and `SimulatedVenue`, counting `place_order`/
+`cancel_order` calls:
+ordinary-close boundaries for stop and target (16:00 ET minus 1 µs submit; 16:00 wait; overnight
+wait; 09:30 ET minus 1 µs wait; 09:30 submit), the 13:00 ET half-day (2026-11-27) and its next
+open, weekend and holiday; rejected at the bell then overnight passes with no new order, ID or
+`exit_attempt` growth, exactly one permitted attempt at the open, reuse of the same reserved ID,
+and the normal 5 s delay applying again; original stop/target observed after hours; submitted
+close and dispatch-marked EOD close staying exclusive; EOD fallback held then placed once with
+its dispatch marker; EOD-inside-window control; claim after the bell (no marker, reservation
+reused) including the fallback at the next close; resume with changed committed quantity, an
+unreceipted fill, a working entry and a flat position; engine tests for repeated overnight
+passes (one venue call in total before the open, no warnings), an after-hours original, and the
+bell ringing between prepare and claim.
+
+Regression guard: with the guard neutralised, 22 of the 32 fail; restored, 32 pass.
+
+Existing tests: four tests in `test_exit_ledger_eod_postgres.py` needed their fallback placement
+time moved to the next open (see CHANGES.md); all other existing tests unchanged.
+
+Focused run (exit ledger, EOD ledger, new file, venue, EOD integration, engine): 109 passed.
+Full backend suite: **1453 passed**, 1 pre-existing warning, run after the final code change
+(1421 on the previous baseline + 32 new). Only docs were edited afterwards.
+
+Not covered: no real-IBKR/paper path; no timer-driven resume (the worker's own poll is the only
+trigger); ledger vs venue clock disagreement is reasoned, not tested; calendar years outside
+2026-2028 follow MarketClock's documented unverified behavior.
+
+---
+
 # TESTING — `market-clock-2027-2028-coverage`
 
 Baseline: clean GitHub `main` `0390ef1` (unchanged at packaging). Tests ran on a scratch

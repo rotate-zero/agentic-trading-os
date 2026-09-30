@@ -31,6 +31,10 @@ FLATTEN = datetime(2026, 9, 16, 19, 59, tzinfo=UTC)
 CLOSE = datetime(2026, 9, 16, 20, 0, tzinfo=UTC)
 IN_WINDOW = FLATTEN + timedelta(seconds=10)
 AFTER = CLOSE + timedelta(seconds=30)
+# 2026-09-17 09:30 ET. A stop/target fallback is only ever placeable after the EOD
+# expiry at the bell, i.e. outside regular hours, so it waits for the next open
+# (`simulated-protective-session-retry`).
+NEXT_OPEN = datetime(2026, 9, 17, 13, 30, tzinfo=UTC)
 
 
 class Clock:
@@ -456,6 +460,8 @@ def test_unsent_approved_reservation_is_cancelled_atomically_at_the_deadline_and
     assert ledger.observe_exit(protective(pid, ts=AFTER)).disposition is O.FALLBACK_STORED
     assert ledger.pending_exit_position_ids() == (pid,)
     clock.now = AFTER
+    assert ledger.prepare_exit(pid).disposition is P.WAIT_OUTSIDE_REGULAR_SESSION  # after the bell: retained, not placed
+    clock.now = NEXT_OPEN
     nxt = ledger.prepare_exit(pid)
     assert nxt.disposition is P.SUBMIT
     assert (nxt.action.client_order_id, nxt.action.exit_reason, nxt.action.qty) == (f"{trade_id}:exit:2", "stop", 5)
@@ -572,7 +578,9 @@ def test_terminal_eod_at_or_after_close_expires_and_only_a_fallback_can_place(te
     assert ledger.observe_exit(protective(pid, "stop" if fallback == "target" else "target", ts=clock.now)
                                ).disposition is O.FALLBACK_ALREADY_STORED
     assert ledger.prepare_exit(pid).disposition is P.WAIT_RETRY_DELAY  # 5 s bound not reset
-    clock.now = CLOSE + timedelta(seconds=6)
+    clock.now = CLOSE + timedelta(seconds=6)  # delay elapsed, but the venue is closed: retained, not placed
+    assert ledger.prepare_exit(pid).disposition is P.WAIT_OUTSIDE_REGULAR_SESSION and len(orders_of(pid)) == 1
+    clock.now = NEXT_OPEN
     nxt = ledger.prepare_exit(pid)
     assert (nxt.action.client_order_id, nxt.action.exit_reason, nxt.action.qty) == (f"{trade_id}:exit:2", fallback, 5)
     assert [o.exit_reason for o in orders_of(pid)] == ["eod_flatten", fallback]
@@ -614,6 +622,8 @@ def test_dispatch_marked_approved_close_at_close_is_uncertain_not_unsent():
     # a real venue report resolves it, and only then may the fallback place
     assert ledger.set_status(action.client_order_id, "rejected", reason="venue_report")
     clock.now = AFTER + timedelta(seconds=6)
+    assert ledger.prepare_exit(pid).disposition is P.WAIT_OUTSIDE_REGULAR_SESSION
+    clock.now = NEXT_OPEN
     assert ledger.prepare_exit(pid).action.exit_reason == "stop"
 
 
@@ -655,6 +665,8 @@ def test_partial_fill_keeps_one_active_order_then_fallback_sizes_the_settled_rem
     assert ledger.prepare_exit(pid).disposition is P.WAIT_PENDING_FILL
     with SessionLocal.begin() as session:
         session.query(Fill).filter(Fill.venue_fill_id == "p2").delete()
+    assert ledger.prepare_exit(pid).disposition is P.WAIT_OUTSIDE_REGULAR_SESSION  # settled, but the venue is closed
+    clock.now = NEXT_OPEN
     nxt = ledger.prepare_exit(pid)
     assert (nxt.action.qty, nxt.action.exit_reason, nxt.action.client_order_id) == (7, "target", f"{trade_id}:exit:2")
 
