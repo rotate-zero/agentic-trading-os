@@ -1,3 +1,43 @@
+<!-- BEGIN DELIVERY SECTION: outcome-read-path-integration (backend tests + docs/comments; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-read-path-integration`
+
+Based on `main` `fb9462a` (re-checked against `origin/main` before packaging: no newer commits). Branch
+`outcome-read-path-integration`. **No new decision number:** this verifies and documents what decision #186 already
+built; `INDEX.md`, the `confirmed-decisions.md` tail and the archive list (ends at 184, with 185/186 in the live log)
+agree the latest is 186. `OutcomeRecorder`, the `strategy_outcomes` schema and decision #186 are untouched.
+
+- **New test `backend/tests/test_outcome_read_path_integration.py`** (real PostgreSQL). The real
+  `OutcomeRecorder.record_trade()` writes two simulated rows from ledger rows seeded by the existing
+  `tests.test_outcome_recorder._seed` (reused, not rebuilt — no new execution pipeline fixture); only
+  `capture_strategy_outcome_snapshots` is stubbed, as in the recorder's own tests. Trade A has no entry market-state
+  snapshot (`engine_cold_start`) but an entry context with `calendar.session = power_hour`; trade B has both entry
+  snapshots NULL (`recorder_unavailable`). Two backtest rows (EDT 14:05Z and EST 15:05Z, both 10:05 Eastern; session
+  `power_hour` R=-1.0 and `open` R=+2.0) are written through `record_strategy_outcome()`.
+  One test asserts all four read paths:
+  - `GET /intelligence/strategy-outcomes`: default == `is_backtest=false`; each population contains only its own rows
+    and modes; recorder values arrive exactly (price/qty/P&L/R/exit reason, unknown commission stays `null`,
+    `signal_confirmed_at` `null`); NULL snapshots are `null` (not `{}`) with the exact `snapshot_missing_reasons`.
+  - `GET /intelligence/win-rate-by-hour` and `/expectancy-by-session-type` (scoped by `strategy_name` for exact
+    populations): simulated hours match an independent Python ET conversion; backtest EDT/EST rows share hour 10 with
+    win rate 0.5; the NULL-context row is its own `session_type = null` group; backtest `power_hour` (-1.0) does not
+    leak into simulated `power_hour` (+1.3125).
+  - `GET /intelligence/world-view` `performance`: before/after deltas (shared-DB safe) equal the same buckets per
+    population, and each population equals the corresponding aggregate route output.
+  - Reading wrote nothing (row count and P&L unchanged).
+- **Mutation-checked:** dropping the `is_backtest` filter in the aggregates or in the route, bucketing by UTC hour,
+  swapping World View's populations, and breaking the session JSONB key each fail the test.
+- **No reader defect found**, so no reader behavior changed.
+- **Stale current-state claims corrected (comments/docstrings/docs only):** `GET /strategy-outcomes` and
+  `GET /win-rate-by-hour` route docstrings (no longer say no live writer / zero live rows / no Execution Engine);
+  `performance_queries.py` module docstring; `useBacktestOutcomes.ts` and `BacktestResultsPanel.tsx` comments;
+  `trading-intelligence-architecture.md` (said `OutcomeRecorder` "remains unwired" — it is wired in `main.py`);
+  `execution-engine-design.md` gains §6.7.1 J with the read-path diagram. Historical decision entries and the
+  "Historical" §1 inventory were left as written.
+- **Deliberately not changed:** the `execution_mode` field description in `schemas/performance.py` still says a
+  "live writer" may not exist and names only Backtest Runner + tests as callers; it is part of the outcome schema
+  module, so it is reported as a follow-up rather than edited.
+<!-- END DELIVERY SECTION: outcome-read-path-integration -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-performance-panel-refresh (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `frontend-performance-panel-refresh`
 

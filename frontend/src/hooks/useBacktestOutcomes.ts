@@ -10,11 +10,12 @@ import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "
  * an extension of it — that hook backs "Recent Closed Trades" and is
  * pinned to `isBacktest: false` by design (see its own comment); adding
  * a toggle there would blur two hooks with opposite, fixed intents into
- * one confusing one. `strategy_outcomes` has zero real LIVE rows today
- * but real, persisted BACKTEST rows as of decision #128 — so unlike
- * `useStrategyOutcomes`, defaulting this hook to the live-only value
- * would make it default to an always-empty view of the one thing this
- * panel exists to show.
+ * one confusing one. The `is_backtest=false` population is the
+ * simulated-execution rows the `OutcomeRecorder` writes (decision #186),
+ * while real, persisted BACKTEST rows come from the Backtest Runner
+ * (decision #128) — so unlike `useStrategyOutcomes`, defaulting this hook
+ * to the live-only value would show simulated trades instead of the
+ * backtest evidence this panel exists to show.
  *
  * `backtestRunId` and `limit` are reactive params (changing either
  * re-fetches, same dependency-array shape `usePerformanceAnalytics.ts`
@@ -43,7 +44,9 @@ import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "
  * Deliberately one-shot on mount + on reactive-param change, not a
  * WebSocket subscription: no `OutcomeRecorded`-shaped event exists
  * anywhere in `backend/app/schemas/events/` (confirmed by grep, not
- * assumed) since no live writer exists yet — same reasoning
+ * assumed) — the `OutcomeRecorder` (decision #186) writes Postgres and
+ * publishes no event for `strategy_outcomes`, and Backtest Runner rows
+ * arrive through a synchronous `POST /backtest/run` — same reasoning
  * `useStrategyOutcomes.ts`/`usePerformanceAnalytics.ts` already
  * document for this exact table. `refetch()` is exposed for a manual
  * "Refresh" action in the panel.

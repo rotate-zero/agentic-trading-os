@@ -16,9 +16,10 @@ const DEFAULT_WIDTH = 340; // slightly wider than Scanner/Backtest's 300 — thi
 
 // This panel's own default read: "everything this table currently has"
 // (see BacktestResultsPanel's own top-level comment / the route's own
-// docstring — `strategy_outcomes` has zero real LIVE rows today, so
-// `is_backtest=true` with no `backtest_run_id` filter is the only view
-// worth defaulting to). 500 is the backend's own hard cap
+// docstring — `is_backtest=false` rows are the simulated-execution rows the
+// `OutcomeRecorder` writes (decision #186), a different population from
+// this panel's backtest evidence, so `is_backtest=true` with no
+// `backtest_run_id` filter is the view this panel defaults to). 500 is the backend's own hard cap
 // (`Query(50, le=500)` on the route) — passed explicitly rather than
 // omitted, since omitting it would fall back to the route's own
 // live-oriented default of 50, which could silently hide older

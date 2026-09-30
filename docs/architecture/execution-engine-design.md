@@ -2415,6 +2415,34 @@ carried comments saying no live writer existed.
      rows                            ─► Populated (mode · venue, "N snapshots unavailable" when reasons exist)
 ```
 
+#### J. Read-path verification (`outcome-read-path-integration`; decision #186 is the writer, no new decision number)
+
+**As built (tests and read-side comments only).** The row `OutcomeRecorder` writes is proven readable through every
+existing reader, against real PostgreSQL, with no change to the recorder, the `strategy_outcomes` schema, or any
+reader's behavior. `tests/test_outcome_read_path_integration.py` lets the real recorder write two simulated rows
+(one with an honest NULL entry market-state snapshot and its reason, one with both entry snapshots NULL and
+`recorder_unavailable`), seeds two backtest rows through `record_strategy_outcome()`, and asserts exact values on each
+path. The reader docstrings that still said no live writer exists (`GET /strategy-outcomes`, `GET /win-rate-by-hour`,
+`performance_queries.py`) and `trading-intelligence-architecture.md`'s "OutcomeRecorder remains unwired" sentence were
+corrected to the #186 state. No reader defect was found.
+
+```
+ OutcomeRecorder (#186) ──INSERT──► strategy_outcomes ◄──INSERT── BacktestRunner (#128)
+ is_backtest=false, mode=simulated        │               is_backtest=true, mode=backtest
+   NULL snapshot + reason kept            │
+        ┌───────────────┬─────────────────┼──────────────────────────┐
+        ▼               ▼                 ▼                          ▼
+ GET /strategy-   GET /win-rate-    GET /expectancy-        GET /world-view
+ outcomes         by-hour           by-session-type         .performance
+ row-level,       GROUP BY ET hour  GROUP BY                {live, backtest} each =
+ limit, strict    of entry_filled_at context_at_entry->     the two aggregates with
+ is_backtest      (AT TIME ZONE     'calendar'->>'session'  is_backtest=False / True
+ selector         market_timezone)  (NULL → session=None)   (never blended, system-wide)
+```
+
+Every path applies `is_backtest` as a strict equality selector, never a blend; a NULL snapshot stays `null` on the wire
+(never `{}`), and a NULL entry context is reported as the `session_type = null` group rather than dropped or labelled.
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**

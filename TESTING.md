@@ -1,3 +1,29 @@
+<!-- BEGIN DELIVERY SECTION: outcome-read-path-integration (backend tests; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-read-path-integration`
+
+**Database target:** real local PostgreSQL 16.15 (Ubuntu package) on `localhost:5432`, database `trading_workspace`,
+user `trading` (superuser), no external or production database. For the final run the database was dropped, recreated
+and migrated with `alembic upgrade head` (revision `0016`, `strategy_outcomes` empty) before the suite. Ledger rows and
+outcomes are real; only `capture_strategy_outcome_snapshots` is stubbed. No broker touched.
+
+- Baseline on `fb9462a` before changes: focused recorder/performance/World View files 48 passed.
+- New: `python -m pytest tests/test_outcome_read_path_integration.py -q` → 1 passed.
+- Mutation checks (each reverted afterwards, tree clean): removing the aggregate `is_backtest` filter, UTC hour
+  bucketing, removing the route's `is_backtest` filter, swapping World View's populations, and changing the session
+  JSONB key each failed the test with a specific assertion.
+- Focused set: `tests/test_outcome_read_path_integration.py tests/test_outcome_recorder.py tests/test_world_view.py
+  tests/test_performance_queries.py tests/test_performance_analytics_routes.py
+  tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py` → 67 passed.
+- **Full suite** (`python -m pytest tests -q` from `backend/`): 1544 passed in ~140 s on the freshly wiped DB
+  (1543 baseline + 1 new); also 1544 passed on the pre-wipe DB. The test leaves no `TEST_OUTCOME_RECORDER` rows behind.
+- Frontend (comment-only edits): `npx tsc -b` exit 0; `npm run build` built.
+- **Shared-DB behavior:** World View's envelope is system-wide with no filter, so its assertions are before/after
+  deltas; nothing deletes rows the test did not create.
+- **Not covered:** the recorder's own writes are not re-tested here (see `test_outcome_recorder.py`); the simulated
+  rows are all wins because the reused ledger seed always produces the same prices, so win-rate variety comes from
+  the backtest rows; no full app-lifespan run and no real-market data.
+<!-- END DELIVERY SECTION: outcome-read-path-integration -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-performance-panel-refresh (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `frontend-performance-panel-refresh`
 

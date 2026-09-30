@@ -515,15 +515,22 @@ async def get_strategy_outcomes(
     AND-combined filters. Ordering and `limit` still apply once to the
     globally filtered outcome rows, not once per run.
 
-    `strategy_outcomes` has zero real LIVE rows in production today (no
-    Execution Engine/Position Monitor writes to it yet) — but, as of
-    decision #128, it does have real, persisted BACKTEST rows
-    (`is_backtest=True`): genuine database records produced by Backtest
-    Runner v1, representing simulated/backtest execution rather than
-    live execution, not fabricated placeholders. The default
-    (`is_backtest=False`) still honestly returns `{"outcomes": []}`, 200,
-    not an error, matching the convention every route in this file
-    already follows for a genuinely empty result set.
+    Two writers feed this table, and each owns exactly one population.
+    Backtest Runner v1 (decision #128) writes the `is_backtest=True` rows
+    (`execution_mode='backtest'`). The simulated `OutcomeRecorder`
+    (decision #186, `trading_intelligence/outcome_recorder.py`) is the
+    only writer of `is_backtest=False` rows, and it writes one per closed,
+    strategy-attributed SIMULATED auto trade (`execution_mode='simulated'`).
+    No paper, live or manual writer exists, so a default
+    (`is_backtest=False`) row is simulated execution, never real-money
+    trading — each row states its own `execution_mode`/`execution_venue`.
+    A recorder row can carry honest NULL entry/exit snapshots with the
+    reason in `snapshot_missing_reasons`; they serialize as JSON `null`,
+    never as a fabricated `{}`. When no row of the requested population
+    exists (for example before any simulated trade has closed) the route
+    honestly returns `{"outcomes": []}`, 200, not an error, matching the
+    convention every route in this file already follows for a genuinely
+    empty result set.
 
     Database and schema imports stay local to `_fetch_strategy_outcomes`.
     The synchronous query and row serialization run in that worker's own
@@ -671,11 +678,13 @@ async def get_win_rate_by_hour_view(
     `HourlyWinRate` dataclass row (`hour_et`, `total_trades`,
     `win_count`, `win_rate`) via `dataclasses.asdict()` — no new
     Pydantic schema, matching that module's own stated reasoning for
-    using local dataclasses over `schemas/performance.py`. Zero real
-    `strategy_outcomes` rows exist in production today (no Execution
-    Engine yet), so this honestly returns `{"hourly_win_rates": []}`,
-    200, not an error — same convention every route in this file
-    already follows.
+    using local dataclasses over `schemas/performance.py`. The default
+    (`is_backtest=False`) population is the simulated rows the
+    `OutcomeRecorder` writes (decision #186); `is_backtest=true` is the
+    Backtest Runner's. When nothing of the requested population matches
+    (for example no simulated trade has closed yet) this honestly returns
+    `{"hourly_win_rates": []}`, 200, not an error — same convention every
+    route in this file already follows.
 
     Import is local to this function, not hoisted to this file's
     top-of-file import block — same collision-avoidance reasoning GET

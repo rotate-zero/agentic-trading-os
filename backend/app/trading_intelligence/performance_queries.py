@@ -90,10 +90,10 @@ as a top-level key at all, and the real field inside `calendar` is named
 because its synthetic fixture (`test_performance_queries.py`'s
 `_make_outcome()`) built `context_at_entry = {"session_type": ...}`
 directly — a shape matching this bug, not matching what
-`ContextEngine` actually produces. Against real production data (once a
-real caller populates `context_at_entry` via `capture_context_snapshot()`
-— none exists yet, same "zero real rows today" state this table has had
-since decision #120), the original query would have silently returned
+`ContextEngine` actually produces. Against real data (historically no real
+caller populated `context_at_entry` via `capture_context_snapshot()`
+before decision #128's Backtest Runner and decision #186's
+`OutcomeRecorder`), the original query would have silently returned
 only the honest-`None` group on every row, never a real breakdown — not
 a crash, a silently-useless result. Fixed by extracting
 `context_at_entry->'calendar'->>'session'` instead, and by rebuilding the
@@ -162,11 +162,17 @@ strategies' outcomes into one aggregate — exactly the kind of blending
 
 **Empty-result semantics.** No matching rows -> `[]`. Never `None`,
 never a fabricated zero-filled row, never a NULL-populated aggregate.
-`strategy_outcomes` has zero real rows in production today (§5's own
-framing: "prove the contract now, real callers arrive later," same
-precedent as decisions #98/#120) — an empty result is the normal,
-expected case this module is built to handle correctly from day one,
-not an edge case discovered later.
+`strategy_outcomes` has two real writers — the Backtest Runner
+(`is_backtest=True`, decision #128) and the simulated `OutcomeRecorder`
+(`is_backtest=False`, `execution_mode='simulated'`, decision #186) — but
+a population can still be empty (for example no simulated trade has
+closed yet), and an empty result remains a normal, expected case this
+module handles correctly (§5's own framing: "prove the contract now,
+real callers arrive later," same precedent as decisions #98/#120). A
+recorder row's honest NULL entry snapshot is not dropped: a NULL
+`context_at_entry` (or one with no `calendar.session`) lands in the
+`session_type=None` group of the expectancy query, never a fabricated
+label.
 
 **Query implementation: real SQL-level `GROUP BY`, not fetch-then-
 aggregate-in-Python.** §5 itself frames every one of these queries as
