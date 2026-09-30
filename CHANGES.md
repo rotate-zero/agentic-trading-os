@@ -1,3 +1,34 @@
+<!-- BEGIN DELIVERY SECTION: execution-outcome-status-route (backend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-outcome-status-route`
+
+Based on `main` `2d11108` (re-checked against `origin/main` before packaging: no newer commits). Backend and docs only.
+**No new decision number, no migration:** the route is a read of `trades.outcome_status`, whose vocabulary and writer
+are already fixed by #186 and `execution-engine-design.md` §6.7.1 D. `INDEX.md`, `confirmed-decisions.md` and the
+archive list are untouched.
+
+- **New route `GET /intelligence/execution-outcome-status?limit=50`** (`backend/app/api/routes/intelligence.py`,
+  helper `_fetch_execution_outcome_status`). Read-only view of the `OutcomeRecorder`'s progress. Response:
+  `{"counts":{"pending","pending_retry","blocked","recorded","other"},"trades":[{"trade_id","symbol","strategy_name","outcome_status","outcome_id","updated_at"}]}`.
+  - **Population (fixed, not parameters):** approved, closed, `execution_mode = 'simulated'`, `origin = 'auto'` trades.
+  - **`counts` cover the whole population regardless of `limit`.** SQL NULL is `pending`; `pending_retry`, `blocked`,
+    `recorded` are their own buckets; any other non-NULL value (including the never-written literal `"pending"`) is
+    `other`. `trades` is the bounded recent list, `updated_at` descending then `trade_id` descending, `limit` 1–100
+    (default 50, else 422).
+  - **`outcome_status` is returned as stored** (NULL stays `null`). **No blocked reason is exposed** (#186 keeps
+    reasons in logs). `updated_at` is normalised to UTC.
+  - Counts and list are read in one `REPEATABLE READ` transaction; the read runs through `asyncio.to_thread` like the
+    sibling `execution-*` routes. It writes nothing, takes no lock, triggers no recovery and changes no recorder
+    behavior.
+- **Tests:** new `backend/tests/test_execution_outcome_status_route.py` (22 tests, real PostgreSQL 16).
+- **Docs:** `docs/architecture/execution-engine-design.md` gains §6.7.1 subsection **K** (as-built rules, data-flow and
+  internal-flow diagrams, limits). `TESTING.md` updated.
+- **Shared-doc follow-up at merge (not edited here, to avoid colliding with the parallel UI task):**
+  `docs/roadmap/phase-roadmap.md` (its "Read surfaces" bullet lists the five existing `execution-*` routes) and the
+  execution-engine-design read-route table near line 2456 can name this route once the UI lands.
+- **Known limit:** `updated_at` is "last time the trade row changed through the ORM" (close, recorder status write), not
+  a close or outcome time, and a raw-SQL re-arm that does not set it will not move the row.
+<!-- END DELIVERY SECTION: execution-outcome-status-route -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-world-view-simulated-column (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `frontend-world-view-simulated-column`
 

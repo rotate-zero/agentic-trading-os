@@ -1,3 +1,34 @@
+<!-- BEGIN DELIVERY SECTION: execution-outcome-status-route (backend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `execution-outcome-status-route`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading`, created fresh and migrated with `alembic upgrade head` (revision `0016`) before the runs. No external or
+production database and no broker touched. Python 3.12.3. Base `main` `2d11108`.
+
+- New file: `cd backend && python3 -m pytest tests/test_execution_outcome_status_route.py -q` → **22 passed**.
+  Covers: population isolation (rejected, open, closing, NULL status, backtest/paper/live, manual all excluded;
+  undeclared mode/origin/decision/status query params ignored); all five buckets with exact counts, incl. unexpected
+  values (`"pending"`, `""`, an unknown label, upper-case `BLOCKED`) under `other`; SQL NULL returned as `null` and
+  counted `pending`; counts independent of `limit`; buckets sum to the population; stored status returned verbatim;
+  `updated_at` descending ordering, `trade_id` descending tie-break, a `limit` cutting through a tie, default 50 with
+  51 rows, limit 0/-1/101/abc → 422 and 1/100 accepted; a truly empty population (scratch schema with an empty
+  `trades` table) → all-zero counts and `[]`; exact key sets and types, UUID strings, a real linked `outcome_id`,
+  microsecond-exact UTC `updated_at` (also with a non-UTC `Asia/Dhaka` session); GET leaves the row untouched and
+  POST/PUT/PATCH/DELETE → 405; a blocked helper does not block `/health` (event-loop offload).
+- **Mutation checks** (each reverted; tree restored and re-run green): dropping the `origin` filter (3 failed),
+  dropping the `status` filter (2 failed), dropping the `trade_id` tie-break (2 failed), making `other` ignore
+  unexpected values (2 failed), removing UTC normalisation (1 failed), calling the helper synchronously instead of via
+  `asyncio.to_thread` (1 failed). Not cleanly mutated: "counts computed from the limited list" (my mutation did not
+  compile); `test_route_counts_are_independent_of_limit` compares `limit=2` with `limit=100` on 5 rows and is the guard.
+- **Full suite** (`cd backend && python3 -m pytest tests -q`): **1566 passed in 175 s** (1544 baseline + 22 new), 1
+  existing deprecation warning. The new tests leave no `trades`/`strategy_outcomes` rows and drop their scratch schema.
+- **Not covered / limits:** only the route was tested; the recorder is not run (rows are hand-inserted), so the
+  end-to-end "recorder writes status → route reports it" path is not exercised. The `REPEATABLE READ` snapshot is not
+  proven by a concurrent-writer test (it is set and the read succeeds; it makes no behavioral difference in the
+  single-connection tests). Only one test DB exists here, so counts in a DB with other qualifying trades are checked as
+  deltas, not absolutes. No frontend, `tsc` or build was run (none touched).
+<!-- END DELIVERY SECTION: execution-outcome-status-route -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-world-view-simulated-column (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `frontend-world-view-simulated-column`
 

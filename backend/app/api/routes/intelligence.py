@@ -1535,3 +1535,136 @@ async def get_execution_exit_requests(
     """
     exit_requests = await asyncio.to_thread(_fetch_execution_exit_requests, symbol, limit)
     return {"exit_requests": exit_requests}
+
+
+# `trades.outcome_status` vocabulary the OutcomeRecorder writes (§6.7.1 D):
+# SQL NULL = pending (the literal "pending" is never written), plus the three
+# stored values below. Anything else is reported under `other`, not dropped.
+_OUTCOME_STATUS_STORED = ("pending_retry", "blocked", "recorded")
+
+
+def _fetch_execution_outcome_status(limit: int) -> dict[str, Any]:
+    """Synchronous read of OutcomeRecorder progress on `trades`
+    (`models/execution_ledger.py`; writer: `trading_intelligence/
+    outcome_recorder.py`, EX-12 option (a), `execution-engine-design.md`
+    §6.7.1) — same module-level, patchable-for-tests shape as the
+    `_fetch_execution_*` helpers above. Opens and closes its own `Session`
+    entirely inside whatever thread runs it.
+
+    **Population:** `decision = 'approved'`, `status = 'closed'`,
+    `execution_mode = 'simulated'`, `origin = 'auto'` — the trades the
+    recorder's scan is allowed to record (§6.7.1 C7). Rejected, open/closing,
+    backtest/paper/live and manual trades are never counted or listed.
+
+    **`counts` cover the whole population, independent of `limit`.** One
+    aggregate query buckets `outcome_status`: SQL NULL -> `pending`;
+    `pending_retry`, `blocked`, `recorded` -> their own bucket; any other
+    non-NULL value (including the never-written literal `"pending"`) ->
+    `other`. The buckets are mutually exclusive and sum to the population.
+    The aggregate and the list are read in one REPEATABLE READ transaction so
+    they describe the same snapshot.
+
+    **`trades` is the bounded recent list**, `updated_at` descending then
+    `trade_id` descending. `trade_id` is the primary key, so the pair is a
+    strict total order and a `limit` that lands inside a tie never reshuffles
+    rows; the tie-break is stable but not chronological (random `uuid4`).
+    `outcome_status` is returned exactly as stored (NULL stays `None`, never
+    rewritten to `"pending"`); `outcome_id` is `None` until linked. No
+    blocked reason is returned: #186 keeps reason codes in logs only, and
+    there is no reason column. `updated_at` is normalised to UTC.
+
+    Read-only: one `SELECT` aggregate and one `SELECT` list; no write, no
+    lock, no recovery trigger.
+    """
+    from sqlalchemy import func, select
+
+    from app.db.session import SessionLocal
+    from app.models.execution_ledger import Trade
+
+    session = SessionLocal()
+    try:
+        session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
+        population = (
+            Trade.decision == "approved",
+            Trade.status == "closed",
+            Trade.execution_mode == "simulated",
+            Trade.origin == "auto",
+        )
+        status = Trade.outcome_status
+        agg = session.execute(
+            select(
+                func.count().filter(status.is_(None)),
+                func.count().filter(status == "pending_retry"),
+                func.count().filter(status == "blocked"),
+                func.count().filter(status == "recorded"),
+                func.count().filter(status.is_not(None), status.not_in(_OUTCOME_STATUS_STORED)),
+            ).where(*population)
+        ).one()
+        rows = session.execute(
+            select(
+                Trade.trade_id,
+                Trade.symbol,
+                Trade.strategy_name,
+                Trade.outcome_status,
+                Trade.outcome_id,
+                Trade.updated_at,
+            )
+            .where(*population)
+            .order_by(Trade.updated_at.desc(), Trade.trade_id.desc())
+            .limit(limit)
+        ).all()
+        session.rollback()  # read-only: end the snapshot transaction explicitly
+        return {
+            "counts": dict(zip(("pending", "pending_retry", "blocked", "recorded", "other"), (int(n) for n in agg))),
+            "trades": [
+                {
+                    "trade_id": row.trade_id,
+                    "symbol": row.symbol,
+                    "strategy_name": row.strategy_name,
+                    "outcome_status": row.outcome_status,
+                    "outcome_id": row.outcome_id,
+                    "updated_at": row.updated_at.astimezone(timezone.utc),
+                }
+                for row in rows
+            ],
+        }
+    finally:
+        session.close()
+
+
+@router.get("/execution-outcome-status")
+async def get_execution_outcome_status(
+    limit: int = Query(50, ge=1, le=100, description="Newest-first cap on the `trades` list only, 1-100."),
+) -> dict[str, Any]:
+    """
+    Read-only view of the OutcomeRecorder's progress over closed simulated
+    auto trades (EX-12 option (a), `execution-engine-design.md` §6.7.1; the
+    recorder itself is decision #186). Answers "which closed trades have an
+    outcome row, which are waiting, retrying or blocked" without reading logs.
+
+    Response: `{"counts": {"pending", "pending_retry", "blocked", "recorded",
+    "other"}, "trades": [{"trade_id", "symbol", "strategy_name",
+    "outcome_status", "outcome_id", "updated_at"}]}`.
+
+    **Population (hard-scoped, not parameters):** approved, closed,
+    `execution_mode == "simulated"`, `origin == "auto"` trades. **`counts`
+    cover every matching trade regardless of `limit`**; `limit` (1-100,
+    default 50) bounds only `trades`, newest `updated_at` first, ties broken
+    by `trade_id` descending (see `_fetch_execution_outcome_status`).
+
+    **`outcome_status` is the stored value.** SQL NULL is counted as
+    `pending` and returned as JSON `null` in its row; a value outside
+    {`pending_retry`, `blocked`, `recorded`} is counted under `other` and
+    returned verbatim. **No blocked reason is exposed** — reason codes live in
+    logs only (#186).
+
+    `updated_at` is `trades.updated_at`, the last time the trade row changed
+    (status change, recorder link or status write); it is not a close time
+    or an outcome time.
+
+    Off the event loop via `asyncio.to_thread`, the same
+    `scanner-route-db-offload` convention as the sibling routes. An empty
+    population returns all-zero counts and `"trades": []`, 200. Read-only: no
+    ledger write, no recovery trigger, no recorder behavior change.
+    """
+    return await asyncio.to_thread(_fetch_execution_outcome_status, limit)

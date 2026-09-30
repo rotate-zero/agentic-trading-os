@@ -2443,6 +2443,77 @@ corrected to the #186 state. No reader defect was found.
 Every path applies `is_backtest` as a strict equality selector, never a blend; a NULL snapshot stays `null` on the wire
 (never `{}`), and a NULL entry context is reported as the `session_type = null` group rather than dropped or labelled.
 
+#### K. Read-only recorder status route (`execution-outcome-status-route`; decision #186 is the writer, no new decision number)
+
+**As built (backend only).** `GET /intelligence/execution-outcome-status?limit=50` reports how far the
+`OutcomeRecorder` has got over the trades it is allowed to record, so an operator no longer needs the logs to learn
+that a closed trade is waiting, retrying or blocked. It reads `trades` only. It writes nothing, takes no lock, triggers
+no recovery sweep and does not touch recorder behavior, the `trades.outcome_status` vocabulary (§D) or any migration.
+A UI is built separately against the response shape below.
+
+**Response (exact):**
+`{"counts": {"pending", "pending_retry", "blocked", "recorded", "other"}, "trades": [{"trade_id", "symbol", "strategy_name", "outcome_status", "outcome_id", "updated_at"}]}`
+
+| Rule | As built |
+|---|---|
+| Population (not parameters) | `decision = 'approved'`, `status = 'closed'`, `execution_mode = 'simulated'`, `origin = 'auto'` — the same set the recorder's scan may record (§C7). Rejected, open/closing, backtest/paper/live and manual trades are never counted or listed. |
+| `counts` | Cover **every** matching trade, independent of `limit`. SQL `NULL` → `pending`; `pending_retry`, `blocked`, `recorded` → their own bucket; any other non-NULL value, including the literal `"pending"` the recorder never writes → `other`. Buckets are exclusive and sum to the population. |
+| `trades` | The recent bounded list: `updated_at` descending, then `trade_id` descending (primary key, so a strict total order; a `limit` inside a tie never reshuffles rows). `limit` is 1–100, default 50, else 422. |
+| `outcome_status` | Returned **as stored**: `NULL` stays JSON `null` (never rewritten to `"pending"`); unexpected values are returned verbatim. |
+| `outcome_id` | The linked `strategy_outcomes.outcome_id`, or `null`. Reported as stored; the route does not cross-check it against `outcome_status`. |
+| Blocked reason | **Not exposed.** #186 keeps reason codes in logs, and no reason column exists. |
+| `updated_at` | `trades.updated_at` normalised to UTC (ISO 8601). It is the last time the trade row changed, **not** the close time or the outcome time. |
+| Concurrency | Counts and list are read in one `REPEATABLE READ` transaction so they describe one snapshot. The whole read runs through `asyncio.to_thread` (`scanner-route-db-offload` convention) and opens and closes its own `Session` in the worker. |
+
+**Data flow between components (as built)**
+
+```
+ OutcomeRecorder (#186) ──writes──► trades.outcome_status / outcome_id / updated_at     [unchanged, sole writer]
+                                          │
+                                          │ SELECT only (REPEATABLE READ, no lock, no write)
+                                          ▼
+          GET /intelligence/execution-outcome-status?limit=N
+                                          │ JSON {counts, trades}
+                                          ▼
+                     Execution panel UI (separate parallel task)
+
+ not read here: strategy_outcomes · positions · orders · fills · logs (blocked reasons) · recorder state
+```
+
+**Internal flow of the route**
+
+```
+GET /intelligence/execution-outcome-status?limit=N
+   │
+   ▼
+FastAPI validation ── limit outside [1, 100] or non-integer ──► 422  (before any DB touch)
+   ▼
+await asyncio.to_thread(_fetch_execution_outcome_status, limit)        ── event loop free
+   ▼
+_fetch_execution_outcome_status()  [worker thread — opens AND closes its own Session]
+   BEGIN ISOLATION LEVEL REPEATABLE READ
+   population = approved AND closed AND simulated AND auto
+   1. SELECT count(*) FILTER (status IS NULL)                      → pending
+             count(*) FILTER (status = 'pending_retry')            → pending_retry
+             count(*) FILTER (status = 'blocked')                  → blocked
+             count(*) FILTER (status = 'recorded')                 → recorded
+             count(*) FILTER (status NOT NULL AND NOT IN the three)→ other
+      WHERE population                                             (all rows, no LIMIT)
+   2. SELECT trade_id, symbol, strategy_name, outcome_status, outcome_id, updated_at
+      WHERE population ORDER BY updated_at DESC, trade_id DESC LIMIT :limit
+   ROLLBACK (read-only)  ──► {counts, trades[updated_at → UTC]}
+```
+
+**Limits.** `updated_at` is maintained by the ORM's `onupdate` and the `now()` default only; a raw-SQL update that does
+not set it (for example a manual re-arm of a `blocked` trade to `NULL`) does not move the row in the list. The order is
+"most recently changed through the ORM", not "most recently closed". `outcome_id` and `outcome_status` are not
+cross-validated. Empty population → all-zero counts and `"trades": []`, 200.
+
+**Verification.** `tests/test_execution_outcome_status_route.py` (real PostgreSQL 16, hand-inserted `trades` rows, no
+lifespan): population isolation, every bucket incl. unexpected values, SQL NULL, counts independent of `limit`,
+order/tie/limit behaviour, an empty population (scratch-schema `trades`), serialization, read-only, and event-loop
+offload. See `TESTING.md`.
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**
