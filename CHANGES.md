@@ -1,3 +1,48 @@
+<!-- BEGIN DELIVERY SECTION: frontend-outcomes-simulated-reader (frontend-only; integrate alongside the backend task's section, do not merge the two) -->
+# CHANGES — `frontend-outcomes-simulated-reader` (frontend for decision #186)
+
+Frontend-only follow-up to decision #186's simulated `OutcomeRecorder`. **No decision number was
+assigned** (slug only); the reader is a consumer of #186 and changes no architecture. Whether it
+deserves its own numbered decision is for Saqib to decide at merge, after re-checking `main`.
+Built on `main` `9c69d91` on branch `frontend-outcomes-simulated-reader`. No backend file,
+endpoint, migration, dependency, polling or WebSocket event was added, and there is no trading
+control and no trade-detail view.
+
+- **"Recent Closed Trades" now reads as simulated execution.** `InfoTab.tsx`'s
+  `RecentClosedTrades` keeps its strict `is_backtest=false` request (limit 10) and adds a
+  "Simulated" badge plus the subtitle "Simulated execution results — not real-money trading."
+  Each row also prints its own `execution_mode · execution_venue`, so a future paper/live row
+  could not be mislabelled by the section header.
+- **Manual Refresh and distinct states.** Loading (first request), Error (first request failed —
+  never shown as "no trades"), Empty (a request succeeded with zero rows) and Populated. A failed
+  Refresh keeps the previously loaded rows and shows a banner with the time of the last good load;
+  a later success replaces the rows and clears the banner.
+- **Stale-response safety.** `useStrategyOutcomes.ts` gives every load a monotonically increasing
+  request id and drops any response (success or failure) that is no longer the newest, so an older
+  request cannot replace a newer refresh's rows or bring back a stale error. The old cancel
+  closure was unreachable from `refetch()` callers; that gap is closed. The hook now returns
+  `outcomes`, `loading`, `error`, `hasLoaded`, `lastLoadedAt`, `refetch`.
+- **`StrategyOutcomeWireShape` corrected** against `schemas/performance.py`: added
+  `execution_mode`, `execution_venue`, `snapshot_missing_reasons` (`Record<string, string> | null`);
+  the four `market_state_*` / `context_*` snapshots are `Record<string, unknown> | null`.
+  `StrategyOutcomeRow` carries mode, venue and missing-snapshot reasons; rows whose snapshots were
+  unavailable show "N snapshots unavailable" (reasons in the tooltip).
+- **Required knock-on type edit:** `BacktestResultsPanel.tsx`'s JSON-blob field list type was widened
+  to `Record<string, unknown> | null` so the nullable snapshots compile. No behavior change.
+- **Stale comments corrected** where they describe this reader, the wire shape or
+  `fetchStrategyOutcomes()` (`api-client.ts`, `useStrategyOutcomes.ts`, `InfoTab.tsx`): the "no live
+  writer / one-shot because nothing writes" claims are replaced with the as-built #186 behavior.
+- **Docs:** `execution-engine-design.md` §6.7.1 I (as-built frontend reader, data-flow and internal-flow
+  diagrams); additive correction note in `backtest-runner-design.md` beside its "no writer yet"
+  diagram. `confirmed-decisions.md` and `INDEX.md` are untouched.
+- **Reported, not changed (related follow-ups):** other frontend comments and one user-visible string
+  still say no live/simulated writer exists — `InfoTab.tsx` `StrategyPerformanceSummary` ("no Execution
+  Engine exists to write it", "No live trades yet."), `BacktestResultsPanel.tsx`, `useBacktestOutcomes.ts`,
+  `usePerformanceAnalytics.ts`, `useWorldView.ts`, and `fetchWinRateByHour`'s docstring. The backend
+  route docstring for `GET /strategy-outcomes` (`intelligence.py`) says the same. Separate sections/files,
+  outside this task's scope.
+<!-- END DELIVERY SECTION: frontend-outcomes-simulated-reader -->
+
 # CHANGES — decision #186, `outcome-recorder-contract` (EX-12 option a)
 
 Saqib approved the dedicated, ledger-driven `OutcomeRecorder` for simulated,

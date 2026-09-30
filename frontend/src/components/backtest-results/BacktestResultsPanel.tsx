@@ -132,7 +132,7 @@ function OutcomeDetail({ outcome }: { outcome: StrategyOutcomeWireShape }) {
     ["confidence_at_signal", String(outcome.confidence_at_signal)],
   ];
 
-  const blobFields: Array<[string, Record<string, unknown>]> = [
+  const blobFields: Array<[string, Record<string, unknown> | null]> = [
     ["evidence", outcome.evidence],
     ["market_state_at_entry", outcome.market_state_at_entry],
     ["market_state_at_exit", outcome.market_state_at_exit],

@@ -2349,6 +2349,72 @@ The ledger stays authoritative because every quantity, price and time in the out
 
 Saqib confirmed EX-12 option (a): `OutcomeRecorder` is the only writer of non-backtest `strategy_outcomes`; the ledger supplies facts and events only wake it. The table remains strict: missing required attribution blocks the trade and logs a reason code. The delivered scope is simulated, strategy-attributed auto trades. Snapshot lag and sweep default to 60 seconds; the first opening fill defines `entry_filled_at`, the closing fill's order defines `exit_reason`, and blocked reasons remain in logs only.
 
+#### I. Frontend reader — "Recent Closed Trades" (`frontend-outcomes-simulated-reader`; decision #186 is the backend it reads, no new decision number)
+
+**As built (frontend only).** The Info tab's existing "Recent Closed Trades" section
+(`InfoTab.tsx`, `RecentClosedTrades`) now reads the rows the `OutcomeRecorder` writes. It uses the
+existing `GET /intelligence/strategy-outcomes` route unchanged, still with a strict
+`is_backtest=false` request, and labels the result as **simulated execution — not real-money
+trading**. The rows are `execution_mode: "simulated"` outcomes of closed, strategy-attributed
+simulated auto trades; no paper, live or manual writer exists, and the section does not claim
+otherwise (each row prints its own `execution_mode · execution_venue`). Before this delivery the
+reader fetched once on mount, folded a failed request into the "no closed trades" empty state, and
+carried comments saying no live writer existed.
+
+- `StrategyOutcomeWireShape` (`api-client.ts`) was corrected against `schemas/performance.py`
+  `StrategyOutcome`: added `execution_mode`, `execution_venue` and `snapshot_missing_reasons`
+  (`Record<string, string> | null`), and the four `market_state_*`/`context_*` snapshots are now
+  `Record<string, unknown> | null`. `BacktestResultsPanel.tsx`'s JSON-blob field list was widened to
+  accept `null` (type only; backtest rows still carry all four snapshots).
+- `useStrategyOutcomes.ts` returns `outcomes`, `loading`, `error`, `hasLoaded`, `lastLoadedAt` and
+  `refetch`. A failed request keeps the last loaded rows and sets `error`; only the newest request
+  may write state (monotonic request id), so an older response can neither replace a newer
+  refresh's rows nor resurrect a stale error. `StrategyOutcomeRow` additionally carries
+  `executionMode`, `executionVenue` and `snapshotMissingReasons`.
+- Refresh is manual only. No polling and no WebSocket subscription: the recorder writes Postgres
+  and publishes no event for `strategy_outcomes`. No backend endpoint, trading control or
+  trade-detail view was added.
+
+**Data flow between components**
+
+```
+ OutcomeRecorder (backend, #186) ──INSERT──► strategy_outcomes
+                                             (is_backtest=false, execution_mode='simulated')
+                                                        │
+        GET /intelligence/strategy-outcomes?limit=10&is_backtest=false   (existing route)
+                                                        │  StrategyOutcome.model_dump(mode="json")
+                                                        ▼
+ api-client.ts  fetchStrategyOutcomes() ─► StrategyOutcomeWireShape
+                (+ execution_mode / execution_venue / snapshot_missing_reasons,
+                 four snapshots nullable)
+                                                        ▼
+ useStrategyOutcomes(10)  normalize() ─► StrategyOutcomeRow[]
+                          state: outcomes · loading · error · hasLoaded · lastLoadedAt
+                                                        ▼
+ InfoTab.tsx  RecentClosedTrades  ── "Simulated" badge + "not real-money trading" subtitle
+                                  ── Refresh button ──► hook.refetch()   (manual; no poll / no WS)
+```
+
+**Internal flow of the reader**
+
+```
+ mount │ limit change │ Refresh click
+                 ▼
+   load():  id = ++latestRequestId ; loading = true
+                 ▼
+   fetchStrategyOutcomes(limit, false)
+        ├─ resolves, id == latest ─► outcomes = rows ; error = null ; lastLoadedAt = now ; loading = false
+        ├─ rejects,  id == latest ─► error = message ; outcomes UNCHANGED ; loading = false
+        └─ id != latest (superseded, or unmounted / limit changed) ─► response dropped, no state write
+
+   render (first match wins for the message; rows render whenever outcomes is non-empty):
+     loading ∧ ¬hasLoaded ∧ no error ─► Loading
+     error ∧ ¬hasLoaded              ─► Error   ("Could not load closed trades", never "no trades")
+     error ∧ hasLoaded               ─► banner "Refresh failed … showing last loaded result (time)" + rows/empty
+     hasLoaded ∧ no rows             ─► Empty   ("No simulated closed trades recorded yet.")
+     rows                            ─► Populated (mode · venue, "N snapshots unavailable" when reasons exist)
+```
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**

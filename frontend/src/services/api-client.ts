@@ -528,14 +528,30 @@ export async function fetchExecutionExitRequests(): Promise<ExecutionExitRequest
 
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
-// `StrategyOutcome` (re-verified against that file's current contents) —
-// the route validates every ORM row through that exact Pydantic contract
-// before returning it (`model_validate(row, from_attributes=True).
-// model_dump(mode="json")`), so this is the real, exact wire shape, not a
-// guess. `outcome_id`/`opportunity_id`/`backtest_run_id`/
-// `feature_snapshot_id` serialize as plain strings (JSON has no UUID
-// type); `trading_day` as "YYYY-MM-DD"; every `datetime` field as a full
-// ISO 8601 string.
+// `StrategyOutcome` (re-verified against that file's contents at
+// `9c69d91`, decision #186) — the route validates every ORM row through
+// that exact Pydantic contract before returning it
+// (`model_validate(row, from_attributes=True).model_dump(mode="json")`),
+// so this is the real wire shape, not a guess. `outcome_id`/
+// `opportunity_id`/`backtest_run_id`/`feature_snapshot_id` serialize as
+// plain strings (JSON has no UUID type); `trading_day` as "YYYY-MM-DD";
+// every `datetime` field as a full ISO 8601 string.
+//
+// Corrected for decision #186 (this shape had drifted from the backend):
+//  - `execution_mode` / `execution_venue` (EX-2, decision #170) are
+//    always present in the response — the Pydantic model fills them from
+//    `is_backtest` when omitted, and the DB enforces the pairing. A live
+//    (`is_backtest: false`) row's mode is "simulated" today; "paper" and
+//    "live" exist in the contract but have no writer.
+//  - the four snapshot fields are `dict | None` (EX-7, decision #170):
+//    a simulated row whose entry/exit snapshot was genuinely unavailable
+//    stores NULL rather than a fabricated `{}`. Backtest rows still carry
+//    all four (the backend validator requires it).
+//  - `snapshot_missing_reasons` maps each NULL snapshot field name to a
+//    machine-readable reason. Not an exhaustive union on purpose: the
+//    backend documents 'engine_cold_start' | 'engine_state_lost_on_restart'
+//    | 'snapshot_capture_error' | 'recorder_unavailable' but types it as a
+//    plain `dict[str, str]`, so this stays `Record<string, string>`.
 export interface StrategyOutcomeWireShape {
   outcome_id: string;
   opportunity_id: string;
@@ -546,6 +562,8 @@ export interface StrategyOutcomeWireShape {
   origin: "auto" | "manual";
   is_backtest: boolean;
   backtest_run_id: string | null;
+  execution_mode: "backtest" | "simulated" | "paper" | "live";
+  execution_venue: string;
   trading_day: string;
   setup_detected_at: string;
   signal_confirmed_at: string | null;
@@ -569,10 +587,11 @@ export interface StrategyOutcomeWireShape {
   final_target: number;
   confidence_at_signal: number;
   evidence: Record<string, unknown>;
-  market_state_at_entry: Record<string, unknown>;
-  context_at_entry: Record<string, unknown>;
-  market_state_at_exit: Record<string, unknown>;
-  context_at_exit: Record<string, unknown>;
+  market_state_at_entry: Record<string, unknown> | null;
+  context_at_entry: Record<string, unknown> | null;
+  market_state_at_exit: Record<string, unknown> | null;
+  context_at_exit: Record<string, unknown> | null;
+  snapshot_missing_reasons: Record<string, string> | null;
   feature_snapshot_id: string | null;
 }
 
@@ -612,12 +631,16 @@ export interface StrategyOutcomesWireShape {
  * shape stops scaling past one optional param for the same reason
  * `_performanceAnalyticsQuery`'s own comment gives.
  *
- * `strategy_outcomes` has zero real LIVE rows in production today (no
- * Execution Engine/Position Monitor writes to it yet), but does have
- * real, persisted BACKTEST rows as of decision #128 (Backtest Runner
- * v1) — genuine rows representing simulated execution, not fabricated
- * ones. An empty `outcomes` array from the default (live-only) call is
- * still the honest, expected response today, not an error.
+ * With `isBacktest === false` (the route default) the response holds
+ * non-backtest rows only. Since decision #186 the simulated
+ * `OutcomeRecorder` writes those for closed, strategy-attributed
+ * SIMULATED auto trades (`execution_mode: "simulated"`, simulated
+ * venue) — simulated execution, never real-money trading; no paper,
+ * live or manual writer exists. An empty `outcomes` array is still a
+ * valid, honest response (no such trade has closed, or the recorder
+ * blocked it), and is NOT an error — a failed request always throws
+ * `ApiError`. `isBacktest: true` returns Backtest Runner rows
+ * (decision #128) instead.
  */
 export async function fetchStrategyOutcomes(
   limit?: number,

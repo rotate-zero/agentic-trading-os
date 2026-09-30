@@ -43,54 +43,124 @@ function formatExitTime(iso: string): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-// Small additional section (decision #123) surfacing GET /intelligence/
-// strategy-outcomes — global, not tied to any one connector's symbol, so
-// it lives here in GeneralContent (the market-wide view) rather than
-// inside ConnectorContent/AIAnalysisPanel below, which are both scoped to
-// whichever single symbol a connector currently holds. Always rendered,
-// including the empty case — hiding it entirely would make this
-// capability harder to notice once real rows start flowing in (no
-// Execution Engine/Position Monitor writes here yet — decision #120).
+// Clock time of the last successful Recent Closed Trades load (freshness note).
+function formatLoadedAt(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+// Small additional section (decision #123, updated by decision #186)
+// surfacing GET /intelligence/strategy-outcomes — global, not tied to any
+// one connector's symbol, so it lives here in GeneralContent (the
+// market-wide view) rather than inside ConnectorContent/AIAnalysisPanel
+// below, which are both scoped to whichever single symbol a connector
+// currently holds. Always rendered, including the empty case.
+//
+// Decision #186: since the simulated OutcomeRecorder now writes
+// non-backtest rows, this section shows SIMULATED execution results — the
+// request stays strictly is_backtest=false (never blended with backtest
+// rows), and the header/subtitle say plainly that these are simulated
+// trades, not real-money trading. No paper/live/manual writer exists.
+//
+// States are deliberately distinct, never folded together:
+//   loading   — first request in flight, nothing loaded yet
+//   error     — first request failed, nothing to show (NOT "no trades")
+//   empty     — a request succeeded and returned zero rows
+//   populated — rows, optionally with a refreshing indicator and/or a
+//               "refresh failed, showing last loaded rows" banner
+// A failed Refresh keeps the previously loaded rows on screen (the hook
+// never clears them) and says how old they are. Refresh is a manual
+// action only — no polling, no WebSocket (see useStrategyOutcomes.ts).
 function RecentClosedTrades() {
-  const { outcomes, loading } = useStrategyOutcomes(10);
+  const { outcomes, loading, error, hasLoaded, lastLoadedAt, refetch } = useStrategyOutcomes(10);
 
   return (
-    <div className="flex flex-col gap-1">
-      <div className="text-[11px] uppercase tracking-wide text-text-muted">Recent Closed Trades</div>
-      {loading && outcomes.length === 0 ? (
-        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
-      ) : outcomes.length === 0 ? (
-        <p className="p-1 text-[11px] text-text-muted">No closed trades recorded yet.</p>
-      ) : (
+    <section className="flex flex-col gap-1" aria-label="Recent closed trades (simulated)">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <div className="text-[11px] uppercase tracking-wide text-text-muted">Recent Closed Trades</div>
+          <span className="rounded border border-base-border px-1 font-mono text-[9px] uppercase text-signal">
+            Simulated
+          </span>
+        </div>
+        <button
+          onClick={refetch}
+          disabled={loading}
+          aria-busy={loading}
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+        >
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+      <p className="px-1 text-[10px] text-text-muted">
+        Simulated execution results — not real-money trading.
+      </p>
+
+      {loading && !hasLoaded && error === null && (
+        <p role="status" className="p-1 text-[11px] text-text-muted">
+          Loading simulated closed trades…
+        </p>
+      )}
+
+      {error !== null && !hasLoaded && (
+        <p role="alert" className="p-1 text-[11px] text-bear">
+          Could not load closed trades: {error}. Use Refresh to try again.
+        </p>
+      )}
+
+      {error !== null && hasLoaded && (
+        <p role="alert" className="p-1 text-[11px] text-bear">
+          Refresh failed: {error}. Showing the last loaded result
+          {lastLoadedAt !== null ? ` (${formatLoadedAt(lastLoadedAt)})` : ""}.
+        </p>
+      )}
+
+      {hasLoaded && outcomes.length === 0 && (
+        <p className="p-1 text-[11px] text-text-muted">No simulated closed trades recorded yet.</p>
+      )}
+
+      {outcomes.length > 0 && (
         <div className="flex flex-col gap-1">
-          {outcomes.map((o) => (
-            <div
-              key={o.outcomeId}
-              className="flex items-center justify-between rounded border border-base-border px-2 py-1.5"
-            >
-              <div>
-                <div className="font-mono text-xs font-medium text-text-primary">
-                  {o.symbol} <span className="text-text-muted">{o.strategyName}</span>
+          {outcomes.map((o) => {
+            const missing = o.snapshotMissingReasons ? Object.entries(o.snapshotMissingReasons) : [];
+            return (
+              <div
+                key={o.outcomeId}
+                className="flex items-center justify-between rounded border border-base-border px-2 py-1.5"
+              >
+                <div>
+                  <div className="font-mono text-xs font-medium text-text-primary">
+                    {o.symbol} <span className="text-text-muted">{o.strategyName}</span>
+                  </div>
+                  <div className="text-[10px] text-text-muted">
+                    {o.direction} · {o.exitReason} · {formatExitTime(o.exitFilledAt)}
+                  </div>
+                  <div className="text-[10px] text-text-muted">
+                    {o.executionMode} · {o.executionVenue}
+                    {missing.length > 0 && (
+                      <span
+                        title={missing.map(([field, reason]) => `${field}: ${reason}`).join("\n")}
+                      >
+                        {" "}· {missing.length} snapshot{missing.length === 1 ? "" : "s"} unavailable
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="text-[10px] text-text-muted">
-                  {o.direction} · {o.exitReason} · {formatExitTime(o.exitFilledAt)}
+                <div className="text-right">
+                  <div className={`font-mono text-xs ${o.realizedPnl >= 0 ? "text-bull" : "text-bear"}`}>
+                    {o.realizedPnl >= 0 ? "+" : ""}
+                    {o.realizedPnl.toFixed(2)}
+                  </div>
+                  <div className={`font-mono text-[10px] ${o.realizedR >= 0 ? "text-bull" : "text-bear"}`}>
+                    {o.realizedR >= 0 ? "+" : ""}
+                    {o.realizedR.toFixed(2)}R
+                  </div>
                 </div>
               </div>
-              <div className="text-right">
-                <div className={`font-mono text-xs ${o.realizedPnl >= 0 ? "text-bull" : "text-bear"}`}>
-                  {o.realizedPnl >= 0 ? "+" : ""}
-                  {o.realizedPnl.toFixed(2)}
-                </div>
-                <div className={`font-mono text-[10px] ${o.realizedR >= 0 ? "text-bull" : "text-bear"}`}>
-                  {o.realizedR >= 0 ? "+" : ""}
-                  {o.realizedR.toFixed(2)}R
-                </div>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
-    </div>
+    </section>
   );
 }
 

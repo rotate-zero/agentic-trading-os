@@ -1,3 +1,33 @@
+<!-- BEGIN DELIVERY SECTION: frontend-outcomes-simulated-reader (frontend-only; integrate alongside the backend task's section, do not merge the two) -->
+# TESTING — `frontend-outcomes-simulated-reader`
+
+Verified on `main` `9c69d91` (branch `frontend-outcomes-simulated-reader`), Node v22.22.2, `npm ci`
+in `frontend/`. Frontend only: no backend, database or broker was touched, so no backend or
+PostgreSQL run applies to this delivery.
+
+- `npx tsc -b`: baseline before changes clean, and clean after (exit 0, no diagnostics).
+- `npm run build` (`tsc -b && vite build`): succeeded, 103 modules transformed. Only the existing
+  Vite chunk-size (>500 kB) advisory appeared.
+- **Behavior check (not committed).** The frontend has no test runner, and adding one is outside this
+  task's scope, so the hook and section were exercised with a throwaway jsdom + React `act` script kept
+  outside the repository, against a controllable mocked `fetch`: 23 checks passed. It covered:
+  the request URL (`is_backtest=false&limit=10`, never `is_backtest=true`); loading, empty,
+  populated and first-load-error states (an error is never shown as the empty state); Refresh re-request;
+  a failed refresh keeping the loaded rows and showing the banner; a later success clearing it; mode/venue
+  and "N snapshots unavailable" rendering; an older success not replacing a newer refresh's rows;
+  an older failure after a newer success being ignored; an older success not masking a newer
+  failure; a response after unmount being harmless; and no unexpected React `console.error`.
+  As a mutation check, disabling the request-id guard made exactly the three race checks fail
+  (20 passed, 3 failed); the guard was restored afterward.
+- **Not covered:** no real browser, no visual/Tailwind review, and no run against a live backend
+  with real `OutcomeRecorder` rows (the fixtures are hand-built and mirror the Pydantic contract). Manual
+  check for reviewers: with the backend up, open the Info tab, confirm the Simulated label,
+  press Refresh, then stop the backend and press Refresh again — the rows must stay with a
+  "Refresh failed" banner.
+- **Housekeeping:** `tsc -b` rewrites the tracked `frontend/tsconfig.tsbuildinfo`; it is not part of
+  this delivery and was restored before packaging.
+<!-- END DELIVERY SECTION: frontend-outcomes-simulated-reader -->
+
 # TESTING — decision #186, `outcome-recorder-contract` (EX-12 option a)
 
 Database target: isolated local PostgreSQL 18.6 in `/tmp/atos_pg2`, port 5545,
