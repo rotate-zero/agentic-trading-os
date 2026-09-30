@@ -1,3 +1,26 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-zero-position-recovery (backend-only; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-recorder-zero-position-recovery`
+
+**Database:** real local PostgreSQL 16 (Ubuntu package), database `trading_workspace`, user `trading` (superuser),
+created fresh for this run and migrated with `alembic upgrade head` (through `0016`). No mocks for the ledger;
+only `capture_strategy_outcome_snapshots` is stubbed, as in the existing recorder tests. No broker or external DB.
+
+- **Reproduced first, on unmodified `main` `c7c8550`:** new tests, 8 failed / 18 passed in
+  `tests/test_outcome_recorder.py` (zero-position trade stayed unblocked after startup scan and after sweep; a
+  3-position trade was returned 3 times; page walks lost or repeated candidates for batch sizes 1, 2, 3; sweep
+  rotation never queued the zero-position trades).
+- **After the fix:** `python -m pytest tests/test_outcome_recorder.py -q` → 26 passed.
+- **Full suite:** `python -m pytest tests -q` (from `backend/`) → 1543 passed in ~120 s.
+- **New coverage:** no event + zero positions blocked by startup scan; same via sweep for a trade that appears
+  after start, and a blocked trade is not rediscovered; multiple position rows give one bounded candidate and
+  `blocked`; NULL `closed_at` discovered and blocked; each candidate appears exactly once, in key order, across page
+  boundaries for batch sizes 1, 2, 3; `batch_size=1` startup scan records the ordinary trade once (a later sweep
+  adds no second outcome) and blocks the others; sweep rotation wraps. Every blocked case asserts no
+  `strategy_outcomes` row and no position created.
+- **Not covered:** the NULL-`closed_at` ordering when other unrelated rows already exist in a shared dev database
+  (tests assert only on their own trade ids); no run against the app's full startup wiring beyond the recorder's `start()`.
+<!-- END DELIVERY SECTION: outcome-recorder-zero-position-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-outcomes-simulated-reader (frontend-only; integrate alongside the backend task's section, do not merge the two) -->
 # TESTING — `frontend-outcomes-simulated-reader`
 

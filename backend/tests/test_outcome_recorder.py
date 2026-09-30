@@ -357,3 +357,168 @@ async def test_periodic_sweep_recovers_closure_without_event(monkeypatch):
         await asyncio.sleep(0.02)
     assert _result(trade_id)[0] == "recorded"
     await recorder.stop()
+
+
+# --- Lost-PositionClosed recovery: trades the positions inner join could not see (§6.7.1 C8) ---
+
+def _drop_positions(trade_id, *, keep=0):
+    """Model a ledger whose position rows are missing (zero) without touching the schema."""
+    with SessionLocal.begin() as session:
+        session.execute(text("DELETE FROM position_fill_receipts WHERE position_id IN "
+                             "(SELECT position_id FROM positions WHERE trade_id = :t)"), {"t": trade_id})
+        session.execute(text("DELETE FROM positions WHERE trade_id = :t"), {"t": trade_id})
+
+
+def _seed_zero_position():
+    """Closed approved simulated trade with a reservation but no positions row."""
+    trade_id, _ = _seed()
+    _drop_positions(trade_id)
+    return trade_id
+
+
+def _add_extra_position(trade_id, *, closed_at):
+    with SessionLocal.begin() as session:
+        session.add(Position(position_id=uuid4(), trade_id=trade_id, execution_mode="simulated",
+                             execution_venue="simulated", symbol="AAPL", side="BUY", qty=0, avg_price=100,
+                             opened_at=datetime.now(timezone.utc) - timedelta(minutes=5), closed_at=closed_at,
+                             status="closed", realized_pnl=0))
+
+
+def _position_count(trade_id):
+    with SessionLocal() as session:
+        return session.scalar(text("SELECT count(*) FROM positions WHERE trade_id = :t"), {"t": trade_id})
+
+
+def _outcome_count(trade_id):
+    return len(_result(trade_id)[2])
+
+
+def _page_all(recorder, limit=50):
+    """Walk _pending_rows exactly the way the startup scan does; return every row seen."""
+    seen, cursor = [], None
+    for _ in range(limit):
+        rows = recorder._pending_rows(cursor)
+        seen.extend(rows)
+        if len(rows) < recorder._batch_size:
+            return seen
+        cursor = rows[-1]
+    raise AssertionError("pagination did not terminate")
+
+
+def _quiet(monkeypatch):
+    monkeypatch.setattr(module, "capture_strategy_outcome_snapshots", lambda symbol: StrategyOutcomeSnapshots(None, None))
+
+
+@pytest.mark.asyncio
+async def test_startup_scan_blocks_zero_position_trade_with_no_event(monkeypatch, caplog):
+    _quiet(monkeypatch)
+    trade_id = _seed_zero_position()
+    assert _position_count(trade_id) == 0
+    recorder = OutcomeRecorder(EventBus(), SessionLocal)  # no PositionClosed is ever published
+    await recorder.start()
+    await recorder._queue.join()
+    status, outcome_id, rows = _result(trade_id)
+    assert (status, outcome_id, rows) == ("blocked", None, [])
+    assert "reason=multi_position_trade" in caplog.text
+    assert _position_count(trade_id) == 0  # nothing fabricated
+    await recorder.stop()
+
+
+@pytest.mark.asyncio
+async def test_sweep_blocks_zero_position_trade_that_appears_after_start(monkeypatch):
+    _quiet(monkeypatch)
+    recorder = OutcomeRecorder(EventBus(), SessionLocal, sweep_interval_seconds=60)
+    await recorder.start()
+    await recorder._queue.join()
+    trade_id = _seed_zero_position()
+    await recorder.scan()
+    await recorder._queue.join()
+    assert _result(trade_id)[0] == "blocked"
+    assert _outcome_count(trade_id) == 0 and _position_count(trade_id) == 0
+    await recorder.scan()  # a blocked trade is never rediscovered
+    assert not [row for row in recorder._pending_rows(None) if row[1] == trade_id]
+    await recorder.stop()
+
+
+@pytest.mark.asyncio
+async def test_multi_position_trade_is_one_bounded_candidate_and_blocked(monkeypatch):
+    _quiet(monkeypatch)
+    trade_id, _ = _seed()
+    now = datetime.now(timezone.utc)
+    _add_extra_position(trade_id, closed_at=now)
+    _add_extra_position(trade_id, closed_at=None)
+    assert _position_count(trade_id) == 3
+    recorder = OutcomeRecorder(EventBus(), SessionLocal)
+    assert [row for row in recorder._pending_rows(None) if row[1] == trade_id].__len__() == 1
+    await recorder.start()
+    await recorder._queue.join()
+    assert _result(trade_id)[0] == "blocked" and _outcome_count(trade_id) == 0
+    await recorder.stop()
+
+
+@pytest.mark.asyncio
+async def test_null_closed_at_position_is_discovered_and_blocked(monkeypatch):
+    _quiet(monkeypatch)
+    trade_id = _seed_zero_position()
+    _add_extra_position(trade_id, closed_at=None)
+    recorder = OutcomeRecorder(EventBus(), SessionLocal)
+    assert [row for row in recorder._pending_rows(None) if row[1] == trade_id].__len__() == 1
+    await recorder.start()
+    await recorder._queue.join()
+    assert _result(trade_id)[0] == "blocked" and _outcome_count(trade_id) == 0
+    await recorder.stop()
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_pagination_returns_each_candidate_exactly_once_across_page_boundaries(batch_size):
+    ordinary = [_seed()[0] for _ in range(2)]
+    zero = [_seed_zero_position() for _ in range(2)]
+    multi = _seed()[0]
+    _add_extra_position(multi, closed_at=datetime.now(timezone.utc))
+    _add_extra_position(multi, closed_at=None)
+    null_only = _seed_zero_position()
+    _add_extra_position(null_only, closed_at=None)
+    mine = {*ordinary, *zero, multi, null_only}
+    recorder = OutcomeRecorder(EventBus(), SessionLocal, batch_size=batch_size)
+    rows = _page_all(recorder)
+    ids = [trade_id for _, trade_id in rows]
+    assert sorted(t for t in ids if t in mine) == sorted(mine)
+    assert len(ids) == len(set(ids))  # no trade repeats across pages
+    assert rows == sorted(rows, key=lambda row: (row[0], row[1]))  # stable keyset order
+    assert all(len(rows[i:i + batch_size]) <= batch_size for i in range(0, len(rows), batch_size))
+
+
+@pytest.mark.asyncio
+async def test_batch_size_one_startup_scan_records_ordinary_once_and_blocks_the_rest(monkeypatch):
+    _quiet(monkeypatch)
+    ordinary = _seed()[0]
+    zero = _seed_zero_position()
+    multi = _seed()[0]
+    _add_extra_position(multi, closed_at=datetime.now(timezone.utc))
+    null_only = _seed_zero_position()
+    _add_extra_position(null_only, closed_at=None)
+    recorder = OutcomeRecorder(EventBus(), SessionLocal, batch_size=1)
+    await recorder.start()
+    await recorder._queue.join()
+    assert _result(ordinary)[0] == "recorded" and _outcome_count(ordinary) == 1
+    for trade_id in (zero, multi, null_only):
+        assert _result(trade_id)[0] == "blocked" and _outcome_count(trade_id) == 0
+    await recorder.scan()
+    await recorder._queue.join()
+    assert _outcome_count(ordinary) == 1  # a later sweep never records it twice
+    await recorder.stop()
+
+
+@pytest.mark.asyncio
+async def test_sweep_rotates_through_pages_and_wraps(monkeypatch):
+    _quiet(monkeypatch)
+    recorder = OutcomeRecorder(EventBus(), SessionLocal, batch_size=1)
+    recorder._started_at = datetime.now(timezone.utc)
+    zero, null_only = _seed_zero_position(), _seed_zero_position()
+    _add_extra_position(null_only, closed_at=None)
+    ordinary = _seed()[0]
+    for _ in range(60):  # bounded: one row per scan, cursor rotates and wraps
+        if all(("close", t) in recorder._queued for t in (zero, null_only, ordinary)):
+            break
+        await recorder.scan()
+    assert all(("close", t) in recorder._queued for t in (zero, null_only, ordinary))

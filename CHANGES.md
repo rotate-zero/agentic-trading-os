@@ -1,3 +1,43 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-zero-position-recovery (backend-only; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-recorder-zero-position-recovery`
+
+Narrow `OutcomeRecorder` recovery fix under decision #186. **No decision number assigned** (slug only);
+#186 and the outcome contract are unchanged. Built on `main` `c7c8550` (contains `9c69d91`), branch
+`outcome-recorder-zero-position-recovery`. No schema, migration, endpoint, trading behavior or frontend change.
+
+**Gap.** §6.7.1 C8 says a closed trade with zero `positions` rows becomes `blocked` (`multi_position_trade`),
+but `_pending_rows()` inner-joined `positions`, so after a lost `PositionClosed` neither the startup scan nor the
+sweep could ever discover such a trade. The old query also returned one row per position (a multi-position trade
+consumed several page slots), and its `(closed_at, trade_id)` keyset silently dropped NULL `closed_at` rows
+(`NULL > x` is unknown).
+
+**Fix (`outcome_recorder.py`, `_pending_rows` only).** The query now starts from `trades`, left-joins `positions`
+pre-aggregated to one row per trade, and orders/pages on `(coalesce(min(closed_at), 1970-01-01), trade_id)`.
+Same filters as before (approved, closed, simulated, auto, no outcome, not `blocked`; `pending_retry` still
+eligible). Discovery only: `record_trade` / `_build` are untouched, so a zero-position trade reaches the existing
+C8 check and is blocked with no outcome row and no fabricated position.
+
+```
+lost PositionClosed ─X─►                       (no event needed)
+startup _startup_scan ─┐
+periodic  scan()  ─────┴─► _pending_rows(cursor)
+                            trades ⟕ (positions GROUP BY trade_id → min(closed_at))
+                            WHERE approved∧closed∧simulated∧auto∧outcome_id NULL∧¬blocked
+                            ORDER BY (coalesce(min_closed_at, epoch), trade_id) LIMIT batch
+                              │  one row per trade, never-NULL key
+                              ▼
+                     _enqueue("close", trade_id) ─► record_trade ─► _close_candidate ─► _record_locked ─► _build
+                                                                          1 closed position ─► outcome recorded (once)
+                                                                          0 / >1 / not closed ─► blocked: multi_position_trade
+```
+
+Discovery order changed slightly: trades with no usable close time now sort first (previously NULL sorted last,
+and was unreachable past page one). Ordinary trades keep oldest-close-first order.
+
+**Also touched:** `docs/architecture/execution-engine-design.md` §6.7.1 C7 (as-built recovery description) and the
+Verification sentence; `backend/tests/test_outcome_recorder.py` (+7 test functions, 9 cases; the NULL-`closed_at` discovery test already passed before the fix at default batch size, the page-boundary tests catch the paging loss).
+<!-- END DELIVERY SECTION: outcome-recorder-zero-position-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: frontend-outcomes-simulated-reader (frontend-only; integrate alongside the backend task's section, do not merge the two) -->
 # CHANGES — `frontend-outcomes-simulated-reader` (frontend for decision #186)
 

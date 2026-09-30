@@ -24,6 +24,8 @@ from app.trading_intelligence.state_snapshot import capture_strategy_outcome_sna
 logger = logging.getLogger(__name__)
 _STOP = object()
 _CENT = Decimal("0.000001")
+# Sort key for trades with no usable position close time; positions.closed_at is timezone-naive.
+_NO_CLOSE_TIME = datetime(1970, 1, 1)
 
 
 class OutcomeBlocked(Exception):
@@ -148,14 +150,27 @@ class OutcomeRecorder:
             self._scan_cursor = rows[-1]
 
     def _pending_rows(self, after):
+        """One bounded, keyset-ordered page of closed trades still lacking an outcome verdict.
+
+        Driven from `trades` so a closed trade with zero position rows (a lost
+        PositionClosed plus a missing projection) is still discovered and can be
+        blocked as `multi_position_trade` (§6.7.1 C8). Positions are pre-aggregated to
+        one row per trade, so a trade with several position rows costs one page slot,
+        and the key `(coalesce(min(closed_at), epoch), trade_id)` is never NULL, which
+        keeps the tuple comparison, and therefore paging, well-defined for NULL `closed_at`.
+        """
         with self._sessions() as session:
-            query = (select(Position.closed_at, Trade.trade_id).join(Trade, Position.trade_id == Trade.trade_id)
+            closed = (select(Position.trade_id.label("trade_id"), func.min(Position.closed_at).label("closed_at"))
+                      .group_by(Position.trade_id).subquery())
+            sort_at = func.coalesce(closed.c.closed_at, _NO_CLOSE_TIME)
+            query = (select(sort_at.label("closed_at"), Trade.trade_id)
+                .outerjoin(closed, closed.c.trade_id == Trade.trade_id)
                 .where(Trade.decision == "approved", Trade.status == "closed", Trade.execution_mode == "simulated",
                        Trade.origin == "auto", Trade.outcome_id.is_(None),
                        func.coalesce(Trade.outcome_status, "pending") != "blocked")
-                .order_by(Position.closed_at, Trade.trade_id).limit(self._batch_size))
+                .order_by(sort_at, Trade.trade_id).limit(self._batch_size))
             if after is not None:
-                query = query.where(tuple_(Position.closed_at, Trade.trade_id) > after)
+                query = query.where(tuple_(sort_at, Trade.trade_id) > tuple(after))
             return session.execute(query).all()
 
     async def _sweep(self):
