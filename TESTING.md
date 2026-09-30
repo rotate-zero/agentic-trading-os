@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: frontend-world-view-simulated-column (frontend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `frontend-world-view-simulated-column`
+
+Verified on `main` `c91ad01` (branch `frontend-world-view-simulated-column`), Node v22.22.2, `npm ci` in `frontend/`.
+Frontend and docs only: no backend, database or broker was touched.
+
+- `npx tsc -b`: exit 0, no diagnostics.
+- `npm run build` (`tsc -b && vite build`): built (`✓ built`); only the existing Vite chunk-size (>500 kB) advisory appeared.
+  (`frontend/tsconfig.tsbuildinfo`, which `tsc -b` rewrites, was restored and is not part of the change.)
+- **Behavior check (temporary; not committed, no dependency added to the repo).** The real `WorldViewSummary` and
+  `useWorldView` were bundled with the installed esbuild (via a temporary exported copy of `InfoTab.tsx`, deleted
+  afterwards) and driven with jsdom + React `act` against a mocked `fetch`: **16 checks passed, 0 failed.** Covered:
+  loading state and one request to `/intelligence/world-view`; both columns empty ("Simulated execution" /
+  "No simulated-execution trades recorded yet." and "Backtest" / "No backtest trades yet."); simulated populated +
+  backtest empty; backtest populated + simulated empty; both populated independently; no "Live"/"No live trades yet"
+  wording in the columns; subtitle says not real-money; manual Refresh refetches and shows Loading; a failed fetch
+  renders the error (not an empty message) and Refresh recovers.
+- **Mutation check:** restoring the old label and old empty message failed exactly 3 checks; discarded afterwards.
+- **Not covered:** no committed frontend test runner exists, so the check is not part of the repo; the Portfolio block
+  and the backend envelope were not re-tested (unchanged); no visual/browser inspection.
+<!-- END DELIVERY SECTION: frontend-world-view-simulated-column -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-read-path-integration (backend tests; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-read-path-integration`
 

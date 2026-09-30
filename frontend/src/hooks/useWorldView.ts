@@ -18,10 +18,17 @@ import { ApiError, fetchWorldView, type WorldViewPerformanceWireShape, type Worl
  * useMarketState/useContextSnapshot directly, the real owners of that
  * data; duplicating their normalization here, for fields this task's own
  * UI never renders, would be dead code. Only `performance` (the one
- * field with genuinely new shape — both live and backtest populations,
- * always, side by side, all-time; nothing else in this codebase shows
- * both populations at once) and `portfolio` (the restored execution
+ * field with genuinely new shape — both populations, always, side by side,
+ * all-time; nothing else in this codebase shows both at once) and `portfolio` (the restored execution
  * snapshot when available) are exposed.
+ *
+ * Population keys: `performance.live` is the `is_backtest=false` population
+ * and `performance.backtest` is `is_backtest=true` (names unchanged).
+ * Since decision #186 the only writer of non-backtest `strategy_outcomes`
+ * rows is the simulated OutcomeRecorder, so `live` currently holds
+ * SIMULATED execution results, not real-money trades (no paper/live/manual
+ * outcome writer exists); WorldViewSummary labels it accordingly. Empty
+ * means none recorded yet. Backtest rows are never blended into it.
  *
  * Always calls `fetchWorldView()` with no `symbol` — `performance`/
  * `portfolio` are system-wide/unscoped regardless of `symbol` (only

@@ -678,9 +678,9 @@ lifespan restored PortfolioState ──▶ route injects reader ──▶ _read_
 No writer, mutation, SQL query, or symbol filter is introduced by this path.
 ```
 
-**As-built: frontend surfacing (decision #154), now populated for Portfolio State.** The existing `WorldViewSummary` remains below `StrategyPerformanceSummary` and retains its Live/Backtest performance columns. It shows the count of open positions and compact rows of the position details when a snapshot is available, an explicit unavailable state when it is null, and a manual Refresh control. The hook still performs one fetch on mount and does not poll or subscribe to a new channel.
+**As-built: frontend surfacing (decision #154), now populated for Portfolio State.** The existing `WorldViewSummary` remains below `StrategyPerformanceSummary` and retains its two performance columns (simulated execution and Backtest — see below). It shows the count of open positions and compact rows of the position details when a snapshot is available, an explicit unavailable state when it is null, and a manual Refresh control. The hook still performs one fetch on mount and does not poll or subscribe to a new channel.
 
-The existing `frontend/src/hooks/useWorldView.ts` remains one-shot on mount with a caller-visible error and `refetch()`; there is no World View poll or WebSocket subscription. `fetchWorldView()` keeps the existing Market State, Context, and Performance wire envelopes and adds a typed portfolio shape. `WorldViewSummary` retains its side-by-side Live/Backtest trades, win rate, and expectancy display. Its Portfolio section now uses the typed read shape, and the Refresh button calls `refetch()` to show a subsequent fill without a page reload.
+The existing `frontend/src/hooks/useWorldView.ts` remains one-shot on mount with a caller-visible error and `refetch()`; there is no World View poll or WebSocket subscription. `fetchWorldView()` keeps the existing Market State, Context, and Performance wire envelopes and adds a typed portfolio shape. `WorldViewSummary` retains its side-by-side two-column trades, win rate, and expectancy display. Since decision #186 the `is_backtest=false` column (wire key `performance.live`, unchanged) holds **simulated-execution** outcomes written by the simulated `OutcomeRecorder`, not real-money trades, so the column is labeled "Simulated execution" with an empty state of "No simulated-execution trades recorded yet." (replacing the pre-#186 "No live trades yet."); the Backtest column is a separate population and keeps its own label and empty state. The backend's two population keys and queries are unchanged. Its Portfolio section now uses the typed read shape, and the Refresh button calls `refetch()` to show a subsequent fill without a page reload.
 
 ```text
 GET /intelligence/world-view                          frontend data flow
@@ -714,7 +714,8 @@ Internal flow inside WorldViewSummary:
         │                    │
         └────────┬───────────┘
                   ▼
-     one compact column per population, Live | Backtest side by side
+     one compact column per population, side by side:
+     "Simulated execution" (performance.live, is_backtest=false) | "Backtest"
 
   portfolio === null  ──▶  "Unavailable (execution pipeline or snapshot)"
   portfolio present   ──▶  count + one compact row per open position

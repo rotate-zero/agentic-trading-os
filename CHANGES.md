@@ -1,3 +1,32 @@
+<!-- BEGIN DELIVERY SECTION: frontend-world-view-simulated-column (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `frontend-world-view-simulated-column`
+
+Based on `main` `c91ad01` (contains `fb9462a`; re-checked against `origin/main` before packaging: no newer commits).
+Branch `frontend-world-view-simulated-column`. Frontend and docs only. **No new decision number:** this is a
+consumer-side wording correction after decision #186; `INDEX.md`, the `confirmed-decisions.md` tail and the archive
+list are untouched and the latest number is still 186.
+
+- **`WorldViewSummary` (`InfoTab.tsx`) describes its `is_backtest=false` column accurately.** The column header
+  changes from "Live" to "Simulated execution", and the empty message from "No live trades yet." to "No simulated-execution
+  trades recorded yet." The subtitle now reads "Simulated execution and backtest, shown separately — … Simulated
+  execution is not real-money trading." The Backtest column (label and "No backtest trades yet.") is unchanged and stays
+  a separate population.
+- **Unchanged on purpose:** the backend's `performance.live` / `performance.backtest` keys and the two
+  `is_backtest=False` / `True` queries; `aggregateWinRate`/`aggregateExpectancy`; the Portfolio block; manual Refresh;
+  the loading and error rendering; `useWorldView`'s request-id ordering and clear-on-failure behavior. No polling,
+  WebSocket, metric, backend, or new view. The wire key stays `live`; only the displayed wording changed.
+- **Current-state comments corrected** in `InfoTab.tsx` (new note above `aggregateWinRate`) and `useWorldView.ts`
+  (docstring): `performance.live` is the `is_backtest=false` population, and since #186 the simulated `OutcomeRecorder`
+  is the only writer of those rows — no paper/live/manual outcome writer exists. Neither file previously claimed that
+  no writer exists; the only stale wording was the two display strings above.
+- **`docs/architecture/trading-intelligence-architecture.md` §15** (frontend surfacing): states the simulated-execution
+  meaning and new labels; the internal-flow diagram now names the two columns. Historical text (decision #154 wording,
+  `docs/decisions/archive/134-160.md`) is left as written.
+- **Not changed, reported:** the two earlier CHANGES entries that quote "No live trades yet." are history and were kept;
+  `api-client.ts`'s World View comments and `schemas/performance.py`'s `execution_mode` description are outside the
+  requested files (the latter is already reported as a follow-up by `outcome-read-path-integration`).
+<!-- END DELIVERY SECTION: frontend-world-view-simulated-column -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-read-path-integration (backend tests + docs/comments; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-read-path-integration`
 

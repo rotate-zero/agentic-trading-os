@@ -608,6 +608,18 @@ function MarketStateSummary() {
 // trades, what fraction won, what expectancy" as a single side-by-side
 // glance rather than duplicating the full hour-by-hour/session-by-
 // session breakdown a second time in a different section.
+//
+// Current state of the `is_backtest=false` column (decision #186): the
+// backend still names the two populations "live" and "backtest"
+// (`performance.live` is `is_backtest=False`, `performance.backtest` is
+// `is_backtest=True`; keys and queries unchanged — this is wording only).
+// Since #186 the only writer of non-backtest `strategy_outcomes` rows is
+// the simulated OutcomeRecorder, so the `live` key currently holds
+// SIMULATED EXECUTION results, not real-money trades; no paper/live/manual
+// outcome writer exists. The column is therefore labeled "Simulated
+// execution" while the wire key stays `live`. Backtest is a separate
+// population and is never blended into it. An empty simulated column means
+// none has been recorded yet, not that nothing can write one.
 function aggregateWinRate(rows: HourlyWinRateWireShape[]): { trades: number; winRate: number | null } {
   const trades = rows.reduce((sum, row) => sum + row.total_trades, 0);
   const wins = rows.reduce((sum, row) => sum + row.win_count, 0);
@@ -635,7 +647,8 @@ function WorldViewSummary() {
         </button>
       </div>
       <div className="text-[10px] text-text-muted">
-        Live and backtest together, all matching history — distinct from the hour/session toggle above.
+        Simulated execution and backtest, shown separately — all matching history, distinct from the
+        hour/session toggle above. Simulated execution is not real-money trading.
       </div>
       {loading ? (
         <p className="p-1 text-[11px] text-text-muted">Loading…</p>
@@ -654,11 +667,13 @@ function WorldViewSummary() {
                   key={population}
                   className="rounded border border-base-border px-2 py-1.5 font-mono text-[11px]"
                 >
-                  <div className="mb-1 text-text-muted">{population === "live" ? "Live" : "Backtest"}</div>
+                  <div className="mb-1 text-text-muted">
+                    {population === "live" ? "Simulated execution" : "Backtest"}
+                  </div>
                   {isEmpty ? (
                     <div className="text-text-muted">
                       {population === "live"
-                        ? "No live trades yet."
+                        ? "No simulated-execution trades recorded yet."
                         : "No backtest trades yet."}
                     </div>
                   ) : (
