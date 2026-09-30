@@ -1,7 +1,8 @@
 # TESTING — `execution-status-doc-sync`
 
-Documentation-only delivery: no application code or test was changed, so no new tests were
-written. Baseline: GitHub `main` `eca3573`, unchanged at the final fetch. Local PostgreSQL 16
+Documentation delivery plus a test-only fix. The first pass changed no code or test and was
+verified at `eca3573`; the follow-up (below) was verified at `main` `79650ad`, which contains
+that first pass (`c2ea927`) and the later `79650ad` governor-evidence commit. Local PostgreSQL 16
 (`trading_workspace`, timezone UTC) created for this run and migrated with `alembic upgrade
 head` through `0016`; no external, broker or production database was contacted.
 
@@ -26,7 +27,8 @@ text (the one remaining "monitor half only" is the deliberate historical label);
 decision-log state re-checked (INDEX and the tail of `confirmed-decisions.md` both end at #185;
 archive `161-184.md` plus #185 in the main log) and untouched.
 
-**Test runs (evidence for the claims, not new coverage).**
+**Test runs for the first pass (evidence for the claims, at `eca3573`; superseded for the
+real-clock result by the follow-up below).**
 
 - Focused (market clock, session window, monitor EOD, exit-ledger EOD Postgres and migration,
   EOD integration, protective session retry, entry lifecycle, main execution pipeline): **242
@@ -41,11 +43,48 @@ archive `161-184.md` plus #185 in the main log) and untouched.
   `test_database_rejects_second_active_close_for_same_position`. Cause: they use
   `datetime.now()` and the real `MarketClock`, and the session guard added at `eca3573` makes
   `prepare()` return `None` outside regular hours. All four tests in that file pass at the
-  market-hours instant and when `is_regular_session` is forced true. Not fixed here (test and
-  code changes are outside this documentation task); reported in `CHANGES.md`.
+  market-hours instant and when `is_regular_session` is forced true. Fixed in the follow-up
+  below.
 - An additional run forcing `is_regular_session` true for the whole suite was discarded: it
   breaks tests that deliberately assert out-of-session behavior (42 failures) and says nothing
   about the documentation.
+
+**Follow-up: time-independent `test_exit_ledger_postgres.py` (base `79650ad`).**
+
+Change: `NOW` is fixed at `2026-09-16 15:00Z` (11:00 ET) and injected as the clock into every
+`PostgresExitLedger` in the file; one guard test added. See `CHANGES.md` for the consistency
+check of `opened_at`, `retry_after`, `trigger_ts` and `venue_ts` against that instant.
+
+- `tests/test_exit_ledger_postgres.py`, real clock at 06:23 UTC (outside US hours):
+  **5 passed** (4 existing + `test_fixed_now_is_a_regular_session`).
+- Same file under `faketime` at other instants, all **5 passed** each: Wed 2026-09-30 15:00Z
+  (11:00 ET, in session); Wed 2026-09-30 13:30Z (09:30 ET, at the open); Wed 2026-09-30 22:30Z
+  (after hours); Sat 2026-10-03 15:00Z (weekend); Fri 2026-11-27 19:00Z (after the 13:00 ET
+  half-day close); Wed 2026-09-16 15:00Z (the fixed instant itself).
+- Control: the pre-fix file at 2026-09-30 22:30Z: **3 failed, 1 passed** — the same three tests,
+  confirming the fix addresses the cause.
+- Focused set (market clock, session window, monitor EOD, exit-ledger Postgres, EOD Postgres and
+  migration, EOD integration, protective session retry, entry lifecycle, main execution
+  pipeline): **247 passed**, 1 warning. (The first pass's 242-test set plus this file's 5
+  tests.)
+- **Full backend suite on the real clock (outside US hours), at `79650ad`, two runs:**
+  - 06:33 UTC: **1512 passed, 1 failed** —
+    `tests/test_feature_engine.py::test_get_snapshot_reflects_latest_computed_values`
+    (`KeyError: '__TEST_FE_SNAP_B__'`). That test publishes two candles and then waits a fixed
+    `asyncio.sleep(0.1)` before reading the snapshot, so it is timing-sensitive under full-suite
+    load. It passed alone, in its whole file (81 passed), and on pristine `origin/main` with
+    these changes stashed, and at a market-hours instant. It does not touch the ledger, clock
+    or config; not changed here.
+  - 06:36 UTC, immediately re-run, no code change: **1513 passed, 0 failed**, 1 pre-existing
+    warning.
+- Full backend suite at a fixed market-hours start (`faketime '2026-09-30 15:00:00'`):
+  **1513 passed, 0 failed**.
+- `git diff --check`: clean.
+
+Remaining known issue: the `test_feature_engine.py` snapshot test above is intermittently
+flaky (one failure in three full runs at `79650ad`; the fix would be to await the event
+instead of sleeping, in a separate change). Nothing else fails. The exit-ledger fix is test-only
+and the `config.py` edit is a comment, so no production code path changed.
 
 Not covered: no real IBKR/paper path (none exists); doc rows outside the execution path
 (Phases 1–4 roadmap bullets, most of `system-design.md`, `strategy-engine-design.md`) were not

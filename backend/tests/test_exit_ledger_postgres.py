@@ -5,13 +5,22 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.core.market_clock import MarketClock
 from app.db.session import SessionLocal
 from app.execution_engine.exit_ledger import PostgresExitLedger
 from app.models.execution_ledger import ExitRequest, Fill, Order, Position, Trade
 from app.position_monitor.engine import ExitIntent
 
 NAME = "TEST_SIMULATED_EXIT_LEDGER"
-NOW = datetime.now(timezone.utc)
+# Fixed instant inside a regular US session (Wed 2026-09-16, 11:00 ET / 15:00Z; the
+# session runs 09:30-16:00 ET). Every ledger below gets this as its clock, so the
+# protective-close session guard sees the same time as the seeded rows and the
+# result never depends on when pytest runs. test_fixed_now_is_a_regular_session pins it.
+NOW = datetime(2026, 9, 16, 15, 0, tzinfo=timezone.utc)
+
+
+def make_ledger() -> PostgresExitLedger:
+    return PostgresExitLedger(SessionLocal, clock=lambda: NOW)
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +66,7 @@ def intent(position_id):
 
 def test_cancel_entry_then_reserve_one_close_and_retry_after_rejection():
     _, position_id, entry_id = seeded(entry_status="partially_filled")
-    ledger = PostgresExitLedger(SessionLocal)
+    ledger = make_ledger()
     assert ledger.observe(intent(position_id))
     assert ledger.observe(intent(position_id))
     assert ledger.prepare(position_id).client_order_id == entry_id
@@ -83,7 +92,7 @@ def test_cancel_entry_then_reserve_one_close_and_retry_after_rejection():
 
 def test_pre_submit_guard_rejects_new_entry_activity_and_unapplied_fill():
     trade_id, position_id, entry_id = seeded()
-    ledger = PostgresExitLedger(SessionLocal)
+    ledger = make_ledger()
     assert ledger.observe(intent(position_id))
     close = ledger.prepare(position_id)
     assert close is not None
@@ -104,7 +113,7 @@ def test_pre_submit_guard_rejects_new_entry_activity_and_unapplied_fill():
 
 def test_closed_position_does_not_create_or_retry_exit():
     _, position_id, _ = seeded()
-    ledger = PostgresExitLedger(SessionLocal)
+    ledger = make_ledger()
     assert ledger.observe(intent(position_id))
     with SessionLocal.begin() as session:
         position = session.get(Position, position_id)
@@ -116,7 +125,7 @@ def test_closed_position_does_not_create_or_retry_exit():
 
 def test_database_rejects_second_active_close_for_same_position():
     trade_id, position_id, _ = seeded()
-    ledger = PostgresExitLedger(SessionLocal)
+    ledger = make_ledger()
     assert ledger.observe(intent(position_id))
     first = ledger.prepare(position_id)
     assert first is not None
@@ -127,3 +136,11 @@ def test_database_rejects_second_active_close_for_same_position():
                               execution_venue="simulated", symbol="ZZEXIT", side="SELL",
                               position_effect="close", qty=5, order_type="market", status="approved"))
     assert ledger.prepare(position_id) == first
+
+
+def test_fixed_now_is_a_regular_session():
+    assert NOW.tzinfo is not None
+    assert MarketClock().is_regular_session(NOW)
+    # Every derived instant the tests use (opened_at, retry_after) stays in session too.
+    assert MarketClock().is_regular_session(NOW - timedelta(minutes=1))
+    assert MarketClock().is_regular_session(NOW + timedelta(seconds=5))

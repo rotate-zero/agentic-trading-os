@@ -1,11 +1,40 @@
 # CHANGES — `execution-status-doc-sync`
 
-Documentation correction only. GitHub `main` was `eca3573` at start and at the final fetch (no
-newer commits); working tree clean at start. No application code, test, migration, dependency
-or decision-log file was edited, and **no decision number was assigned** (slug only): every
-behavior described below is already built and covered by decisions #170–#185 or by the
-slug-only deliveries that extend #185's approval. Nothing here authorizes new trading behavior
-or the EX-12 `OutcomeRecorder`, which stays proposed.
+Documentation correction plus two small follow-ups. The first pass (the claim table below) was
+written against `eca3573` and has landed as `c2ea927` ("Execution status doc sync"). This
+follow-up is verified against `main` `79650ad`, the tip at the final fetch. Between the two,
+only `79650ad` ("Governor approval evidence") landed; it touches `governor/`, its own tests
+and one additive paragraph in `execution-engine-design.md` §6.2, and none of the four files
+changed here or any claim in the first-pass table.
+No migration, dependency, trading-behavior or decision-log file was edited, and **no decision
+number was assigned** (slug only): every behavior described below is already built and covered
+by decisions #170–#185 or by the slug-only deliveries that extend #185's approval. Nothing here
+authorizes new trading behavior or the EX-12 `OutcomeRecorder`, which stays proposed.
+
+## Follow-up fixes (test and comment only)
+
+- **`backend/tests/test_exit_ledger_postgres.py` no longer depends on the wall clock.** The
+  module's `NOW = datetime.now(timezone.utc)` is now a fixed instant, Wed 2026-09-16 15:00Z
+  (11:00 ET, inside the 09:30–16:00 ET session), and a `make_ledger()` helper passes
+  `clock=lambda: NOW` to all four `PostgresExitLedger` instances. Before, three tests failed
+  whenever pytest ran outside US regular hours because the session guard added by
+  `simulated-protective-session-retry` (`eca3573`) makes `prepare()` return `None` then. All
+  existing assertions are unchanged, and the production session guard, `PostgresExitLedger`
+  and `MarketClock` are untouched.
+  - *Consistency with the injected time.* The seeded position's `opened_at` is `NOW − 1 min`;
+    the venue-rejection retry timestamp the ledger writes is `NOW + 5 s` (so
+    `prepare()` correctly returns `None` for the bounded retry), and the test then sets
+    `retry_after = NOW − 1 s` so attempt 2 is reserved; the intent's `trigger_ts` and the
+    late fill's `venue_ts` are `NOW`. All of these fall in the same regular session.
+  - *New guard test.* `test_fixed_now_is_a_regular_session` asserts `NOW` is timezone-aware
+    and that `NOW`, `NOW − 1 min` and `NOW + 5 s` are all regular-session instants per
+    `MarketClock`, so a calendar change cannot silently turn the fixed instant into an
+    out-of-session one.
+- **`backend/app/core/config.py` comment corrected.** The comment on
+  `execution_eod_flatten_lead_seconds` said "the timer and ledger consumers are later tasks".
+  It now says the lead (1..900 s) is read by Position Monitor's EOD timer and by
+  `PostgresExitLedger`, which stores the `[close − lead, close)` window on the EOD row. The
+  setting, its default and its validator are unchanged.
 
 The living status text still described the execution path as it stood before decision #171
 (roadmap) or before the EOD deliveries (execution design, system design). Each claim below was
@@ -45,19 +74,6 @@ the Phase 1–4 roadmap bullets.
 
 ## Findings reported, not fixed (AGENTS.md §9)
 
-- **Related follow-up — time-of-day-dependent tests.** Three tests in
-  `backend/tests/test_exit_ledger_postgres.py`
-  (`test_cancel_entry_then_reserve_one_close_and_retry_after_rejection`,
-  `test_pre_submit_guard_rejects_new_entry_activity_and_unapplied_fill`,
-  `test_database_rejects_second_active_close_for_same_position`) build the ledger with the real
-  wall clock (`NOW = datetime.now(timezone.utc)`) and the real `MarketClock`. Since
-  `simulated-protective-session-retry` (`eca3573`), `prepare()` returns `None` outside US
-  regular hours, so they fail whenever the suite runs outside 09:30–16:00 ET on a trading day
-  (reproduced at 04:13 UTC; all pass with `is_regular_session` forced true). Not blocking a
-  documentation task; the fix is to inject a regular-session clock into those tests.
-- **Related follow-up — stale code comment.** `backend/app/core/config.py` still says the EOD
-  lead's "timer and ledger consumers are later tasks"; both are built. Application code was out
-  of scope.
 - **Decision-log question, no entry written.** Decision #185's log text says the EOD timer,
   ledger, orders, recovery and UI "remain unbuilt". Later deliveries built them under #185's
   approval without a new number, and this delivery documents that in the living docs. The log is
@@ -65,12 +81,15 @@ the Phase 1–4 roadmap bullets.
   condition `simulated-protective-session-retry` added to the fallback wording) is wanted is
   your call at merge. No number is needed for this delivery.
 - **Related follow-up — other docs.** `strategy-engine-design.md` (lines ~386 and ~444) still
-  quotes the "no Execution Engine" Live-tab message; not audited or edited here.
+  quotes the "no Execution Engine" Live-tab message. It is historical wording and is left
+  for a separate review; not audited or edited here.
 
 ## Files
 
-`CHANGES.md`, `TESTING.md`, `docs/roadmap/phase-roadmap.md`,
+First pass (landed as `c2ea927`): `CHANGES.md`, `TESTING.md`, `docs/roadmap/phase-roadmap.md`,
 `docs/architecture/execution-engine-design.md`, `docs/architecture/system-design.md`.
+This follow-up: `CHANGES.md`, `TESTING.md`, `backend/tests/test_exit_ledger_postgres.py`,
+`backend/app/core/config.py`.
 
 ---
 

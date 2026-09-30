@@ -244,7 +244,8 @@ class Settings(BaseSettings):
     execution_fixed_notional_usd: float = 1000.0
     execution_daily_loss_cap_usd: float = 100.0
 
-    # Simulated EOD placement lead; the timer and ledger consumers are later tasks.
+    # Simulated EOD placement lead in seconds (1..900): read by Position Monitor's EOD timer
+    # and by PostgresExitLedger, which stores the [close - lead, close) window on the EOD row.
     execution_eod_flatten_lead_seconds: int = 60
 
     @field_validator("execution_eod_flatten_lead_seconds", mode="before")
