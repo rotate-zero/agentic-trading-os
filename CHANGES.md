@@ -1,3 +1,79 @@
+# CHANGES — `execution-status-doc-sync`
+
+Documentation correction only. GitHub `main` was `eca3573` at start and at the final fetch (no
+newer commits); working tree clean at start. No application code, test, migration, dependency
+or decision-log file was edited, and **no decision number was assigned** (slug only): every
+behavior described below is already built and covered by decisions #170–#185 or by the
+slug-only deliveries that extend #185's approval. Nothing here authorizes new trading behavior
+or the EX-12 `OutcomeRecorder`, which stays proposed.
+
+The living status text still described the execution path as it stood before decision #171
+(roadmap) or before the EOD deliveries (execution design, system design). Each claim below was
+checked against the code at `eca3573` and, where noted, a test that exercises it.
+
+## Corrected stale claims
+
+| # | Where | Stale claim | Now says | Code evidence |
+|---|---|---|---|---|
+| 1 | `phase-roadmap.md`, Phase 5–6 status | Portfolio State, Execution Engine and Position Monitor "not started as application modules" | Built for `execution_mode = simulated` only; lists entry, stop/target, EOD, calendar, session-aware retries, read surfaces | `app/portfolio_state/`, `app/execution_engine/`, `app/position_monitor/`, `app/main.py` (pipeline wiring) |
+| 2 | same | "no live Execution/Position Monitor writer exists"; World View Portfolio State slot "honestly returns `null`" | No live `StrategyOutcome` writer (still true, now tied to the unbuilt `OutcomeRecorder`); the slot reads the running Portfolio State and is `null` when the pipeline did not start or the snapshot is unavailable | `app/main.py` (`world_view_portfolio_reader = portfolio_state`), `app/world_view/composite.py`, `tests/test_world_view_portfolio.py` |
+| 3 | same | "no Governor rule engine exists" implied nothing between the schema and a real Governor | A provisional simulated-only authorizer stub (rules 0–6) is built; a real Governor rule engine is not | `app/governor/engine.py` (subscribes to `OpportunityCreated`), `app/governor/rules.py` |
+| 4 | same, diagram | Execution Engine, Position Monitor, Portfolio State all `[not started]` | Re-drawn: built / proposed / not built per box | as above; no `OutcomeRecorder` class exists |
+| 5 | same, header | "Status as of decision #164" for the whole section | Phase 5–6 re-verified at `eca3573`; Phases 1–4 explicitly not re-audited | — |
+| 6 | `execution-engine-design.md`, header and §0 | No current-status statement; §0 items 1–5 read as the live state | §0 item 6 gives current built / proposed / not-built status | as above |
+| 7 | same, §1 | Inventory rows "not built" for ledger tables, Portfolio State, Execution Engine, Position Monitor | Labelled historical (main through #167); points to §0 item 6 | `alembic/versions/0012…0016`, modules above |
+| 8 | same, EX-5 (table row, heading, "Approved EOD policy") and §7 intro / §7.1 item 1 | "EOD order path unbuilt"; "the monitor, durable fallback/dispatch path and order placement still need implementation" | EX-5 resolved **and built** for simulated stop/target and EOD; manual/paper/live exits still have no policy | `exit_ledger.py` (`EOD_FLATTEN`, `FALLBACK_ALREADY_STORED`), `position_monitor/engine.py`, `alembic/versions/0016_simulated_eod_exit_state.py`, `tests/test_simulated_eod_integration.py` |
+| 9 | same, EX-5 "As-built resolution" | "This does not implement EOD…" (present tense) | Kept, marked as historical wording at `simulated-protective-exits` | as above |
+| 10 | same, §6.6 `simulated-eod-monitor-handoff` note | "This is the monitor half only. No EOD order can be placed…" | Kept as a delivery-time limit, marked superseded by the ledger, visibility and integration deliveries | `app/main.py` (`restore_observation`), `execution_engine/engine.py` (`on_observation`) |
+| 11 | same, §6.5 Portfolio State | "No … forced EOD exit … exists here" | Clarifies EOD flatten is Position Monitor/Execution policy, not Portfolio State | — |
+| 12 | same, §6.7 | Presented as the live-half design without a status | Banner: design sketch, **not built**; EX-12 open; `BacktestRunner` is `record_strategy_outcome()`'s only caller | `app/backtest_runner/runner.py:414`; no `class OutcomeRecorder` |
+| 13 | same, §6.7.1 A10 | "exit path writes `exit_reason` as `stop` or `target`; the approved EOD policy has no executable order path yet" | `stop`, `target` or `eod_flatten` | `exit_ledger.py`, `tests/test_simulated_eod_integration.py` |
+| 14 | same, §6.7.1 status | Verified at `f517834` | Adds re-verification note (A1, A5 re-checked; A10 corrected; others not re-audited) | — |
+| 15 | same, §8 World View bullet | "simulated stop/target observations now also enter the durable execution path" | stop/target **and EOD** | `exit_ledger.py` |
+| 16 | same, §9 | Acceptance criteria read as a status list | Labelled a historical proposal, not audited | — |
+| 17 | `system-design.md`, companion-doc line | "forks still open (… EOD aspect of EX-5)" | EX-5 removed; EX-12 noted as proposed, not built | — |
+| 18 | same, §4.8 implementation status | "Governor … Position Monitor remain the target shape only, not yet built" | Update: authorizer stub and Position Monitor-lite built; ranking, Decision Engine, Trade Planning, real Governor and thesis logic not | `app/governor/`, `app/position_monitor/` |
+| 19 | same, §4.9 "As built" | "EOD flatten … remain separate work" | EOD built (best-effort, `[close − lead, close)`, 2026–2028 only); session-aware protective retries; still not built: paper/live, broker-side protection, manual exits, `OutcomeRecorder` | `core/session_window.py`, `exit_ledger.py`, `core/market_clock.py` |
+| 20 | same, §3 diagram | Position Monitor → Performance Intelligence edge shown without qualification | Caveat added: target shape; writer proposed, not built | — |
+| 21 | same, §4.13 tables | "no Execution Engine/Position Monitor exists yet to write one" | The engine and monitor exist (simulated); the `OutcomeRecorder` does not | as row 12 |
+| 22 | same, §8 folder tree | Lists `order_manager.py`, `execution_router.py`, `mode.py`, `approval_queue.py`, `governor.py`, `position_sizing.py`, `risk_rules.py`, `monitor.py` | Note: original target layout; lists the as-built execution modules; those eight files do not exist | `find backend/app` |
+
+**Preserved unchanged:** every decision-log entry (including #185's wording that EOD timer,
+ledger and orders "remain unbuilt", which was true when written), the §6.6 "Historical baseline
+before decision #185 integration" and "Historical staged implementation footprint" text, and
+the Phase 1–4 roadmap bullets.
+
+## Findings reported, not fixed (AGENTS.md §9)
+
+- **Related follow-up — time-of-day-dependent tests.** Three tests in
+  `backend/tests/test_exit_ledger_postgres.py`
+  (`test_cancel_entry_then_reserve_one_close_and_retry_after_rejection`,
+  `test_pre_submit_guard_rejects_new_entry_activity_and_unapplied_fill`,
+  `test_database_rejects_second_active_close_for_same_position`) build the ledger with the real
+  wall clock (`NOW = datetime.now(timezone.utc)`) and the real `MarketClock`. Since
+  `simulated-protective-session-retry` (`eca3573`), `prepare()` returns `None` outside US
+  regular hours, so they fail whenever the suite runs outside 09:30–16:00 ET on a trading day
+  (reproduced at 04:13 UTC; all pass with `is_regular_session` forced true). Not blocking a
+  documentation task; the fix is to inject a regular-session clock into those tests.
+- **Related follow-up — stale code comment.** `backend/app/core/config.py` still says the EOD
+  lead's "timer and ledger consumers are later tasks"; both are built. Application code was out
+  of scope.
+- **Decision-log question, no entry written.** Decision #185's log text says the EOD timer,
+  ledger, orders, recovery and UI "remain unbuilt". Later deliveries built them under #185's
+  approval without a new number, and this delivery documents that in the living docs. The log is
+  immutable; whether a correction entry recording the as-built state (and the regular-hours
+  condition `simulated-protective-session-retry` added to the fallback wording) is wanted is
+  your call at merge. No number is needed for this delivery.
+- **Related follow-up — other docs.** `strategy-engine-design.md` (lines ~386 and ~444) still
+  quotes the "no Execution Engine" Live-tab message; not audited or edited here.
+
+## Files
+
+`CHANGES.md`, `TESTING.md`, `docs/roadmap/phase-roadmap.md`,
+`docs/architecture/execution-engine-design.md`, `docs/architecture/system-design.md`.
+
+---
+
 # CHANGES — `simulated-protective-session-retry`
 
 Stops a simulated stop/target close from minting a new attempt every five seconds while the

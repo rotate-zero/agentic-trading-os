@@ -1,6 +1,6 @@
 # Execution Engine & Portfolio State — Design (approved in principle; amended by decision #170)
 **Owner:** Saqib
-**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#185 and the simulated protective/EOD deliveries implement the simulated entry and exit paths described in §§6.2–6.6. The original inventory in §§1–2 and build prerequisites in §7.1 are historical. Decision #185 governs the executable simulated EOD path; EX-12 remains open. Baseline of the original design: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
+**Status:** Approved in principle by Saqib (2026-09-22), amended by decision #170. Decisions #171–#185 and the simulated protective/EOD deliveries implement the simulated entry and exit paths described in §§6.2–6.6. The original inventory in §§1–2 and build prerequisites in §7.1 are historical. Decision #185 governs the executable simulated EOD path; EX-12 remains open. **Present-tense status was re-verified against `main` at `eca3573` by `execution-status-doc-sync`:** the simulated entry, stop/target exit, EOD flatten (calendar verified for 2026–2028 only) and session-aware protective-retry paths are **built**; the `OutcomeRecorder` (§6.7, §6.7.1, EX-12) is **proposed, not built**; paper/live venues, manual mode and the Decision/Planning/Governor stages are not built. Sections labelled historical keep their original text. Baseline of the original design: `main` through decision #169. Fork labels `EX-n` are provisional, not D-numbers.
 **Companion documents:** [`system-design.md`](./system-design.md) §4.4 (Event Bus), §4.6 (Portfolio State Engine), §4.9 (Execution Engine), §4.13 (Database), §10 (event contracts) — the prose this doc turns into a design; [`trading-intelligence-architecture.md`](./trading-intelligence-architecture.md) §6, §10–§13, §18 (Portfolio State, Decision Engine, Trade Planning, Governor, Position Monitor, Manual Trading & Execution Modes) — the reasoning behind each module; [`strategy-engine-design.md`](./strategy-engine-design.md) §5 (`StrategyOutcome`), §6 (Decision Engine vs Governor), §9 (the full feedback loop); [`strategy-engine-open-decisions.md`](./strategy-engine-open-decisions.md) (D1, D4, D17 — the three rows this design touches); [`backtest-runner-design.md`](./backtest-runner-design.md) §7 (the only existing writer of `StrategyOutcome`, and the precedent for decision #128's option (a)); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (#6, #9, #89, #120, #128, #158); [`../decisions/future-ideas.md`](../decisions/future-ideas.md) (#14, #16, #21, #27).
 
 **Why this doc exists.** Everything downstream of the Strategy Engine — Decision Engine, Trade Planning, Governor, Portfolio State, Execution Engine, Position Monitor — exists only as prose (`system-design.md` §4.6/§4.9, `trading-intelligence-architecture.md` §6/§10–§13/§18). Performance Intelligence is built and tested, but its live half is empty: `record_strategy_outcome()` has no live caller (D17's live half, decision #158), and Decision Engine's arbitration (D4) is explicitly waiting for real outcome data. The Execution Engine is the missing writer, so it is the module whose design most gates the rest. The prose was written before the surrounding code existed; several of its premises no longer match the as-built repository (§2). This project's pattern is *design → forks resolved by Saqib → build*; this is the design pass, and it stops at the forks.
@@ -20,12 +20,13 @@
 3. **"Only the Governor can place orders" needs one reconciliation, not a new rule** (§3, I2): the Governor is the only *authorizer*; the Execution Engine is the only *placer*; manual mode adds a human confirmation *after* the Governor, it does not replace it. The task brief's shorthand "human as Governor" for manual-first was imprecise — §18.5 keeps the Governor in the path even for manual, sized requests.
 4. **Approved first slice (§5, Slice A; decision #170):** a simulated venue, the auto path, and one deliberately thin, clearly-labelled authorizer stub in place of the unbuilt Decision/Planning/Governor stages — **technically restricted to simulated execution and failing closed for `paper`/`live`** (§6.2) — with fixed sizing, protective exits monitored in-process, and an `OutcomeRecorder` that writes the outcome. It inverts the roadmap's stage order (Execution before its Phase 5 predecessors); Saqib approved that inversion (EX-1).
 5. **Six forks are resolved and six requirements are added by #170 (§7, §3):** `execution_mode` and `execution_venue` are separate columns (EX-2); the venue seam is a new narrow `OrderVenue` port and an `execution` registry role, and `BrokerAdapter` is not enlarged (EX-3); Portfolio State owns accounting and `PositionClosed` is published only after its commit (EX-6); the snapshot requirement is a pre-trade gate and a reported fill is never discarded (EX-7); and every order has a stable client-order ID, fills and updates are deduplicated, restart recovery reconciles non-terminal orders with the venue, the database ledger is authoritative, persist-before-publish covers fills and closures, and the daily-loss gate counts unrealized loss and open risk (§3 I10–I15, §6.9). Initial limits: 1 concurrent position, $1,000 notional per trade, $100 daily loss cap — all configurable (§6.10).
+6. **Current status (`main` at `eca3573`; items 1–5 are the original design summary and describe the plan as written).** *Built, `execution_mode = simulated` only:* the authorizer stub, entry-order Execution Engine, execution ledger, `SimulatedVenue`, Portfolio State, restart reconciliation and `main.py` wiring (#171–#178, #179–#180); Position Monitor-lite stop/target observation (#175, #178); durable position-bound stop/target closes (#184); simulated EOD flatten — monitor timer, exit-ledger state machine (migration `0016`), Execution worker, startup restore and read-only panel (#185 and its slug-only deliveries); `MarketClock` holiday/early-close coverage for 2026–2028 only, with EOD failing closed for other entry years; and session-aware protective retries (`simulated-protective-session-retry`). *Proposed, not built:* the `OutcomeRecorder` (§6.7.1; EX-12 open), so `record_strategy_outcome()` still has no live caller and `strategy_outcomes` has no live rows. *Not built:* a paper/live venue (`IBKRAdapter.place_order()` still raises `NotImplementedError`), broker-side protective orders, manual mode, Decision/Planning/Opportunity ranking and a real Governor rule engine.
 
 ---
 
 ## 1. Verified inventory of the downstream pipeline
 
-All rows verified against `main` through decision #167 (`grep`/`view`, not recalled from docs).
+**Historical.** This inventory (and §2) describes `main` through decision #167, before any execution code existed; its "not built" rows for the ledger tables, Portfolio State, Execution Engine and Position Monitor no longer hold — see §0 item 6 for current status. All rows were verified against `main` through decision #167 (`grep`/`view`, not recalled from docs).
 
 ### 1.1 Events and the bus
 
@@ -882,7 +883,7 @@ collapse / unmount ──► cleanup marks run inactive; a late response or late
 
 **Built in decisions #172–#174; integration remains partial.** Portfolio State owns position accounting, in-flight exposure, marks, and daily realized amounts. It is a cache over the ledger, never the record (I5/I12). Decision #173 revises #172's package with Saqib's approval; the same database-free arithmetic now serves both the event worker and the retained Session/reconciliation API.
 
-**Holding period is unrestricted by this component.** Day trading is the primary use, but positions may remain open across days, months, and restarts. No daily position reset, forced EOD exit, or maximum holding period exists here. Exit policy belongs to Position Monitor. A position's UUID is persisted at opening, survives adds/reductions/restarts, and is retired at full closure. A later opening in the same symbol receives a new UUID.
+**Holding period is unrestricted by this component.** Day trading is the primary use, but positions may remain open across days, months, and restarts. No daily position reset, forced EOD exit, or maximum holding period exists here (the simulated EOD flatten in §6.6 is Position Monitor/Execution exit policy, not Portfolio State behavior). Exit policy belongs to Position Monitor. A position's UUID is persisted at opening, survives adds/reductions/restarts, and is retired at full closure. A later opening in the same symbol receives a new UUID.
 
 ```text
 OrderApproved / OrderFilled / OrderStatusChanged        PriceUpdated
@@ -1345,11 +1346,15 @@ panel row:  exit_reason != eod_flatten ─► stop/target row exactly as before
 ```
 
 **As built (`simulated-eod-monitor-handoff`; decision #185 already exists, no new number).**
-Position Monitor now owns the EOD timer, a validated tick cache and a
-pending/acknowledged observation handoff. **This is the monitor half only.** No EOD
-order can be placed: nothing consumes the EOD observation, `exit_ledger.py`,
-`execution_engine/engine.py`, the migration, `main.py` and reconciliation are unchanged, and
-the exit-requests route/panel still show only stop/target. It supersedes two earlier
+Position Monitor owns the EOD timer, a validated tick cache and a
+pending/acknowledged observation handoff. *Delivery-time limits (historical, superseded):*
+when this slice landed it was the monitor half only — nothing consumed the EOD observation,
+and `exit_ledger.py`, `execution_engine/engine.py`, the migration, `main.py`, reconciliation
+and the exit-requests route/panel were unchanged. The later deliveries
+`simulated-eod-ledger-handoff` (exit ledger, migration `0016`),
+`simulated-eod-exit-request-visibility` (route and panel) and
+`simulated-eod-flatten-integration` (Execution worker, `main.py` restore) added those
+halves; the current end-to-end state is in the subsections below. This delivery superseded two earlier
 statements in this section for the monitor only: `_evaluate()` no longer produces
 `eod_flatten` from an event timestamp (stop/target only), and one `ExitIntent` per position
 is no longer the control latch (two slots are; the diagnostic map is unchanged).
@@ -2126,6 +2131,8 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
 
 ### 6.7 `OutcomeRecorder` and D17's live half (`trading_intelligence/`)
 
+**Status: design sketch — NOT BUILT.** No `OutcomeRecorder` module exists at `eca3573`, `record_strategy_outcome()` has no live caller (`BacktestRunner` is its only one), and EX-12 is open. The diagram and policy below are the original proposal; §6.7.1 refines it and is itself Proposed. What this component would consume — fills, position closure, `PositionClosed`, and `orders.exit_reason` values `stop`, `target` and `eod_flatten` — is built.
+
 **What it is.** The one place that turns a closed position into a `StrategyOutcome` and calls `record_strategy_outcome()` — the live-path caller D17 says does not exist.
 
 ```
@@ -2160,7 +2167,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
 
 ### 6.7.1 Proposed `OutcomeRecorder` contract (`outcome-recorder-contract`) — PROPOSED, not built; EX-12 awaits Saqib's confirmation
 
-**Status.** Design only. No application code, migration or decision number comes with this section; the slug is the temporary identifier. Rows marked **as-built** were verified against backend code at `f517834`; `main` later advanced to `3c23701`, which changed only documentation (`simulated-eod-flatten-contract`, an unapproved proposal that does not touch EX-12 or this section). A scratch run on real PostgreSQL 16 confirmed the three writer facts in A6). Everything marked **Proposed** is neither built nor decided. §6.7's sketch above stays as written; this section refines four points where `main` disagrees with it: (1) `PositionClosed` is a wake-up hint, not the data source; (2) the outcome insert and the `trades` link commit in one transaction, not as two steps; (3) a fourth `outcome_status` value, `blocked`, exists for trades that cannot be recorded honestly; (4) `record_strategy_outcome()` needs a same-session variant before any live caller can exist.
+**Status.** Design only. *Re-verified at `eca3573` (`execution-status-doc-sync`): A1 and A5 still hold; A10 was corrected for the built EOD path; the other rows were not re-audited and remain as verified at `f517834`.* No application code, migration or decision number comes with this section; the slug is the temporary identifier. Rows marked **as-built** were verified against backend code at `f517834`; `main` later advanced to `3c23701`, which changed only documentation (`simulated-eod-flatten-contract`, an unapproved proposal that does not touch EX-12 or this section). A scratch run on real PostgreSQL 16 confirmed the three writer facts in A6). Everything marked **Proposed** is neither built nor decided. §6.7's sketch above stays as written; this section refines four points where `main` disagrees with it: (1) `PositionClosed` is a wake-up hint, not the data source; (2) the outcome insert and the `trades` link commit in one transaction, not as two steps; (3) a fourth `outcome_status` value, `blocked`, exists for trades that cannot be recorded honestly; (4) `record_strategy_outcome()` needs a same-session variant before any live caller can exist.
 
 #### A. What `main` has today (as-built)
 
@@ -2175,7 +2182,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
 | A7 | The authorization commit persists strategy, version, direction, `structural_invalidation`/`structural_target` (with `final_*` equal to them), confidence, `setup_detected_at` and `decided_at` in `trades.thesis` and `trades.decision_record`. It does **not** persist `Opportunity.evidence` or `Opportunity.confirmed_at`; `TradeDecisionRecord` has no field for either. | `backend/app/governor/postgres.py:PostgresTradeLedger.commit_decision`; `backend/app/governor/ports.py:TradeDecisionRecord`; `backend/app/strategy_engine/base_strategy.py:Opportunity` |
 | A8 | `trade_reservations.reference_price` is retained after handoff and is the value the Governor publishes as `TradePlanned.entry`. | `backend/app/governor/engine.py` (`entry=result.reference_price`); `backend/app/models/execution_ledger.py:TradeReservation` |
 | A9 | `positions` has no uniqueness on `trade_id` (scratch run: two rows for one trade). Protective exits cancel an unfinished entry order before submitting a close, so a second position per trade is prevented by procedure, not by a constraint. Close orders are `<trade_id>:exit:<attempt>`, sized to the remaining position, each carrying its own `exit_reason`. | `backend/app/execution_engine/exit_ledger.py`; `backend/app/models/execution_ledger.py:Position` |
-| A10 | `SimulatedVenue` reports `commission = None` on every fill. The as-built exit path writes `exit_reason` as `stop` or `target`; the approved EOD policy has no executable order path yet. If that path is later built, `eod_flatten` would flow through the same `orders.exit_reason` source with no change to this contract. | `backend/app/broker_adapters/simulated_venue.py`; `backend/app/execution_engine/exit_ledger.py` |
+| A10 | `SimulatedVenue` reports `commission = None` on every fill. The as-built exit path writes `orders.exit_reason` as `stop`, `target` or `eod_flatten` (EOD is built and integrated; `exit_ledger.py` reserves and claims EOD closes, and `test_simulated_eod_integration.py` asserts `eod_flatten` orders). `eod_flatten` therefore flows through the same `orders.exit_reason` source with no change to this contract. | `backend/app/broker_adapters/simulated_venue.py`; `backend/app/execution_engine/exit_ledger.py` |
 | A11 | The Backtest Runner stamps `schema_version = 1`; §6.8 and decision #170 say writers of the new shape write 2. | `backend/app/backtest_runner/runner.py:_build_strategy_outcome` |
 
 #### B. Field-by-field source map for `StrategyOutcome` (Proposed)
@@ -2532,7 +2539,7 @@ All values live in `core/config.py`'s `Settings` (the repository's single source
 
 ## 7. Forks — six resolved by decision #170, the rest still open
 
-Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29, and its shared window foundation is built. The EOD order path remains unbuilt. EX-12 remains open.
+Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29 (decision #185), and the simulated EOD path is now built end to end (`simulated-eod-flatten-foundation` through `simulated-eod-flatten-integration`), with session-aware protective retries added by `simulated-protective-session-retry`. EX-12 remains open: the `OutcomeRecorder` is proposed in §6.7.1, not built.
 
 | Fork | Question | Status | Outcome / recommendation |
 |---|---|---|---|
@@ -2540,14 +2547,14 @@ Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, 
 | EX-2 | Labelling simulated-money outcomes | **RESOLVED (#170)** | separate `execution_mode` (`backtest\|simulated\|paper\|live`) and `execution_venue` (`simulated\|ibkr\|…`); `is_backtest` kept temporarily for compatibility |
 | EX-3 | Venue port and registry role | **RESOLVED (#170)** | new narrow `OrderVenue` interface + an `execution` registry role; `BrokerAdapter` not enlarged |
 | EX-4 | Authorizer stub shape and numbers | **RESOLVED (#170)** | one stub; 1 concurrent position, $1,000 notional per trade, $100 daily loss cap — all configurable |
-| EX-5 | Do protective exits need authorization? | RESOLVED for simulated stop/target (`simulated-protective-exits`) and simulated EOD policy (`simulated-eod-flatten-contract`); EOD order path unbuilt | no fresh Governor decision; a durable position-bound reduce-only guard |
+| EX-5 | Do protective exits need authorization? | RESOLVED and built for simulated stop/target (`simulated-protective-exits`, #184) and simulated EOD (#185; integrated) | no fresh Governor decision; a durable position-bound reduce-only guard; manual/paper/live exits have no policy |
 | EX-6 | Position accounting, in-flight orders, `PositionClosed` lane | **RESOLVED (#170)** | Portfolio State owns them; `PositionClosed` on the critical lane only after the commit |
 | EX-7 | D17 live policy for missing snapshots | **RESOLVED (#170)** | pre-trade gate; a reported fill is never discarded; else nullable fields + a missing-data reason |
 | EX-8 | Simulated fill model; `fill_simulator` reuse | OPEN — proceed on recommendation | conventions shared, incremental model new, parity delta documented |
 | EX-9 | Identity and payloads | OPEN in part — proceed on recommendation | the client-order-ID part is settled by I10; `opportunity_id` minting, new models, venue-level rejection event remain |
 | EX-10 | Durability | **Settled by I12** | ledger-first; `market_events` stays independent future work |
 | EX-11 | Exit enforcement | OPEN — proceed on recommendation | in-process for simulated; broker-side mandatory before any real venue |
-| EX-12 | Who writes `StrategyOutcome`; what belongs in it | OPEN — needs confirmation | `OutcomeRecorder`; strategy-attributed trades only |
+| EX-12 | Who writes `StrategyOutcome`; what belongs in it | OPEN — needs confirmation | `OutcomeRecorder`; strategy-attributed trades only (contract proposed in §6.7.1; **not built**) |
 | EX-13 | Manual mode in the first build | OPEN — proceed on recommendation | no — keep the placement-mode seam |
 | EX-14 | `BUY/SELL` vs `long/short`; position effect | OPEN — proceed on recommendation | keep `BUY/SELL` on orders + explicit `position_effect` |
 
@@ -2569,7 +2576,7 @@ Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, 
 ### EX-4 — Authorizer stub: shape and rule numbers  · RESOLVED (decision #170)
 **Resolution.** **Shape:** one stub emitting `TradePlanned → GovernorDecision → OrderApproved/PlanRejected` (§6.2), not a commitment to any D1 shape. **Initial values, all configurable rather than hardcoded (§6.10):** maximum concurrent positions **1**; fixed size **$1,000 notional** per trade; daily loss cap **$100**. These are conservative first-slice defaults for validating the lifecycle, not final trading-risk settings. **The daily-loss gate considers realized loss plus current unrealized loss and open risk, not realized P&L alone** (I15, §6.2).
 
-### EX-5 — Do protective exits need authorization? · RESOLVED for simulated stop/target and simulated EOD policy; EOD order path unbuilt
+### EX-5 — Do protective exits need authorization? · RESOLVED and built for simulated stop/target and simulated EOD; manual, paper and live exits have no policy
 **Question.** I2 as reconciled covers *risk-increasing* orders. Does a stop, target, or EOD-flatten exit also need a Governor-class decision?
 **Options.** (a) **No** — exits are *reduce-only*, checked by the Execution Engine against Portfolio State, carrying an `exit_reason` and their own client-order ID. (b) **Yes** — every order, including exits, gets a `GovernorDecision`.
 **Evidence.** `trading-intelligence-architecture.md` §12 frames the Governor as a *risk gate* on new exposure and §13's Position Monitor issues exits; an authorization round-trip on a stop adds latency exactly when it hurts; the emergency-action design (#16) is the same shape.
@@ -2578,15 +2585,23 @@ Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, 
 **As-built resolution.** Simulated stop and target closes use option (a).
 Execution requires a committed approved trade and matching open position,
 cancels unfinished entries, waits for fill receipts, reserves at most one
-active close per position, and rechecks before venue placement. This does not
-implement EOD, manual, paper, or live exits.
+active close per position, and rechecks before venue placement. *(Historical wording at
+`simulated-protective-exits`: that delivery did not implement EOD, manual, paper, or live
+exits; simulated EOD was added later, below. Manual, paper and live exits are still not
+implemented.)*
 
 **Approved EOD policy (decision #185; `simulated-eod-flatten-contract`, 2026-09-29).** Option (a)
-extends to simulated, position-bound reduce-only EOD. The built foundation computes
-the covered entry-day UTC placement window `[close − L, close)` with `L=60` by default
-(§6.6). The monitor, durable fallback/dispatch path and order placement still need
-implementation; this approval does not make EOD orders executable. Manual, paper and
-live exits have no authorization policy here.
+extends to simulated, position-bound reduce-only EOD. The window is the covered entry-day UTC placement interval `[close − L, close)` with `L=60` by default
+(configurable 1–900 s; §6.6).
+
+**As built (`eca3573`).** Later deliveries implemented the monitor timer and tick cache, the durable
+exit-ledger state machine (migration `0016`: stored window, expiry, immutable first stop/target
+fallback, dispatch marker), the Execution worker and startup restore, and the read-only
+reader/panel. EOD is a best-effort attempt to flatten, not a guarantee of closure by the bell.
+The calendar is verified for 2026–2028 only and EOD fails closed for any other entry year. A
+stop/target close, including the fallback after EOD expiry, waits while the regular session is
+closed (`simulated-protective-session-retry`). Manual, paper and live exits have no
+authorization policy here.
 
 ### EX-6 — Position accounting owner, in-flight orders, `PositionClosed` lane  · RESOLVED (decision #170)
 **Resolution.** **Portfolio State owns position accounting, in-flight orders, and daily P&L** (I5), as a cache over the authoritative ledger (I12). **`PositionClosed` may use the critical lane, but only after the position closure has been committed to the database** (I8). **Documented explicitly: the critical lane provides ordering and handler-failure isolation — not persistence, delivery guarantees, crash recovery, or failure propagation to the publisher** (F6, §6.5); recovery comes from the ledger (§6.9). Departure from `system-design.md` §4.8, which has Position Monitor emit `PositionClosed`: Position Monitor is a decision module that reads Portfolio State and issues exit intents (§6.5, §6.6).
@@ -2630,7 +2645,7 @@ live exits have no authorization policy here.
 
 ### 7.1 Historical build prerequisites and remaining choices
 
-1. **EX-5 (historical prerequisite)** — simulated stop/target is implemented by `simulated-protective-exits`. Simulated EOD policy was approved on 2026-09-29; only its shared window foundation is implemented. The executable EOD path remains a subsequent task under that approval.
+1. **EX-5 (historical prerequisite)** — simulated stop/target is implemented by `simulated-protective-exits`. Simulated EOD policy was approved on 2026-09-29 and is now implemented (window helper, monitor timer, exit ledger, Execution worker, startup restore; §6.6). No EX-5 prerequisite remains open for the simulated slice.
 2. **EX-12** — confirm that `strategy_outcomes` holds strategy-attributed trades only, with `trades` recording everything and `OutcomeRecorder` as the writer.
 3. **Judgment calls made in this revision — confirm or overrule:**
    - **J1 — naming.** `trading-intelligence-architecture.md` §18.5's `ExecutionMode` (`auto|manual`) is called *placement mode* here, so that `execution_mode` means the capital mode and nothing else (§10, R7).
@@ -2653,12 +2668,14 @@ These are recorded so they are not rediscovered; none is recommended for now.
 - **A real Governor rule engine, Decision Engine (D1), and Opportunity Engine (D4)** — the stub is designed so these replace it without changing Execution.
 - **Position Monitor proper** — thesis-validity checks, stop management, partials, reversal, manual-position handling (`future-ideas.md` #14).
 - **Frontend** — Positions / Trade Management / live order-status widgets, and any consumer of `orders.status`. The separate read-only simulated order history uses the ledger route (§6.3).
-- **World View `portfolio` slot** — reads the running restored Portfolio State through `main.py`'s separate lifecycle dependency; see `trading-intelligence-architecture.md` §15. Position Monitor's diagnostic route remains read-only; simulated stop/target observations now also enter the durable execution path.
+- **World View `portfolio` slot** — reads the running restored Portfolio State through `main.py`'s separate lifecycle dependency; see `trading-intelligence-architecture.md` §15. Position Monitor's diagnostic route remains read-only; simulated stop/target and EOD observations also enter the durable execution path.
 - **Retiring `is_backtest`** — kept only for compatibility; its removal is a later decision.
 
 ---
 
 ## 9. Acceptance criteria proposed for the eventual build task
+
+*Historical proposal, not a status checklist, and not audited by `execution-status-doc-sync`. Criteria that depend on the `OutcomeRecorder` (1, 2, 14, 21 and part of 9) cannot be met while EX-12 is open; the tests actually shipped are listed in `TESTING.md`.*
 
 **Lifecycle**
 1. **End-to-end fixture:** a scripted `OpportunityCreated` produces exactly one `strategy_outcomes` row — `execution_mode = 'simulated'`, `execution_venue = 'simulated'`, `is_backtest = false`, `origin = 'auto'`, every field per §4 — via the real Execution Engine, `SimulatedVenue`, Portfolio State, Position Monitor-lite, and `OutcomeRecorder`, against real PostgreSQL 16.

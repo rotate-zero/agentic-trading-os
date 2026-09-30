@@ -1,3 +1,58 @@
+# TESTING — `execution-status-doc-sync`
+
+Documentation-only delivery: no application code or test was changed, so no new tests were
+written. Baseline: GitHub `main` `eca3573`, unchanged at the final fetch. Local PostgreSQL 16
+(`trading_workspace`, timezone UTC) created for this run and migrated with `alembic upgrade
+head` through `0016`; no external, broker or production database was contacted.
+
+**Claim verification.** A script asserted, by regex against the source at `eca3573`, every
+positive claim the updated docs make: calendar years `{2026, 2027, 2028}`; EOD fail-closed
+`UnsupportedEodCalendarError`; window `[close − lead, close)`; lead default 60 and range
+1..900; config rejects a non-`simulated` `execution_mode`; authorizer rule 0 and its
+`OpportunityCreated` subscription; `WAIT_OUTSIDE_REGULAR_SESSION` and the ledger's
+`is_regular_session(now)` check; first-fallback-wins (`FALLBACK_ALREADY_STORED`); the venue's
+session guard; `IBKRAdapter.place_order()` raising `NotImplementedError`; the monitor emitting
+`eod_flatten`; `main.py` restoring observations and publishing the World View portfolio reader;
+startup status tracking; the `execution-exit-requests` route; migration `0016`. All passed.
+Negative claims checked by search: `record_strategy_outcome` has one real caller
+(`backtest_runner/runner.py:414`); no `class OutcomeRecorder`; eight `system-design.md` §8
+file names (`order_manager.py`, `execution_router.py`, `mode.py`, `approval_queue.py`,
+`governor.py`, `position_sizing.py`, `risk_rules.py`, `monitor.py`) do not exist.
+
+**Documentation checks.** `git diff --check` clean; every relative link in the three edited
+docs resolves; grep found no remaining "EOD order path unbuilt", "no live Execution/Position
+Monitor writer", "Not started as application modules" or "Portfolio State slot honestly"
+text (the one remaining "monitor half only" is the deliberate historical label);
+decision-log state re-checked (INDEX and the tail of `confirmed-decisions.md` both end at #185;
+archive `161-184.md` plus #185 in the main log) and untouched.
+
+**Test runs (evidence for the claims, not new coverage).**
+
+- Focused (market clock, session window, monitor EOD, exit-ledger EOD Postgres and migration,
+  EOD integration, protective session retry, entry lifecycle, main execution pipeline): **242
+  passed**.
+- Full backend suite at a fixed market-hours start (`faketime '2026-09-30 15:00:00'`, 11:00 ET):
+  **1453 passed**, 1 pre-existing warning — the same count `simulated-protective-session-retry`
+  recorded.
+- Full backend suite on the real clock at 04:13 UTC (outside US regular hours): **1450 passed,
+  3 failed**. The three failures are `tests/test_exit_ledger_postgres.py`
+  `test_cancel_entry_then_reserve_one_close_and_retry_after_rejection`,
+  `test_pre_submit_guard_rejects_new_entry_activity_and_unapplied_fill` and
+  `test_database_rejects_second_active_close_for_same_position`. Cause: they use
+  `datetime.now()` and the real `MarketClock`, and the session guard added at `eca3573` makes
+  `prepare()` return `None` outside regular hours. All four tests in that file pass at the
+  market-hours instant and when `is_regular_session` is forced true. Not fixed here (test and
+  code changes are outside this documentation task); reported in `CHANGES.md`.
+- An additional run forcing `is_regular_session` true for the whole suite was discarded: it
+  breaks tests that deliberately assert out-of-session behavior (42 failures) and says nothing
+  about the documentation.
+
+Not covered: no real IBKR/paper path (none exists); doc rows outside the execution path
+(Phases 1–4 roadmap bullets, most of `system-design.md`, `strategy-engine-design.md`) were not
+re-audited; §6.7.1 rows A2–A4, A6–A9 and A11 and the §9 acceptance list were not re-verified.
+
+---
+
 # TESTING — `simulated-protective-session-retry`
 
 Baseline: GitHub `main` `b6d1e57`, unchanged at the final fetch. Local PostgreSQL 16
