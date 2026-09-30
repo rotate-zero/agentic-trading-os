@@ -1,3 +1,42 @@
+<!-- BEGIN DELIVERY SECTION: frontend-performance-panel-refresh (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `frontend-performance-panel-refresh`
+
+Based on `main` `5079a08` (re-checked against `origin/main` before packaging: no newer commits). Frontend
+and docs only. **No new decision number:** the repository check found no new decision — this is a
+consumer-side correction of #137/#138/#162 after #186, and the latest number in `INDEX.md`, the
+`confirmed-decisions.md` tail and the archive list is still 186.
+
+- **Truthful Live empty state.** `StrategyPerformanceSummary` (`InfoTab.tsx`) no longer says "no
+  Execution Engine exists to write it". The empty message now depends on the selected view *and*
+  strategy: Live says no simulated-execution outcome has been recorded (naming the strategy if one
+  is selected); Backtest wording is unchanged. The Live subtitle says the data is simulated, not
+  real-money trading. The Live/Backtest labels, the Backtest default (#138) and the strict
+  `is_backtest` filters are unchanged.
+- **Manual Refresh** in the panel header re-runs the two existing aggregate requests for the current
+  selection; a "last loaded" time is shown. No polling, no WebSocket, no endpoint, no new statistic,
+  no trading control.
+- **`usePerformanceAnalytics.ts` rewritten around request order and population identity.**
+  - Monotonic request id (the `useStrategyOutcomes.ts` pattern): a superseded response — success or
+    failure — is dropped, for both filter changes and repeated `refetch()` calls. The previous
+    `cancelled` closure was unreachable from `refetch()`.
+  - Results and failures are tagged with the `(isBacktest, strategyName, strategyVersion)` they were
+    fetched for and returned only when they match the current filters, derived at render time — rows
+    for one population/strategy are never returned under another's label, not even for one render.
+  - Loading, genuinely empty and failed stay distinct. New return fields: `hasLoaded`,
+    `lastLoadedAt`. A failed request still clears rows (deliberately unlike `useStrategyOutcomes`);
+    a same-population Refresh keeps its rows visible while re-fetching.
+- **Comments corrected to current state** in `InfoTab.tsx` (new "CURRENT STATE" paragraph; older
+  decision paragraphs kept as history), `usePerformanceAnalytics.ts` (docstring replaced) and
+  `api-client.ts` (`fetchWinRateByHour` docstring no longer says no writer exists).
+- **Docs:** as-built note with data-flow and internal-flow diagrams added to the performance-read
+  section of `docs/architecture/strategy-engine-design.md` (after the #162 note); #137/#162 notes
+  untouched as history.
+- **Reported, not changed (related follow-ups, outside scope):** `InfoTab.tsx` `WorldViewSummary`
+  still renders "No live trades yet." for its Live column; `useWorldView.ts`, `useBacktestOutcomes.ts`,
+  `BacktestResultsPanel.tsx` comments and the `GET /strategy-outcomes` backend docstring still carry the
+  "no live writer" wording.
+<!-- END DELIVERY SECTION: frontend-performance-panel-refresh -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-zero-position-recovery (backend-only; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-zero-position-recovery`
 

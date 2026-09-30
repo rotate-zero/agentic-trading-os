@@ -254,6 +254,27 @@ function RecentClosedTrades() {
 // fetch — including a toggle switch — shows "Loading…" instead of a
 // mismatched render. `usePerformanceAnalytics.ts`/`api-client.ts`/the
 // backend are otherwise completely untouched by this decision.
+//
+// CURRENT STATE (task `frontend-performance-panel-refresh`, after
+// decision #186 — the paragraphs above are history and stay as written):
+//   - "Live" is the strict is_backtest=false population. Since #186 the
+//     simulated OutcomeRecorder writes rows into it (execution_mode
+//     "simulated"), so it is no longer structurally empty and its empty
+//     state no longer claims that no Execution Engine exists. It is
+//     still not real-money trading; the subtitle says so. The toggle
+//     labels and the default (Backtest, decision #138) are unchanged.
+//   - The empty message is chosen from BOTH the view and the strategy
+//     selection (see `emptyMessage` below), for all four combinations.
+//   - A manual Refresh button re-runs the same two aggregate requests
+//     (usePerformanceAnalytics().refetch). No polling, no WebSocket.
+//   - The hook now isolates populations at render time and drops
+//     superseded responses (request-id pattern from
+//     useStrategyOutcomes.ts), so the "Loading…" gate that #137 added
+//     here is no longer the only thing stopping a mismatched render: rows
+//     are only ever returned for the population currently labeled. A
+//     same-population Refresh keeps its rows visible while re-fetching;
+//     a population/strategy change shows Loading… with no rows.
+//   - Loading, genuinely empty and failed remain three distinct states.
 function formatHourEt(hourEt: number): string {
   const period = hourEt < 12 ? "AM" : "PM";
   const hour12 = hourEt % 12 === 0 ? 12 : hourEt % 12;
@@ -271,23 +292,30 @@ function StrategyPerformanceSummary() {
   // Decision #162: undefined = "All strategies" (no strategy_name param).
   const [strategyName, setStrategyName] = useState<StrategyPerformanceStrategy>(undefined);
   const isBacktest = view === "backtest";
-  const { winRateByHour, sessionExpectancy, loading, error } = usePerformanceAnalytics({ isBacktest, strategyName });
+  const { winRateByHour, sessionExpectancy, loading, error, hasLoaded, lastLoadedAt, refetch } = usePerformanceAnalytics({
+    isBacktest,
+    strategyName,
+  });
   const isEmpty = winRateByHour.length === 0 && sessionExpectancy.length === 0;
 
-  // Honest, view-specific absence — "no live data" and "no backtest
-  // data" are different facts, not one collapsed message: the former
-  // because no Execution Engine exists to write live rows at all; the
-  // latter because no backtest run happens to have produced a matching
-  // row (a fixable, per-run fact, not a structural one). With a
-  // strategy selected, the Backtest message names it — the filter can
-  // itself be the reason nothing matches, and a run of THAT strategy is
-  // what would change it (a run can also legitimately record none:
-  // decision #131). The Live message stays as-is: no Execution Engine
-  // means no live rows for any strategy, so naming one would imply a
-  // strategy-specific absence that isn't the real reason.
+  // Honest, view- and strategy-specific absence. "No simulated
+  // performance data" and "no backtest performance data" are different
+  // facts, not one collapsed message, and a strategy selection can
+  // itself be the reason nothing matches, so every message names the
+  // selected strategy when there is one.
+  //   Live     (is_backtest=false): rows come from the simulated
+  //     OutcomeRecorder (decision #186) once a strategy-attributed
+  //     simulated auto trade has closed and been recorded. An empty
+  //     result means none has been recorded for this selection yet —
+  //     not that no writer exists. Nothing here is real-money trading.
+  //   Backtest (is_backtest=true): rows come from Backtest Runs; a run
+  //     of the selected strategy is what would add them (a run can
+  //     legitimately record none, decision #131).
   const emptyMessage =
     view === "live"
-      ? "No live performance data is available yet — no Execution Engine exists to write it."
+      ? strategyName === undefined
+        ? "No simulated-execution performance data has been recorded yet — no closed simulated trade has produced an outcome."
+        : `No simulated-execution performance data for ${strategyName} has been recorded yet — no closed simulated trade of this strategy has produced an outcome.`
       : strategyName === undefined
         ? "No matching backtest performance data is available yet — run a backtest to populate this."
         : `No backtest performance data for ${strategyName} is available yet — run a backtest with this strategy (a run can legitimately record none).`;
@@ -302,7 +330,15 @@ function StrategyPerformanceSummary() {
             {strategyName !== undefined && ` · ${strategyName}`}
           </span>
         </div>
-        <div className="flex gap-1">
+        <div className="flex items-center gap-1">
+          <button
+            onClick={refetch}
+            disabled={loading}
+            aria-busy={loading}
+            className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          >
+            {loading ? "Refreshing…" : "Refresh"}
+          </button>
           <button
             onClick={() => setView("live")}
             className={`rounded px-2 py-0.5 font-mono text-[10px] ${
@@ -343,12 +379,21 @@ function StrategyPerformanceSummary() {
       <div className="text-[10px] text-text-muted">
         {view === "backtest"
           ? "Backtest-derived performance from simulated StrategyOutcome data."
-          : "Live-trading-derived performance from live StrategyOutcome data."}
+          : "Non-backtest performance from simulated-execution StrategyOutcome data — not real-money trading."}
+        {lastLoadedAt !== null && ` Updated ${formatLoadedAt(lastLoadedAt)}.`}
       </div>
-      {loading ? (
-        <p className="p-1 text-[11px] text-text-muted">Loading…</p>
-      ) : error ? (
-        <p className="p-1 text-[11px] text-bear">Couldn't load performance data — {error}</p>
+      {/* State precedence: rows for THIS selection (hasLoaded) win, even
+          while a refresh is in flight; otherwise Loading…; otherwise the
+          failure. The hook never returns rows fetched for another
+          population, so hasLoaded can't describe a different label. */}
+      {!hasLoaded && loading ? (
+        <p role="status" className="p-1 text-[11px] text-text-muted">
+          Loading…
+        </p>
+      ) : !hasLoaded && error !== null ? (
+        <p role="alert" className="p-1 text-[11px] text-bear">
+          Couldn't load performance data — {error}. Use Refresh to try again.
+        </p>
       ) : isEmpty ? (
         <p className="p-1 text-[11px] text-text-muted">{emptyMessage}</p>
       ) : (

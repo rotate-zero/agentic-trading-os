@@ -1,3 +1,35 @@
+<!-- BEGIN DELIVERY SECTION: frontend-performance-panel-refresh (frontend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `frontend-performance-panel-refresh`
+
+Verified on `main` `5079a08` (branch `frontend-performance-panel-refresh`), Node v22.22.2, `npm ci` in
+`frontend/`. Frontend and docs only: no backend, database or broker was touched.
+
+- `npx tsc -b`: exit 0, no diagnostics (before and after changes).
+- `npm run build` (`tsc -b && vite build`): exit 0, 103 modules transformed; only the existing Vite
+  chunk-size (>500 kB) advisory appeared.
+- **Behavior check (not committed; no dependency added to the repo).** The frontend has no test runner,
+  so the real `StrategyPerformanceSummary` and `usePerformanceAnalytics` were bundled with the
+  already-installed esbuild and driven with jsdom + React `act` against a controllable mocked `fetch`
+  (kept outside the repo, shipped beside the zip as `performance-panel-behavior-check/`): **50 checks
+  passed, 0 failed.** Covered: default Backtest and request URLs (`is_backtest`, `strategy_name`);
+  loading → genuine empty; the four Live/Backtest × All/strategy empty messages, none claiming that no
+  Execution Engine exists; fetch failure distinct from empty, and Refresh recovering from it; rows
+  never shown under another population's or strategy's label (while pending, and on the first render
+  after a switch); rapid filter changes resolving out of order (older success, older failure, and an
+  older success after a newer failure are all ignored); repeated `refetch()` ordering; same-population
+  Refresh keeping rows while in flight; failed refresh clearing rows; late response after unmount
+  harmless; no unexpected React `console.error`.
+- **Mutation checks:** removing the request-id guard failed exactly 6 checks (the older-response
+  cases); removing the render-time population match failed exactly 6 checks (cross-population and
+  first-render cases); both mutations were discarded afterwards.
+- **Not covered:** no real browser, no Tailwind/visual review, no run against a live backend with real
+  `OutcomeRecorder` rows (fixtures are hand-built). Manual check: with the backend up, open the Info tab,
+  switch Live/Backtest and strategy quickly, confirm the label always matches the rows, press Refresh,
+  then stop the backend and Refresh — an error (not "no data") must show.
+- **Housekeeping:** `tsc -b` rewrites tracked `frontend/tsconfig.tsbuildinfo`; it was restored and is
+  not part of this delivery.
+<!-- END DELIVERY SECTION: frontend-performance-panel-refresh -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-zero-position-recovery (backend-only; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-recorder-zero-position-recovery`
 

@@ -856,10 +856,11 @@ function _performanceAnalyticsQuery(filters?: PerformanceAnalyticsFilters): stri
 /**
  * GET /intelligence/win-rate-by-hour — decision #127. Global/strategy-
  * level, not symbol-scoped (the route has no `symbol` filter — same
- * posture as fetchStrategyOutcomes above). `strategy_outcomes` has zero
- * real rows in production today (no Execution Engine/Position Monitor
- * writes to it yet); an empty `hourly_win_rates` array is the honest,
- * expected response, not an error. Throws `ApiError` (e.g. status 400
+ * posture as fetchStrategyOutcomes above). An empty `hourly_win_rates`
+ * array is the honest, expected response when no matching outcome has
+ * been recorded for the requested population (backtest rows come from
+ * Backtest Runs; non-backtest rows come from the simulated
+ * OutcomeRecorder since decision #186) — not an error. Throws `ApiError` (e.g. status 400
  * for a `strategyVersion` passed without `strategyName`) rather than
  * returning a value — callers must distinguish a request error from a
  * genuinely empty result themselves (see `usePerformanceAnalytics`).

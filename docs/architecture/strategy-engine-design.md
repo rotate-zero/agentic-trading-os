@@ -448,6 +448,54 @@ strategy_outcomes
                     └── data  → existing win-rate / expectancy rows
 ```
 
+**As-built note (`frontend-performance-panel-refresh`, after decision #186; no new decision number) — the Strategy Performance panel is refreshable and truthful about the "Live" population.** This supersedes the current-state claims in the #137/#162 notes above; those notes stay as history. Frontend only: `InfoTab.tsx` (`StrategyPerformanceSummary`), `usePerformanceAnalytics.ts`, and one docstring in `api-client.ts`. No endpoint, statistic, polling, WebSocket subscription or trading control was added; the two aggregate routes are unchanged.
+
+- **"Live" is no longer structurally empty.** Since #186 the simulated `OutcomeRecorder` writes strict `is_backtest=false` rows (`execution_mode = "simulated"`). The toggle labels, the Backtest default (#138) and the strict either/or population filter are unchanged, but the Live empty state no longer says no Execution Engine exists. It now says no simulated-execution outcome has been recorded (naming the strategy when one is selected), and the Live subtitle says the data is simulated, not real-money trading.
+- **Manual Refresh** re-runs the same two requests for the current selection (`refetch()`). The last-loaded time is shown beside the subtitle.
+- **Request ordering.** Every load takes a monotonically increasing id (the `useStrategyOutcomes.ts` pattern); a superseded response — success or failure — is dropped, whether the older request came from a filter change or a repeated Refresh. The old cancel closure was unreachable from `refetch()`.
+- **Population isolation.** Results and failures are tagged with the `(isBacktest, strategyName, strategyVersion)` they were fetched for, and the hook returns only those matching the current filters, derived at render time. Numbers fetched for one population/strategy are therefore never shown under another's label, not even for a single render.
+- **Three distinct states** remain: loading, genuinely empty (`hasLoaded` and no rows) and failed. Unlike `useStrategyOutcomes`, a failed request clears the rows, so an error never sits above a previous success's numbers; a same-population Refresh keeps its rows visible while it re-fetches.
+
+**Data flow (unchanged routes, changed consumer):**
+
+```
+ OutcomeRecorder (#186, non-backtest) ─┐
+                                       ├─► strategy_outcomes ─► GROUP BY queries (#122/#124)
+ Backtest Runner (#128, backtest)     ─┘                                │
+                                                                        ▼
+        GET /win-rate-by-hour?[strategy_name=..&]is_backtest=..   (two existing routes,
+        GET /expectancy-by-session-type?[strategy_name=..&]is_backtest=..  unchanged)
+                                                                        ▼
+ usePerformanceAnalytics(filters)   ── result/failure tagged with population key
+        returns { rows | [], loading, error, hasLoaded, lastLoadedAt, refetch }
+                                                                        ▼
+ InfoTab.tsx StrategyPerformanceSummary ── toggle · strategy <select> · Refresh button
+```
+
+**Internal flow of the hook and panel:**
+
+```
+ mount │ toggle/select change │ Refresh click
+                 ▼
+   load(): id = ++latestRequestId ; inFlight = true
+                 ▼
+   Promise.all(win-rate, expectancy)  for key = (isBacktest, strategyName, strategyVersion)
+        ├─ ok,   id == latest ─► result = {key, rows, loadedAt} ; failure = null ; inFlight = false
+        ├─ fail, id == latest ─► result = null ; failure = {key, msg} ; inFlight = false
+        └─ id != latest (superseded / unmounted / filters changed) ─► dropped, no state write
+
+   render (every render, derived from the CURRENT filters' key):
+     currentResult  = result  if result.key  == key else none
+     currentFailure = failure if failure.key == key else none
+     loading        = inFlight OR (neither exists for this key)
+
+   panel, first match wins:
+     ¬hasLoaded ∧ loading         ─► "Loading…"
+     ¬hasLoaded ∧ error           ─► "Couldn't load performance data — …  Use Refresh"
+     hasLoaded ∧ no rows          ─► empty message for (Live|Backtest) × (All|strategy)
+     rows                         ─► win-rate / expectancy rows (kept during a same-key refresh)
+```
+
 `strategyVersion` stays deferred, and deliberately so: unlike names, no list of selectable versions exists (versions are per-strategy strings such as `"orb_v1"`, minted in each strategy's `default_config()`; the UI only ever shows one as a read-only field on a single result), and `_validate_strategy_filters()` rejects a version without a name (400, #127), so a version control would also have to depend on the name selection. That is its own design/data-source question.
 
 ---
