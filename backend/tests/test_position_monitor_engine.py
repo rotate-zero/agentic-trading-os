@@ -23,7 +23,7 @@ from uuid import uuid4
 import pytest
 
 from app.core.market_clock import MarketClock
-from app.event_bus.bus import EventBus
+from app.event_bus.bus import WILDCARD, EventBus
 from app.event_bus.events import make_envelope
 from app.position_monitor.engine import PositionMonitor, _Bar, _evaluate
 from app.position_monitor.ports import PositionView
@@ -115,6 +115,69 @@ def _make_monitor(bus: EventBus, positions: list[PositionView]) -> tuple[Positio
     return monitor, reader
 
 
+async def _wait_until(predicate, description, *, observed=None, timeout=5.0, interval=0.005) -> None:
+    """Poll `predicate()` until it is truthy, or fail after `timeout` seconds.
+
+    Replaces fixed `asyncio.sleep` guesses for tests that expect a result: the
+    wait ends as soon as the positive signal appears and the bound is only a
+    failure ceiling. `observed()` (optional) is evaluated on timeout so the
+    failure says what the monitor actually held.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        if loop.time() >= deadline:
+            seen = observed() if observed is not None else "n/a"
+            raise AssertionError(f"timed out after {timeout:.1f}s waiting for: {description} (last observed: {seen})")
+        await asyncio.sleep(interval)
+
+
+async def _wait_for_intents(monitor: PositionMonitor, count: int, *, symbol: str | None = None) -> None:
+    await _wait_until(
+        lambda: len(monitor.get_exit_intents(symbol)) >= count,
+        f"{count} exit intent(s)" + ("" if symbol is None else f" for {symbol}"),
+        observed=lambda: monitor.get_exit_intents(symbol),
+    )
+
+
+async def _settle(bus: EventBus, monitor: PositionMonitor, *envelopes: EventEnvelope, timeout: float = 5.0) -> None:
+    """Publish `envelopes` and return only once the monitor has finished them.
+
+    This is the barrier for every "no intent / no second intent" assertion:
+    elapsed time never proves absence, so absence is asserted only after the
+    published inputs were fully processed. Two stages:
+
+    1. Bus dispatch. A wildcard probe records each published envelope (by object
+       identity — the bus hands handlers the same object) once the bus lane has
+       dispatched it. `EventBus` has no public flush, and the monitor's
+       subscriber (`_on_market_event`) is synchronous, so by the time this
+       probe's wake-up runs, the subscriber has run for that envelope too:
+       both handlers were scheduled in the same dispatch step, before the probe
+       could wake this coroutine. This is also what proves an unheld-symbol
+       envelope was seen and dropped by the subscriber's held-symbol filter,
+       which never reaches the monitor's own queue.
+    2. Worker. `monitor._queue.join()` returns once the monitor's worker has
+       finished every item the subscriber enqueued (the same private signal
+       `test_position_monitor_eod.py`'s `drain()` uses).
+    """
+    pending = {id(envelope) for envelope in envelopes}
+    dispatched = asyncio.Event()
+
+    def probe(envelope: EventEnvelope) -> None:
+        pending.discard(id(envelope))
+        if not pending:
+            dispatched.set()
+
+    bus.subscribe_all(probe)
+    try:
+        for envelope in envelopes:
+            await bus.publish(envelope)
+        await asyncio.wait_for(dispatched.wait(), timeout)
+        await asyncio.wait_for(monitor._queue.join(), timeout)
+    finally:
+        bus.unsubscribe(WILDCARD, probe)
+
+
 @pytest.mark.asyncio
 async def test_stop_exit_produces_intent_for_long_position() -> None:
     bus = EventBus()
@@ -124,7 +187,7 @@ async def test_stop_exit_produces_intent_for_long_position() -> None:
     monitor.start()
     try:
         await bus.publish(_tick_envelope("AAPL", 94.5, _OPENED_AT))
-        await asyncio.sleep(0.1)
+        await _wait_for_intents(monitor, 1)
 
         intents = monitor.get_exit_intents()
         assert len(intents) == 1
@@ -145,7 +208,7 @@ async def test_target_exit_produces_intent_for_short_position() -> None:
     monitor.start()
     try:
         await bus.publish(_tick_envelope("AAPL", 89.0, _OPENED_AT))
-        await asyncio.sleep(0.1)
+        await _wait_for_intents(monitor, 1)
 
         intents = monitor.get_exit_intents()
         assert len(intents) == 1
@@ -165,8 +228,8 @@ async def test_stop_wins_tie_when_one_candle_touches_both(caplog) -> None:
     monitor.start()
     try:
         # High crosses target, low crosses stop, in the same bar.
-        await bus.publish(_candle_envelope("AAPL", o=100.0, h=110.0, low=90.0, c=100.0, ts=_OPENED_AT))
-        await asyncio.sleep(0.1)
+        await _settle(bus, monitor, _candle_envelope("AAPL", o=100.0, h=110.0, low=90.0, c=100.0, ts=_OPENED_AT))
+        await _wait_for_intents(monitor, 1)
 
         intents = monitor.get_exit_intents()
         assert len(intents) == 1
@@ -187,10 +250,13 @@ async def test_event_at_session_close_no_longer_labels_eod() -> None:
     monitor, _ = _make_monitor(bus, [position])
     monitor.start()
     try:
-        await bus.publish(_tick_envelope("AAPL", 100.0, _BEFORE_CLOSE))
-        await bus.publish(_tick_envelope("AAPL", 101.5, _SESSION_CLOSE_UTC))
-        await bus.publish(_candle_envelope("AAPL", o=100.0, h=102.0, low=99.0, c=101.0, ts=_SESSION_CLOSE_UTC))
-        await asyncio.sleep(0.1)
+        await _settle(
+            bus,
+            monitor,
+            _tick_envelope("AAPL", 100.0, _BEFORE_CLOSE),
+            _tick_envelope("AAPL", 101.5, _SESSION_CLOSE_UTC),
+            _candle_envelope("AAPL", o=100.0, h=102.0, low=99.0, c=101.0, ts=_SESSION_CLOSE_UTC),
+        )
 
         assert monitor.get_exit_intents() == ()
     finally:
@@ -207,16 +273,19 @@ async def test_idempotent_no_second_intent_for_already_closing_position() -> Non
     monitor.start()
     try:
         await bus.publish(_tick_envelope("AAPL", 94.0, _OPENED_AT))  # stop touched
-        await asyncio.sleep(0.1)
+        await _wait_for_intents(monitor, 1)
         first = monitor.get_exit_intents()
         assert len(first) == 1
 
         # More ticks arrive after the intent — even ones that would also
         # independently qualify (e.g. an even lower stop-touch, or later
         # a target-range price) must not produce a second intent.
-        await bus.publish(_tick_envelope("AAPL", 90.0, _OPENED_AT))
-        await bus.publish(_tick_envelope("AAPL", 200.0, _OPENED_AT))
-        await asyncio.sleep(0.1)
+        await _settle(
+            bus,
+            monitor,
+            _tick_envelope("AAPL", 90.0, _OPENED_AT),
+            _tick_envelope("AAPL", 200.0, _OPENED_AT),
+        )
 
         second = monitor.get_exit_intents()
         assert second == first  # unchanged — same single ExitIntent, not replaced or duplicated
@@ -235,8 +304,7 @@ async def test_unheld_symbol_events_are_ignored() -> None:
     try:
         # MSFT is not held — even a price that would trigger AAPL's stop
         # must produce nothing, since it isn't AAPL's price.
-        await bus.publish(_tick_envelope("MSFT", 1.0, _OPENED_AT))
-        await asyncio.sleep(0.1)
+        await _settle(bus, monitor, _tick_envelope("MSFT", 1.0, _OPENED_AT))
 
         assert monitor.get_exit_intents() == ()
     finally:
@@ -255,7 +323,7 @@ async def test_get_exit_intents_filters_by_symbol() -> None:
     try:
         await bus.publish(_tick_envelope("AAPL", 94.0, _OPENED_AT))  # AAPL stop
         await bus.publish(_tick_envelope("MSFT", 199.0, _OPENED_AT))  # MSFT stop
-        await asyncio.sleep(0.1)
+        await _wait_for_intents(monitor, 2)
 
         assert len(monitor.get_exit_intents()) == 2
         aapl_only = monitor.get_exit_intents(symbol="AAPL")
@@ -275,8 +343,8 @@ async def test_multiple_positions_same_symbol_evaluated_independently() -> None:
     monitor, _ = _make_monitor(bus, [tight_stop, wide_stop])
     monitor.start()
     try:
-        await bus.publish(_tick_envelope("AAPL", 98.0, _OPENED_AT))  # trips tight_stop only
-        await asyncio.sleep(0.1)
+        await _settle(bus, monitor, _tick_envelope("AAPL", 98.0, _OPENED_AT))  # trips tight_stop only
+        await _wait_for_intents(monitor, 1)
 
         intents = monitor.get_exit_intents()
         assert len(intents) == 1

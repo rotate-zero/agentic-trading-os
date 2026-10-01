@@ -1,3 +1,49 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `position-monitor-engine-test-waits`
+
+Based on `main` `26ba01b` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and
+`backend/tests/test_simulated_eod_integration.py` was not touched or run (owned by another session). **No new decision
+number:** nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code
+file changed is `backend/tests/test_position_monitor_engine.py`.
+
+- **Problem.** Nine EventBus-driven tests in this file synchronized with a fixed `await asyncio.sleep(0.1)` (the
+  idempotency test twice). Under a slow hand-off the positive tests asserted before the intent existed, and the three
+  "nothing happened" assertions (session-close event, unheld symbol, no second intent) could pass without the published
+  inputs ever having been processed.
+- **Edited** `backend/tests/test_position_monitor_engine.py` (new test-local helpers; no production seam added):
+  - `_wait_until(predicate, description, ...)` — polls (5 ms) for a positive signal up to a 5 s failure ceiling and
+    reports what was observed on timeout.
+  - `_wait_for_intents(monitor, count, symbol=None)` — bounded wait on the public `get_exit_intents()`.
+  - `_settle(bus, monitor, *envelopes)` — publishes the envelopes and returns only once they were fully processed:
+    (1) a temporary wildcard probe on the real `EventBus` records each envelope (by object identity) once its lane has
+    dispatched it, which also proves the monitor's synchronous subscriber ran, including for an unheld symbol it drops
+    before queuing; then (2) `monitor._queue.join()` waits for the worker to finish everything the subscriber enqueued.
+    The probe is unsubscribed in `finally`.
+  - **Tests expecting an intent** (stop long, target short, tie, filter-by-symbol, multiple positions, first half of
+    idempotency) wait with a bound for the expected number of intents before asserting details. The tie and
+    multiple-positions tests also run `_settle` first, because their assertions are exact ("one intent, stop";
+    "only the tight-stop position").
+  - **Tests expecting no intent / no second intent** (session-close events, unheld symbol, idempotency second half)
+    call `_settle` and assert absence only afterwards.
+- **Unchanged.** The real `EventBus`, the fake position reader, the fixed `MarketClock`, the pure `_evaluate` tests and
+  every substantive assertion (stop/target reason and trigger price, EX-8 stop-wins-tie, no `eod_flatten` from events,
+  idempotent single intent, unheld-symbol and no-stop/target absence, symbol filter, independent positions). No
+  assertion was removed or weakened and none was added.
+- **Uncovered product defect:** none found.
+- **Reliable completion signals that do not exist (reported, not changed).**
+  1. `EventBus` has no public flush/idle signal; `queue_depths()` reaches 0 while a handler is still running. `_settle`
+     therefore uses a wildcard probe, and `PositionMonitor` has no public "queue drained" signal, so it reads
+     `monitor._queue` (the same private signal `test_position_monitor_eod.py` uses). If the subscriber ever stopped
+     being synchronous (offloaded or awaited), stage (1) would no longer imply it had enqueued and the barrier would
+     weaken silently; a delay injected into the subscriber itself demonstrates this.
+  2. There is no positive "evaluated, nothing to do" signal for a processed event, so absence is asserted after the
+     input is known processed, not after a branch is known taken.
+  3. Idempotency compares `second == first` by value. A re-registered intent with identical fields would not be seen;
+     the existing assertion is kept as-is (a latch-removal mutation is still caught because the later 200.0 tick yields
+     a different reason).
+<!-- END DELIVERY SECTION: position-monitor-engine-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: execution-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `execution-engine-test-waits`
 

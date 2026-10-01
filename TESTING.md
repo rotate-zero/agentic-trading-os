@@ -1,3 +1,50 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `position-monitor-engine-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (the project defaults in `app/core/config.py`), created fresh in the sandbox and migrated with
+`alembic upgrade head` (revision `0016`). No external or production database and no broker touched. Python 3.12.3.
+`test_position_monitor_engine.py` itself uses only a fake reader and a real in-process `EventBus` (no database).
+Verified on `main` `26ba01b` (unchanged on `origin/main` at packaging).
+
+All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_position_monitor_engine.py -q` (before edit) | 10 passed (1.9 s) |
+| `python -m pytest tests/test_position_monitor_engine.py -q` (whole file, after edit) | 10 passed (0.7 s) |
+| same command, 20 consecutive runs, no injected delay | 20/20 green |
+| `python -m pytest tests/test_position_monitor_engine.py tests/test_position_monitor_eod.py tests/test_position_monitor_portfolio_reader.py tests/test_event_bus.py -q` | 72 passed (1.6 s) |
+| neighbours: the four files above plus `test_exit_*.py`, `test_simulated_protective_session_retry.py`, `test_simulated_venue.py`, `test_fill_*.py`, `test_portfolio_*.py`, `test_execution_exit_requests_route.py`, `test_execution_outcome_status_recorder_integration.py` | 288 passed (15.7 s) |
+
+`tests/test_simulated_eod_integration.py` was not run or edited (owned by another session). Not run: the full backend
+suite.
+
+**Injected-delay check** (throwaway plugin outside the repo replaces the monitor's worker loop with a copy that awaits
+`D` seconds before processing each queued item; `PYTHONPATH=/tmp/plug INJ_DELAY=<D> python -m pytest -p delayplug <file> -q`;
+"old" is `26ba01b`'s file run from a copy):
+
+| Worker delay per item | Old tests | New tests |
+|---|---|---|
+| 0 | 10 passed | 10 passed |
+| 0.1 s | **6 failed** (every intent-expecting test) | 10 passed (2.1 s) |
+| 0.3 s | **6 failed** (same six) | 10 passed (4.4 s) |
+
+**Mutation checks** (same plugin; production code untouched; delay 0.3 s unless noted):
+
+| Mutation | Old test | New test |
+|---|---|---|
+| Subscriber and worker stop filtering by symbol (MSFT tick trips AAPL's stop) | `test_unheld_symbol_events_are_ignored` **passed** (vacuous: the sleep ended before the worker ran; 0 s delay: failed) | **failed** |
+| Idempotency latch removed, later intent replaces the first | `test_idempotent_no_second_intent...` failed (at 0.3 s only because its first `sleep(0.1)` was too short, at 0 s on the mutation itself) | **failed** (also at 0 s) |
+| An event at/after session close produces an intent | `test_event_at_session_close_no_longer_labels_eod` **passed** (vacuous at 0.3 s; failed at 0 s) | **failed** (also at 0 s) |
+
+An earlier injection that delayed the subscriber itself (not the worker) let the new absence tests return early; that
+is the documented limitation in `CHANGES.md` item 1, not a worker-delay result, and is why the injection above is at the
+worker.
+
+Remaining failures: none. No pre-existing flakiness was attributed to anything other than the removed fixed sleeps.
+<!-- END DELIVERY SECTION: position-monitor-engine-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: execution-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-engine-test-waits`
 
