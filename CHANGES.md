@@ -1,3 +1,30 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-test-featureset-wait (backend tests + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `feature-engine-test-featureset-wait`
+
+Based on `main` `41aafc0` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, indicator behavior, API contract, schema, migration or frontend file was edited**, and neither
+`conftest.py` nor `test_simulated_eod_integration.py` was touched. **No new decision number:** nothing new is decided;
+`INDEX.md`, `confirmed-decisions.md` and the archive list are untouched.
+
+- **Root cause: a timing assumption in the tests, not a computation defect.** Both tests published five 1m candles and
+  then asserted after a fixed `asyncio.sleep(0.1)`. The Feature Engine's worker is strictly serial and does a
+  thread-offloaded compute (`asyncio.to_thread(self._compute_one, ...)`, with a cold-start history read on the first
+  candle of a symbol) per candle, then publishes through the EventBus. Five candles must yield six `FeaturesUpdated`
+  events (five 1m + the 5m bucket-close set). On a loaded machine the 100 ms guess can expire first, so the assertions
+  see a partial list: `kama_2` is not yet in the latest 1m set / no 5m entry exists (`KAMA` test), or
+  `set(by_timeframe) == {"1m"}` instead of `{"1m", "5m"}` (`vwap_ext` test).
+- **Edited** `backend/tests/test_feature_engine.py` (`test_kama_only_computed_for_its_configured_timeframe`) and
+  `backend/tests/test_vwap_ext.py` (`test_vwap_ext_is_identical_across_1m_and_5m_featuresets_on_the_same_close`): the
+  fixed sleep is replaced by the file's existing bounded poll `_wait_until` (5 s timeout) on the exact condition the
+  assertions need — at least five `1m` events and one `5m` event received. `test_vwap_ext.py` imports `_wait_until` from
+  `tests.test_feature_engine`, the same module it already imports its other helpers from. **No new helper, no
+  production change, every timeframe and value assertion is unchanged.** A real defect still fails: if the 5m set is
+  never published the wait times out with a named message instead of passing.
+- **Not changed (reported only):** other tests in these and neighboring files still use fixed `asyncio.sleep(0.1)`
+  waits after publishing candles (see `TESTING.md`); `test_simulated_eod_integration.py::test_partial_venue_fills_keep_one_close_until_real_remaining_fill`
+  failed once in a post-change full run for an unrelated reason (fill row order, see `TESTING.md`).
+<!-- END DELIVERY SECTION: feature-engine-test-featureset-wait -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-status-repeatable-read-test (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-status-repeatable-read-test`
 

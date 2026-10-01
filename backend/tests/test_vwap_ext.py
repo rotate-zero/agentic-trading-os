@@ -18,7 +18,7 @@ from app.event_bus.events import make_envelope  # noqa: F401 — re-exported for
 from app.feature_engine.engine import FeatureEngine
 from app.schemas.events.envelope import EventType
 from app.services.candle_recorder import CandleRecorder
-from tests.test_feature_engine import _clean_test_symbol, _db_available, _et, _publish_candle
+from tests.test_feature_engine import _clean_test_symbol, _db_available, _et, _publish_candle, _wait_until
 
 
 @pytest.mark.asyncio
@@ -150,7 +150,13 @@ async def test_vwap_ext_is_identical_across_1m_and_5m_featuresets_on_the_same_cl
         base = _et(2026, 8, 11, 9, 30)
         for i in range(5):
             await _publish_candle(bus, "__TEST_FE_VWAPEXT_5M__", base + timedelta(minutes=i), 100.0 + i)
-        await asyncio.sleep(0.1)
+        # Bounded wait for the exact FeatureSets this test asserts on (five 1m + the one
+        # 5m bucket-close set), not a fixed guess at how long the serial worker takes.
+        await _wait_until(
+            lambda: sum(e.payload["timeframe"] == "1m" for e in received) >= 5
+            and any(e.payload["timeframe"] == "5m" for e in received),
+            description="five 1m FeaturesUpdated events plus the 5m bucket-close event",
+        )
 
         by_timeframe = {e.payload["timeframe"]: e.payload["features"]["vwap_ext"] for e in received}
         assert set(by_timeframe) == {"1m", "5m"}

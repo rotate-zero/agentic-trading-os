@@ -1,3 +1,67 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-test-featureset-wait (backend tests + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `feature-engine-test-featureset-wait`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE USER trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision
+`0016`). No external or production database and no broker touched. Python 3.12.3, 1 vCPU sandbox. Verified on `main`
+`41aafc0` (unchanged on `origin/main` at packaging).
+
+## What was reproduced
+
+```
+test (event loop)                     FeatureEngine worker (serial)                EventBus normal lane
+-----------------                     -----------------------------                --------------------
+publish candle 1..5  --------------->  queue.get -> to_thread(_compute_one) ---->  FEATURES_UPDATED (1m) x5
+asyncio.sleep(0.1)  <-- guess -->      ...5 serial computes, then the 5m set ---->  FEATURES_UPDATED (5m) x1
+assert on `received`                   (6 events total; finishes in 10-26 ms idle)  handler -> received.append
+```
+
+- **Idle latency** (diagnostic script outside the repo, same engine config, last publish -> last FeatureSet): 10-26 ms,
+  always exactly six events (`1m` x5, `5m` x1) — comfortably inside 100 ms.
+- **Under CPU contention** (3 busy-loop processes on 1 vCPU): the cold first run took **129 ms** (KAMA config) and
+  **108 ms** (default config) — past the 100 ms sleep — while still producing the correct six events; warm runs 21-46 ms.
+  So the engine finishes correctly, just later than the fixed wait.
+- **Deterministic reproduction** (external pytest plugin, not in the repo, adding a per-candle sleep inside
+  `_compute_one`): 0 ms and 10 ms per candle -> both tests pass; **20 ms and 30 ms per candle -> both fail** with the
+  reported symptoms: `assert 'kama_2' in {... 'sma_1': 102.0 ...}` (latest 1m set seen, warm-up not reached yet) and
+  `assert {'1m'} == {'1m', '5m'}`. Same assertions, same code, only latency changed -> an assertion-before-completion
+  race, not a computation defect.
+- **Natural reproduction was not achieved in this sandbox:** 6 runs of `test_feature_engine.py` + `test_vwap_ext.py` under
+  3 busy loops all passed (87 passed), and the pre-change full run 1 passed (1572). The previous delivery's recorded
+  full runs (two of three) did hit these tests; this session's evidence for the mechanism is the contention timing plus
+  the deterministic delay reproduction above.
+
+## Checks run after the fix
+
+- Both target tests alone, 30 separate processes: **30/30 passed**.
+- Both target tests with 20 ms/candle injected delay (fails before the fix), 10 runs: **10/10 passed**; also passed at
+  0, 30 and 100 ms per candle.
+- Both target tests under 3 busy loops, 15 runs: **15/15 passed**.
+- `tests/test_feature_engine.py tests/test_vwap_ext.py` in file order, 5 runs: **87 passed** each.
+- Neighbors in suite order (`test_candle_aggregator.py`, `test_candle_recorder.py`, `test_daily_levels.py`,
+  `test_feature_engine.py`, `test_premarket_volume_ratio.py`, `test_vwap_ext.py`, `test_vwap_strategy.py`): **149 passed**
+  x3, and **149 passed** once more under 3 busy loops.
+- **Mutation checks (reverted; `git diff` showed only the intended edits afterwards):** suppressing 5m aggregation
+  (`_AGGREGATED_WIDTHS = ()`) -> both tests fail after the 5 s bound with `five 1m FeaturesUpdated events plus the 5m
+  bucket-close event was not met within 5.0s`; changing the expected `vwap_ext` value -> the equality assertion fails.
+- **Full suite** (`cd backend && python3 -m pytest -q`), database freshly migrated, three runs: run 1 (pre-change):
+  1572 passed; run 2 (post-change): **1 failed, 1571 passed**, the failure being
+  `test_simulated_eod_integration.py::test_partial_venue_fills_keep_one_close_until_real_remaining_fill` (not one of the
+  two target tests); run 3 (post-change, `-v`): **1572 passed**, both target tests `PASSED`. About 126 s per run.
+
+## Wider issues found (not fixed — out of scope)
+
+1. **Same fixed-sleep pattern elsewhere:** `asyncio.sleep(0.x)` after publishing candles appears 32 times in
+   `test_feature_engine.py`, 6 in `test_vwap_ext.py` (the remaining ones, incl. 0.1 s waits), 8 in `test_daily_levels.py`,
+   and in 29 test files overall. Any of them is exposed to the same race at enough latency; they were not individually
+   audited here. Suggested follow-up: convert them to `_wait_until` on the expected event count, test by test.
+2. **`test_simulated_eod_integration.py` is flaky for a different reason** (file not edited): `rows(pid)` loads fills with
+   `select(Fill).where(...)` and **no `ORDER BY`**, then the test asserts `[f.qty for f in fills] == [3, 2]`; the failing
+   run saw `[2, 3]`. That is an unspecified row-order assumption, not a wait, and not related to this change. Suggested
+   follow-up: order the fills query by the fill's own sequence/timestamp column.
+3. **Sandbox limit:** one vCPU, so contention numbers above are indicative, not a model of Saqib's machine.
+<!-- END DELIVERY SECTION: feature-engine-test-featureset-wait -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-status-repeatable-read-test (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-status-repeatable-read-test`
 

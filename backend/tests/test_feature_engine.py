@@ -1676,7 +1676,13 @@ async def test_kama_only_computed_for_its_configured_timeframe():
         base = _et(2026, 8, 11, 9, 30)
         for i in range(5):  # :34 completes the [9:30,9:35) 5m bucket; 5 closes > needed(4)
             await _publish_candle(bus, "__TEST_FE_KAMA_TF__", base + timedelta(minutes=i), 100.0 + i)
-        await asyncio.sleep(0.1)
+        # Bounded wait for the exact FeatureSets this test asserts on (five 1m + the one
+        # 5m bucket-close set), not a fixed guess at how long the serial worker takes.
+        await _wait_until(
+            lambda: sum(e.payload["timeframe"] == "1m" for e in received) >= 5
+            and any(e.payload["timeframe"] == "5m" for e in received),
+            description="five 1m FeaturesUpdated events plus the 5m bucket-close event",
+        )
 
         by_timeframe = {e.payload["timeframe"]: e.payload["features"] for e in received}
         assert "kama_2" in by_timeframe["1m"]
