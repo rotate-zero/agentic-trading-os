@@ -22,11 +22,11 @@ Daily Levels tests (confirmed decision #59), three tiers:
 """
 from __future__ import annotations
 
-import asyncio
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, func, select, update
 
 from app.db.session import SessionLocal
 from app.event_bus.bus import EventBus
@@ -38,6 +38,7 @@ from app.models.market_data import Symbol
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed
 from app.services import broker_registry
+from tests.test_feature_engine import _wait_until
 
 # --- Tier 1: pure clustering math -------------------------------------------
 
@@ -171,44 +172,103 @@ def _reset_broker_registry():
     broker_registry.clear_all()
 
 
-def _delete_daily_levels_rows_for(ticker: str) -> None:
+async def _wait_for_features_updated(received: list, expected_count: int, *, what: str, timeout: float = 5.0) -> None:
+    """Bounded wait until `received` holds at least `expected_count` FeaturesUpdated events.
+
+    Replaces the fixed `asyncio.sleep(0.05-0.1)` these tests used after publishing a
+    candle, which only guessed how long EventBus -> FeatureEngine's serial worker (and
+    its asyncio.to_thread DB/provider round trips) takes. Same shape as the helper of
+    the same name in test_vwap_ext.py. It only waits for the event(s) to ARRIVE — each
+    test still asserts the exact count, levels, ids and provider-call counts afterwards,
+    so a wait can never mask an incomplete or wrong result. A timeout reports what was
+    actually received.
+    """
+    try:
+        await _wait_until(lambda: len(received) >= expected_count, timeout=timeout, description=what)
+    except AssertionError as exc:
+        seen = [(e.symbol, e.payload["timeframe"], str(e.payload["candle_ts"])) for e in received]
+        raise AssertionError(f"{exc} — expected >= {expected_count} FeaturesUpdated, received {len(seen)}: {seen}") from exc
+
+
+def _delete_daily_levels_rows_for_tickers(tickers: list[str]) -> None:
+    """Delete the `symbols` rows for exactly these tickers (either namespace) and the
+    `daily_levels_state` rows that reference them — child table first, because
+    `daily_levels_state` carries a composite (symbol_id, is_backtest) FK to `symbols`.
+    Rows for any other ticker are never touched. Idempotent: a ticker with no rows is a no-op.
+    """
+    if not tickers:
+        return
     session = SessionLocal()
     try:
-        symbol_id = session.execute(
-            select(Symbol.id).where(Symbol.ticker == ticker, Symbol.is_backtest.is_(False))
-        ).scalar_one_or_none()
-        if symbol_id is not None:
-            session.execute(DailyLevelState.__table__.delete().where(DailyLevelState.symbol_id == symbol_id))
-            session.execute(Symbol.__table__.delete().where(Symbol.id == symbol_id))
+        symbol_ids = select(Symbol.id).where(Symbol.ticker.in_(tickers))
+        session.execute(delete(DailyLevelState).where(DailyLevelState.symbol_id.in_(symbol_ids)))
+        session.execute(delete(Symbol).where(Symbol.ticker.in_(tickers)))
         session.commit()
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()
 
 
+def _count_rows_for_tickers(tickers: list[str]) -> tuple[int, int]:
+    """(symbols rows, daily_levels_state rows) still present for exactly these tickers."""
+    session = SessionLocal()
+    try:
+        symbol_ids = select(Symbol.id).where(Symbol.ticker.in_(tickers))
+        symbols = session.execute(select(func.count()).select_from(Symbol).where(Symbol.ticker.in_(tickers))).scalar_one()
+        states = session.execute(
+            select(func.count()).select_from(DailyLevelState).where(DailyLevelState.symbol_id.in_(symbol_ids))
+        ).scalar_one()
+        return symbols, states
+    finally:
+        session.close()
+
+
+@contextmanager
+def _tracked_daily_levels_symbols():
+    """Registrar for the exact tickers a test persists real rows for.
+
+    `track(ticker)` returns the ticker after (1) defensively deleting any rows a prior
+    interrupted run left behind — so restart-survival never short-circuits on stale state —
+    and (2) recording it. On exit — normal OR exception, via `finally` — it deletes exactly
+    the recorded tickers' rows in FK order, then verifies none remain. A leftover raises
+    instead of silently accumulating, which is how five `__TEST_DL_*__` symbols piled up
+    before. Engines/buses must already be stopped (each test's own `finally`), which is the
+    order pytest gives: test body first, fixture finalizer second.
+    """
+    tracked: list[str] = []
+
+    def track(ticker: str) -> str:
+        assert len(ticker) <= 16  # symbols.ticker is VARCHAR(16)
+        _delete_daily_levels_rows_for_tickers([ticker])
+        if ticker not in tracked:
+            tracked.append(ticker)
+        return ticker
+
+    try:
+        yield track
+    finally:
+        _delete_daily_levels_rows_for_tickers(tracked)
+        leftover = _count_rows_for_tickers(tracked) if tracked else (0, 0)
+        assert leftover == (0, 0), f"Daily Levels test rows survived teardown for {tracked}: (symbols, daily_levels_state)={leftover}"
+
+
 @pytest.fixture
-def _clean_daily_levels_symbol():
-    """Stage 2 (decision #63) tests, unlike Stage 1's, actually persist
-    real symbols/daily_levels_state rows — real Postgres, not reset
-    between separate pytest invocations, so leftover rows from a prior
-    run of THIS test can otherwise be picked up by the next run's
-    restart-survival check and produce confusing, order-dependent
-    failures (this happened once during development — see the
-    reconciliation/restart tests' own tickers for why they're short).
-    Returns the cleanup function so a test can call it once up front
-    (defensive, in case a prior run left something) and doesn't need a
-    second call after — Postgres isn't rolled back between tests in this
-    suite, so leaving the fresh rows in place after a PASSING run is
-    fine and matches how the rest of this file already behaves."""
-    return _delete_daily_levels_rows_for
+def _daily_levels_symbols():
+    """Per-test wrapper over `_tracked_daily_levels_symbols` — pytest runs the code after
+    `yield` (the context manager's teardown) even when the test body failed."""
+    with _tracked_daily_levels_symbols() as track:
+        yield track
 
 
 @pytest.mark.asyncio
-async def test_daily_levels_populate_from_the_registered_historical_provider(_clean_daily_levels_symbol):
-    # Stage 2 (decision #63) persists real rows for this ticker now —
-    # clean up any from a prior run of this exact test in this same
-    # (not-reset-between-invocations) Postgres, or the restart-survival
-    # check would short-circuit past the provider before it's even set up.
-    _clean_daily_levels_symbol("__TEST_DL__")
+async def test_daily_levels_populate_from_the_registered_historical_provider(_daily_levels_symbols):
+    # Stage 2 (decision #63) persists real rows for this ticker — tracking it
+    # pre-cleans any stale rows (or the restart-survival check would
+    # short-circuit past the provider before it's even set up) and guarantees
+    # its rows are deleted at teardown, pass or fail.
+    _daily_levels_symbols("__TEST_DL__")
 
     # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
     # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
@@ -240,7 +300,7 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
 
     try:
         await _publish_1m_candle(bus, "__TEST_DL__", now, 130.0)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 1, what="the first candle's FeaturesUpdated event for __TEST_DL__")
 
         assert fake.calls_by_timeframe.get("1d", 0) == 1  # the daily-levels 1d fetch specifically — premarket's own separate 1m fetch also happens now, correctly, and isn't what this assertion is about
         assert len(received) == 1
@@ -267,7 +327,7 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
         # A second candle the SAME (ET) day must not trigger a second fetch —
         # this IS the caching/gate design doc §2 asked for.
         await _publish_1m_candle(bus, "__TEST_DL__", now + timedelta(minutes=1), 130.5)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 2, what="the second same-day candle's FeaturesUpdated event for __TEST_DL__")
         assert fake.calls_by_timeframe.get("1d", 0) == 1  # the daily-levels 1d fetch specifically — premarket's own separate 1m fetch also happens now, correctly, and isn't what this assertion is about
     finally:
         await engine.stop()
@@ -275,7 +335,10 @@ async def test_daily_levels_populate_from_the_registered_historical_provider(_cl
 
 
 @pytest.mark.asyncio
-async def test_no_historical_provider_connected_yields_empty_daily_levels_not_a_crash():
+async def test_no_historical_provider_connected_yields_empty_daily_levels_not_a_crash(_daily_levels_symbols):
+    # No rows are expected for this ticker, but tracking it makes the "leaves nothing
+    # behind" guarantee verified rather than assumed.
+    _daily_levels_symbols("__TEST_DLNOPRV__")
     # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
     # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
     # (hour fixed, but DATE still real/relative) — broke the moment real
@@ -295,7 +358,7 @@ async def test_no_historical_provider_connected_yields_empty_daily_levels_not_a_
     try:
         for i, close in enumerate([100.0, 102.0, 104.0]):
             await _publish_1m_candle(bus, "__TEST_DLNOPRV__", now + timedelta(minutes=i), close)
-            await asyncio.sleep(0.05)
+        await _wait_for_features_updated(received, 3, what="three FeaturesUpdated events for __TEST_DLNOPRV__")
 
         # VWAP accumulates during regular session regardless of Daily
         # Levels (`now` is set to a regular-session UTC hour), so every
@@ -310,12 +373,12 @@ async def test_no_historical_provider_connected_yields_empty_daily_levels_not_a_
 
 
 @pytest.mark.asyncio
-async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lookback(_clean_daily_levels_symbol):
+async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lookback(_daily_levels_symbols):
     """Confirmed decision #62 — the lookback selector. Feeds enough
     distinct daily candles that a SHORTER lookback genuinely changes
     which points are available to cluster, not just re-returning the
     same result with a different label."""
-    _clean_daily_levels_symbol("__TEST_DL_LKBK__")  # same not-reset-between-runs reasoning as the test above
+    _daily_levels_symbols("__TEST_DL_LKBK__")
     # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
     # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
     # (hour fixed, but DATE still real/relative) — broke the moment real
@@ -342,9 +405,11 @@ async def test_get_daily_levels_reclusters_from_cached_candles_at_a_different_lo
     await bus.start()
     engine = FeatureEngine(bus, sma_periods=[], ema_periods=[])
     engine.start()
+    received: list = []
+    bus.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
     try:
         await _publish_1m_candle(bus, "__TEST_DL_LKBK__", now, 130.0)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 1, what="the candle's FeaturesUpdated event for __TEST_DL_LKBK__")
         assert fake.calls_by_timeframe.get("1d", 0) == 1  # the one and only 1d fetch — premarket's separate 1m fetch is a different, legitimate call
 
         # No lookback override — the full cached default: both clusters.
@@ -377,7 +442,7 @@ def test_get_daily_levels_returns_empty_for_a_symbol_with_no_state():
     assert engine.get_daily_levels("__TEST_DL_NOST__", lookback_days=30) == []
 
 
-def test_reconciliation_carries_level_id_forward_archives_and_mints_fresh(_clean_daily_levels_symbol):
+def test_reconciliation_carries_level_id_forward_archives_and_mints_fresh(_daily_levels_symbols):
     """The actual point of Stage 2 (design doc §4, confirmed decision
     #63) — calls _reconcile_and_persist_daily_levels directly across two
     simulated days for the same symbol, rather than fabricating full
@@ -388,9 +453,7 @@ def test_reconciliation_carries_level_id_forward_archives_and_mints_fresh(_clean
       - A level that disappears entirely gets archived, not deleted.
       - A genuinely new cluster mints a brand-new level_id.
     """
-    ticker = "__TEST_DL_RCN__"
-    assert len(ticker) <= 16
-    _clean_daily_levels_symbol(ticker)
+    ticker = _daily_levels_symbols("__TEST_DL_RCN__")
 
     bus = EventBus()
     engine = FeatureEngine(bus, sma_periods=[], ema_periods=[])
@@ -440,7 +503,7 @@ def test_reconciliation_carries_level_id_forward_archives_and_mints_fresh(_clean
 
 
 @pytest.mark.asyncio
-async def test_restart_survival_loads_todays_levels_without_a_second_provider_call(_clean_daily_levels_symbol):
+async def test_restart_survival_loads_todays_levels_without_a_second_provider_call(_daily_levels_symbols):
     """Design doc §9's own Stage 2 requirement: rebuild level_id state
     from persisted history on a FRESH process, same standing pattern as
     every other engine in this codebase. Simulates a restart by
@@ -449,9 +512,7 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
     return visibly different data if it were ever called — proving the
     restart-survival DB check short-circuits before reaching it, not
     just that the numbers happen to match."""
-    ticker = "__TEST_DL_RST__"
-    assert len(ticker) <= 16
-    _clean_daily_levels_symbol(ticker)
+    ticker = _daily_levels_symbols("__TEST_DL_RST__")
 
     # Fixed, deterministic anchor — Wednesday 2026-08-12, solidly a
     # regular-session weekday. Was `datetime.now(timezone.utc).replace(hour=15,...)`
@@ -473,9 +534,14 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
     await bus_a.start()
     engine_a = FeatureEngine(bus_a, sma_periods=[], ema_periods=[])
     engine_a.start()
+    received_a: list = []
+    bus_a.subscribe(EventType.FEATURES_UPDATED, lambda e: received_a.append(e))
     try:
         await _publish_1m_candle(bus_a, ticker, now, 130.0)
-        await asyncio.sleep(0.1)
+        # The event is published only after the daily-levels fetch AND its persistence
+        # (_reconcile_and_persist_daily_levels) finished, so its arrival means the
+        # level rows engine_b must restore are already committed.
+        await _wait_for_features_updated(received_a, 1, what=f"the first engine's FeaturesUpdated event for {ticker}")
         original_levels = engine_a.get_daily_levels(ticker)
         assert len(original_levels) == 1
         assert original_provider.calls_by_timeframe.get("1d", 0) == 1
@@ -503,7 +569,7 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
     bus_b.subscribe(EventType.FEATURES_UPDATED, lambda e: received.append(e))
     try:
         await _publish_1m_candle(bus_b, ticker, now + timedelta(minutes=1), 130.5)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 1, what=f"the restarted engine's FeaturesUpdated event for {ticker}")
 
         assert poisoned_provider.calls_by_timeframe.get("1d", 0) == 0  # the 1d fetch is never reached — the whole point; premarket's own unrelated 1m fetch against this provider doesn't affect that claim
         restored_levels = engine_b.get_daily_levels(ticker)
@@ -517,11 +583,11 @@ async def test_restart_survival_loads_todays_levels_without_a_second_provider_ca
 
 
 @pytest.mark.asyncio
-async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_them(_clean_daily_levels_symbol):
+async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_them(_daily_levels_symbols):
     """An unexpected provider failure on a LATER day must not erase a
     symbol's already-computed levels — same 'stale beats silently empty'
     reasoning as the docstring in engine.py's _maybe_refresh_daily_levels."""
-    _clean_daily_levels_symbol("__TEST_DL_FLKY__")  # same not-reset-between-runs reasoning as the tests above
+    _daily_levels_symbols("__TEST_DL_FLKY__")
 
     class _FlakyProvider:
         """`self.calls` counts 1d-relevant calls only — premarket's own
@@ -573,7 +639,7 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
         # until real time actually reached a Saturday.
         now = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
         await _publish_1m_candle(bus, "__TEST_DL_FLKY__", now, 130.0)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 1, what="the first candle's FeaturesUpdated event for __TEST_DL_FLKY__")
         assert len(received[-1].payload["daily_levels"]) == 1
 
         # Force a same-process "new day": clearing the in-memory cache
@@ -585,28 +651,25 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
         # last_confirmed_day so the DB check genuinely misses, the same
         # as it would the morning after a real rollover.
         engine._daily_levels_state["__TEST_DL_FLKY__"]["for_day"] = None
-        from app.db.session import SessionLocal
-        from app.models.daily_levels import DailyLevelState
-        from app.models.market_data import Symbol
-        from sqlalchemy import select, update
-
         session = SessionLocal()
-        symbol_id = session.execute(
-            select(Symbol.id).where(
-                Symbol.ticker == "__TEST_DL_FLKY__",
-                Symbol.is_backtest.is_(False),
+        try:
+            symbol_id = session.execute(
+                select(Symbol.id).where(
+                    Symbol.ticker == "__TEST_DL_FLKY__",
+                    Symbol.is_backtest.is_(False),
+                )
+            ).scalar_one()
+            session.execute(
+                update(DailyLevelState)
+                .where(DailyLevelState.symbol_id == symbol_id)
+                .values(last_confirmed_day=date(2020, 1, 1))
             )
-        ).scalar_one()
-        session.execute(
-            update(DailyLevelState)
-            .where(DailyLevelState.symbol_id == symbol_id)
-            .values(last_confirmed_day=date(2020, 1, 1))
-        )
-        session.commit()
-        session.close()
+            session.commit()
+        finally:
+            session.close()  # never hold this session (and its locks) into the teardown delete
 
         await _publish_1m_candle(bus, "__TEST_DL_FLKY__", now + timedelta(minutes=1), 131.0)
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 2, what="the second candle's FeaturesUpdated event for __TEST_DL_FLKY__ (after the failed refetch)")
         assert flaky.calls == 2
         # Still one level published — the flaky second fetch's exception
         # must not have wiped state to empty.
@@ -614,3 +677,57 @@ async def test_provider_error_leaves_prior_levels_in_place_instead_of_wiping_the
     finally:
         await engine.stop()
         await bus.stop()
+
+
+# --- Teardown self-checks (the cleanup guarantee itself) ---------------------
+
+
+def _persist_one_level(ticker: str) -> None:
+    """Persist a real symbols + daily_levels_state row for `ticker`, via the same
+    engine path production uses (no provider/event loop needed)."""
+    engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+    engine._reconcile_and_persist_daily_levels(
+        ticker, date(2026, 8, 17), [ClusteredLevel(price=100.00, strength=3, distinct_candle_count=3)]
+    )
+
+
+def test_teardown_deletes_tracked_rows_even_when_the_test_body_fails_and_spares_others():
+    """Failure-path cleanup: an exception raised after rows were persisted must still end
+    with those rows gone, and an unrelated (untracked) ticker's rows must be left alone."""
+    tracked_ticker = "__TEST_DL_TDF__"
+    bystander = "__TEST_DL_KEEP__"
+    _delete_daily_levels_rows_for_tickers([tracked_ticker, bystander])
+    try:
+        _persist_one_level(bystander)
+        with pytest.raises(RuntimeError, match="simulated test failure"):
+            with _tracked_daily_levels_symbols() as track:
+                track(tracked_ticker)
+                _persist_one_level(tracked_ticker)
+                assert _count_rows_for_tickers([tracked_ticker]) == (1, 1)
+                raise RuntimeError("simulated test failure")
+        assert _count_rows_for_tickers([tracked_ticker]) == (0, 0)  # deleted despite the failure
+        assert _count_rows_for_tickers([bystander]) == (1, 1)  # unrelated rows preserved
+    finally:
+        _delete_daily_levels_rows_for_tickers([tracked_ticker, bystander])
+    assert _count_rows_for_tickers([tracked_ticker, bystander]) == (0, 0)
+
+
+def test_teardown_removes_all_state_rows_for_a_symbol_before_its_symbols_row():
+    """FK order: a symbol with several daily_levels_state rows (active + archived) can only
+    be deleted if the child rows go first; the composite (symbol_id, is_backtest) FK would
+    otherwise reject deleting the parent."""
+    ticker = "__TEST_DL_FKO__"
+    _delete_daily_levels_rows_for_tickers([ticker])
+    try:
+        engine = FeatureEngine(EventBus(), sma_periods=[], ema_periods=[])
+        engine._reconcile_and_persist_daily_levels(
+            ticker, date(2026, 8, 17), [ClusteredLevel(price=100.00, strength=3, distinct_candle_count=3)]
+        )
+        engine._reconcile_and_persist_daily_levels(  # day 2: the ~100 level vanishes -> archived, new ~200 minted
+            ticker, date(2026, 8, 18), [ClusteredLevel(price=200.00, strength=2, distinct_candle_count=2)]
+        )
+        assert _count_rows_for_tickers([ticker]) == (1, 2)
+        _delete_daily_levels_rows_for_tickers([ticker])
+        assert _count_rows_for_tickers([ticker]) == (0, 0)
+    finally:
+        _delete_daily_levels_rows_for_tickers([ticker])

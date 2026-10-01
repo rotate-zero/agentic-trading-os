@@ -1,34 +1,56 @@
-<!-- BEGIN DELIVERY SECTION: feature-engine-aggregation-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
-# CHANGES — `feature-engine-aggregation-test-waits`
+<!-- BEGIN DELIVERY SECTION: daily-levels-test-cleanup (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `daily-levels-test-cleanup`
 
 Based on `main` `91791ed` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
-**no production code, aggregation behavior, API contract, schema, migration or frontend file was edited**, and
-`test_daily_levels.py` was not touched. **No new decision number:** nothing new is decided; `INDEX.md`,
+**no production code, Feature Engine behavior, API contract, schema, migration or frontend file was edited**, and
+`test_feature_engine.py` was not touched. **No new decision number:** nothing new is decided; `INDEX.md`,
 `confirmed-decisions.md` and the archive list are untouched. The only code file changed is
-`backend/tests/test_feature_engine.py`.
+`backend/tests/test_daily_levels.py`.
 
-- **Problem.** Four aggregation tests published candles and then asserted after a fixed `asyncio.sleep(0.1)`, guessing
-  that the Feature Engine's serial worker (thread-offloaded `_compute_one` per candle, then an EventBus publish) had
-  finished. When compute is slower than the guess, the assertions see a partial event list: the 5m/15m/1h set is not there
-  yet (`{"1m"} != {"1m","5m"}`), and the "not before" test can pass **vacuously** because nothing has arrived yet.
-- **Edited** `backend/tests/test_feature_engine.py` — each fixed sleep replaced by the file's existing bounded poll
-  `_wait_until` (5 s timeout, named failure message), waiting for exactly the events that test's published candles produce:
-  - `test_5m_bucket_completes_only_on_its_final_minute_not_before`: waits for **all four 1m results**, then asserts the
-    absence of a 5m result (`timeframes_seen == {"1m"}`).
-  - `test_5m_bucket_completion_publishes_5m_features_with_correct_close` and
-    `test_vwap_is_identical_across_1m_and_5m_featuresets_on_the_same_close`: wait for five 1m events plus the 5m
-    bucket-close event.
-  - `test_1h_boundary_publishes_5m_15m_and_1h_together`: waits until 1m, 5m, 15m and 1h results have all arrived for the
-    single hour-boundary candle.
-  **No new helper.** Every timeframe set, count, `candle_ts`, close, `sma_1` and VWAP assertion is unchanged (the diff
-  removes four sleep lines and no assertion line).
-- **What the waits do and do not do.** A wait only blocks until the expected events *arrive*; the original assertions then
-  run in full. A real defect still fails: if the 5m set is never produced the wait times out with a named message, and a
-  wrong value fails the original equality assertion (mutation checks in `TESTING.md`).
-- **Not changed (reported only).** Fixed `asyncio.sleep(0.1)` waits remain in other tests of `test_feature_engine.py`
-  (9 call sites) and elsewhere; four of them fail at 30 ms injected compute delay (see `TESTING.md`). `test_daily_levels.py`
-  was out of scope. These are suggested next conversions.
-<!-- END DELIVERY SECTION: feature-engine-aggregation-test-waits -->
+- **Problem 1 — leaked rows.** The `_clean_daily_levels_symbol` fixture only deleted rows *before* a test and said, in
+  its own docstring, that leaving fresh rows after a passing run was fine. Every run therefore left its `symbols` and
+  `daily_levels_state` rows behind: five `__TEST_DL_*__` symbols (and eight state rows) were present in a freshly migrated
+  database after one run of the unmodified file. Nothing cleaned up after a failure either.
+- **Problem 2 — fixed sleeps.** Six tests published a candle and then asserted after `asyncio.sleep(0.05)` or `0.1`,
+  guessing how long the EventBus, the Feature Engine's serial worker and its thread-offloaded provider fetch + DB
+  persistence take.
+- **Edited** `backend/tests/test_daily_levels.py`:
+  - *Teardown.* `_delete_daily_levels_rows_for` is replaced by `_delete_daily_levels_rows_for_tickers(tickers)`: one
+    transaction that deletes `daily_levels_state` rows for the given tickers' symbol ids **first**, then the `symbols` rows
+    (the table has a composite `(symbol_id, is_backtest)` FK to `symbols`), with rollback on error. Only the listed tickers
+    are touched; there is no broad reset. `_count_rows_for_tickers` reports what remains.
+  - *Fixture.* `_clean_daily_levels_symbol` is replaced by `_daily_levels_symbols`, a per-test registrar built on the
+    context manager `_tracked_daily_levels_symbols`. `track(ticker)` pre-cleans stale rows (so restart-survival cannot
+    short-circuit on leftovers from an interrupted run) and records the ticker. Teardown runs in a `finally` — so it runs after
+    a failing test body too — deletes exactly the recorded tickers, then **asserts none remain**, so a leak fails loudly
+    instead of accumulating. The five DB-touching tests register the exact tickers they use (`__TEST_DL__`,
+    `__TEST_DL_LKBK__`, `__TEST_DL_RCN__`, `__TEST_DL_RST__`, `__TEST_DL_FLKY__`); the no-provider test registers
+    `__TEST_DLNOPRV__` so "leaves nothing behind" is verified rather than assumed.
+  - *Bounded waits.* New private helper `_wait_for_features_updated(received, expected_count, *, what, timeout=5.0)`, the
+    same shape as the one in `test_vwap_ext.py`, wrapping `tests.test_feature_engine._wait_until` (already used by sibling
+    test files) and reporting what was actually received on timeout. Every `asyncio.sleep` is replaced by a wait for the
+    specific number of `FeaturesUpdated` events the test published candles for. The restart-survival test now also
+    subscribes on the first engine and waits for its event before "restarting": that event is published only after the
+    daily-levels fetch **and** `_reconcile_and_persist_daily_levels` have committed, so the persisted state the second
+    engine must restore is guaranteed to exist. The lookback test gained a `received` subscription for the same reason.
+    The flaky-provider test's back-dating session is now closed in a `finally` and its function-local imports were
+    removed (the names are already imported at module level). The file contains no `asyncio.sleep` and no longer imports
+    `asyncio`.
+  - *Two new tests (the cleanup guarantee itself).*
+    `test_teardown_deletes_tracked_rows_even_when_the_test_body_fails_and_spares_others` raises inside the tracked context
+    after persisting a real level and checks the tracked rows are gone while an untracked "bystander" ticker's rows survive;
+    `test_teardown_removes_all_state_rows_for_a_symbol_before_its_symbols_row` persists an active and an archived state row
+    for one symbol and checks both and the parent are deleted without an FK violation. Both clean up their own tickers
+    (`__TEST_DL_TDF__`, `__TEST_DL_KEEP__`, `__TEST_DL_FKO__`) in `finally`.
+- **Assertions preserved verbatim.** Clustering math (tier 1 is untouched), the once-per-day `1d` fetch count, level
+  strength/count/price/`level_id` shape, lookback re-clustering and clamping, identity carry-forward / archive / mint,
+  restart-survival (poisoned provider never called for `1d`, same `level_id` and price, event payload `level_id`), and the
+  failure-retention check (`flaky.calls == 2`, one level still published after the failed refetch). Waits only wait for
+  arrival; they never replace an assertion.
+- **Not changed (reported only).** `asyncio.sleep(0.x)` waits remain in `test_feature_engine.py` and other test files; they
+  were out of scope. The first engine in the restart test and the flaky test still assume the premarket 1m fetch is
+  harmless (unchanged behavior, noted in the existing comments).
+<!-- END DELIVERY SECTION: daily-levels-test-cleanup -->
 
 <!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `vwap-ext-test-bounded-waits`

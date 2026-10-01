@@ -1,59 +1,59 @@
-<!-- BEGIN DELIVERY SECTION: feature-engine-aggregation-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
-# TESTING — `feature-engine-aggregation-test-waits`
+<!-- BEGIN DELIVERY SECTION: daily-levels-test-cleanup (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `daily-levels-test-cleanup`
 
 **Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
-`trading` (`CREATE USER trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision `0016`).
-No external or production database and no broker touched. Python 3.12.3, 1 vCPU sandbox, so contention numbers are
-indicative, not a model of Saqib's machine. Verified on `main` `91791ed` (unchanged on `origin/main` at packaging).
+`trading` (`CREATE ROLE trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision `0016`).
+No external or production database and no broker touched. Python 3.12.3, **1 vCPU** sandbox, so timings and contention
+numbers are indicative, not a model of Saqib's machine. Verified on `main` `91791ed` (unchanged on `origin/main` at
+packaging).
 
-## The race being removed
+## What changed in the lifecycle
 
 ```
-test (event loop)              FeatureEngine worker (serial)                 EventBus
------------------              -----------------------------                 --------
-publish candle(s) ----------->  queue.get -> to_thread(_compute_one) ------> FEATURES_UPDATED (1m, then 5m/15m/1h)
-sleep(0.1)  <-- guess -->        (latency varies with load)                  handler -> received.append
-assert on `received`             # before: asserts whenever the guess expires
-                                 # after:  _wait_until(expected events arrived), THEN asserts everything
+before:  pre-clean ticker -> test writes symbols + daily_levels_state -> (nothing)        rows leak on pass AND fail
+after:   track(ticker): pre-clean + record
+         test body ........ publish -> wait for exact FeaturesUpdated count -> assert all
+         finally: DELETE daily_levels_state (child) -> DELETE symbols (parent)  [tracked tickers only]
+                  -> assert 0 symbols / 0 state rows remain for the tracked tickers
 ```
 
-## Controlled slow-compute condition
+## Checks run
 
-An external pytest plugin (`-p slow_compute`, **not in the repo**) wraps `FeatureEngine._compute_one` with
-`time.sleep(SLOW_COMPUTE_MS/1000)` per candle. Same code, only latency changes.
+- **Baseline, unmodified file, fresh migrated DB:** `15 passed` (1.92 s) and **5 leftover symbols**
+  (`__TEST_DL__`, `__TEST_DL_LKBK__`, `__TEST_DL_RCN__`, `__TEST_DL_RST__`, `__TEST_DL_FLKY__`) plus **8**
+  `daily_levels_state` rows (7 active, 1 archived) remained afterward.
+- **New file, one run on the emptied database:** `17 passed` (1.40 s); 0 symbols and 0 state rows for `__TEST_DL%`.
+- **Repeated runs, each a separate process, with an unrelated sentinel symbol + state row (`SENTINEL_UNREL`) present:**
+  - idle: **25/25** `17 passed` (1.17-1.25 s each); after **every** run `__TEST_DL%` symbols = 0, their state rows = 0,
+    sentinel still 1 symbol / 1 state row.
+  - under one busy-loop process per vCPU: **15/15** `17 passed`, same post-run counts (0/0, sentinel 1/1).
+- **Failure-path cleanup, run for real:** a throw-away copy of the file with three assertions deliberately broken (the
+  populate test's `len(received)`, the restart test's `1d` call count, the flaky test's `flaky.calls`) gave
+  `3 failed, 14 passed`; afterwards **0 `__TEST_DL%` symbols, 0 state rows, sentinel intact (1/1)** — rows were removed for
+  the failing tests too. The copy was deleted and is not in the delivery. The in-repo test
+  `test_teardown_deletes_tracked_rows_even_when_the_test_body_fails_and_spares_others` pins the same guarantee permanently.
+- **Deterministic latency injection** (external pytest plugin, **not in the repo**: `time.sleep` inside
+  `FeatureEngine._compute_one` and `_reconcile_and_persist_daily_levels`; original file is the control, DB cleaned between
+  runs):
 
-| Per-candle delay | Before (4 target tests) | After (4 target tests) |
-|---|---|---|
-| 0 ms | 4 passed | 4 passed (x30 idle processes: **30/30**) |
-| 30 ms | **2 failed** (`..._publishes_5m_features_with_correct_close`, `..._identical_across_1m_and_5m_...`) | 4 passed (x12) |
-| 100 ms | **4 failed** | 4 passed (x2) |
-| 300 ms | not run | 4 passed (x2, ~5.3 s each) |
+  | injected latency per call | original `test_daily_levels.py`              | new `test_daily_levels.py`  |
+  |---------------------------|----------------------------------------------|-----------------------------|
+  | none                      | 15 passed (5 test symbols left behind)       | 17 passed (0 left)          |
+  | 0.15 s                    | **5 failed**, 10 passed (5 left)             | 17 passed (0 left) 4.15 s   |
+  | 0.5 s                     | **5 failed**, 10 passed (5 left)             | 17 passed (0 left) 11.19 s  |
 
-Also after the change: 3 busy-loop processes on the single vCPU, 10 runs: **10/10 passed**.
+- **Neighbouring suites on the same DB** (`test_daily_levels`, `test_feature_engine`, `test_vwap_ext`,
+  `test_level_interaction_engine`, `test_level_touch_tracking`): **153 passed** (14.57 s); 0 `__TEST_DL%` symbols left.
+- **Timeout message** (helper called with nothing received, 0.2 s): `demo event was not met within 0.2s — expected >= 2
+  FeaturesUpdated, received 0: []`.
 
-## Mutation checks (reverted; `git diff` showed only the intended edits afterwards)
+## Limits
 
-- Suppressing aggregation (`_AGGREGATED_WIDTHS = []`) -> the three tests that need a 5m/15m/1h result fail after the 5 s
-  bound with their named messages (`five 1m ... plus the 5m bucket-close event was not met within 5.0s`; `1m, 5m, 15m and
-  1h ... was not met within 5.0s`); the "not before" test correctly still passes.
-- Changing an expected value (`close == 104.0` -> `105.0`) -> `assert 104.0 == 105.0` fails.
-
-## Full Feature Engine file (`tests/test_feature_engine.py`)
-
-- Baseline before the change: **81 passed**. After the change, idle, 3 runs: **81 passed** each (~6 s).
-- Under 30 ms/candle, whole file: before the change **6 failed**; after **4 failed** — the two target tests no longer
-  fail, the remaining four are untouched tests that still use a fixed sleep:
-  `test_feature_engine_drops_duplicate_candle_closed`, `test_vwap_accumulates_within_a_session_and_resets_at_the_next_one`,
-  `test_regression_only_computed_for_its_configured_timeframe`, `test_regression_and_kama_absent_before_their_window_warms_up`.
-  Not fixed (out of the four-test scope); suggested follow-up.
-
-## Wider issues found (not fixed)
-
-1. The four tests above (and other `asyncio.sleep(0.1)` sites in this file) share the same race at enough latency.
-2. A first slow-compute sweep was invalidated mid-session when PostgreSQL stopped after a timed-out shell command
-   (`Connection refused`); it was discarded and rerun after restarting the cluster. Not a repo issue.
-3. Full backend suite was not run (task scope: the Feature Engine test file).
-<!-- END DELIVERY SECTION: feature-engine-aggregation-test-waits -->
+- Cleanup runs in teardown; a hard kill (SIGKILL, power loss) mid-test can still leave rows. The next run's `track()`
+  pre-clean removes them, so they cannot corrupt a later run, but they remain until then.
+- Two `FeatureEngine` instances in one process share the DB: the tests assume nothing else writes `__TEST_DL%` tickers.
+- Waits poll every 20 ms with a 5 s ceiling; a genuinely stuck pipeline fails with a named timeout rather than passing.
+<!-- END DELIVERY SECTION: daily-levels-test-cleanup -->
 
 <!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `vwap-ext-test-bounded-waits`
