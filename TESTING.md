@@ -1,3 +1,24 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-event-path-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-recorder-event-path-integration`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading`, created fresh and migrated with `alembic upgrade head` (revision `0016`). No external or production database
+and no broker touched. Python 3.12.3. Verified on `main` `55e8678`.
+
+- New file: `cd backend && python3 -m pytest tests/test_outcome_recorder_event_path_integration.py -q` -> **1 passed**
+  (about 1.2 s); 4 runs in total (3 consecutive plus one with an unrelated pending trade present), 1 passed each time.
+- **Full suite** (`cd backend && python3 -m pytest tests -q`): **1570 passed, 1 warning in 124 s** (1569 baseline + 1
+  new); the warning is the existing starlette/anyio deprecation notice.
+- **Mutation checks** (each reverted; `git status` showed only the new test file afterwards): removing the recorder's
+  `POSITION_CLOSED` subscription -> 1 failed (bounded wait timed out); making `_on_close` enqueue nothing -> 1 failed
+  (same timeout). The failures take about 11 s, i.e. the 10 s bound, not a hang.
+- **Shared-database check:** with an unrelated qualifying closed trade seeded beforehand, the test passed and that trade
+  still had `outcome_status` NULL and no outcome (the startup scan did not record it); it was then removed by id.
+- **Cleanup check:** `trades` and `strategy_outcomes` held 0 rows after the full suite on this database.
+- **Not covered / limits:** no execution-pipeline fixture; startup-scan and sweep recovery not exercised; one duplicate
+  timing (after completion); one trade shape (the `_seed` default).
+<!-- END DELIVERY SECTION: outcome-recorder-event-path-integration -->
+
 <!-- BEGIN DELIVERY SECTION: execution-outcome-status-recorder-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-outcome-status-recorder-integration`
 

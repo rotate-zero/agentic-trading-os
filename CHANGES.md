@@ -1,3 +1,46 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-event-path-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-recorder-event-path-integration`
+
+Based on `main` `55e8678` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited, and no existing test was edited.**
+No production defect was found. **No new decision number:** nothing new is decided; `INDEX.md`,
+`confirmed-decisions.md` and the archive list are untouched (latest number is still 186) and decision #186 is not altered.
+
+- **New test file** `backend/tests/test_outcome_recorder_event_path_integration.py` (1 test, real PostgreSQL). The
+  existing `test_execution_outcome_status_recorder_integration.py` calls `OutcomeRecorder.record_trade()` directly; this
+  test proves the event-driven wake-up path (#186: `PositionClosed` only wakes the worker; the ledger supplies the facts):
+
+  ```
+  seeded closed trade        EventBus (critical lane)         OutcomeRecorder
+  (tests.test_outcome_  ---> publish(PositionClosed) -------> _on_close -> _enqueue("close", trade_id)
+   recorder._seed)                                                 |
+                                                                   v  worker task: record_trade(trade_id)
+                                  GET /intelligence/            _close_candidate -> _record_locked
+                                  execution-outcome-status <--- trades.outcome_status='recorded'
+                                  (httpx.ASGITransport)         + strategy_outcomes row + trades.outcome_id
+  ```
+
+  Sequence: start a real `EventBus` and a real `OutcomeRecorder` **before any test trade exists** (so the startup scan
+  cannot be what records it) -> seed the closed eligible trade -> route shows it `pending` (NULL status) and the worker
+  idle -> publish a valid `PositionClosed` (built from the seeded position) -> the worker returns `recorded` -> the route
+  shows `recorded` +1 with `outcome_id` equal to both `trades.outcome_id` and the single real `strategy_outcomes` row ->
+  publish a **duplicate** `PositionClosed` -> the worker returns `skipped`, still one outcome row, same `outcome_id`,
+  route counts unchanged.
+- **Bounded synchronization, no fixed sleeps:** `record_trade` on the recorder *instance* is wrapped so each real worker
+  result lands on an `asyncio.Queue`; the test awaits it with `asyncio.wait_for(timeout=10)`. The wrapper calls the real
+  method and returns its real result.
+- **Isolation:** the recorder's startup scan is a database-wide query and would otherwise record any unrelated qualifying
+  trade in a shared database. The instance's `_pending_rows` is therefore wrapped so the real scan still runs (asserted:
+  exactly once, before seeding) but its rows are not acted on, and `sweep_interval_seconds=3600` keeps the sweeper out.
+  Counts are deltas against a route baseline. Cleanup deletes only the seeded `trade_id`s' rows (children first; the
+  `trades.outcome_id` link is cleared before outcome rows go). The recorder and then the bus are stopped in a `finally`
+  with a bounded `stop()`.
+- **Known limits:** the fixture is the recorder suite's hand-seeded ledger, not an execution run (authorizer -> venue ->
+  portfolio is out of scope); the startup scan and sweep recovery paths are not exercised here; the duplicate is published
+  after the first record completed (coalescing of a duplicate that arrives while still queued is not asserted); exit
+  snapshots are the real engine's cold-start result, not asserted.
+<!-- END DELIVERY SECTION: outcome-recorder-event-path-integration -->
+
 <!-- BEGIN DELIVERY SECTION: execution-outcome-status-recorder-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `execution-outcome-status-recorder-integration`
 
