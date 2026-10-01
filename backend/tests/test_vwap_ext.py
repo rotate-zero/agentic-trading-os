@@ -8,7 +8,6 @@ still the authority on `vwap`'s own behavior).
 """
 from __future__ import annotations
 
-import asyncio
 from datetime import timedelta
 
 import pytest
@@ -18,7 +17,31 @@ from app.event_bus.events import make_envelope  # noqa: F401 — re-exported for
 from app.feature_engine.engine import FeatureEngine
 from app.schemas.events.envelope import EventType
 from app.services.candle_recorder import CandleRecorder
-from tests.test_feature_engine import _clean_test_symbol, _db_available, _et, _publish_candle, _wait_until
+from tests.test_feature_engine import (
+    _clean_test_symbol,
+    _db_available,
+    _et,
+    _publish_candle,
+    _wait_until,
+    _wait_until_candles_persisted,
+)
+
+
+async def _wait_for_features_updated(received: list, expected_count: int, *, what: str, timeout: float = 5.0) -> None:
+    """Bounded wait until `received` holds at least `expected_count` FeaturesUpdated events.
+
+    Replaces the fixed `asyncio.sleep(0.1-0.3)` these tests used to guess how long
+    EventBus -> FeatureEngine's serial worker (and its asyncio.to_thread compute) takes.
+    Wraps the shared `_wait_until` so a timeout reports what was actually received
+    (symbol / timeframe / candle_ts) instead of a bare 'condition not met'. This only
+    waits for the events to ARRIVE; each test still asserts the exact count and every
+    VWAP value afterwards, so a wait can never mask an incomplete or wrong result.
+    """
+    try:
+        await _wait_until(lambda: len(received) >= expected_count, timeout=timeout, description=what)
+    except AssertionError as exc:
+        seen = [(e.symbol, e.payload["timeframe"], str(e.payload["candle_ts"])) for e in received]
+        raise AssertionError(f"{exc} — expected >= {expected_count} FeaturesUpdated, received {len(seen)}: {seen}") from exc
 
 
 @pytest.mark.asyncio
@@ -36,7 +59,7 @@ async def test_vwap_ext_present_during_premarket_unlike_vwap():
 
     try:
         await _publish_candle(bus, "__TEST_FE_VWAPEXT_PM__", _et(2026, 8, 11, 8, 0), 50.0)  # pre-market
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 1, what="the pre-market candle's FeaturesUpdated event")
 
         assert len(received) == 1
         features = received[0].payload["features"]
@@ -66,7 +89,7 @@ async def test_vwap_ext_continues_across_the_930_boundary_without_resetting():
         ticker = "__TEST_FE_VWAPEXT_CONT__"
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 8, 0), 50.0)  # pre-market
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 9, 30), 100.0)  # regular open
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 2, what="two FeaturesUpdated events (pre-market bar, then the 9:30 bar)")
 
         assert len(received) == 2
         # `vwap` (regular-session-only) at the open == just its own bar.
@@ -97,7 +120,7 @@ async def test_vwap_ext_resets_at_next_trading_day_not_at_930_boundary():
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 8, 0), 50.0)  # day 1 pre-market
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 9, 30), 100.0)  # day 1 regular open
         await _publish_candle(bus, ticker, _et(2026, 8, 12, 8, 0), 300.0)  # day 2 pre-market — must NOT blend with day 1
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 3, what="three FeaturesUpdated events (day 1 pre-market, day 1 open, day 2 pre-market)")
 
         assert len(received) == 3
         assert received[2].payload["features"]["vwap_ext"] == 300.0  # not mean(50, 100, 300)
@@ -124,7 +147,7 @@ async def test_vwap_ext_absent_after_hours_same_as_vwap_not_frozen_like_premarke
         ticker = "__TEST_FE_VWAPEXT_AH__"
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 9, 30), 100.0)  # regular session
         await _publish_candle(bus, ticker, _et(2026, 8, 11, 16, 30), 999.0)  # after-hours
-        await asyncio.sleep(0.1)
+        await _wait_for_features_updated(received, 2, what="two FeaturesUpdated events (regular-session bar, then the after-hours bar)")
 
         assert len(received) == 2
         assert "vwap_ext" in received[0].payload["features"]
@@ -183,7 +206,10 @@ async def test_vwap_ext_backfills_pre_market_history_on_cold_start():
         recorder.start()
         try:
             await _publish_candle(bus, ticker, _et(2026, 8, 11, 8, 0), 50.0)  # pre-market, persisted
-            await asyncio.sleep(0.3)
+            # Wait for the actual persisted row before the recorder is stopped and the
+            # fresh engine starts — a missing row would make the backfill assertion below
+            # fail for the wrong reason (or pass-by-accident on a no-backfill engine).
+            await _wait_until_candles_persisted(ticker, expected_count=1)
         finally:
             await recorder.stop()
 
@@ -194,7 +220,9 @@ async def test_vwap_ext_backfills_pre_market_history_on_cold_start():
 
         try:
             await _publish_candle(bus, ticker, _et(2026, 8, 11, 9, 30), 150.0)  # this engine's first observed bar
-            await asyncio.sleep(0.2)
+            # Wait for the fresh engine's cold-start backfill + compute to publish its
+            # FeaturesUpdated, then assert on that exact event below.
+            await _wait_for_features_updated(received, 1, what=f"the fresh engine's FeaturesUpdated event for {ticker}")
 
             assert len(received) == 1
             # mean(50, 150) — NOT just 150.0, which is what no backfill would wrongly produce.

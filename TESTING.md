@@ -1,3 +1,92 @@
+<!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `vwap-ext-test-bounded-waits`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE ROLE trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision
+`0016`). No external or production database and no broker touched. Python 3.12.3, **1 vCPU** sandbox, so the contention
+numbers below are indicative, not a model of Saqib's machine. Verified on `main` `4137a16` (unchanged on `origin/main`
+at packaging).
+
+## The race being removed
+
+```
+test (event loop)                 EventBus            FeatureEngine worker (serial)           CandleRecorder writer
+-----------------                 --------            -----------------------------           ---------------------
+publish CandleClosed ----------> dispatch -----------> queue -> to_thread(_compute_one) ----> FEATURES_UPDATED
+                                    \---------------------------------------------------->  queue -> to_thread(_write_one)
+sleep(0.1-0.3)  <-- guess -->       (any hop can be late under load)
+assert on `received` / on persisted history      # before:  asserts whenever the guess expires
+                                                 # after:   waits for exact count / row, THEN asserts everything
+```
+
+Cold-start test, two independent guesses, both replaced: (1) `sleep(0.3)` that the bus had handed the pre-market candle
+to the recorder (and it had been written) before `recorder.stop()` — `stop()` only drains what is *already queued*, so a
+late bus hop loses the row; (2) `sleep(0.2)` that the fresh engine's cold-start backfill + compute had published.
+
+## Checks run
+
+Baseline before the change (`main` `4137a16`, file unmodified): `tests/test_vwap_ext.py` **6 passed** (1.81 s).
+
+- **Whole file, idle, 30 separate processes after the change:** **30/30** `6 passed` (0.86-1.20 s each).
+- **Whole file under 3 busy-loop processes on 1 vCPU:** new file **14/14** passed (stopped at 14 of a planned 20 by
+  the tool time budget). **Control, original file under the same load:** **1 passed, 10 failed** in 11 runs (stopped
+  by the time budget); failing tests: `..._present_during_premarket_unlike_vwap` x10,
+  `..._resets_at_next_trading_day_not_at_930_boundary` x1.
+- **Deterministic latency injection** (external pytest plugin, **not in the repo**: sleeps inside
+  `FeatureEngine._compute_one` and/or `CandleRecorder._write_one`; the original file is the control):
+
+  | injected latency                        | original `test_vwap_ext.py`                                   | new `test_vwap_ext.py` |
+  |-----------------------------------------|---------------------------------------------------------------|------------------------|
+  | none                                    | 6 passed                                                      | 6 passed               |
+  | compute 50 ms / candle                  | **3 failed** (`continues_across_930`, `resets_at_next_trading_day`, `absent_after_hours`) | 6 passed |
+  | compute 150 ms / candle                 | **4 failed** (+ `present_during_premarket`)                   | 6 passed               |
+  | recorder write 400 ms / row             | 6 passed (`stop()` drains the writer queue)                   | 6 passed               |
+  | compute 150 ms + recorder 400 ms        | **4 failed**                                                  | 6 passed               |
+
+  Cold-start test only (`-k backfills_pre_market_history_on_cold_start`), adding a bus-to-recorder delivery lag
+  (the recorder's `_on_candle_closed` deferred with `call_later`):
+
+  | injected latency                        | original                                                      | new    |
+  |-----------------------------------------|---------------------------------------------------------------|--------|
+  | none                                    | passed                                                        | passed |
+  | bus lag 400 ms                          | **failed**: `vwap_ext` obtained `150.0`, expected `100.0` (history never persisted, so the engine had nothing to backfill: exactly the wrong-result shape a guess-wait can produce) | passed |
+  | engine compute 300 ms                   | **failed**: `assert 0 == 1` (no `FeaturesUpdated` yet)        | passed |
+  | bus lag 400 ms + compute 300 ms         | **failed**: `assert 0 == 1`                                   | passed |
+
+  Honest note: recorder *write* latency alone did not break the original cold-start test, because `stop()` drains the
+  queue; the persisted-row wait protects the earlier bus-to-recorder hop, shown by the bus-lag rows.
+- **Mutation checks** (temporary edits to `feature_engine/engine.py` `_update_vwap_ext`; each reverted, and
+  `engine.py` confirmed byte-identical to `main` with `cmp` afterwards) — the waits do not mask wrong results:
+  1. remove the per-day reset (`if state is None:`) -> `..._resets_at_next_trading_day_...` fails, `assert 150.0 == 300.0`
+     (the other five pass, as expected);
+  2. disable the cold-start history read (`rows = []`) -> the cold-start test fails on the `100.0` approx assertion;
+  3. add `+ 1` to the published `vwap_ext` -> 5 of 6 fail (premarket, 9:30 continuation, day reset, 1m/5m parity,
+     cold-start); only the after-hours test passes, because it asserts presence/absence, not the value.
+  (A first attempt at mutation 1 used an anchor that matched four lines and was not applied; it was redone with a unique
+  anchor and only the redone result is reported.)
+- **Feature Engine neighbors, single files:** `test_feature_engine.py` **81 passed** (5.79 s);
+  `test_vwap_strategy.py` + `test_premarket_volume_ratio.py` + `test_candle_recorder.py` + `test_event_bus.py` +
+  `test_candle_aggregator.py` **51 passed** (9.69 s).
+- **`test_feature_engine.py` + `test_vwap_ext.py` together, 8 runs:** **87 passed** each.
+- **Neighbors in suite order** (`test_candle_aggregator.py`, `test_candle_recorder.py`, `test_daily_levels.py`,
+  `test_event_bus.py`, `test_feature_engine.py`, `test_premarket_volume_ratio.py`, `test_vwap_ext.py`,
+  `test_vwap_strategy.py`), 3 runs: **153 passed** each (about 15.7 s).
+- `diff -rq` against a pristine `main` `4137a16` tree: the only code file that differs is
+  `backend/tests/test_vwap_ext.py` (plus these two docs). `grep asyncio.sleep` on it finds only the helper's docstring.
+
+Not run: the full backend suite (not requested; the changed file and its Feature Engine / recorder / bus / aggregator /
+daily-levels neighbors were run instead), frontend checks (no frontend file changed).
+
+## Wider issues found (not fixed — out of scope)
+
+1. **Same pattern remains elsewhere:** `asyncio.sleep(0.x)` after publishing candles still appears in
+   `test_feature_engine.py` and other files (earlier delivery counted 32 in `test_feature_engine.py` and 29 test files
+   overall). Suggested follow-up: convert test by test with `_wait_until` on the exact event count, as done here.
+2. **Leftover rows from `test_daily_levels.py`:** after those tests run, five `__TEST_DL_*__` rows remain in `symbols`
+   (`FLKY`, `LKBK`, `RCN`, `RST`, plain `DL`). Unrelated to this change and not touched; worth a look at that file's
+   teardown.
+<!-- END DELIVERY SECTION: vwap-ext-test-bounded-waits -->
+
 <!-- BEGIN DELIVERY SECTION: market-clock-next-session-boundary (backend + tests + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `market-clock-next-session-boundary`
 

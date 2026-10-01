@@ -1,3 +1,42 @@
+<!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `vwap-ext-test-bounded-waits`
+
+Based on `main` `4137a16` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, indicator behavior, API contract, schema, migration or frontend file was edited**, and
+`test_feature_engine.py` was not touched. **No new decision number:** nothing new is decided; `INDEX.md`,
+`confirmed-decisions.md` and the archive list are untouched. The only code file changed is
+`backend/tests/test_vwap_ext.py`.
+
+- **Problem.** Five of the six tests in `test_vwap_ext.py` still published candles and then asserted after a fixed
+  `asyncio.sleep(0.1)`, `0.2` or `0.3`, guessing that the EventBus, the Feature Engine's serial worker (thread-offloaded
+  compute, plus a cold-start history read on a symbol's first candle) and `CandleRecorder`'s write-behind writer had all
+  finished. The sixth test (`..._identical_across_1m_and_5m_featuresets_...`) was already converted to a bounded wait by
+  `feature-engine-test-featureset-wait`; it is unchanged. After this change the file contains **no** `asyncio.sleep`.
+- **Edited** `backend/tests/test_vwap_ext.py`:
+  - *Four event-count tests* (`..._present_during_premarket_...`, `..._continues_across_the_930_boundary_...`,
+    `..._resets_at_next_trading_day_...`, `..._absent_after_hours_...`): the sleep is replaced by a bounded wait (5 s) for
+    the exact number of `FeaturesUpdated` events the test publishes candles for (1, 2, 3 and 2 respectively).
+  - *Cold-start test* (`..._backfills_pre_market_history_on_cold_start`), both halves: before the recorder is stopped and
+    the fresh engine started it now waits for the pre-market row to actually be **persisted**
+    (`_wait_until_candles_persisted(ticker, expected_count=1)`), then, after publishing the 9:30 bar to the fresh engine,
+    waits for that engine's own `FeaturesUpdated`.
+  - *One new private helper* in the test file, `_wait_for_features_updated(received, expected_count, *, what, timeout=5.0)`:
+    a thin wrapper over the existing `_wait_until` that, on timeout, re-raises with what was actually received
+    (symbol / timeframe / `candle_ts` of each event) so a failure is diagnosable instead of a bare "condition not met".
+    `_wait_until` and `_wait_until_candles_persisted` are imported from `tests.test_feature_engine`, the module this file
+    already imports its other helpers from. The unused `asyncio` import was removed.
+- **What the waits do and do not do.** A wait only blocks until the events (or the persisted row) *arrive*. Every existing
+  assertion is kept verbatim and still runs afterwards: the exact `len(received)` checks, every `vwap`, `vwap_ext` and
+  `session_volume_ext` value, the day-2 reset, the after-hours absence, the 1m/5m parity, and the cold-start
+  `mean(50, 150) == 100.0` check. A wrong or missing result still fails: if an event never arrives the wait times out
+  with a named message; if it arrives with the wrong value the original assertion fails (verified by mutation checks in
+  `TESTING.md`).
+- **Not changed (reported only).** `asyncio.sleep(0.x)` publish-then-assert waits remain in `test_feature_engine.py` and
+  other test files (e.g. `test_daily_levels.py`); they were out of scope here and are the suggested next conversions.
+  Five `__TEST_DL_*__` symbols from `test_daily_levels.py` were observed left in the sandbox test database after its
+  runs (not touched, not related to this change).
+<!-- END DELIVERY SECTION: vwap-ext-test-bounded-waits -->
+
 <!-- BEGIN DELIVERY SECTION: market-clock-next-session-boundary (backend + tests + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `market-clock-next-session-boundary`
 
