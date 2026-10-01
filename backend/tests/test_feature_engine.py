@@ -1047,7 +1047,10 @@ async def test_aggregated_timeframe_backfills_prior_bars_on_cold_start():
         try:
             for i in range(10):
                 await _publish_candle(bus, ticker, base + timedelta(minutes=i), 100.0 + i)
-            await asyncio.sleep(0.3)  # let the write-behind writer land all 10 rows
+            # Bounded wait (was `asyncio.sleep(0.3)`): all 10 rows must be
+            # committed before the recorder is stopped, else the fresh
+            # engine's backfill could see fewer than the two prior 5m buckets.
+            await _wait_until_candles_persisted(ticker, expected_count=10)
         finally:
             await recorder.stop()
 
@@ -1064,7 +1067,14 @@ async def test_aggregated_timeframe_backfills_prior_bars_on_cold_start():
             # Third 5m bucket (09:40-09:44), close=114.0.
             for i in range(10, 15):
                 await _publish_candle(bus, ticker, base + timedelta(minutes=i), 100.0 + i)
-            await asyncio.sleep(0.2)
+            # Bounded wait (was `asyncio.sleep(0.2)`): five 1m results plus the
+            # 5m bucket-close result, so the exactly-one-5m assertion below
+            # runs after the worker has handled every fed candle.
+            await _wait_until(
+                lambda: sum(1 for e in received if e.payload["timeframe"] == "1m") >= 5
+                and any(e.payload["timeframe"] == "5m" for e in received),
+                description=f"five 1m FeaturesUpdated events plus the 5m bucket-close event for {ticker}",
+            )
 
             five_min_events = [e for e in received if e.payload["timeframe"] == "5m"]
             assert len(five_min_events) == 1  # correct on the FIRST aggregated event after cold start
@@ -1253,7 +1263,9 @@ async def test_vwap_backfills_from_persisted_history_on_cold_start():
         try:
             await _publish_candle(bus, ticker, base, 100.0)
             await _publish_candle(bus, ticker, base + timedelta(minutes=1), 200.0)
-            await asyncio.sleep(0.3)
+            # Bounded wait (was `asyncio.sleep(0.3)`): both rows committed
+            # before the recorder is stopped.
+            await _wait_until_candles_persisted(ticker, expected_count=2)
         finally:
             await recorder.stop()
 
@@ -1264,7 +1276,9 @@ async def test_vwap_backfills_from_persisted_history_on_cold_start():
 
         try:
             await _publish_candle(bus, ticker, base + timedelta(minutes=2), 300.0)
-            await asyncio.sleep(0.2)
+            # Bounded wait (was `asyncio.sleep(0.2)`): the first post-restart
+            # FeaturesUpdated must arrive before its VWAP is asserted.
+            await _wait_until(lambda: len(received) >= 1, description=f"a FeaturesUpdated event for {ticker}")
 
             assert len(received) == 1
             # mean(100, 200, 300) — NOT just 300.0, which is what a fresh

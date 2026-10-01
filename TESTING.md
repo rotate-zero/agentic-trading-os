@@ -1,3 +1,31 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-cold-start-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `feature-engine-cold-start-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (the project defaults in `app/core/config.py`), created fresh in the sandbox and migrated with
+`alembic upgrade head` (revision `0016`). No external or production database and no broker touched. Python 3.12.3.
+Verified on `main` `91a3323`.
+
+All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_feature_engine.py -k cold_start -v` (before edit) | 4 passed |
+| `python -m pytest tests/test_feature_engine.py tests/test_candle_recorder.py -k "cold_start or backfill" -v` | 4 passed |
+| `python -m pytest tests/test_feature_engine.py -k cold_start -q` x10 | 10/10 passed (~2 s each) |
+| `python -m pytest tests/test_feature_engine.py -q` (whole file) | 81 passed |
+
+**Injected-delay check** (throwaway plugin outside the repo, adds `time.sleep(d)` to `CandleRecorder._write_one` and
+`FeatureEngine._compute_one`; `PYTHONPATH=/tmp/plug INJ_DELAY=<d> python -m pytest -p delayplug ...`):
+
+| Delay | Old tests | New tests |
+|---|---|---|
+| 60 ms | `test_aggregated_timeframe_backfills_prior_bars_on_cold_start` FAILED, vwap test passed | both passed |
+| 150 ms | not run | all 4 cold-start tests passed |
+
+Remaining failures: none.
+<!-- END DELIVERY SECTION: feature-engine-cold-start-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: daily-levels-test-cleanup (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `daily-levels-test-cleanup`
 

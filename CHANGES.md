@@ -1,3 +1,29 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-cold-start-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `feature-engine-cold-start-test-waits`
+
+Based on `main` `91a3323` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and
+`backend/tests/test_main_execution_pipeline.py` was not touched (owned by another session). **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file
+changed is `backend/tests/test_feature_engine.py`.
+
+- **Problem.** Two cold-start tests used fixed sleeps in both halves of the restart: `asyncio.sleep(0.3)` before
+  stopping the first `CandleRecorder` (guessing its write-behind writer had committed the candles) and
+  `asyncio.sleep(0.2)` after starting the fresh `FeatureEngine` (guessing its thread-offloaded compute had published).
+  Too-short sleeps stop the recorder before rows land (the fresh engine then backfills less history) or assert on a
+  partial event list.
+- **Edited** `backend/tests/test_feature_engine.py`, reusing the file's existing helpers (no new helper):
+  - `test_aggregated_timeframe_backfills_prior_bars_on_cold_start`: `_wait_until_candles_persisted(ticker, expected_count=10)`
+    before `recorder.stop()`; after feeding the third 5m bucket, `_wait_until` five 1m results **plus** the 5m
+    bucket-close result, so the exactly-one-5m assertion runs after the worker handled every fed candle.
+  - `test_vwap_backfills_from_persisted_history_on_cold_start`: `_wait_until_candles_persisted(ticker, expected_count=2)`
+    before `recorder.stop()`; `_wait_until(len(received) >= 1)` before asserting.
+- **Unchanged.** The restart shape (real recorder, stop, fresh engine, same bus), every count, close, `sma_3` and VWAP
+  assertion. The diff removes four sleep lines and no assertion line.
+- **Not changed (reported only).** Other fixed sleeps remain in this file (e.g. the remaining `asyncio.sleep(0.1/0.2)`
+  sites and `test_gap_backfills_regular_open_on_cold_start`'s `0.2` pair). Suggested next conversions.
+<!-- END DELIVERY SECTION: feature-engine-cold-start-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: daily-levels-test-cleanup (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `daily-levels-test-cleanup`
 
