@@ -1,3 +1,46 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-pipeline-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `position-monitor-pipeline-test-waits`
+
+Based on `main` `867846d` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and
+`backend/tests/test_feature_engine.py` was not touched (owned by another session). **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file
+changed is `backend/tests/test_main_execution_pipeline.py`.
+
+- **Problem.** `test_position_monitor_places_durable_exit_and_closes_on_later_tick` (both parametrized cases, stop and
+  target) drove the real FastAPI lifespan and pipeline but synchronized with five fixed `asyncio.sleep` guesses
+  (0.3, 0.3, 0.1, 0.8, 0.4 s). Any slower commit in the entry, fill, exit or close path made it assert on a half-finished
+  pipeline. With only 0.2 s injected per DB commit the unmodified test failed (see `TESTING.md`).
+- **Edited** `backend/tests/test_main_execution_pipeline.py`:
+  - New module helper `_wait_for(predicate, what, *, describe=None, timeout=10.0, interval=0.02)`: polls from the test
+    thread (the app runs on the TestClient portal's own loop thread, so polling never blocks the pipeline) and, on
+    timeout, fails with what it waited for and what the pipeline had actually reached.
+  - Each fixed sleep is replaced by a bounded wait for the milestone the next assertions need:
+    1. entry **approved and submitted** (`Trade.decision == "approved"` and entry `Order.status == "submitted"`; the
+       Execution Engine places the order at the venue *before* committing `submitted`, so this also means the venue can
+       fill it);
+    2. entry fill recorded, **position open**, one entry fill **and visible to the Position Monitor**, i.e.
+       `world_view_portfolio_reader.get_snapshot()` shows the position (see finding below);
+    3. **durable exit request** (`ExitRequest` row), the exit intent listed by `/intelligence/exit-intents`, and the
+       **close order `submitted`**;
+    4. **position closed** and **`PositionClosed` published**.
+- **Unchanged.** The full lifespan, the real event path (`bus.publish` of the price/opportunity envelopes and
+  `venue.ingest_tick`, as before), and every assertion, including realized P&L (-150 stop / +250 target), the exact
+  `/intelligence/exit-intents` bodies, the `{trade_id}:exit:1` close order, fill and receipt counts, the closed trade
+  and the shutdown checks. The diff removes exactly the five sleep lines and no assertion line. No pipeline component is
+  called directly; the new waits only read the ledger, the HTTP route and the existing `app.state` reader.
+- **Finding that shaped the wait (not a defect, no production change).** A DB `open` position is not yet enough to send
+  the trigger tick. `PositionMonitor._on_market_event` reads positions through `PortfolioState.get_snapshot()`, which
+  returns `None` until the Portfolio State worker has finished syncing the fill, and a tick seen while it is
+  unavailable is logged and dropped, not retried. The old 0.3 s + 0.1 s sleeps covered this implicitly. A throwaway
+  variant of the test waiting only on the DB row lost the trigger tick under a 0.15 s Portfolio State read delay and
+  timed out waiting for the exit request; the monitor-visible snapshot is therefore part of milestone 2.
+- **Not changed (reported only).** Fixed sleeps remain in other tests of this file
+  (`test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes` 0.3 s x2,
+  `test_partial_startup_rolls_back_before_serving_requests` 0.2 s); they were out of the named scope. They are the
+  obvious next conversions, and the new `_wait_for` is reusable for them.
+<!-- END DELIVERY SECTION: position-monitor-pipeline-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: feature-engine-cold-start-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `feature-engine-cold-start-test-waits`
 

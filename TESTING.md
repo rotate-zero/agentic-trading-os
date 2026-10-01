@@ -1,3 +1,43 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-pipeline-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `position-monitor-pipeline-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (the project defaults in `app/core/config.py`), created fresh in the sandbox and migrated with
+`alembic upgrade head` (revision `0016`). No external or production database and no broker touched. Python 3.12.3.
+Verified on `main` `867846d` (unchanged on `origin/main` at packaging).
+
+All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_main_execution_pipeline.py -q` (before edit) | 7 passed |
+| `python -m pytest tests/test_main_execution_pipeline.py -k position_monitor_places_durable -v` (before edit, x6) | 2 passed each (~5.4 s) |
+| `python -m pytest tests/test_main_execution_pipeline.py -k position_monitor_places_durable -v` (after edit) | both cases PASSED (`[89.0-stop-90.0-85.0--150]`, `[121.0-target-120.0-125.0-250]`), 2.3 s |
+| same command, 20 consecutive runs, no injected delay | 20/20 green (2 cases each) |
+| `python -m pytest tests/test_main_execution_pipeline.py tests/test_simulated_eod_integration.py tests/test_simulated_protective_session_retry.py tests/test_outcome_recorder_event_path_integration.py tests/test_execution_outcome_status_recorder_integration.py tests/test_execution_engine.py tests/test_exit_intents_route.py tests/test_position_monitor_engine.py tests/test_position_monitor_eod.py tests/test_portfolio_worker.py tests/test_simulated_venue.py tests/test_world_view_portfolio.py -q` | 162 passed |
+| `python -m pytest tests -q` (full backend suite) | 1582 passed |
+
+**Injected-delay check** (throwaway plugin outside the repo, adds `time.sleep(d)` to the thread-offloaded commits
+`PostgresOrderLedger.update_order_status`, `PostgresFillLedger.record_fill`, `PostgresExitLedger.observe_exit` /
+`prepare_exit` / `claim_dispatch` and `PostgresPositionLedger.commit_fill`;
+`PYTHONPATH=/tmp/plug INJ_DELAY=<d> python -m pytest -p delayplug tests/test_main_execution_pipeline.py -k position_monitor_places_durable -q`):
+
+| Delay per commit | Old test | New test |
+|---|---|---|
+| 0.1 s | 2 passed | 2 passed |
+| 0.2 s | **2 failed** (position never open in its window) | 2 passed |
+| 0.4 s | **failed** (entry order still `approved` at the first assertion) | 2 passed (8.1 s) |
+| 0.8 s | not run | 2 passed (15.3 s) |
+
+**Snapshot-visibility check** (second throwaway plugin delaying `PostgresPositionLedger.load_state` /
+`pending_fills` / `get_order`, plus a temporary copy of the test whose milestone 2 waits only on the DB row, deleted
+afterwards): at 0.15 s and 0.3 s read delay both cases of the copy **failed** with
+`timed out after 10.0s waiting for: durable exit request, exit intent listed and close order submitted (last observed: (False, [], 0))`
+(the trigger tick was dropped by the monitor); the real test passed (2 passed) at 0.3 s.
+
+Remaining failures: none. No pre-existing flakiness was attributed to this work.
+<!-- END DELIVERY SECTION: position-monitor-pipeline-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: feature-engine-cold-start-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `feature-engine-cold-start-test-waits`
 

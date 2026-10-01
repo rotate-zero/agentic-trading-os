@@ -19,6 +19,7 @@ construct a "process died mid-fill" scenario against this venue
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -136,6 +137,25 @@ def _price_envelope() -> EventEnvelope:
 
 def _opportunity_envelope() -> EventEnvelope:
     return EventEnvelope(event_type=EventType.OPPORTUNITY_CREATED, symbol=SYMBOL, payload=_opportunity_payload())
+
+
+def _wait_for(predicate, what, *, describe=None, timeout=10.0, interval=0.02):
+    """Poll `predicate()` until it is truthy, or fail with `what` after `timeout`.
+
+    Replaces fixed `asyncio.sleep` guesses with a bounded wait for the actual
+    pipeline milestone. Called from the test thread: the app (lifespan, bus,
+    workers) runs on the TestClient portal's own event-loop thread, so polling
+    here never blocks the pipeline. `describe()` (optional) is evaluated only on
+    timeout, to report what the pipeline had actually reached.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return
+        if time.monotonic() >= deadline:
+            seen = describe() if describe is not None else "n/a"
+            raise AssertionError(f"timed out after {timeout:.1f}s waiting for: {what} (last observed: {seen})")
+        time.sleep(interval)
 
 
 def test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes(monkeypatch):
@@ -345,7 +365,17 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
         bus.subscribe_all(lambda env: published.append(env))
         client.portal.call(bus.publish, _price_envelope())
         client.portal.call(bus.publish, _opportunity_envelope())
-        client.portal.call(asyncio.sleep, 0.3)
+
+        def entry_state() -> tuple:
+            with SessionLocal() as s:
+                trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
+                order = None if trade is None else s.scalar(select(Order).where(Order.trade_id == trade.trade_id))
+                return (None if trade is None else trade.decision, None if order is None else order.status)
+
+        # The engine places the order at the venue BEFORE committing "submitted",
+        # so this milestone also means the venue can now fill it.
+        _wait_for(lambda: entry_state() == ("approved", "submitted"),
+                  "entry approved and submitted", describe=entry_state)
 
         with SessionLocal() as s:
             trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
@@ -356,7 +386,24 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
         venue = broker_registry.get_execution_venue()
         assert venue is not None
         client.portal.call(venue.ingest_tick, SYMBOL, 100.0, NOW)
-        client.portal.call(asyncio.sleep, 0.3)
+
+        def open_position_state() -> tuple:
+            with SessionLocal() as s:
+                pos = s.scalar(select(Position).where(Position.trade_id == trade.trade_id))
+                fills = len(s.scalars(select(Fill).where(Fill.client_order_id == order.client_order_id)).all())
+                db = (None if pos is None else pos.status, fills)
+            # The Position Monitor reads positions through Portfolio State's snapshot,
+            # which is unavailable (None) until the worker has finished syncing the
+            # fill, and a tick seen before that is dropped, not retried. The
+            # trigger tick below must therefore wait for this reader too.
+            snapshot = fastapi_app.state.world_view_portfolio_reader.get_snapshot()
+            visible = snapshot is not None and any(
+                p.symbol == SYMBOL and p.qty > 0 for p in snapshot.positions.values())
+            return db + (visible,)
+
+        _wait_for(lambda: open_position_state() == ("open", 1, True),
+                  "entry filled, position open and visible to the Position Monitor",
+                  describe=open_position_state)
 
         with SessionLocal() as s:
             position = s.scalar(select(Position).where(Position.trade_id == trade.trade_id))
@@ -370,10 +417,19 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
                 payload=PriceUpdated(price=price, size=100, exchange_ts=NOW).model_dump(mode="json"),
             )
             client.portal.call(bus.publish, envelope)
-            client.portal.call(asyncio.sleep, 0.1)
 
         send_price(trigger_price)
-        client.portal.call(asyncio.sleep, 0.8)
+
+        def exit_state() -> tuple:
+            with SessionLocal() as s:
+                durable = s.scalar(select(ExitRequest).where(ExitRequest.position_id == position.position_id)) is not None
+                close_statuses = [o.status for o in s.scalars(select(Order).where(
+                    Order.trade_id == trade.trade_id, Order.position_effect == "close")).all()]
+            return durable, close_statuses, len(client.get("/intelligence/exit-intents").json()["exit_intents"])
+
+        _wait_for(lambda: exit_state() == (True, ["submitted"], 1),
+                  "durable exit request, exit intent listed and close order submitted",
+                  describe=exit_state)
         response = client.get("/intelligence/exit-intents")
         assert response.status_code == 200
         body = response.json()
@@ -406,7 +462,14 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
         venue = broker_registry.get_execution_venue()
         assert venue is not None
         client.portal.call(venue.ingest_tick, SYMBOL, fill_price, NOW)
-        client.portal.call(asyncio.sleep, 0.4)
+
+        def close_state() -> tuple:
+            with SessionLocal() as s:
+                status = s.get(Position, position.position_id).status
+            return status, EventType.POSITION_CLOSED in [event.event_type for event in list(published)]
+
+        _wait_for(lambda: close_state() == ("closed", True),
+                  "position closed and PositionClosed published", describe=close_state)
         with SessionLocal() as s:
             closed = s.get(Position, position.position_id)
             assert closed.status == "closed" and closed.qty == 0
