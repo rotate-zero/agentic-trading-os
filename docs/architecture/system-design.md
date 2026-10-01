@@ -285,10 +285,30 @@ class MarketClock:
     def is_holiday(self, date: date) -> bool: ...
     def is_half_day(self, date: date) -> bool: ...
     def minutes_since_open(self, ts: datetime = None) -> int: ...
-    def next_session_boundary(self) -> datetime: ...
+    def next_session_boundary(self, ts: datetime = None) -> datetime: ...   # next instant current_session() changes
     def session_bounds(self, ts: datetime = None) -> tuple[datetime, datetime] | None: ...
 ```
 Handles exchange holidays, half-days, and DST in one place. Its holiday and 13:00 ET early-close tables are verified against the official NYSE calendar for 2026-2028 only (`has_calendar_for_year()` reports exactly those years); outside them the session methods know no holidays or early closes rather than raising, so callers that must fail closed (the EOD window, `core.session_window`) check `has_calendar_for_year()` themselves. The Scanner's cadence schedule (§4.7) and the Strategy Scheduler (§4.8) both key off `current_session()` rather than raw wall-clock math.
+
+`next_session_boundary()` returns the next instant strictly after `ts` at which `current_session()` changes, so a consumer sleeping on it (the Context Engine's boundary loop, decision #92) wakes only at real state changes. A weekend or verified holiday has no boundary of its own (the session stays CLOSED all day), a verified half-day contributes its 13:00 ET close and no later boundary, and the last boundary of a trading day is followed by the next trading day's 04:00 pre-market open. The result is timezone-aware in the clock's zone. Unverified years keep the existing behavior (no holidays/early closes known, weekends skipped), so `has_calendar_for_year()` still decides whether a caller may trust that answer.
+
+```text
+ts (aware, any zone) --_now()--> ET wall clock
+        |
+        v
+day = ET date of ts
+   +--> _boundary_times(day) ------------------------------------------+
+   |       weekend or is_holiday(day)  -> []        (CLOSED all day)     |
+   |       is_half_day(day)            -> 04:00 09:30 11:30 13:00       |
+   |       otherwise                   -> 04:00 09:30 11:30 14:30 16:00 20:00
+   |                                                                    |
+   +--< first time whose instant is strictly > ts ? -- yes --> return it (ET-aware)
+   |                         no (or empty list)
+   +--> day + 1, repeat   (day's last boundary -> next trading day 04:00)
+
+Context Engine _loop:  evaluate_all() -> boundary = next_session_boundary()
+                       -> asyncio.sleep(boundary - now) -> evaluate_all() -> ...
+```
 
 `session_bounds()` (decision #44) is the anchor candle aggregation buckets off of (§4.2) — `open`/`lunch`/`power_hour` collapse to one continuous "regular session" domain for this purpose (same bounds for all three), so a bucket only ever resets at a genuine session-type change (pre-market → regular, regular → after-hours), never at the lunch/power-hour sub-boundaries `current_session()` still distinguishes for other callers.
 

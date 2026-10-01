@@ -1,3 +1,44 @@
+<!-- BEGIN DELIVERY SECTION: market-clock-next-session-boundary (backend + tests + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `market-clock-next-session-boundary`
+
+Based on `main` `93f6d2a` (re-checked against `origin/main` before packaging: no newer commits). **No new decision
+number:** this corrects `MarketClock.next_session_boundary()` to behave as decisions #92 and #44's contract and the
+verified 2026-2028 calendar already imply; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched.
+No Context Engine, scheduler, API, schema, migration or frontend file was edited; **no caller defect was found.**
+
+- **Defect.** `next_session_boundary()` built every window start/end as same-day wall-clock times and only walked
+  forward once *none* were left today. On a weekend or verified holiday (session CLOSED all day) it therefore still
+  returned same-day times such as 04:00/09:30/…/20:00 that are not session changes, and on a configured half-day it
+  returned 14:30/16:00/20:00 even though the session closes at 13:00 and never reopens, never returning the actual
+  13:00 close.
+- **Fix** (`backend/app/core/market_clock.py`): a new private `_boundary_times(d)` returns the real session-state
+  change times for a date, mirroring `current_session()`: weekend or `is_holiday()` -> none; `is_half_day()` -> 04:00,
+  09:30, 11:30, 13:00; otherwise -> 04:00, 09:30, 11:30, 14:30, 16:00, 20:00. `next_session_boundary()` now walks day
+  by day and returns the first boundary strictly after `ts`; after a day's last boundary the next one is the next
+  trading day's 04:00 pre-market open. Normal-day boundaries, the strictly-after rule (exactly at a boundary returns
+  the following one), clock-zone timezone-aware results, and the naive-`ts` `ValueError` are unchanged. One private
+  constant `_HALF_DAY_CLOSE = time(13, 0)` was added; the existing literal `time(13, 0)` uses elsewhere in the file
+  were left alone.
+- **Caller impact (`ContextEngine._loop`, `backend/app/context_engine/engine.py`, unchanged).** The loop sleeps until
+  `next_session_boundary()` and re-evaluates. It no longer wakes at meaningless times on closed days, and on a
+  half-day it now wakes at the 13:00 close (previously it kept the stale pre-close state until 14:30). The loop's
+  `datetime.now(boundary.tzinfo)` / `max(..., 0)` arithmetic is correct for the aware result.
+- **Unverified years (not extended, not claimed).** `_VERIFIED_CALENDAR_YEARS` is still `{2026, 2027, 2028}`;
+  `has_calendar_for_year(2029)` is still `False`. For an unverified year `is_holiday()`/`is_half_day()` still answer
+  `False` and never raise, so `next_session_boundary()` there skips weekends only: e.g. from Fri 2028-12-29 20:00 ET
+  it returns Mon 2029-01-01 04:00 although 2029-01-01 is in reality an NYSE holiday. That limit is the same one the
+  earlier `market-clock-2027-2028-coverage` note recorded; callers needing a trusted answer still check
+  `has_calendar_for_year()` first.
+- **Docs:** `docs/architecture/system-design.md` §4.3 (signature takes optional `ts`; contract paragraph plus a
+  data-flow/internal-flow diagram including the Context Engine loop) and `docs/architecture/execution-engine-design.md`
+  (the calendar diagram's "next_session_boundary (unchanged ...)" note corrected). Earlier `CHANGES.md` history is
+  left as written.
+- **Tests** (`backend/tests/test_market_clock.py`, 8 new): covered holiday, weekend, normal-day sequence, half-days
+  2026-11-27, 2026-12-24, 2027-11-26, 2028-07-03 and 2028-11-24, covered year crossings (2027->2028 and 2026->2027),
+  timezone-aware/UTC-input/DST results, a minute-by-minute oracle over six covered windows, and the 2029 unverified
+  behavior. Every case checks the session immediately before and at the returned boundary. Results in `TESTING.md`.
+<!-- END DELIVERY SECTION: market-clock-next-session-boundary -->
+
 <!-- BEGIN DELIVERY SECTION: eod-partial-fill-test-order (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `eod-partial-fill-test-order`
 

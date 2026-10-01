@@ -1,3 +1,38 @@
+<!-- BEGIN DELIVERY SECTION: market-clock-next-session-boundary (backend + tests + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `market-clock-next-session-boundary`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE USER trading ... SUPERUSER`), `alembic upgrade head` (revision `0016`). Dropped, recreated and
+re-migrated before the final full run (a first full run was killed mid-way by the sandbox and a second, on that
+leftover data, showed 91 ledger/execution failures from stale rows; the wiped-DB rerun below is the authoritative one).
+No external or production database and no broker touched. Python 3.12.3. Base `main` `93f6d2a`.
+
+- **Focused:** `cd backend && python -m pytest tests/test_market_clock.py -q` -> **25 passed** (17 existing + 8 new).
+- **Relevant Context Engine / clock tests:** `python -m pytest tests/test_context_engine.py tests/test_calendar_provider.py
+  tests/test_session_window.py tests/test_market_clock.py -q` -> **113 passed**.
+- **Full suite, wiped DB:** `python -m pytest -q -rf` -> **1580 passed, 1 warning in 126.23 s**. Collection on the
+  untouched base is 1572, so the delta is exactly the 8 new tests, with zero regressions.
+- **Regression guard:** with the pre-change `market_clock.py` restored and the new tests kept, `test_market_clock.py`
+  gives **7 failed, 18 passed**: the holiday, weekend, half-day, year-crossing, timezone, minute-oracle and 2029 tests
+  fail on the old code; the normal-day sequence test passes on both, confirming normal sessions are unchanged.
+
+New tests, all pure (no database), each asserting that the returned boundary is strictly after `ts`, aware, that the
+session at `boundary - 1 microsecond` differs from the session at `boundary`, and that the session at `ts` equals the
+session just before the boundary (no skipped transition):
+`test_boundary_on_covered_holiday_skips_to_next_trading_day_pre_market` (Thanksgiving 2026 at eight instants, 2026-07-03
+observed holiday into a weekend), `test_boundary_on_weekend_skips_to_monday_pre_market`,
+`test_boundary_normal_session_day_sequence_is_unchanged` (04:00, 09:30, 11:30, 14:30, 16:00, 20:00, next day 04:00;
+exact-boundary and sub-minute probes), `test_boundary_half_day_close_2026_2027_2028` (13:00 close for all five
+configured half-days: LUNCH at 12:59:59.999999, CLOSED at 13:00, `is_market_open` flips, then next trading day 04:00),
+`test_boundary_covered_year_crossing_2027_to_2028` (also 2026->2027), `test_boundary_results_are_timezone_aware_in_clock_zone_for_any_input_zone`
+(UTC input, EST/EDT offsets across the 2027-03-14 shift, naive input still `ValueError`),
+`test_boundary_matches_minute_by_minute_session_changes_across_covered_windows` (oracle over six windows, probes every
+15 minutes), and `test_unverified_year_2029_keeps_existing_behavior_and_is_not_claimed_covered`.
+
+Not run: frontend checks (no frontend file changed). No test exercises `ContextEngine._loop` sleep timing directly;
+the existing Context Engine tests pass unchanged.
+<!-- END DELIVERY SECTION: market-clock-next-session-boundary -->
+
 <!-- BEGIN DELIVERY SECTION: eod-partial-fill-test-order (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `eod-partial-fill-test-order`
 

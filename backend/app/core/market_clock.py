@@ -62,6 +62,7 @@ _REGULAR_SESSION_LABELS = {Session.OPEN, Session.LUNCH, Session.POWER_HOUR}
 
 _MARKET_OPEN = time(9, 30)
 _MARKET_CLOSE = time(16, 0)
+_HALF_DAY_CLOSE = time(13, 0)
 
 # NYSE full-day equity closures and 13:00 ET equity early closes, verified
 # against https://www.nyse.com/trade/hours-calendars (checked 2026-09-30, which
@@ -253,27 +254,41 @@ class MarketClock:
         """
         return self._now(ts).date()
 
+    def _boundary_times(self, d: date) -> list[time]:
+        """Session-state change times (ET wall clock, ascending) on date `d`.
+
+        Mirrors `current_session()` exactly: a weekend or holiday never
+        changes state (it stays CLOSED all day), a half-day runs the normal
+        windows only up to its 13:00 close (so 14:30/16:00/20:00 never
+        happen), and any other day changes state at every window start and
+        end. Unverified years follow `is_holiday()`/`is_half_day()` (no
+        holidays, no early closes), unchanged.
+        """
+        if d.weekday() >= 5 or self.is_holiday(d):
+            return []
+        times = sorted({w.start for w in _SESSION_WINDOWS} | {w.end for w in _SESSION_WINDOWS})
+        if self.is_half_day(d):
+            return [t for t in times if t < _HALF_DAY_CLOSE] + [_HALF_DAY_CLOSE]
+        return times
+
     def next_session_boundary(self, ts: datetime | None = None) -> datetime:
+        """The next instant strictly after `ts` at which `current_session()` changes.
+
+        Walks forward day by day using `_boundary_times()`, so closed days
+        (weekends, verified holidays) contribute no boundary, a configured
+        half-day contributes its 13:00 ET close, and the first boundary after
+        a day's last one is the next trading day's pre-market open. The
+        result is timezone-aware in the clock's own zone. Callers that must
+        not guess an unverified year ask `has_calendar_for_year()` first.
+        """
         now = self._now(ts)
-        # Every window's start AND end, deduped — subsumes the old
-        # "just append market close" approach, which predated AFTER_HOURS
-        # existing at all and so had no way to represent 20:00 as a
-        # boundary (only 16:00, via _MARKET_CLOSE, was ever a candidate).
-        boundary_times = sorted({w.start for w in _SESSION_WINDOWS} | {w.end for w in _SESSION_WINDOWS})
-        candidates = [
-            now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0) for t in boundary_times
-        ]
-
-        for boundary in sorted(candidates):
-            if boundary > now:
-                return boundary
-
-        # Nothing left today — walk forward to the next non-holiday weekday's pre-market open.
-        next_day = now.date() + timedelta(days=1)
-        while next_day.weekday() >= 5 or self.is_holiday(next_day):
-            next_day += timedelta(days=1)
-        first_window = _SESSION_WINDOWS[0]
-        return datetime.combine(next_day, first_window.start, tzinfo=self._tz)
+        day = now.date()
+        while True:
+            for t in self._boundary_times(day):
+                boundary = datetime.combine(day, t, tzinfo=self._tz)
+                if boundary > now:
+                    return boundary
+            day += timedelta(days=1)
 
 
 _market_clock: MarketClock | None = None

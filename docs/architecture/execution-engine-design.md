@@ -1574,8 +1574,8 @@ market_clock.py  _HOLIDAYS_<year> / _HALF_DAYS_<year>   _VERIFIED_CALENDAR_YEARS
 is_holiday(d) / is_half_day(d)      \                            |
         |                            \                           |
         +--> current_session, is_market_open, session_bounds,    |
-        |    next_session_boundary (unchanged; unverified year = |
-        |    no holidays/early closes, never raises)             |
+        |    next_session_boundary (skips closed days, 13:00 half-|
+        |    day close; unverified year = no holidays, no raise) |
         +--> Backtest Runner regular_session_close_utc           |
         +--> core.session_window.eod_session_window <------------+
                        |  unverified entry year -> UnsupportedEodCalendarError

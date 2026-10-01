@@ -5,7 +5,7 @@ pure wall-clock logic.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from app.core.market_clock import MarketClock, Session
@@ -199,3 +199,165 @@ def test_next_session_boundary_skips_2027_2028_holidays_and_year_end():
     assert clock.next_session_boundary(_et(2027, 12, 31, 20, 0)) == _et(2028, 1, 3, 4, 0)
     # Fri 2028-01-14 close -> Mon 01-17 (MLK) -> Tue 01-18.
     assert clock.next_session_boundary(_et(2028, 1, 14, 20, 0)) == _et(2028, 1, 18, 4, 0)
+
+
+# --- next_session_boundary on verified calendar dates (market-clock-next-session-boundary) ---
+# Contract: the next instant strictly after `ts` at which current_session() changes.
+
+_MICRO = timedelta(microseconds=1)
+
+
+def _assert_real_boundary(clock: MarketClock, ts: datetime, expected: datetime) -> datetime:
+    """Returns `expected` exactly, aware, strictly after `ts`, and is a real session-state change:
+    the session is constant from `ts` up to the instant before the boundary (no skipped transition)
+    and differs at the boundary itself."""
+    boundary = clock.next_session_boundary(ts)
+    assert boundary == expected
+    assert boundary.tzinfo is not None and boundary.utcoffset() is not None
+    assert boundary > ts
+    before, at = clock.current_session(boundary - _MICRO), clock.current_session(boundary)
+    assert before != at
+    assert clock.current_session(ts) == before
+    return boundary
+
+
+def test_boundary_on_covered_holiday_skips_to_next_trading_day_pre_market():
+    clock = MarketClock()
+    # Thu 2026-11-26 Thanksgiving: CLOSED all day; before the fix every call returned a same-day time.
+    for hh, mm in [(0, 0), (3, 59), (4, 0), (9, 30), (12, 0), (16, 0), (19, 59), (23, 59)]:
+        ts = _et(2026, 11, 26, hh, mm)
+        assert clock.current_session(ts) == Session.CLOSED
+        # Fri 2026-11-27 is a half-day whose pre-market still opens at 04:00.
+        _assert_real_boundary(clock, ts, _et(2026, 11, 27, 4, 0))
+    # Holiday followed by a weekend: Fri 2026-07-03 (observed) -> Mon 07-06.
+    _assert_real_boundary(clock, _et(2026, 7, 3, 10, 0), _et(2026, 7, 6, 4, 0))
+    # From the prior trading day's after-hours close the holiday is skipped too.
+    _assert_real_boundary(clock, _et(2026, 11, 25, 20, 0), _et(2026, 11, 27, 4, 0))
+
+
+def test_boundary_on_weekend_skips_to_monday_pre_market():
+    clock = MarketClock()
+    for ts in [_et(2026, 8, 15, 0, 0), _et(2026, 8, 15, 12, 0), _et(2026, 8, 16, 23, 59)]:  # Sat, Sat, Sun
+        assert clock.current_session(ts) == Session.CLOSED
+        _assert_real_boundary(clock, ts, _et(2026, 8, 17, 4, 0))
+    # Friday after-hours close -> Monday, not Saturday.
+    _assert_real_boundary(clock, _et(2026, 8, 14, 20, 0), _et(2026, 8, 17, 4, 0))
+
+
+def test_boundary_normal_session_day_sequence_is_unchanged():
+    clock = MarketClock()
+    # Tue 2026-08-11: every state change, in order, then the next trading day's pre-market open.
+    sequence = [(4, 0), (9, 30), (11, 30), (14, 30), (16, 0), (20, 0)]
+    ts = _et(2026, 8, 11, 0, 0)
+    for hh, mm in sequence:
+        ts = _assert_real_boundary(clock, ts, _et(2026, 8, 11, hh, mm))
+    _assert_real_boundary(clock, ts, _et(2026, 8, 12, 4, 0))
+    # Strictly after: exactly at a boundary returns the following one; sub-minute instants round up.
+    assert clock.next_session_boundary(_et(2026, 8, 11, 9, 30)) == _et(2026, 8, 11, 11, 30)
+    assert clock.next_session_boundary(datetime(2026, 8, 11, 9, 29, 59, 999999, tzinfo=_ET)) == _et(2026, 8, 11, 9, 30)
+
+
+def test_boundary_half_day_close_2026_2027_2028():
+    clock = MarketClock()
+    # (half-day, next trading day's pre-market open)
+    cases = [
+        (date(2026, 11, 27), date(2026, 11, 30)),  # Fri -> Mon
+        (date(2026, 12, 24), date(2026, 12, 28)),  # Thu; Fri 12-25 Christmas, weekend -> Mon
+        (date(2027, 11, 26), date(2027, 11, 29)),  # Fri -> Mon
+        (date(2028, 7, 3), date(2028, 7, 5)),      # Mon; Tue 07-04 holiday -> Wed
+        (date(2028, 11, 24), date(2028, 11, 27)),  # Fri -> Mon
+    ]
+    for half, nxt in cases:
+        assert clock.is_half_day(half)
+        y, m, d = half.year, half.month, half.day
+        # From 11:30 the next change is the 13:00 close, not 14:30/16:00/20:00.
+        _assert_real_boundary(clock, _et(y, m, d, 4, 0), _et(y, m, d, 9, 30))
+        _assert_real_boundary(clock, _et(y, m, d, 9, 30), _et(y, m, d, 11, 30))
+        _assert_real_boundary(clock, _et(y, m, d, 10, 0), _et(y, m, d, 11, 30))
+        close = _assert_real_boundary(clock, _et(y, m, d, 11, 30), _et(y, m, d, 13, 0))
+        assert clock.current_session(close - _MICRO) == Session.LUNCH
+        assert clock.current_session(close) == Session.CLOSED
+        assert not clock.is_market_open(close) and clock.is_market_open(close - _MICRO)
+        # From the close (and anywhere after it that day) -> next trading day 04:00.
+        for hh, mm in [(13, 0), (14, 30), (16, 0), (20, 0)]:
+            _assert_real_boundary(clock, _et(y, m, d, hh, mm), datetime.combine(nxt, time(4, 0), tzinfo=_ET))
+
+
+def test_boundary_covered_year_crossing_2027_to_2028():
+    clock = MarketClock()
+    # Thu 2027-12-30 closes at 20:00 -> Fri 12-31 04:00 (a trading day).
+    _assert_real_boundary(clock, _et(2027, 12, 30, 20, 0), _et(2027, 12, 31, 4, 0))
+    # Fri 2027-12-31 runs its normal day, then Sat/Sun and Mon 2028-01-03 (2028-01-01 is not a holiday, just a Saturday).
+    ts = _et(2027, 12, 31, 14, 30)
+    ts = _assert_real_boundary(clock, ts, _et(2027, 12, 31, 16, 0))
+    ts = _assert_real_boundary(clock, ts, _et(2027, 12, 31, 20, 0))
+    _assert_real_boundary(clock, ts, _et(2028, 1, 3, 4, 0))
+    # Weekend days inside the crossing never produce a boundary of their own.
+    for ts in [_et(2028, 1, 1, 4, 0), _et(2028, 1, 1, 12, 0), _et(2028, 1, 2, 9, 30)]:
+        _assert_real_boundary(clock, ts, _et(2028, 1, 3, 4, 0))
+    # 2026 -> 2027: Thu 2026-12-31 close -> Fri 2027-01-01 is a holiday -> Mon 2027-01-04.
+    _assert_real_boundary(clock, _et(2026, 12, 31, 20, 0), _et(2027, 1, 4, 4, 0))
+
+
+def test_boundary_results_are_timezone_aware_in_clock_zone_for_any_input_zone():
+    clock = MarketClock()
+    utc = ZoneInfo("UTC")
+    # 2026-11-26 15:00Z (Thanksgiving, 10:00 ET) -> Fri 11-27 04:00 ET == 09:00Z.
+    b = clock.next_session_boundary(datetime(2026, 11, 26, 15, 0, tzinfo=utc))
+    assert b == datetime(2026, 11, 27, 9, 0, tzinfo=utc)
+    assert b.tzinfo == _ET and b.utcoffset() == timedelta(hours=-5)
+    # DST: Sat 2027-03-13 -> Mon 2027-03-15 04:00 EDT (08:00Z) after the 03-14 shift.
+    b = clock.next_session_boundary(_et(2027, 3, 13, 12, 0))
+    assert b == _et(2027, 3, 15, 4, 0) and b.utcoffset() == timedelta(hours=-4)
+    assert b.astimezone(utc) == datetime(2027, 3, 15, 8, 0, tzinfo=utc)
+    # Naive input is still rejected.
+    try:
+        clock.next_session_boundary(datetime(2026, 8, 11, 12, 0))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("naive datetime must raise ValueError")
+
+
+def test_boundary_matches_minute_by_minute_session_changes_across_covered_windows():
+    """Oracle: walk each window one minute at a time, record every instant current_session() changes,
+    and require next_session_boundary() from probes in the window to return the first change after it."""
+    clock = MarketClock()
+    windows = [
+        (_et(2027, 12, 20, 0, 0), _et(2028, 1, 6, 0, 0)),   # covered year crossing, Christmas observed
+        (_et(2026, 11, 23, 0, 0), _et(2026, 12, 1, 0, 0)),  # Thanksgiving + 2026 half-day
+        (_et(2026, 12, 21, 0, 0), _et(2026, 12, 30, 0, 0)), # 2026-12-24 half-day, Christmas
+        (_et(2027, 11, 22, 0, 0), _et(2027, 11, 30, 0, 0)), # 2027 half-day
+        (_et(2028, 6, 30, 0, 0), _et(2028, 7, 7, 0, 0)),    # 2028-07-03 half-day, 07-04 holiday
+        (_et(2028, 11, 20, 0, 0), _et(2028, 11, 28, 0, 0)), # 2028 half-day
+    ]
+    for start, end in windows:
+        minutes, ts = [], start
+        while ts <= end + timedelta(days=5):
+            minutes.append(ts)
+            ts += timedelta(minutes=1)
+        changes = [m for prev, m in zip(minutes, minutes[1:]) if clock.current_session(prev) != clock.current_session(m)]
+        idx = 0
+        for probe in minutes:
+            if probe > end:
+                break
+            if probe.minute % 15 or probe.second:  # probe every quarter hour, includes every boundary minute
+                continue
+            while changes[idx] <= probe:
+                idx += 1
+            assert clock.next_session_boundary(probe) == changes[idx], probe
+
+
+def test_unverified_year_2029_keeps_existing_behavior_and_is_not_claimed_covered():
+    """2029 is NOT verified calendar data. `has_calendar_for_year(2029)` stays False, and the session
+    methods keep treating an unverified year as having no holidays/early closes (never raising), so
+    next_session_boundary() there skips weekends only. Holiday correctness is a verified-year property."""
+    clock = MarketClock()
+    assert clock.has_calendar_for_year(2028) is True
+    assert clock.has_calendar_for_year(2029) is False
+    assert clock.is_holiday(date(2029, 1, 1)) is False and clock.is_half_day(date(2029, 11, 23)) is False
+    # Weekend skip still works (Fri 2029-03-02 close -> Mon 03-05).
+    assert clock.next_session_boundary(_et(2029, 3, 2, 20, 0)) == _et(2029, 3, 5, 4, 0)
+    assert clock.next_session_boundary(_et(2029, 3, 3, 12, 0)) == _et(2029, 3, 5, 4, 0)
+    # An ordinary 2029 weekday keeps the normal sequence and never raises.
+    assert clock.next_session_boundary(_et(2029, 3, 6, 9, 30)) == _et(2029, 3, 6, 11, 30)
