@@ -1,3 +1,53 @@
+<!-- BEGIN DELIVERY SECTION: execution-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-engine-test-waits`
+
+Based on `main` `cbf3735` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and
+`backend/tests/test_main_execution_pipeline.py` was not touched (owned by another session). **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file
+changed is `backend/tests/test_execution_engine.py`.
+
+- **Problem.** Nine orchestration tests in this file synchronized with fixed `asyncio.sleep` guesses: eight with
+  `sleep(0.1)` (the duplicate test twice) and `test_critical_lane_not_blocked_by_slow_venue_call` with `sleep(0.05)`,
+  `sleep(0.1)` and a final `sleep(1.0)`. Under slow ledger commits the positive tests asserted before the order was processed, and the two "nothing
+  happened" tests (`close` dropped, malformed ID dropped) could pass without the input ever having been handled.
+- **Edited** `backend/tests/test_execution_engine.py` (new test-local helpers; no production seam added):
+  - `_wait_until(predicate, description, ...)` — polls (5 ms) for a positive signal up to a 5 s bound and fails with
+    what was observed on timeout.
+  - `_track_processing(engine)` — wraps that engine **instance's** `_process_one` and records the `order_id` of every
+    queued `OrderApproved` the worker has finished handling (returned or raised). It is the positive "this exact input
+    was processed" signal for tests whose expected outcome is nothing.
+  - `_wait_order_processed(bus, processed, order_id, count=1)` — barrier: waits for the engine to finish `count`
+    item(s) for `order_id`, then joins both bus lanes. `asyncio.Queue` counts an envelope finished only after every
+    subscriber returned, so any `OrderStatusChanged` the engine published has reached its subscribers.
+  - **Positive tests** (happy path, authorization gate, no venue, mode not supported, venue rejection ack) wait for the
+    expected ledger update or published event, then run the barrier, then make the unchanged assertions. The happy-path
+    "no `OrderStatusChanged`" and the mode-not-supported "never routed" assertions now run only after the barrier.
+  - **Duplicate test.** Waits for the first delivery to be fully processed, publishes the duplicate, and waits until
+    the engine has finished **two** items for that ID before asserting one venue call and one ledger row.
+  - **Absence tests** (`close` dropped, malformed ID dropped). Assert absence only after the engine has finished that
+    exact input and the bus is flushed.
+  - **`_FakeVenue`.** The unused-elsewhere `delay` parameter is replaced by an optional `release` event plus an
+    always-present `entered` event set when `place_order()` is reached; with `release`, placement blocks until the test
+    sets it.
+  - **`test_critical_lane_not_blocked_by_slow_venue_call`.** Waits for `entered` (placement provably in flight),
+    asserts `release` unset and no ledger status update, publishes `PlanRejected`, waits for its delivery, then asserts
+    it was delivered **while the venue was still blocked** and within 0.5 s of publishing (the prompt-delivery bound
+    is kept, now measured from the publish call). Then it sets `release`, waits for the ledger `submitted` update
+    (replacing the final `sleep(1.0)`), and `finally` sets `release` again before `engine.stop()` / `bus.stop()` so
+    teardown cannot hang on a blocked venue call.
+- **Unchanged.** Every substantive assertion (ledger rows and status updates, event payload reasons, one venue call for
+  a duplicate, `place_order_calls == []`, `PlanRejected` delivery and its 0.5 s bound) and the
+  `test_execution_engine_package_imports_no_concrete_broker_module_at_module_scope` test. No assertion was removed or
+  weakened. Added assertions are limited to the critical-lane test (venue still blocked, ledger untouched while
+  blocked, `submitted` update after release).
+- **Uncovered product defect:** none found. The barrier relies on private attributes (`engine._queue`, `bus._critical_queue`,
+  `bus._normal_queue`, `engine._process_one`); the file already reads engine privates (`_venue_provider`).
+- **Observed, not changed (related follow-up only).** `ExecutionEngine.stop()` is a poison-pill drain that awaits the
+  worker with no timeout, so a venue `place_order()` that never returns would hang shutdown. The critical-lane test
+  therefore releases its fake venue in `finally`. No production change was made.
+<!-- END DELIVERY SECTION: execution-engine-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: main-pipeline-restart-rollback-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `main-pipeline-restart-rollback-test-waits`
 

@@ -1,3 +1,46 @@
+<!-- BEGIN DELIVERY SECTION: execution-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `execution-engine-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (the project defaults in `app/core/config.py`), created fresh in the sandbox and migrated with
+`alembic upgrade head` (revision `0016`). No external or production database and no broker touched. Python 3.12.3.
+`test_execution_engine.py` itself uses only fakes and a real in-process `EventBus` (no database).
+Verified on `main` `cbf3735` (unchanged on `origin/main` at packaging).
+
+All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_execution_engine.py -q` (before edit) | 10 passed (2.8 s) |
+| `python -m pytest tests/test_execution_engine.py -q` (whole file, after edit) | 10 passed (0.7 s) |
+| same command, 20 consecutive runs, no injected delay | 20/20 green |
+| 26 neighbouring files (`tests/test_execution_*.py` except this file and `test_main_execution_pipeline.py`, `test_event_bus.py`, `test_exit_*.py`, `test_fill_*.py`, `test_simulated_*.py`, `test_position_monitor_*.py`, `test_portfolio_*.py`) | 405 passed (17 s) |
+
+`tests/test_main_execution_pipeline.py` was not run or edited (owned by another session).
+
+**Injected-delay check** (throwaway plugin outside the repo adds `time.sleep(d)` to the fake ledger's
+`insert_order` and `update_order_status`, which the engine runs via `asyncio.to_thread`;
+`PYTHONPATH=/tmp/plug INJ_DELAY=<d> python -m pytest -p delayplug <file> -q`; "old" is `cbf3735`'s file run from a copy):
+
+| Delay per ledger call | Old tests | New tests |
+|---|---|---|
+| 0 | 10 passed | 10 passed |
+| 0.1 s | **4 failed** (happy path, no venue, mode not supported, venue rejection ack) | 10 passed (2.0 s) |
+| 0.2 s | **4 failed** (same four) | 10 passed (3.3 s) |
+| 0.5 s | **5 failed** (the four plus the duplicate test) | 10 passed (7.2 s) |
+
+**Mutation checks** (throwaway plugins outside the repo; production code untouched):
+
+| Mutation | Old test | New test |
+|---|---|---|
+| Engine stops dropping `close` orders (treats them as an entry), 0.3 s ledger delay | `test_close_position_effect_is_dropped_not_processed` **passed** (vacuous: the sleep ended before the insert) | **failed** (ledger row found) |
+| `_on_order_approved` runs `_process_one` inline on the bus critical lane (violates I7) | failed (`PlanRejected should have been delivered promptly`) | **failed** in 5.4 s with `timed out after 5.0s waiting for PlanRejected delivery while the venue call is blocked; observed: []`; teardown did not hang because the venue is released in `finally` |
+
+Not run in this delivery: the full backend suite (the neighbouring set above was run instead).
+
+Remaining failures: none. No pre-existing flakiness was attributed to anything other than the removed fixed sleeps.
+<!-- END DELIVERY SECTION: execution-engine-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: main-pipeline-restart-rollback-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `main-pipeline-restart-rollback-test-waits`
 

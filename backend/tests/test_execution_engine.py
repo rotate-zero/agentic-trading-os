@@ -67,12 +67,16 @@ class _FakeVenue:
         venue_id: str = "fake-venue",
         supported_modes: frozenset[str] = frozenset({"simulated"}),
         ack: VenueAck = VenueAck(status="submitted"),
-        delay: float = 0.0,
+        release: asyncio.Event | None = None,
     ) -> None:
         self._venue_id = venue_id
         self._supported_modes = supported_modes
         self._ack = ack
-        self._delay = delay
+        # `entered` is set the moment place_order() is reached. When a `release`
+        # event is supplied, place_order() then blocks until the test sets it,
+        # so a test controls exactly how long placement stays in flight.
+        self._release = release
+        self.entered = asyncio.Event()
         self.place_order_calls: list[VenueOrderInstruction] = []
 
     @property
@@ -94,8 +98,9 @@ class _FakeVenue:
 
     async def place_order(self, instruction: VenueOrderInstruction) -> VenueAck:
         self.place_order_calls.append(instruction)
-        if self._delay:
-            await asyncio.sleep(self._delay)
+        self.entered.set()
+        if self._release is not None:
+            await self._release.wait()
         return self._ack
 
     async def cancel_order(self, client_order_id: str) -> None:
@@ -137,6 +142,61 @@ async def _publish_order_approved(bus: EventBus, **overrides) -> None:
     await bus.publish(envelope)
 
 
+_WAIT_TIMEOUT = 5.0  # generous upper bound; a healthy wait returns within milliseconds
+
+
+async def _wait_until(predicate, description: str, *, timeout: float = _WAIT_TIMEOUT, describe=None) -> None:
+    """Poll for a positive completion signal, failing with what was observed
+    if it never arrives within `timeout` (never a fixed guess-the-delay sleep)."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            observed = f"; observed: {describe()!r}" if describe is not None else ""
+            pytest.fail(f"timed out after {timeout}s waiting for {description}{observed}")
+        await asyncio.sleep(0.005)
+
+
+def _track_processing(engine: ExecutionEngine) -> list[str]:
+    """Record the order_id of every queued OrderApproved the engine's worker has
+    FINISHED handling (returned or raised). It wraps the engine instance's
+    `_process_one` only — no production code is touched — and gives the
+    "nothing happened" tests a positive proof that the input was processed
+    before they assert absence."""
+    processed: list[str] = []
+    original = engine._process_one  # noqa: SLF001 — test introspection only
+
+    async def tracked(payload):
+        try:
+            await original(payload)
+        finally:
+            processed.append(payload.get("order_id"))
+
+    engine._process_one = tracked  # type: ignore[method-assign]  # noqa: SLF001
+    return processed
+
+
+async def _wait_order_processed(bus: EventBus, processed: list[str], order_id: str, *, count: int = 1) -> None:
+    """Barrier: `count` OrderApproved(s) for `order_id` were fully handled by the
+    engine AND every event the engine published for them has been dispatched.
+
+    Order matters: the engine's worker finishing proves the ledger/venue work is
+    done; then both bus lanes are joined, because asyncio.Queue only counts an
+    envelope as finished after every subscriber has returned — so any
+    OrderStatusChanged the engine published has reached its subscribers too."""
+    await _wait_until(
+        lambda: processed.count(order_id) >= count,
+        f"engine to finish processing {order_id} (x{count})",
+        describe=lambda: list(processed),
+    )
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(bus._critical_queue.join(), bus._normal_queue.join()),  # noqa: SLF001
+            timeout=_WAIT_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        pytest.fail(f"timed out after {_WAIT_TIMEOUT}s waiting for the event bus to dispatch; depths={bus.queue_depths()}")
+
+
 def _make_engine(
     bus: EventBus,
     *,
@@ -166,10 +226,17 @@ async def test_happy_path_inserts_ledger_row_and_places_order() -> None:
     published: list[EventEnvelope] = []
     bus.subscribe_all(lambda env: published.append(env))
     engine, ledger = _make_engine(bus)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_until(
+            lambda: ledger.status_updates, "ledger 'submitted' update for TRADE1:entry",
+            describe=lambda: ledger.status_updates,
+        )
+        # Absence of any OrderStatusChanged is only meaningful once the order is
+        # fully processed and the bus has dispatched whatever it published.
+        await _wait_order_processed(bus, processed, "TRADE1:entry")
 
         assert "TRADE1:entry" in ledger.rows
         assert ledger.status_updates == [("TRADE1:entry", "submitted", None, "fake-venue")]
@@ -188,12 +255,15 @@ async def test_duplicate_order_approved_sends_no_second_venue_call() -> None:
     await bus.start()
     engine, ledger = _make_engine(bus)
     venue = engine._venue_provider.get_execution_venue()  # noqa: SLF001 — test introspection only
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_order_processed(bus, processed, "TRADE1:entry", count=1)
         await _publish_order_approved(bus)  # identical order_id — a retry/re-delivery
-        await asyncio.sleep(0.1)
+        # The duplicate must be *processed* (and ignored) before "no second
+        # venue call" is asserted — a delay alone would not prove it.
+        await _wait_order_processed(bus, processed, "TRADE1:entry", count=2)
 
         assert len(venue.place_order_calls) == 1
         assert len(ledger.rows) == 1
@@ -212,10 +282,14 @@ async def test_authorization_gate_rejects_order_with_no_committed_decision() -> 
     published: list[EventEnvelope] = []
     bus.subscribe(EventType.ORDER_STATUS_CHANGED, lambda env: published.append(env))
     engine, ledger = _make_engine(bus, known_trade_ids=set())  # TRADE1 not known
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_until(lambda: published, "OrderStatusChanged(rejected) published", describe=lambda: published)
+        # Fully processed + bus flushed before asserting there is exactly one
+        # event and no ledger row.
+        await _wait_order_processed(bus, processed, "TRADE1:entry")
 
         assert ledger.rows == {}
         assert len(published) == 1
@@ -234,10 +308,12 @@ async def test_venue_refusal_no_venue_configured() -> None:
     published: list[EventEnvelope] = []
     bus.subscribe(EventType.ORDER_STATUS_CHANGED, lambda env: published.append(env))
     engine, ledger = _make_engine(bus, venue=None)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_until(lambda: published, "OrderStatusChanged(rejected) published", describe=lambda: published)
+        await _wait_order_processed(bus, processed, "TRADE1:entry")
 
         assert ledger.status_updates == [("TRADE1:entry", "rejected", "no_execution_venue_configured", None)]
         assert published[0].payload["reason"] == "no_execution_venue_configured"
@@ -256,10 +332,14 @@ async def test_venue_refusal_mode_not_supported() -> None:
     bus.subscribe(EventType.ORDER_STATUS_CHANGED, lambda env: published.append(env))
     venue = _FakeVenue(supported_modes=frozenset({"paper"}))  # does NOT support "simulated"
     engine, ledger = _make_engine(bus, venue=venue)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_until(lambda: published, "OrderStatusChanged(rejected) published", describe=lambda: published)
+        # place_order_calls == [] below is an absence claim: require the order
+        # to be fully processed first.
+        await _wait_order_processed(bus, processed, "TRADE1:entry")
 
         assert ledger.status_updates == [("TRADE1:entry", "rejected", "mode_not_supported", "fake-venue")]
         assert venue.place_order_calls == []  # never routed
@@ -277,10 +357,12 @@ async def test_venue_rejection_ack_is_recorded_and_published() -> None:
     bus.subscribe(EventType.ORDER_STATUS_CHANGED, lambda env: published.append(env))
     venue = _FakeVenue(ack=VenueAck(status="rejected", reason="insufficient_liquidity"))
     engine, ledger = _make_engine(bus, venue=venue)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.1)
+        await _wait_until(lambda: published, "OrderStatusChanged(rejected) published", describe=lambda: published)
+        await _wait_order_processed(bus, processed, "TRADE1:entry")
 
         assert ledger.status_updates == [("TRADE1:entry", "rejected", "insufficient_liquidity", "fake-venue")]
         assert published[0].payload["reason"] == "insufficient_liquidity"
@@ -294,10 +376,13 @@ async def test_close_position_effect_is_dropped_not_processed() -> None:
     bus = EventBus()
     await bus.start()
     engine, ledger = _make_engine(bus)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus, order_id="TRADE1:exit:1", position_effect="close")
-        await asyncio.sleep(0.1)
+        # Absence test: first prove the engine finished handling this exact
+        # input (it was dropped, not merely still queued).
+        await _wait_order_processed(bus, processed, "TRADE1:exit:1")
 
         assert ledger.rows == {}
         assert ledger.status_updates == []
@@ -311,10 +396,11 @@ async def test_malformed_client_order_id_is_dropped() -> None:
     bus = EventBus()
     await bus.start()
     engine, ledger = _make_engine(bus)
+    processed = _track_processing(engine)
     engine.start()
     try:
         await _publish_order_approved(bus, order_id="not-a-real-id")
-        await asyncio.sleep(0.1)
+        await _wait_order_processed(bus, processed, "not-a-real-id")
 
         assert ledger.rows == {}
     finally:
@@ -325,30 +411,55 @@ async def test_malformed_client_order_id_is_dropped() -> None:
 @pytest.mark.asyncio
 async def test_critical_lane_not_blocked_by_slow_venue_call() -> None:
     """AC #20 (I7): a venue whose place_order() blocks does not delay an
-    unrelated critical event."""
+    unrelated critical event.
+
+    The venue signals when placement is entered and then blocks until this
+    test releases it, so the test proves PlanRejected is delivered *while*
+    placement is still in flight — not merely "within some time"."""
     bus = EventBus()
     await bus.start()
     plan_rejected_received: list[float] = []
     bus.subscribe(EventType.PLAN_REJECTED, lambda env: plan_rejected_received.append(time.monotonic()))
 
-    slow_venue = _FakeVenue(delay=1.0)
-    engine, _ledger = _make_engine(bus, venue=slow_venue)
+    release = asyncio.Event()
+    slow_venue = _FakeVenue(release=release)
+    engine, ledger = _make_engine(bus, venue=slow_venue)
     engine.start()
     try:
-        t0 = time.monotonic()
         await _publish_order_approved(bus)
-        await asyncio.sleep(0.05)  # let the engine's worker pick it up and enter the slow venue call
+        try:
+            await asyncio.wait_for(slow_venue.entered.wait(), timeout=_WAIT_TIMEOUT)
+        except asyncio.TimeoutError:
+            pytest.fail(f"venue place_order() was never entered within {_WAIT_TIMEOUT}s")
+        assert not release.is_set()
+        assert ledger.status_updates == []  # placement is still blocked inside the venue
 
+        t_publish = time.monotonic()
         await bus.publish(
             make_envelope(EventType.PLAN_REJECTED, PlanRejected(symbol="MSFT", reasons=["unrelated"]), symbol="MSFT")
         )
-        await asyncio.sleep(0.1)
+        await _wait_until(
+            lambda: plan_rejected_received,
+            "PlanRejected delivery while the venue call is blocked",
+            describe=lambda: plan_rejected_received,
+        )
 
+        # Delivered while the venue was provably still blocked, and promptly.
+        assert not release.is_set()
+        assert ledger.status_updates == []
         assert plan_rejected_received, "PlanRejected should have been delivered promptly"
-        assert plan_rejected_received[0] - t0 < 0.5  # well under the venue's 1.0s delay
+        assert plan_rejected_received[0] - t_publish < 0.5
 
-        await asyncio.sleep(1.0)  # let the slow venue call finish before teardown
+        # Let the blocked placement finish, and wait for its positive completion
+        # signal (the ledger update) instead of sleeping for it.
+        release.set()
+        await _wait_until(
+            lambda: ledger.status_updates == [("TRADE1:entry", "submitted", None, "fake-venue")],
+            "blocked placement to complete after release",
+            describe=lambda: ledger.status_updates,
+        )
     finally:
+        release.set()  # teardown must never hang on a still-blocked venue call
         await engine.stop()
         await bus.stop()
 
