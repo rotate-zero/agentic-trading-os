@@ -1,3 +1,57 @@
+<!-- BEGIN DELIVERY SECTION: outcome-status-repeatable-read-test (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-status-repeatable-read-test`
+
+Based on `main` `b271733` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, response shape, population rule, schema, migration or frontend file was edited.**
+`test_execution_outcome_status_recorder_integration.py` (Claude 1's file) was not touched. **No production defect was
+found:** the route's `REPEATABLE READ` promise holds, so no route fix was needed. **No new decision number:** nothing new
+is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched.
+
+- **Edited test file** `backend/tests/test_execution_outcome_status_route.py`: one new fixture, one helper and one test
+  parametrized over two concurrent changes (2 test cases; the module goes 22 -> 24). Plus `event` added to the existing
+  `sqlalchemy` import. No existing test or helper was changed.
+- **What it proves:** `GET /intelligence/execution-outcome-status` documents that its aggregate and its recent-trades
+  list are read in one `REPEATABLE READ` transaction. PostgreSQL takes that snapshot at the first statement, so the test
+  pauses the route's worker-thread read *after the aggregate has executed and before the list query*, commits a change over
+  an independent connection, then lets the route finish:
+
+  ```
+  test (event loop)                  route worker thread                independent connection
+  -----------------                  -------------------                ----------------------
+  seed 2 trades, read DB baseline
+  GET (asyncio task) ------------->  _fetch_execution_outcome_status
+                                      aggregate SELECT executes
+                                      -> hook: aggregate_done.set()
+  await aggregate_done  <-----------  hook blocks on release.wait()
+  assert executed == ["aggregate"]
+  commit change  --------------------------------------------------->  INSERT new eligible newest trade
+                                                                         or UPDATE NULL -> 'recorded'
+  release.set()  ------------------>  hook returns; list SELECT runs
+  response  <-----------------------  counts + list  (one snapshot)
+  assert counts == pre-change baseline AND list excludes/does not reflect the change
+  fresh unpaused GET: change IS now visible (proves the commit was real)
+  ```
+
+- **Two variants:** `insert` (a new eligible, newest trade: under `READ COMMITTED` it would top the list while the counts
+  omit it) and `transition` (an existing NULL-status trade moved to `recorded`: under `READ COMMITTED` the list would show
+  `recorded` while the counts still say pending). Both assert counts equal the pre-change database baseline, the list is
+  the same snapshot, and a fresh read afterwards does see the change.
+- **Pause mechanism (no sleeps, no global patch):** the route is pointed at a **private engine** through the same
+  `monkeypatch` of `db_session_module.SessionLocal` the file already uses, and an `after_cursor_execute` listener is
+  attached to **that engine only**. It fires once, on the first `FROM trades` statement, and blocks on a
+  `threading.Event` with a 5 s timeout (a stuck test fails with `TimeoutError`, it does not hang). The listener also
+  records `["aggregate", "list"]` so the test asserts the pause really sat between the two statements. Teardown always
+  releases the event, removes the listener and disposes the engine, even on failure.
+- **Independent writer:** uses the test module's own `SessionLocal` (the shared engine, untouched by the monkeypatch) with
+  `SET LOCAL lock_timeout = '3s'` on the update, so a route-side lock would fail fast instead of hanging.
+- **Isolation:** expectations are read straight from the database (the route cannot be used for a baseline because the
+  hook would pause it), so they are deltas that tolerate unrelated qualifying rows. Every row carries `_STRATEGY_NAME`;
+  the existing autouse `_cleanup` fixture removes only those rows.
+- **Known limits:** the test pins the snapshot point to the aggregate statement (PostgreSQL's first-statement snapshot),
+  which is the route's own documented shape; it does not cover a third concurrent change type (e.g. a trade leaving the
+  population) or concurrent writers during the *first* statement.
+<!-- END DELIVERY SECTION: outcome-status-repeatable-read-test -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-event-path-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-event-path-integration`
 

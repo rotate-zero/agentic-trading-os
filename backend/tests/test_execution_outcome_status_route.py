@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 import app.api.routes.intelligence as intelligence_routes
@@ -565,3 +565,145 @@ async def test_blocked_outcome_status_read_does_not_block_an_unrelated_route(_bl
 
     assert response.status_code == 200
     assert response.json() == {"counts": {k: 0 for k in _COUNT_KEYS}, "trades": []}
+
+
+# --- REPEATABLE READ snapshot consistency (counts and list from one snapshot) ---
+
+
+@pytest.fixture
+def _pause_after_aggregate(monkeypatch):
+    """Pauses the route's worker-thread read between its two statements.
+
+    Scope is deliberately narrow: the route is pointed at a *private* engine
+    (same `monkeypatch` of `db_session_module.SessionLocal` the other tests
+    use) and the hook is attached to that engine only, so no other test, the
+    shared engine or the app's own sessions can see it. It fires once, right
+    after the aggregate `SELECT ... FILTER` has executed on the route's
+    connection (which is when PostgreSQL takes a REPEATABLE READ snapshot) and
+    before the recent-trades `SELECT`, then blocks on a `threading.Event` —
+    no sleeps. Teardown always releases the event, removes the listener and
+    disposes the engine, even if the test failed or timed out.
+
+    Yields `(aggregate_done, release, executed)`; `executed` records the
+    ledger statements the route ran, in order, so the test can prove the
+    pause really sat between the aggregate and the list.
+    """
+    aggregate_done = threading.Event()
+    release = threading.Event()
+    executed: list[str] = []
+    engine = create_engine(get_settings().database_url)
+
+    def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        if "FROM trades" not in statement:
+            return
+        executed.append("aggregate" if "FILTER" in statement else "list")
+        if len(executed) == 1:
+            aggregate_done.set()
+            if not release.wait(timeout=_BLOCK_TIMEOUT_SECONDS):
+                raise TimeoutError("test never released the paused execution-outcome-status read")
+
+    event.listen(engine, "after_cursor_execute", _after_cursor_execute)
+    monkeypatch.setattr(db_session_module, "SessionLocal", sessionmaker(bind=engine))
+    try:
+        yield aggregate_done, release, executed
+    finally:
+        release.set()
+        event.remove(engine, "after_cursor_execute", _after_cursor_execute)
+        engine.dispose()
+
+
+def _commit_from_independent_connection(change: str, *, target_id: uuid.UUID | None = None) -> uuid.UUID:
+    """Commit a change over a connection that is not the route's: either a
+    brand-new eligible trade newer than every seeded row (`"insert"`), or a
+    status transition of an existing seeded trade (`"transition"`). Uses the
+    test module's own `SessionLocal` binding (the shared engine), which the
+    fixture's monkeypatch does not touch. A short `lock_timeout` turns any
+    route-side lock (which would be a read-only-contract violation) into a
+    fast, explicit failure instead of a hang."""
+    if change == "insert":
+        return _insert_trade(symbol="ZZOS_RR_NEW", updated_at=_FUTURE + timedelta(days=1)).trade_id
+    session = SessionLocal()
+    try:
+        session.execute(text("SET LOCAL lock_timeout = '3s'"))
+        session.execute(
+            text("UPDATE trades SET outcome_status = 'recorded', updated_at = :u WHERE trade_id = :t"),
+            {"u": _FUTURE + timedelta(days=1), "t": target_id},
+        )
+        session.commit()
+        return target_id
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("change", ["insert", "transition"])
+async def test_counts_and_list_come_from_one_repeatable_read_snapshot(_pause_after_aggregate, change):
+    """The route documents that its aggregate and list are read in ONE
+    REPEATABLE READ transaction. Prove it: pause after the aggregate, commit a
+    concurrent change from another connection, release, and require that
+    counts AND list both still describe the earlier snapshot. Under READ
+    COMMITTED the list would see the committed change while the counts did
+    not — this test fails there."""
+    aggregate_done, release, executed = _pause_after_aggregate
+
+    seeded_pending = _insert_trade(symbol="ZZOS_RR_A", updated_at=_FUTURE + timedelta(minutes=1))
+    seeded_retry = _insert_trade(symbol="ZZOS_RR_B", outcome_status="pending_retry", updated_at=_FUTURE + timedelta(minutes=2))
+    seeded_ids = {str(seeded_pending.trade_id), str(seeded_retry.trade_id)}
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Baseline through the same (hooked) route would pause it, so take the
+        # pre-change expectation straight from the database instead.
+        verify = SessionLocal()
+        try:
+            before = verify.execute(
+                text(
+                    "SELECT count(*) FILTER (WHERE outcome_status IS NULL), "
+                    "count(*) FILTER (WHERE outcome_status = 'recorded') FROM trades "
+                    "WHERE decision = 'approved' AND status = 'closed' "
+                    "AND execution_mode = 'simulated' AND origin = 'auto'"
+                )
+            ).one()
+        finally:
+            verify.close()
+        pending_before, recorded_before = int(before[0]), int(before[1])
+
+        task = asyncio.create_task(client.get("/intelligence/execution-outcome-status", params={"limit": 100}))
+        assert await asyncio.to_thread(aggregate_done.wait, _BLOCK_TIMEOUT_SECONDS), "route never ran its aggregate query"
+        assert executed == ["aggregate"], "pause must sit after the aggregate and before the list"
+
+        changed_id = await asyncio.to_thread(
+            _commit_from_independent_connection, change, target_id=seeded_pending.trade_id
+        )
+
+        release.set()
+        response = await asyncio.wait_for(task, timeout=_BLOCK_TIMEOUT_SECONDS)
+
+        assert executed == ["aggregate", "list"]
+        assert response.status_code == 200
+        body = response.json()
+        rows = {row["trade_id"]: row for row in body["trades"]}
+
+        # Counts: exactly the pre-change snapshot (change invisible).
+        assert body["counts"]["pending"] == pending_before
+        assert body["counts"]["recorded"] == recorded_before
+
+        # List: the same snapshot — the concurrent change is invisible here too.
+        assert seeded_ids <= set(rows)
+        if change == "insert":
+            assert str(changed_id) not in rows
+        else:
+            assert rows[str(changed_id)]["outcome_status"] is None
+            assert datetime.fromisoformat(rows[str(changed_id)]["updated_at"]) == _FUTURE + timedelta(minutes=1)
+        assert rows[str(seeded_retry.trade_id)]["outcome_status"] == "pending_retry"
+
+        # Non-vacuous: the concurrent commit really landed and a fresh read sees it.
+        # (The fixture hook only pauses the first run, so this read is unpaused.)
+        after = (await client.get("/intelligence/execution-outcome-status", params={"limit": 100})).json()
+        after_ids = {row["trade_id"]: row for row in after["trades"]}
+        assert str(changed_id) in after_ids
+        if change == "insert":
+            assert after["counts"]["pending"] == pending_before + 1
+        else:
+            assert after_ids[str(changed_id)]["outcome_status"] == "recorded"
+            assert after["counts"]["pending"] == pending_before - 1
+            assert after["counts"]["recorded"] == recorded_before + 1

@@ -1,3 +1,40 @@
+<!-- BEGIN DELIVERY SECTION: outcome-status-repeatable-read-test (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-status-repeatable-read-test`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE USER trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision
+`0016`). No external or production database and no broker touched. Python 3.12.3. Verified on `main` `b271733`
+(unchanged on `origin/main` at packaging).
+
+- **New tests:** `cd backend && python3 -m pytest tests/test_execution_outcome_status_route.py -q -k repeatable` ->
+  **2 passed** (about 1.2 s); 6 runs in total (1 + 5 consecutive repeats), 2 passed each time.
+- **Focused route suite:** `python3 -m pytest tests/test_execution_outcome_status_route.py -q` -> **24 passed** (22
+  existing + 2 new), about 1.6 s.
+- **Related integration suites** (`test_execution_outcome_status_recorder_integration.py`,
+  `test_outcome_read_path_integration.py`, `test_outcome_recorder.py`, `test_outcome_recorder_event_path_integration.py`,
+  `test_strategy_outcomes_and_opportunity_conflicts_routes.py`): **49 passed, 1 warning** (existing starlette/anyio
+  deprecation notice).
+- **Mutation check (reverted; `git status` showed only the test file afterwards):** changing the route's
+  `"isolation_level": "REPEATABLE READ"` to `"READ COMMITTED"` -> **both new cases failed** — `insert`: the newly
+  committed trade appeared in the list (`assert '<id>' not in {...}`); `transition`: the list showed `'recorded'` where
+  the pre-change snapshot has NULL (`assert 'recorded' is None`). With the real route both pass.
+- **Cleanup check:** `trades` and `strategy_outcomes` held 0 rows with the test `strategy_name` after the new tests.
+- **Full suite** (`cd backend && python3 -m pytest -q`), database dropped, recreated and migrated first: **not green,
+  and not attributable to this change.** Three full runs each produced one failure in a different unrelated file:
+  1. this tree, with `-x`: `tests/test_simulated_eod_integration.py::test_partial_venue_fills_keep_one_close_until_real_remaining_fill`
+     (1386 passed before stopping);
+  2. **untouched fresh clone of `main` `b271733`**: `tests/test_feature_engine.py::test_kama_only_computed_for_its_configured_timeframe`
+     (1 failed, 1569 passed, 122 s);
+  3. this tree, no `-x`: `tests/test_vwap_ext.py::test_vwap_ext_is_identical_across_1m_and_5m_featuresets_on_the_same_close`
+     (1 failed, 1571 passed, 119 s) — 1571 + 1 = 1572 tests = 1570 baseline + 2 new.
+
+  All three failing tests **passed on rerun** (individually, and `test_simulated_eod_integration.py` as a whole: 12
+  passed, on both this tree and the clean clone). Because the untouched baseline fails too, this is pre-existing
+  order/timing-dependent flakiness; its root cause was not investigated here (out of scope — reported as a follow-up).
+- **Not covered / limits:** one concurrent change per run (insert or transition); no concurrent change that removes a
+  trade from the population; verified on a local database that was empty of unrelated qualifying trades at baseline.
+<!-- END DELIVERY SECTION: outcome-status-repeatable-read-test -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-event-path-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-recorder-event-path-integration`
 
