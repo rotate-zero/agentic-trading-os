@@ -1,3 +1,44 @@
+<!-- BEGIN DELIVERY SECTION: main-pipeline-restart-rollback-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `main-pipeline-restart-rollback-test-waits`
+
+Based on `main` `b0a09ad` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and
+`backend/tests/test_execution_engine.py` was not touched (owned by another session). **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file
+changed is `backend/tests/test_main_execution_pipeline.py`.
+
+- **Problem.** Two tests in this file drove the real FastAPI lifespan but synchronized with fixed `asyncio.sleep`
+  guesses: `test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes` (0.3 s ending the first
+  lifespan, 0.3 s before checking resumed operation) and `test_partial_startup_rolls_back_before_serving_requests`
+  (0.2 s before its absence assertions). With 0.4 s injected per DB commit the unmodified restart test failed (see
+  `TESTING.md`); the rollback test's absence checks could pass without the probe events ever having been dispatched.
+- **Edited** `backend/tests/test_main_execution_pipeline.py`, reusing the file's existing `_wait_for` helper
+  (bounded, 10 s, reports what was observed on timeout):
+  - **Restart test, process #1.** Before the first lifespan ends, waits until the first Trade is `approved` and its
+    entry Order is `submitted`. Ending earlier could leave no order to orphan.
+  - **Restart test, process #2.** After publishing the second price and Opportunity, waits until a second Trade row is
+    committed **and** a verdict event (`OrderApproved` or `PlanRejected`) has been published for it. Only then does
+    the unchanged `ORDER_APPROVED in types` assertion run, so a pipeline that did not resume fails on the assertion
+    with the observed events, not on a timer.
+  - **Rollback test.** New local `bus_idle()` barrier: both bus lanes have `_unfinished_tasks == 0`. The bus calls
+    `task_done()` only after every subscriber for an envelope has returned, so this proves all published envelopes are
+    fully dispatched. It is waited (1) right after entering the lifespan, so the Opportunity injected into the normal
+    lane while startup was failing has settled before any assertion, and (2) after publishing the probe price and
+    Opportunity, together with an identity check on a wildcard-subscribed recorder proving those exact two envelopes
+    were dispatched. The trade/order absence assertions run only after (2).
+- **Unchanged.** The real `TestClient` lifespan, the restart (`_reset_singletons`, fresh venue) and rollback paths
+  (`PositionMonitor.start` failure injection) and every substantive assertion. No assertion line was removed or
+  weakened; the diff removes exactly the three sleep lines, the rollback test's two `bus.publish` calls now publish
+  named probe envelopes (same events), and `types` now copies `list(published)`.
+- **Cannot be synchronized without production changes (reported only).**
+  - `bus_idle()` proves dispatch of what was published, not of events other subscribers derive from them, and it reads
+    the bus's private queue attributes (already read by this test for the worker queues).
+  - The restart test proves the second Opportunity was *decided and its verdict published*; it does not wait for the
+    second entry order to reach the venue, because it never asserted on it. Adding that would extend the test.
+  - Process-exit teardown (workers draining on lifespan exit) is awaited by the `TestClient` context manager itself;
+    there is no test-visible signal beyond that.
+<!-- END DELIVERY SECTION: main-pipeline-restart-rollback-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-pipeline-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `position-monitor-pipeline-test-waits`
 

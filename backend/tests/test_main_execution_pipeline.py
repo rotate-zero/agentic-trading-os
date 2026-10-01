@@ -170,11 +170,22 @@ def test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes(mon
     )
 
     # --- "process" #1: submit an entry order, then die before any fill -----
+    def entry_state() -> tuple:
+        with SessionLocal() as s:
+            trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
+            order = None if trade is None else s.scalar(select(Order).where(Order.trade_id == trade.trade_id))
+            return (None if trade is None else trade.decision, None if order is None else order.status)
+
     with TestClient(fastapi_app) as client:
         bus = get_event_bus()
         client.portal.call(bus.publish, _price_envelope())
         client.portal.call(bus.publish, _opportunity_envelope())
-        client.portal.call(asyncio.sleep, 0.3)
+        # Do not leave the lifespan until the entry order is durably
+        # "submitted": ending it earlier would race the authorizer/engine
+        # workers and could leave no order to orphan at all.
+        _wait_for(lambda: entry_state() == ("approved", "submitted"),
+                  "first entry approved and submitted before the first lifespan ends",
+                  describe=entry_state)
         # No tick is ever sent — the order is still "submitted" at the
         # (about to be discarded) venue when this block exits.
 
@@ -207,9 +218,26 @@ def test_orphaned_submitted_order_is_expired_on_restart_and_pipeline_resumes(mon
         bus.subscribe_all(lambda env: published.append(env))
         client.portal.call(bus.publish, _price_envelope())
         client.portal.call(bus.publish, _opportunity_envelope())
-        client.portal.call(asyncio.sleep, 0.3)
 
-        types = [e.event_type for e in published]
+        def second_decision_state() -> tuple:
+            # The second Opportunity is "processed" once the authorizer has
+            # committed its decision (a second Trade row, whatever the
+            # outcome) AND published the verdict event for it.
+            with SessionLocal() as s:
+                trades = len(s.scalars(select(Trade).where(Trade.strategy_name == NAME)).all())
+            verdicts = [e.event_type for e in list(published)
+                        if e.event_type in (EventType.ORDER_APPROVED, EventType.PLAN_REJECTED)]
+            return trades, verdicts
+
+        def second_decided() -> bool:
+            trades, verdicts = second_decision_state()
+            return trades == 2 and bool(verdicts)
+
+        _wait_for(second_decided,
+                  "second Opportunity decided (Trade committed and verdict event published)",
+                  describe=second_decision_state)
+
+        types = [e.event_type for e in list(published)]
         assert EventType.ORDER_APPROVED in types, f"execution pipeline did not resume after restart: {types}"
 
     _reset_singletons()
@@ -266,6 +294,21 @@ def test_partial_startup_rolls_back_before_serving_requests(monkeypatch):
     with TestClient(fastapi_app) as client:
         assert client.get("/health").status_code == 200
         bus = get_event_bus()
+
+        def bus_idle() -> bool:
+            # asyncio.Queue counts an item as unfinished from put() until the
+            # consumer calls task_done(), which the bus only does AFTER every
+            # subscriber for that envelope has returned. 0 on both lanes
+            # therefore means everything published so far is fully dispatched.
+            return bus._critical_queue._unfinished_tasks == 0 and bus._normal_queue._unfinished_tasks == 0
+
+        # The Opportunity injected into the normal lane while startup was
+        # failing is dispatched by the bus's own consumer task, concurrently
+        # with this test body. Let it settle before asserting anything.
+        _wait_for(bus_idle, "bus dispatch of the Opportunity queued during failed startup settled",
+                  describe=lambda: bus.queue_depths())
+        dispatched: list[EventEnvelope] = []
+        bus.subscribe_all(lambda env: dispatched.append(env))
         authorizer = governor_engine_module._authorizer_stub
         engine = execution_engine_module._execution_engine
         monitor = started_monitors[0]
@@ -295,9 +338,16 @@ def test_partial_startup_rolls_back_before_serving_requests(monkeypatch):
         assert portfolio_state._on_event not in bus._subscribers[EventType.ORDER_FILLED]
         assert venue._on_price_updated_envelope not in bus._subscribers[EventType.PRICE_UPDATED]
 
-        client.portal.call(bus.publish, _price_envelope())
-        client.portal.call(bus.publish, _opportunity_envelope())
-        client.portal.call(asyncio.sleep, 0.2)
+        probe_price, probe_opportunity = _price_envelope(), _opportunity_envelope()
+        client.portal.call(bus.publish, probe_price)
+        client.portal.call(bus.publish, probe_opportunity)
+        # Envelopes travel the bus by reference, so identity proves that these
+        # exact two were dispatched to subscribers; bus_idle proves every
+        # subscriber has returned. Only then are the absence checks meaningful.
+        _wait_for(lambda: bus_idle() and all(any(seen is probe for seen in list(dispatched))
+                                              for probe in (probe_price, probe_opportunity)),
+                  "probe PriceUpdated and OpportunityCreated dispatched on the bus",
+                  describe=lambda: (bus.queue_depths(), len(dispatched)))
         # A dispatch that snapshotted a handler before unsubscribe is also
         # harmless; stopped callbacks must leave their queues empty.
         client.portal.call(authorizer._on_opportunity_created, _opportunity_envelope())

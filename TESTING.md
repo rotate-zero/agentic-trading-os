@@ -1,3 +1,43 @@
+<!-- BEGIN DELIVERY SECTION: main-pipeline-restart-rollback-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `main-pipeline-restart-rollback-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (the project defaults in `app/core/config.py`), created fresh in the sandbox and migrated with
+`alembic upgrade head` (revision `0016`). No external or production database and no broker touched. Python 3.12.3.
+Verified on `main` `b0a09ad` (unchanged on `origin/main` at packaging).
+
+All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_main_execution_pipeline.py -q` (before edit) | 7 passed |
+| `python -m pytest tests/test_main_execution_pipeline.py -k "orphaned_submitted or partial_startup_rolls_back" -q` (after edit) | 2 passed |
+| same command, 20 consecutive runs, no injected delay | 20/20 green |
+| `python -m pytest tests/test_main_execution_pipeline.py -q` (whole file, after edit) | 7 passed (2.7 s) |
+| same command, 8 consecutive runs | 8/8 green |
+
+**Injected-delay check** (throwaway plugin outside the repo, adds `time.sleep(d)` to the thread-offloaded commits
+`PostgresTradeLedger.commit_decision` and `PostgresOrderLedger.update_order_status`;
+`PYTHONPATH=/tmp/plug INJ_DELAY=<d> python -m pytest -p delayplug tests/test_main_execution_pipeline.py -k "orphaned_submitted or partial_startup_rolls_back" -q`):
+
+| Delay per commit | Old tests (`b0a09ad`) | New tests |
+|---|---|---|
+| 0 | 2 passed | 2 passed |
+| 0.2 s | 2 passed | 2 passed |
+| 0.4 s | **restart test failed**, rollback test passed | 2 passed (2.9 s) |
+| 0.8 s | **restart test failed**, rollback test passed | 2 passed (4.7 s) |
+
+The rollback test passes under every delay in both versions: correct code never commits anything for the injected
+Opportunity, so delaying commits cannot expose the old 0.2 s sleep. Its new waits do not change the outcome; they make
+the absence assertions non-vacuous by proving dispatch settled first. I did not mutate production code to demonstrate a
+failing rollback case.
+
+Not run in this delivery: the full backend suite and neighbouring pipeline files; the change is confined to two tests in
+one file and the whole of that file was run.
+
+Remaining failures: none. No pre-existing flakiness was attributed to this work.
+<!-- END DELIVERY SECTION: main-pipeline-restart-rollback-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-pipeline-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `position-monitor-pipeline-test-waits`
 
