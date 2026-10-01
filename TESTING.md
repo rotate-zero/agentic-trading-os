@@ -1,3 +1,85 @@
+<!-- BEGIN DELIVERY SECTION: eod-partial-fill-test-order (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `eod-partial-fill-test-order`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE USER trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision
+`0016`). Re-wiped and re-migrated before the post-fix full runs. No external or production database and no broker
+touched. Python 3.12.3, 1 vCPU sandbox. Verified on `main` `66426eb` (unchanged on `origin/main` at packaging).
+
+## Reproduction
+
+- **Natural reproduction: achieved on the first full-suite run of an untouched baseline** (`cd backend && python -m
+  pytest -q -rf`, fresh DB): `1 failed, 1571 passed` in 144.6 s; the one failure was
+  `test_simulated_eod_integration.py::test_partial_venue_fills_keep_one_close_until_real_remaining_fill` at
+  `assert [f.qty for f in fills] == [3, 2]` -> `assert [2, 3] == [3, 2]` (line 441). The earlier assertions in the same
+  test (`Position.qty == 2`, then `status == "closed"`, one order, same `client_order_id`) had already passed.
+- **Not reproduced in isolation:** the test alone, 20 separate processes -> 20/20 passed; alone under 3 busy-loop
+  processes on 1 vCPU -> 32/32 passed (a 33rd run was killed by the tool time limit, not counted).
+
+## Trace of the chain (what the joins actually cover)
+
+```
+test task                 SimulatedVenue          ExecutionEngine (worker)      EventBus critical lane     PortfolioState (worker)
+---------                 --------------          ------------------------      ----------------------     -----------------------
+ingest_tick(99) -------->  _apply_fill
+                           _dispatch -----------> _on_venue_update
+                                                   put_nowait(venue_update)       (sync: queue.unfinished=1
+                                                                                   before ingest_tick returns)
+await engine._queue.join()                         _process_venue_update
+                                                   to_thread(record_fill) COMMIT
+                                                   bus.publish(OrderFilled) ----> critical queue (unfinished=1)
+                                                   task_done  <-- join returns
+await bus._critical_queue.join()                                                  _on_event -------------------> put_nowait(OrderFilled)
+                                                                                  task_done  <-- join returns
+await portfolio._queue.join()                                                                                    _synchronize: load_state,
+                                                                                                                 pending_fills, commit_fill
+                                                                                                                 (position qty 5 -> 2)
+                                                                                                                 task_done  <-- join returns
+assert Position.qty == 2 / status == "closed"; rows(pid) -> fills read back  <-- UNORDERED SELECT (the defect)
+```
+
+Every hand-off enqueues onto the next queue **before** the previous item's `task_done`, so `engine -> bus critical ->
+portfolio` joins cannot return early. To check this empirically rather than only by reading, each step was stalled by
+0.7 s in turn (a scratch pytest file, not in the repo, that wraps the real target test and injects a `time.sleep` /
+`asyncio.sleep` into): `PostgresExitLedger.{observe_exit, pending_exit_position_ids, prepare_exit, claim_dispatch, set_status}`,
+`PostgresFillLedger.record_fill`, `PostgresPositionLedger.{load_state, pending_fills, commit_fill, get_order}` and
+`SimulatedVenue.place_order` -> **11/11 passed**. A stall in any step, including ones long enough to fire the engine's
+0.5 s idle `_service_exits()` pass, did not change the result.
+
+## Root-cause proof (deterministic)
+
+1. **Heap order is not ledger order.** Scratch script (not in the repo) on the real `fills` table: insert a dummy fill
+   and fill #1 (qty 3), delete the dummy, `VACUUM fills`, insert fill #2 (qty 2). Unordered query returned
+   `[(2, ledger_seq 653, ctid (0,2)), (3, ledger_seq 652, ctid (0,3))]`; the `rows()`-style ORM select gave `[2, 3]`;
+   the same select with `ORDER BY ledger_seq` gave `[3, 2]`.
+2. **Same failure from the real test, forced.** Scratch wrapper around the unmodified target test that, after the second
+   `record_fill`, performs a no-op `UPDATE` of fill #1 (new tuple version at a later heap slot): **pre-fix -> FAILED with
+   the identical `assert [2, 3] == [3, 2]`; post-fix -> PASSED.** (A first attempt of this injection used `:f1` inside
+   `text()` and failed for an unrelated bind-parameter reason in the scratch code; it was corrected and rerun, and only
+   the corrected result is reported.)
+
+## Checks run after the fix
+
+- Target test alone, 15 separate processes: **15/15 passed**.
+- `tests/test_simulated_eod_integration.py` (whole file, file order): **12 passed**.
+- Neighboring EOD / exit-ledger files (`test_exit_ledger_eod_migration.py`, `test_exit_ledger_eod_postgres.py`,
+  `test_exit_ledger_postgres.py`, `test_position_monitor_eod.py`, `test_simulated_protective_session_retry.py`,
+  `test_execution_exit_requests_route.py`): **171 passed**.
+- **Full suite** (`cd backend && python -m pytest -q -rf`), database dropped, recreated and migrated first: run 1:
+  **1572 passed** (142.9 s); run 2 (`-v`, same database): **1572 passed** (144.9 s), the target test `PASSED`.
+  Baseline for comparison: `1 failed, 1571 passed` (above). Test count unchanged: 1572.
+- `git diff` shows exactly one edited code file, `backend/tests/test_simulated_eod_integration.py` (the `rows()` fills
+  query); `test_feature_engine.py` and `test_vwap_ext.py` are untouched.
+
+## Limits of this evidence
+
+- The failure rate in the untouched baseline was 1 of 1 full runs here; the user reported it as intermittent, and the
+  full-suite pass in both post-fix runs is consistent with the fix but two passes alone do not prove a rare flake gone.
+  The proof rests on the deterministic reproduction (identical assertion, fails before / passes after) and the
+  heap-order demonstration, not on pass counts.
+- Other multi-row reads without `ORDER BY` in other test files were not audited (out of scope).
+<!-- END DELIVERY SECTION: eod-partial-fill-test-order -->
+
 <!-- BEGIN DELIVERY SECTION: feature-engine-test-featureset-wait (backend tests + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `feature-engine-test-featureset-wait`
 

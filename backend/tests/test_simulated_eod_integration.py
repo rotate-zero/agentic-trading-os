@@ -121,7 +121,10 @@ def rows(pid):
     with SessionLocal() as s:
         request = s.get(ExitRequest, pid)
         orders = s.scalars(select(Order).where(Order.position_id == pid).order_by(Order.id)).all()
-        fills = s.scalars(select(Fill).where(Fill.client_order_id.in_([o.client_order_id for o in orders]))).all()
+        # Heap order is not ledger order: without ORDER BY, Postgres returns rows by physical slot, which
+        # vacuum/page reuse can invert. ledger_seq is the fills table's documented ledger order.
+        fills = s.scalars(select(Fill).where(Fill.client_order_id.in_([o.client_order_id for o in orders]))
+                          .order_by(Fill.ledger_seq)).all()
         return request, orders, fills
 
 

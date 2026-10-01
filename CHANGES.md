@@ -1,3 +1,40 @@
+<!-- BEGIN DELIVERY SECTION: eod-partial-fill-test-order (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `eod-partial-fill-test-order`
+
+Based on `main` `66426eb` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited**, and neither the Feature Engine nor
+the VWAP test files were touched. **No new decision number:** nothing new is decided; `INDEX.md`,
+`confirmed-decisions.md` and the archive list are untouched. **No production partial-fill defect was found.**
+
+- **Root cause: an unordered read-back in the test, not a synchronization race and not a production defect.**
+  `rows(pid)` in `backend/tests/test_simulated_eod_integration.py` loaded the fills with `select(Fill).where(...)` and
+  **no `ORDER BY`**; `test_partial_venue_fills_keep_one_close_until_real_remaining_fill` then asserts
+  `[f.qty for f in fills] == [3, 2]`. Without `ORDER BY` PostgreSQL returns rows in physical heap order, which is not
+  insertion order once earlier cleanup deletes and vacuum/page pruning free slots: the second fill (qty 2, higher
+  `ledger_seq`) can land in an earlier slot than the first (qty 3). The failing full-suite run reported
+  `assert [2, 3] == [3, 2]` **after** `Position.status == "closed"` and the one-order/two-fill checks had already passed,
+  i.e. every downstream step had completed and only the *order* of the list was wrong.
+- **The queue joins are sound.** The chain was traced in source and exercised under injected stalls (see `TESTING.md`):
+  `SimulatedVenue.ingest_tick` -> `_apply_fill` -> `_dispatch` calls `ExecutionEngine._on_venue_update`, which
+  `put_nowait`s onto the engine queue **synchronously** (so `engine._queue.join()` cannot return before the work exists);
+  the engine item is not `task_done` until `record_fill` has committed and `OrderFilled` is in the EventBus critical
+  queue; the critical consumer calls Portfolio State's `_on_event`, which `put_nowait`s before the bus `task_done`; and
+  Portfolio State's item is not `task_done` until `_synchronize` has committed the fill and the position. The test's
+  `engine -> bus critical -> portfolio` join order therefore covers all downstream work. No fixed sleep or extra wait
+  was added because none is needed.
+- **Edited** `backend/tests/test_simulated_eod_integration.py`: in the shared `rows()` helper the fills query gains
+  `.order_by(Fill.ledger_seq)` plus a three-line comment. `ledger_seq` is the `fills` primary key and, per
+  `app/models/execution_ledger.py`, the strictly-monotonic ledger order. The assertions are unchanged: one close order,
+  fills `[3, 2]`, position closed once. The orders query already had `ORDER BY Order.id`. No other test in the file
+  asserts multi-fill order (the others check `fills == []`, a single fill, or counts), so the change is behavior-neutral
+  for them.
+- **Not changed (reported only):** (1) `ExecutionEngine._worker_loop` runs `_service_exits()` on a 0.5 s idle timeout
+  outside any queue, so it can overlap a test's inline `await engine._service_exits()` and is not covered by
+  `queue.join()`. Stalling each of 11 steps in the chain by 0.7 s did **not** break this test, so it is not the cause
+  here; it is a latent shape worth knowing about if a future EOD test shows a different flake. (2) Other tests that read
+  multiple rows without `ORDER BY` were not audited outside this file.
+<!-- END DELIVERY SECTION: eod-partial-fill-test-order -->
+
 <!-- BEGIN DELIVERY SECTION: feature-engine-test-featureset-wait (backend tests + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `feature-engine-test-featureset-wait`
 
