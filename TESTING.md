@@ -1,3 +1,29 @@
+<!-- BEGIN DELIVERY SECTION: execution-outcome-status-recorder-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `execution-outcome-status-recorder-integration`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading`, created fresh and migrated with `alembic upgrade head` (revision `0016`). No external or production
+database and no broker touched. Python 3.12.3. Verified on `main` `fc8e2c9` (`main` advanced from `7ab2522` during the
+task; the new test and the full suite were re-run on `fc8e2c9`).
+
+- New file: `cd backend && python3 -m pytest tests/test_execution_outcome_status_recorder_integration.py -q` →
+  **3 passed** (about 1.2 s); 5 consecutive repeat runs, 3 passed each time.
+- The three source suites plus the new file together
+  (`test_outcome_recorder.py`, `test_outcome_read_path_integration.py`, `test_execution_outcome_status_route.py`):
+  **52 passed** (49 existing + 3 new).
+- **Full suite** (`cd backend && python3 -m pytest tests -q`): **1569 passed, 1 warning in 130 s** (1566 baseline + 3
+  new); the one warning is the existing starlette/anyio deprecation notice.
+- **Mutation checks** (each reverted; `git status` showed only the new test file afterwards): making `_mark_retry` a
+  no-op (1 failed: the `pending_retry` test); making the permanent-block path leave the status NULL (1 failed: the
+  blocked test); the other two tests passed in each case, so the cases are independent.
+- **Cleanup check:** `trades` and `strategy_outcomes` hold 0 rows after the new tests and after the full suite on this
+  database; the test's cleanup is keyed on seeded `trade_id`s only.
+- **Not covered / limits:** not run against a shared database that already contains unrelated qualifying trades
+  (the deltas are designed for it, but this local database was empty at baseline); no entry-to-exit execution fixture
+  and no live recorder worker or sweep (`record_trade()` is called directly); only one permanent-block reason is
+  exercised.
+<!-- END DELIVERY SECTION: execution-outcome-status-recorder-integration -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-status-doc-sync (docs + comments only; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-status-doc-sync`
 

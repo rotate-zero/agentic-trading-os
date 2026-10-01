@@ -1,3 +1,40 @@
+<!-- BEGIN DELIVERY SECTION: execution-outcome-status-recorder-integration (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-outcome-status-recorder-integration`
+
+Based on `main` `fc8e2c9` (re-checked against `origin/main` before packaging; `main` advanced once during the task from
+`7ab2522` and the work was re-verified on the new base). Test and docs only: **no production code, API contract,
+schema, migration or frontend file was edited**, and no production defect was found. **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched (latest number is still
+186) and decision #186 is not altered.
+
+- **New test file** `backend/tests/test_execution_outcome_status_recorder_integration.py` (3 tests, real PostgreSQL).
+  It closes the gap between two existing suites: `test_execution_outcome_status_route.py` hand-inserts
+  `outcome_status` values and never runs the recorder, while `test_outcome_read_path_integration.py` runs the real
+  recorder but never calls this route. Here the ledger rows come from `tests.test_outcome_recorder._seed` (reused, not
+  rebuilt), statuses are changed by the real `OutcomeRecorder.record_trade()`, and every observation is a real
+  `GET /intelligence/execution-outcome-status` call (`httpx.ASGITransport`, no app lifespan).
+  - `test_null_status_is_pending_then_recorded_with_real_outcome_link`: a closed eligible trade before recording has
+    stored NULL status, appears as JSON `null` and moves `pending` by +1; after `record_trade()` it moves to
+    `recorded` (+1, `pending` back to baseline) and the listed `outcome_id` equals both `trades.outcome_id` and the
+    one real `strategy_outcomes` row for that trade.
+  - `test_permanently_blocked_trade_is_counted_blocked_without_link_or_reason`: a trade without `thesis.evidence`
+    is blocked (`evidence_unavailable`, confirmed in the captured log); the route shows `blocked` +1, `outcome_id`
+    null, no `strategy_outcomes` row, response keys exactly `counts`/`trades`, and neither the reason code nor the
+    word "reason" appears anywhere in the response body.
+  - `test_transient_recorder_failure_is_durably_pending_retry_then_recovers`: only
+    `record_strategy_outcome_in_session` is injected to raise `SQLAlchemyError` after its insert. The recorder returns
+    `pending_retry`; a fresh route request shows `pending_retry` +1, no link, and the failed insert rolled back. With
+    the real writer restored, a second `record_trade()` records it and the route shows `recorded` +1 with
+    `pending_retry` back to baseline.
+- **Isolation:** all count assertions are deltas against a baseline read through the route, so unrelated rows do not
+  make the tests brittle. Cleanup deletes only rows the test created, identified by the seeded `trade_id`s (children
+  first; the `trades.outcome_id` link is cleared before outcome rows are removed). It deliberately does not reuse the
+  recorder suite's `strategy_name`-keyed autouse cleanup.
+- **Known limits:** the fixture is the recorder suite's hand-seeded ledger, not an entry-to-exit execution run; the
+  blocked case covers one permanent reason (`evidence_unavailable`), not every reason code; the `limit` and ordering
+  behavior of the route stays covered by its own suite.
+<!-- END DELIVERY SECTION: execution-outcome-status-recorder-integration -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-status-doc-sync (docs + comments only; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-status-doc-sync`
 
