@@ -1,3 +1,35 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-aggregation-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `feature-engine-aggregation-test-waits`
+
+Based on `main` `91791ed` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, aggregation behavior, API contract, schema, migration or frontend file was edited**, and
+`test_daily_levels.py` was not touched. **No new decision number:** nothing new is decided; `INDEX.md`,
+`confirmed-decisions.md` and the archive list are untouched. The only code file changed is
+`backend/tests/test_feature_engine.py`.
+
+- **Problem.** Four aggregation tests published candles and then asserted after a fixed `asyncio.sleep(0.1)`, guessing
+  that the Feature Engine's serial worker (thread-offloaded `_compute_one` per candle, then an EventBus publish) had
+  finished. When compute is slower than the guess, the assertions see a partial event list: the 5m/15m/1h set is not there
+  yet (`{"1m"} != {"1m","5m"}`), and the "not before" test can pass **vacuously** because nothing has arrived yet.
+- **Edited** `backend/tests/test_feature_engine.py` — each fixed sleep replaced by the file's existing bounded poll
+  `_wait_until` (5 s timeout, named failure message), waiting for exactly the events that test's published candles produce:
+  - `test_5m_bucket_completes_only_on_its_final_minute_not_before`: waits for **all four 1m results**, then asserts the
+    absence of a 5m result (`timeframes_seen == {"1m"}`).
+  - `test_5m_bucket_completion_publishes_5m_features_with_correct_close` and
+    `test_vwap_is_identical_across_1m_and_5m_featuresets_on_the_same_close`: wait for five 1m events plus the 5m
+    bucket-close event.
+  - `test_1h_boundary_publishes_5m_15m_and_1h_together`: waits until 1m, 5m, 15m and 1h results have all arrived for the
+    single hour-boundary candle.
+  **No new helper.** Every timeframe set, count, `candle_ts`, close, `sma_1` and VWAP assertion is unchanged (the diff
+  removes four sleep lines and no assertion line).
+- **What the waits do and do not do.** A wait only blocks until the expected events *arrive*; the original assertions then
+  run in full. A real defect still fails: if the 5m set is never produced the wait times out with a named message, and a
+  wrong value fails the original equality assertion (mutation checks in `TESTING.md`).
+- **Not changed (reported only).** Fixed `asyncio.sleep(0.1)` waits remain in other tests of `test_feature_engine.py`
+  (9 call sites) and elsewhere; four of them fail at 30 ms injected compute delay (see `TESTING.md`). `test_daily_levels.py`
+  was out of scope. These are suggested next conversions.
+<!-- END DELIVERY SECTION: feature-engine-aggregation-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `vwap-ext-test-bounded-waits`
 

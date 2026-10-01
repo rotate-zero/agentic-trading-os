@@ -1,3 +1,60 @@
+<!-- BEGIN DELIVERY SECTION: feature-engine-aggregation-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `feature-engine-aggregation-test-waits`
+
+**Database target:** real local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (`CREATE USER trading ... SUPERUSER`), created fresh and migrated with `alembic upgrade head` (revision `0016`).
+No external or production database and no broker touched. Python 3.12.3, 1 vCPU sandbox, so contention numbers are
+indicative, not a model of Saqib's machine. Verified on `main` `91791ed` (unchanged on `origin/main` at packaging).
+
+## The race being removed
+
+```
+test (event loop)              FeatureEngine worker (serial)                 EventBus
+-----------------              -----------------------------                 --------
+publish candle(s) ----------->  queue.get -> to_thread(_compute_one) ------> FEATURES_UPDATED (1m, then 5m/15m/1h)
+sleep(0.1)  <-- guess -->        (latency varies with load)                  handler -> received.append
+assert on `received`             # before: asserts whenever the guess expires
+                                 # after:  _wait_until(expected events arrived), THEN asserts everything
+```
+
+## Controlled slow-compute condition
+
+An external pytest plugin (`-p slow_compute`, **not in the repo**) wraps `FeatureEngine._compute_one` with
+`time.sleep(SLOW_COMPUTE_MS/1000)` per candle. Same code, only latency changes.
+
+| Per-candle delay | Before (4 target tests) | After (4 target tests) |
+|---|---|---|
+| 0 ms | 4 passed | 4 passed (x30 idle processes: **30/30**) |
+| 30 ms | **2 failed** (`..._publishes_5m_features_with_correct_close`, `..._identical_across_1m_and_5m_...`) | 4 passed (x12) |
+| 100 ms | **4 failed** | 4 passed (x2) |
+| 300 ms | not run | 4 passed (x2, ~5.3 s each) |
+
+Also after the change: 3 busy-loop processes on the single vCPU, 10 runs: **10/10 passed**.
+
+## Mutation checks (reverted; `git diff` showed only the intended edits afterwards)
+
+- Suppressing aggregation (`_AGGREGATED_WIDTHS = []`) -> the three tests that need a 5m/15m/1h result fail after the 5 s
+  bound with their named messages (`five 1m ... plus the 5m bucket-close event was not met within 5.0s`; `1m, 5m, 15m and
+  1h ... was not met within 5.0s`); the "not before" test correctly still passes.
+- Changing an expected value (`close == 104.0` -> `105.0`) -> `assert 104.0 == 105.0` fails.
+
+## Full Feature Engine file (`tests/test_feature_engine.py`)
+
+- Baseline before the change: **81 passed**. After the change, idle, 3 runs: **81 passed** each (~6 s).
+- Under 30 ms/candle, whole file: before the change **6 failed**; after **4 failed** — the two target tests no longer
+  fail, the remaining four are untouched tests that still use a fixed sleep:
+  `test_feature_engine_drops_duplicate_candle_closed`, `test_vwap_accumulates_within_a_session_and_resets_at_the_next_one`,
+  `test_regression_only_computed_for_its_configured_timeframe`, `test_regression_and_kama_absent_before_their_window_warms_up`.
+  Not fixed (out of the four-test scope); suggested follow-up.
+
+## Wider issues found (not fixed)
+
+1. The four tests above (and other `asyncio.sleep(0.1)` sites in this file) share the same race at enough latency.
+2. A first slow-compute sweep was invalidated mid-session when PostgreSQL stopped after a timed-out shell command
+   (`Connection refused`); it was discarded and rerun after restarting the cluster. Not a repo issue.
+3. Full backend suite was not run (task scope: the Feature Engine test file).
+<!-- END DELIVERY SECTION: feature-engine-aggregation-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: vwap-ext-test-bounded-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `vwap-ext-test-bounded-waits`
 

@@ -930,7 +930,13 @@ async def test_5m_bucket_completes_only_on_its_final_minute_not_before():
         # Minutes :30, :31, :32, :33 — none of these complete the [9:30,9:35) 5m bucket.
         for i in range(4):
             await _publish_candle(bus, "__TEST_FE_5M_EARLY__", base + timedelta(minutes=i), 100.0 + i)
-        await asyncio.sleep(0.1)
+        # Bounded wait (was `asyncio.sleep(0.1)`): all four 1m results must
+        # have arrived before asserting the ABSENCE of a 5m result, else a
+        # slow worker would make "no 5m yet" pass vacuously.
+        await _wait_until(
+            lambda: sum(1 for e in received if e.payload["timeframe"] == "1m") >= 4,
+            description="all four 1m FeaturesUpdated events",
+        )
 
         timeframes_seen = {e.payload["timeframe"] for e in received}
         assert timeframes_seen == {"1m"}  # only 1m fired — the 5m bucket hasn't closed yet
@@ -953,7 +959,12 @@ async def test_5m_bucket_completion_publishes_5m_features_with_correct_close():
         base = _et(2026, 8, 11, 9, 30)
         for i in range(5):  # :30 through :34 — :34 is the bucket's last member
             await _publish_candle(bus, "__TEST_FE_5M_COMPLETE__", base + timedelta(minutes=i), 100.0 + i)
-        await asyncio.sleep(0.1)
+        # Bounded wait (was `asyncio.sleep(0.1)`): five 1m events plus the 5m bucket-close event.
+        await _wait_until(
+            lambda: sum(1 for e in received if e.payload["timeframe"] == "1m") >= 5
+            and any(e.payload["timeframe"] == "5m" for e in received),
+            description="five 1m FeaturesUpdated events plus the 5m bucket-close event",
+        )
 
         timeframes_seen = {e.payload["timeframe"] for e in received}
         assert timeframes_seen == {"1m", "5m"}  # exactly one aggregated publish, on the 5th candle
@@ -988,7 +999,11 @@ async def test_1h_boundary_publishes_5m_15m_and_1h_together():
         # Only need the boundary candle itself for this check — sma_periods=[1]
         # needs no prior history, so nothing earlier in the hour is required.
         await _publish_candle(bus, "__TEST_FE_1H_BOUNDARY__", boundary_ts, 200.0)
-        await asyncio.sleep(0.1)
+        # Bounded wait (was `asyncio.sleep(0.1)`): the one candle fans out to 1m + 5m + 15m + 1h.
+        await _wait_until(
+            lambda: {e.payload["timeframe"] for e in received} >= {"1m", "5m", "15m", "1h"},
+            description="1m, 5m, 15m and 1h FeaturesUpdated events for the hour-boundary candle",
+        )
 
         timeframes_seen = {e.payload["timeframe"] for e in received}
         assert timeframes_seen == {"1m", "5m", "15m", "1h"}
@@ -1146,7 +1161,12 @@ async def test_vwap_is_identical_across_1m_and_5m_featuresets_on_the_same_close(
         base = _et(2026, 8, 11, 9, 30)
         for i in range(5):  # :30 through :34 — :34 completes the [9:30,9:35) 5m bucket
             await _publish_candle(bus, "__TEST_FE_VWAP_5M__", base + timedelta(minutes=i), 100.0 + i)
-        await asyncio.sleep(0.1)
+        # Bounded wait (was `asyncio.sleep(0.1)`): five 1m events plus the 5m bucket-close event.
+        await _wait_until(
+            lambda: sum(1 for e in received if e.payload["timeframe"] == "1m") >= 5
+            and any(e.payload["timeframe"] == "5m" for e in received),
+            description="five 1m FeaturesUpdated events plus the 5m bucket-close event",
+        )
 
         by_timeframe = {e.payload["timeframe"]: e.payload["features"]["vwap"] for e in received}
         assert set(by_timeframe) == {"1m", "5m"}
