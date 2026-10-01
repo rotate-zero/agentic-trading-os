@@ -1,3 +1,35 @@
+<!-- BEGIN DELIVERY SECTION: outcome-status-doc-sync (docs + comments only; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-status-doc-sync`
+
+Verified on `main` `7ab2522`. Documentation and comments only, so no pytest, PostgreSQL, `tsc` or browser run applies and
+none was made.
+
+- `git diff --check`: clean.
+- **Code unchanged:** an AST comparison of `backend/app/schemas/performance.py` before and after, with every string
+  constant masked, is identical (so only the docstring and `Field` description text moved). The module imports under
+  Python with pydantic installed.
+- **Corrected claims checked against source:** `OutcomeRecorder` exists and is the sole non-backtest writer
+  (`trading_intelligence/outcome_recorder.py`; wired in `main.py` lifespan); it calls
+  `capture_strategy_outcome_snapshots` for entry (`capture_entry`) and exit (`record_trade`) and writes
+  `record_strategy_outcome_in_session`; it constructs `StrategyOutcome` with `is_backtest=False` and explicit
+  `execution_mode`/`execution_venue` taken from the trade; `BacktestRunner` still calls `record_strategy_outcome()`.
+  The route and panel exist (`execution-outcome-status` in `intelligence.py`; "Simulated outcome recording" in
+  `ExecutionLifecyclePanel.tsx`), and the Live empty-state text cited in the correction matches `InfoTab.tsx`.
+- **Cross-references checked:** §6.7.1 K and L headings, the `frontend-performance-panel-refresh` as-built note, and
+  the named source files all exist. No new Markdown links were added.
+- **Not covered:** no rendered-Markdown view.
+
+**Further drift found, not fixed (report only):**
+1. `docs/architecture/strategy-engine-design.md` line ~298 still says the live-path caller "still doesn't exist" and D17
+   "remains open for that path" in the present tense (the paragraph is otherwise a decision-era record).
+2. `strategy-engine-design.md` line ~717 checklist item says "No Execution Engine/Position Monitor exists yet" (dated #120
+   entry; historical, but unmarked).
+3. `backend/app/schemas/performance.py` line ~133: the `origin` comment says the `trades` table is "not yet built"; it
+   exists (`models/execution_ledger.py`, migration 0012).
+4. Same file: `backtest_run_id` and `is_backtest` descriptions say "live" (for example "None for every live trade") where
+   "non-backtest (simulated)" is meant.
+<!-- END DELIVERY SECTION: outcome-status-doc-sync -->
+
 <!-- BEGIN DELIVERY SECTION: execution-panel-outcome-status (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-panel-outcome-status`
 

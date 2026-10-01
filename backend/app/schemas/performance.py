@@ -36,10 +36,12 @@ already defines `StrategyOutcomeSnapshots` — a narrow, 2-field
 `@dataclass(frozen=True)` bundle (`market_state`, `context`) returned by
 `capture_strategy_outcome_snapshots()`. That is NOT this module's
 `StrategyOutcome` — it's the upstream read-side capture contract (#98,
-M4) that a future Execution Engine/Position Monitor fill handler will
-call to help POPULATE four of `StrategyOutcome`'s own fields
-(`market_state_at_entry`/`_at_exit`, `context_at_entry`/`_at_exit`) at
-`entry_filled_at`/`exit_filled_at`. `StrategyOutcomeSnapshots` is
+M4) that its callers use to help POPULATE four of `StrategyOutcome`'s own
+fields (`market_state_at_entry`/`_at_exit`, `context_at_entry`/`_at_exit`)
+around `entry_filled_at`/`exit_filled_at`. Its callers today are the
+Backtest Runner (decision #128) and, for simulated auto trades, the
+`OutcomeRecorder` (decision #186,
+`app/trading_intelligence/outcome_recorder.py`). `StrategyOutcomeSnapshots` is
 untouched, unrenamed, and not imported here — this module doesn't
 depend on it, and nothing about this schema's shape was changed to
 accommodate it (see the discrepancy note below).
@@ -69,12 +71,16 @@ non-`None`, or (b) trigger a real revisit of §5's nullability. Decision
 #128's Backtest Runner chose (a) — it only calls
 `record_strategy_outcome()` once both snapshots are confirmed
 non-`None`, discarding the signal (as a `DiscardedSignal`, not a
-persisted `StrategyOutcome`) otherwise. That resolves D17 for the
-Backtest Runner path; the live-path caller (Execution Engine/Position
-Monitor) still doesn't exist, so D17 remains open for that path — not
-decided here, and no code in this
-module resolves it either way. This module implements §5 exactly as
-locked: all four fields stay required.
+persisted `StrategyOutcome`) otherwise. That resolved D17 for the
+Backtest Runner path; as of #128 the live-path caller (Execution
+Engine/Position Monitor) did not exist yet, so D17 stayed open for that
+path at the time — not decided by this module. (Current state: decision
+#186's `OutcomeRecorder` is that caller for simulated auto trades and
+took EX-12's nullable-plus-reason route, via the EX-7 nullable snapshot
+fields below. Those are simulated outcomes, not paper or real-money
+trading.) For backtest rows this module still implements §5 as locked:
+all four fields are required (enforced by
+`_backtest_requires_all_snapshots` and the DB CHECK).
 """
 from __future__ import annotations
 
@@ -145,11 +151,13 @@ class StrategyOutcome(BaseModel):
             "from execution_venue below — venue identity and capital mode are different "
             "concepts. When omitted, _default_mode_venue_from_is_backtest (below) fills it in "
             "from is_backtest ('backtest' if True, else 'simulated') — a compatibility "
-            "convenience for today's two real callers (Backtest Runner, always is_backtest=True; "
-            "and the population-isolation tests, which construct a synthetic is_backtest=False "
-            "row and correctly expect it NOT to be treated as a backtest row). This default "
-            "is NOT a license for a future live caller to omit this field — pass it explicitly "
-            "once a live writer exists. The DB CHECK (is_backtest = (execution_mode = "
+            "convenience for the Backtest Runner (always is_backtest=True) and the "
+            "population-isolation tests, which construct a synthetic is_backtest=False "
+            "row and correctly expect it NOT to be treated as a backtest row. The simulated "
+            "OutcomeRecorder (decision #186) does not rely on it: it passes is_backtest=False "
+            "and execution_mode/execution_venue explicitly. This default "
+            "is NOT a license for any non-backtest writer to omit this field — pass it "
+            "explicitly. The DB CHECK (is_backtest = (execution_mode = "
             "'backtest')) and this schema's own _execution_mode_matches_is_backtest validator "
             "both reject a mismatched pair outright rather than silently accepting a wrong label."
         ),
@@ -238,7 +246,8 @@ class StrategyOutcome(BaseModel):
             "discarded, never a fabricated {} (I3, I14). See this module's own docstring for the "
             "underlying D17 gap this originally tracked; EX-7 resolves it for the live path the "
             "way decision #128 already resolved it for backtest (discard-on-None there, "
-            "nullable-plus-reason here)."
+            "nullable-plus-reason here); the simulated OutcomeRecorder (decision #186) is the "
+            "writer that implements it."
         ),
     )
     context_at_entry: dict | None = Field(

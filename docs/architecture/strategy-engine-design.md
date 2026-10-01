@@ -394,6 +394,8 @@ fetch resolves
                       not live trading results."
 ```
 
+> **Current-state correction (decision #186, `frontend-performance-panel-refresh`).** This diagram and the data-flow diagram just above it are the #137-era picture and are kept as history: "no Execution Engine exists to write it" and "`is_backtest=False` rows: none yet" described the code when #137 was written, not today's. A simulated Execution Engine has since been built (#170 onward) and, since #186, its `OutcomeRecorder` writes `is_backtest=false` rows (`execution_mode = "simulated"`), so the Live view is no longer structurally empty and its empty state now reads "No simulated-execution performance data has been recorded yet …". Those rows are simulated, not paper or real-money trading. See the as-built note after the #162 diagrams below.
+
 `strategyName`/`strategyVersion` — also real filters on the same hook/routes — deliberately NOT exposed by this toggle: no source of selectable strategy names exists anywhere in this codebase today (checked directly), and building one is a separate UI/data-source design question, not a natural extension of a two-state provenance toggle. Stays real, deferred future work, same as `future-ideas.md`'s own pattern for named-but-not-yet-triggered ideas. *(Correction, decision #162 — the "no source of selectable strategy names" claim was inaccurate when written: `BACKTEST_STRATEGY_NAMES` in `api-client.ts` already existed, predating #133. `strategyName` is now exposed — see the as-built note immediately below. `strategyVersion` remains deferred. Also superseded since: the default view is Backtest, not `"live"` (decision #138).)*
 
 **As-built note (decision #162) — `strategyName` filter added to `StrategyPerformanceSummary`.** A native `<select>` ("All strategies" + the 7 names from `BACKTEST_STRATEGY_NAMES`, the same list `BacktestPanel.tsx`'s Strategy `<select>` renders) drives the hook's existing `strategyName` argument. Frontend-only, one file (`InfoTab.tsx`): `usePerformanceAnalytics.ts`, `api-client.ts`, both routes and `performance_queries.py` are unchanged. This note is a delta on the #137 diagrams above, which hard-code `usePerformanceAnalytics({ isBacktest })` and a bare `?is_backtest=<bool>` query and therefore no longer describe the full chain.
@@ -447,6 +449,8 @@ strategy_outcomes
                     │           Backtest + name:   message names the strategy
                     └── data  → existing win-rate / expectancy rows
 ```
+
+> **Current-state correction (decision #186).** The Live branch's "unchanged message (no Execution Engine …)" is the decision-era behavior and is no longer current: Live is empty only when no simulated-execution outcome has been recorded for the selection, and the message says so (naming the strategy when one is selected). The as-built note below has the current flow.
 
 **As-built note (`frontend-performance-panel-refresh`, after decision #186; no new decision number) — the Strategy Performance panel is refreshable and truthful about the "Live" population.** This supersedes the current-state claims in the #137/#162 notes above; those notes stay as history. Frontend only: `InfoTab.tsx` (`StrategyPerformanceSummary`), `usePerformanceAnalytics.ts`, and one docstring in `api-client.ts`. No endpoint, statistic, polling, WebSocket subscription or trading control was added; the two aggregate routes are unchanged.
 

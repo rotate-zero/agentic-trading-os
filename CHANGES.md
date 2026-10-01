@@ -1,3 +1,38 @@
+<!-- BEGIN DELIVERY SECTION: outcome-status-doc-sync (docs + comments only; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-status-doc-sync`
+
+Based on `main` `7ab2522` (re-checked against `origin/main` before packaging: no newer commits). Documentation and
+schema-description text only: **no API, database, migration, frontend behavior or trading-logic change.** **No new
+decision number:** nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched
+(latest number is still 186) and no existing decision entry was edited. This corrects living documents and comments
+after the `execution-outcome-status-route` and `execution-panel-outcome-status` deliveries, both already on `main`.
+
+- **`docs/roadmap/phase-roadmap.md`:** the execution "Read surfaces" bullet now lists `execution-outcome-status` and
+  names its Execution panel section, "Simulated outcome recording" (simulated `OutcomeRecorder` progress, #186; not a
+  live portfolio or a real-money result).
+- **`docs/architecture/execution-engine-design.md`:** §6.7.1 K no longer says a UI "is built separately" or shows
+  "Execution panel UI (separate parallel task)"; it now says the route's one consumer is the merged §L section, and its
+  "backend only" label is scoped to the route. The §6.8 `trades` row now names the route (§K) and panel section (§L) that
+  expose `outcome_status`. §L was already accurate and is unchanged. The historical "fourth ledger read route" text
+  in §6.6 is left as written.
+- **`backend/app/schemas/performance.py` (docstring and `Field` descriptions only; fields, types, defaults, validators
+  and population rules untouched, verified by an AST comparison that ignores string constants):**
+  - "a future Execution Engine/Position Monitor fill handler will call" `capture_strategy_outcome_snapshots` → its
+    callers are the Backtest Runner (#128) and the simulated `OutcomeRecorder` (#186).
+  - The D17 paragraph keeps its history (Backtest Runner resolution in #128; the live path open at the time) but no
+    longer says in the present tense that the live-path caller does not exist; it adds a dated current-state sentence
+    (the `OutcomeRecorder` is that caller for simulated auto trades, via EX-12's nullable-plus-reason route, simulated and
+    not paper or real-money) and states that all four snapshots are required for **backtest** rows only.
+  - `execution_mode` description: no longer "today's two real callers" / "once a live writer exists"; it names the
+    Backtest Runner and isolation tests as users of the default and says the `OutcomeRecorder` passes the fields
+    explicitly. `market_state_at_entry` note names the `OutcomeRecorder` as the EX-7 writer.
+- **`docs/architecture/strategy-engine-design.md`:** a concise "Current-state correction" blockquote after each of the
+  two #137/#162 Live/Backtest diagrams (the ones with the "no Execution Engine" empty state). The diagrams and their
+  decision-era meaning are unchanged; the notes point to the as-built note that follows and state that the Live view now
+  shows simulated outcomes, not paper or real-money trading.
+- **Further drift found and deliberately not fixed** (outside the four approved items): see `TESTING.md`.
+<!-- END DELIVERY SECTION: outcome-status-doc-sync -->
+
 <!-- BEGIN DELIVERY SECTION: execution-panel-outcome-status (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `execution-panel-outcome-status`
 

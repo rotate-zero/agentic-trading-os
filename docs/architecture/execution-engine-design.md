@@ -2445,11 +2445,12 @@ Every path applies `is_backtest` as a strict equality selector, never a blend; a
 
 #### K. Read-only recorder status route (`execution-outcome-status-route`; decision #186 is the writer, no new decision number)
 
-**As built (backend only).** `GET /intelligence/execution-outcome-status?limit=50` reports how far the
+**As built (this subsection is the backend route; its UI reader is §L, also merged).** `GET /intelligence/execution-outcome-status?limit=50` reports how far the
 `OutcomeRecorder` has got over the trades it is allowed to record, so an operator no longer needs the logs to learn
 that a closed trade is waiting, retrying or blocked. It reads `trades` only. It writes nothing, takes no lock, triggers
 no recovery sweep and does not touch recorder behavior, the `trades.outcome_status` vocabulary (§D) or any migration.
-A UI is built separately against the response shape below.
+Its one consumer is the Execution panel's "Simulated outcome recording" section (§L), which was delivered separately
+against the response shape below and is merged; nothing else reads the route.
 
 **Response (exact):**
 `{"counts": {"pending", "pending_retry", "blocked", "recorded", "other"}, "trades": [{"trade_id", "symbol", "strategy_name", "outcome_status", "outcome_id", "updated_at"}]}`
@@ -2475,7 +2476,7 @@ A UI is built separately against the response shape below.
           GET /intelligence/execution-outcome-status?limit=N
                                           │ JSON {counts, trades}
                                           ▼
-                     Execution panel UI (separate parallel task)
+                     Execution panel ► "Simulated outcome recording" (§L, merged)
 
  not read here: strategy_outcomes · positions · orders · fills · logs (blocked reasons) · recorder state
 ```
@@ -2577,7 +2578,7 @@ Names follow `system-design.md` §4.13; columns are illustrative. Every write go
 
 | Table | Purpose | Key columns / constraints |
 |---|---|---|
-| `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= accepted `opportunity_id` for approvals; audit identity for rejections), `decision_record` (entry-lifecycle-wiring exact authorization inputs), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` |
+| `trades` | One row per authorization, approved or rejected; holds the thesis snapshot the cache will not keep | `trade_id` (= accepted `opportunity_id` for approvals; audit identity for rejections), `decision_record` (entry-lifecycle-wiring exact authorization inputs), `execution_mode`, `execution_venue`, `origin`, strategy name/version, `direction`, thesis (`structural_*`, `final_*`, `confidence`, `evidence`), `decision`, `reasons`, `limits_snapshot` (the three limits in effect — §6.10), `status`, entry snapshots + reasons, `outcome_id`, `outcome_status` (the recorder's progress is exposed read-only, for closed simulated auto trades, by `GET /intelligence/execution-outcome-status` — §6.7.1 K — and shown by the Execution panel's "Simulated outcome recording" section — §6.7.1 L) |
 | `trade_reservations` (entry-lifecycle-wiring) | Durable approval terms before order insertion, retained after handoff | `trade_id` PK/FK, deterministic `client_order_id` UNIQUE, positive `qty`, finite positive exact `reference_price`, `created_at`; migration downgrade refuses to discard reservations or decision records |
 | `orders` | The order ledger and state machine. First read anywhere in this codebase by `GET /intelligence/execution-orders` (decision #181, §6.3) — curated, `execution_mode = 'simulated'`-only, bounded `[1, 100]` | `client_order_id` **UNIQUE**, `trade_id`, `execution_mode`, `execution_venue`, `venue_order_id`, `symbol`, `side`, `position_effect`, `qty`, `order_type`, `limit_price`, `status`, `exit_reason`, timestamps |
 | `fills` | Every fill, deduplicated, in ledger order. Exposed over HTTP by `GET /intelligence/execution-fills` (decision #183, §6.3) — curated, joined to `orders` for `execution_mode = 'simulated'`-only scoping, bounded `[1, 100]` | `ledger_seq` (monotonic), `client_order_id`, `execution_venue`, `venue_fill_id`, `qty`, `price`, `venue_ts`, `commission` (nullable), `anomaly` (nullable: `overfill` \| `unmatched_order`); **UNIQUE (`execution_venue`, `venue_fill_id`)** |
