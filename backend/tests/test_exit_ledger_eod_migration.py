@@ -20,6 +20,19 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import get_settings
 
 BACKEND = Path(__file__).resolve().parents[1]
+
+
+def _head_revision() -> str:
+    """The current Alembic head, so later migrations do not break this 0016 module's 'at head' checks."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(BACKEND / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
+HEAD = _head_revision()
 UTC = timezone.utc
 DB = f"eod_migration_{uuid.uuid4().hex[:8]}"
 OPENED = datetime(2026, 9, 16, 14, 0, tzinfo=UTC)
@@ -103,7 +116,7 @@ def test_upgrade_preserves_legacy_rows_and_downgrade_without_evidence_round_trip
 
     head = alembic("upgrade", "head")
     assert head.returncode == 0, head.stderr
-    assert current(scratch) == "0016"
+    assert current(scratch) == HEAD
     with scratch() as session:
         legacy = session.execute(text(
             "SELECT exit_reason, eod_flatten_at, eod_close_at, eod_expired_at, fallback_reason, "
@@ -126,7 +139,7 @@ def test_upgrade_preserves_legacy_rows_and_downgrade_without_evidence_round_trip
         with pytest.raises(Exception):
             session.execute(text("INSERT INTO exit_requests (position_id, exit_reason, trigger_price, trigger_ts) "
                                  "SELECT gen_random_uuid(), 'eod_flatten', 1, now()"))
-    assert alembic("upgrade", "head").returncode == 0 and current(scratch) == "0016"
+    assert alembic("upgrade", "head").returncode == 0 and current(scratch) == HEAD
 
 
 def _evidence_refuses_downgrade(scratch, mutate_sql, params=None):
@@ -135,7 +148,7 @@ def _evidence_refuses_downgrade(scratch, mutate_sql, params=None):
     refused = alembic("downgrade", "0015")
     assert refused.returncode != 0
     assert "Cannot downgrade 0016" in refused.stderr
-    assert current(scratch) == "0016"  # nothing was dropped
+    assert current(scratch) == HEAD  # nothing was dropped
 
 
 def test_downgrade_refuses_to_discard_eod_fallback_or_dispatch_evidence(scratch):

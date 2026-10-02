@@ -310,6 +310,17 @@ class StrategyOutcomeRecord(Base):
     cross-field invariant at the ORM/DB level and doesn't try to."""
 
     __tablename__ = "strategy_outcomes"
+    __table_args__ = (
+        # Migration 0017 (decision #186's optional follow-up, execution-engine-design.md section 6.7.1):
+        # at most one NON-backtest outcome per opportunity. Backtest rows are outside the predicate and
+        # keep sharing an opportunity_id across runs.
+        Index(
+            "uq_strategy_outcomes_non_backtest_opportunity",
+            "opportunity_id",
+            unique=True,
+            postgresql_where=text("is_backtest IS FALSE"),
+        ),
+    )
 
     # --- A. Identity & Versioning ---
     outcome_id: Mapped[uuid.UUID] = mapped_column(

@@ -1,3 +1,51 @@
+<!-- BEGIN DELIVERY SECTION: outcome-unique-opportunity-guard (backend migration + model + tests + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-unique-opportunity-guard`
+
+Based on `main` `5f7ca87` (re-checked against `origin/main` before packaging: no newer commits). Delivers the optional
+database guard that decision #186 left as a follow-up. **Decision #187** (next free number on `main`; log, `INDEX.md` and
+archive filenames agreed on #186 as latest). `test_main_execution_pipeline.py` and every production module other than the
+model were not touched.
+
+- **What it adds.** A partial unique index `uq_strategy_outcomes_non_backtest_opportunity` on
+  `strategy_outcomes(opportunity_id) WHERE is_backtest IS FALSE`. A second simulated/paper/live outcome for the same
+  opportunity is now rejected by PostgreSQL even from a second writer. Backtest rows are outside the predicate and still
+  share an opportunity ID across runs.
+
+```
+  OutcomeRecorder (unchanged) -> record_strategy_outcome_in_session -> INSERT strategy_outcomes
+                                                                         |
+                          uq_strategy_outcomes_non_backtest_opportunity -+
+                            is_backtest=false, new id        -> accepted
+                            is_backtest=false, existing id   -> IntegrityError, nothing written
+                            is_backtest=true (any run/repeat) -> accepted
+  Backtest Runner -> record_strategy_outcome (is_backtest=true) -> unaffected
+
+  0017 upgrade: LOCK TABLE ... SHARE MODE -> count duplicate non-backtest ids
+                  > 0 -> RuntimeError naming up to 10 (x count); no row/index/revision change
+                  = 0 -> CREATE UNIQUE INDEX ... WHERE is_backtest IS FALSE
+  0017 downgrade: DROP INDEX uq_strategy_outcomes_non_backtest_opportunity (only)
+```
+
+- **New** `backend/alembic/versions/0017_strategy_outcomes_non_backtest_opportunity_unique.py` (down_revision `0016`,
+  the head on `main`). The duplicate check runs under the same `SHARE` lock `CREATE INDEX` takes, so no writer can add a
+  duplicate between check and build. It never deletes, merges or chooses a row; an operator resolves duplicates and
+  re-runs. Existing simulated rows are preserved.
+- **Edited** `backend/app/models/trading_intelligence.py`: `StrategyOutcomeRecord.__table_args__` declares the same
+  index (`Index(..., unique=True, postgresql_where=text("is_backtest IS FALSE"))`). Nothing else in the model changed.
+- **New** `backend/tests/test_strategy_outcomes_unique_opportunity_migration.py` (6 tests, real PostgreSQL, throwaway
+  database per module): model/DB index agreement, unique simulated case, duplicate rejection (simulated and paper),
+  backtest exemption, upgrade preserving rows, upgrade refusal on existing duplicates, downgrade removing only the index.
+- **Edited** `backend/tests/test_exit_ledger_eod_migration.py` (required by the new head, not a behaviour change): three
+  `current(...) == "0016"` assertions made after `upgrade head` now compare to the Alembic script head
+  (`HEAD = _head_revision()`), so they stop breaking on each new migration. Assertions about 0016 content are unchanged.
+- **Docs.** `docs/architecture/execution-engine-design.md` section 6.7.1 G: the "optional follow-up" bullet is now
+  "delivered" with the diagram above. `docs/decisions/confirmed-decisions.md` + `INDEX.md`: decision #187.
+- **Not changed:** `OutcomeRecorder` retry/blocking policy, outcome payloads, read routes, Backtest Runner, frontend.
+- **Pre-existing duplicates:** none in the sandbox database (fresh, 0 `strategy_outcomes` rows). Run the check below
+  against your own database before applying; the upgrade will refuse if it returns rows:
+  `SELECT opportunity_id, count(*) FROM strategy_outcomes WHERE is_backtest IS FALSE GROUP BY 1 HAVING count(*) > 1;`
+<!-- END DELIVERY SECTION: outcome-unique-opportunity-guard -->
+
 <!-- BEGIN DELIVERY SECTION: main-pipeline-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `main-pipeline-outcome-recorded`
 

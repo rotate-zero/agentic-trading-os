@@ -2341,7 +2341,35 @@ The ledger stays authoritative because every quantity, price and time in the out
 - **P2:** `OutcomeRecorder` subscribes to `OrderFilled`, queues the order ID, and captures at the first opening fill only. Fill persistence never waits for this hook. A missed hook leaves NULL entry snapshots with `recorder_unavailable` in the outcome.
 - **P3:** `record_strategy_outcome_in_session()` stages the full row in its caller's session and does not commit or close it; `record_strategy_outcome()` remains the Backtest Runner wrapper.
 - **P4:** `trading_intelligence/outcome_recorder.py` starts only after successful reconciliation, replays the target position's receipts through `apply_fill`, and links the outcome atomically. Its startup failure is isolated. Settings default to 60 seconds for both maximum exit-snapshot lag and recovery sweep.
-- **Optional, not required for correctness:** a partial unique index on `strategy_outcomes(opportunity_id) WHERE NOT is_backtest` makes a duplicate structurally impossible even for a second writer. It is a migration, so it is left as a follow-up.
+- **Database guard (delivered, decision #187, `outcome-unique-opportunity-guard`; was optional in #186).** Migration `0017` adds the partial unique index `uq_strategy_outcomes_non_backtest_opportunity` on `strategy_outcomes(opportunity_id) WHERE is_backtest IS FALSE`, declared identically on `StrategyOutcomeRecord`. A duplicate non-backtest outcome is now structurally impossible even for a second writer; backtest rows keep sharing an opportunity ID across runs. The recorder's under-lock recheck is unchanged and remains the first line of defense; the index is the backstop. The recorder code, retry/blocking policy, outcome payload and read routes are untouched.
+
+```
+  WRITE PATH (unchanged code, new backstop)
+
+  OutcomeRecorder --(locks, recheck outcome_id)--> record_strategy_outcome_in_session()
+                                                        |  INSERT strategy_outcomes
+                                                        v
+                         +----------------------------------------------+
+                         | uq_strategy_outcomes_non_backtest_opportunity |
+                         |   UNIQUE (opportunity_id) WHERE NOT backtest  |
+                         +----------------------------------------------+
+        is_backtest = false, new opportunity_id ---> accepted
+        is_backtest = false, existing opportunity_id -> IntegrityError (nothing written)
+        is_backtest = true (any run, any repeat) ----> accepted (outside the predicate)
+
+  Backtest Runner --> record_strategy_outcome() (is_backtest = true) -------> unaffected
+
+  MIGRATION 0017 upgrade                                   downgrade
+  -----------------------------------------------          -------------------------
+  LOCK strategy_outcomes IN SHARE MODE                     DROP INDEX
+  count non-backtest opportunity_ids with > 1 row            uq_strategy_outcomes_
+     > 0 : RAISE (names up to 10, no row touched,            non_backtest_opportunity
+           revision stays 0016, no index)                  (rows and all other
+     = 0 : CREATE UNIQUE INDEX ... WHERE is_backtest         objects untouched)
+           IS FALSE; revision -> 0017
+```
+
+  Existing duplicates are never deleted or chosen automatically: the operator decides which outcome is authoritative, resolves the rest deliberately, then re-runs the upgrade.
 
 **Verification.** The focused tests cover same-session rollback and the PostgreSQL NULL-snapshot CHECK, replayed partial fills and reductions, known/unknown commissions, duplicate and concurrent writers, blocked evidence/R/exit reason, injected failure between insert and link, entry snapshot capture and failure, delayed exit capture, startup scan, sweep, and startup failure isolation, plus lost-event recovery of zero-position, multi-position and NULL-`closed_at` trades across page boundaries (`outcome-recorder-zero-position-recovery`). Backtest wrapper regression is included in the full backend suite. See `TESTING.md` for exact commands and results.
 

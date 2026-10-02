@@ -1,3 +1,32 @@
+<!-- BEGIN DELIVERY SECTION: outcome-unique-opportunity-guard (backend migration + model + tests + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-unique-opportunity-guard`
+
+**Database target:** local PostgreSQL 16.15 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (project defaults), dropped, recreated and migrated with `alembic upgrade head` (now revision `0017`) before the
+final runs. The migration tests also create and drop their own scratch databases. No external or production database and
+no broker touched. Python 3.12. Verified on `main` `5f7ca87` (unchanged on `origin/main` at packaging). Run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_strategy_outcomes_unique_opportunity_migration.py -q` | 6 passed |
+| same file + `test_exit_ledger_eod_migration.py` + `test_position_ledger_postgres.py` | 44 passed (before the 0016-test edit, `test_exit_ledger_eod_migration.py` failed `'0017' == '0016'`, as expected) |
+| outcome/ledger set: `test_outcome_recorder.py`, `..._event_path_integration.py`, `test_outcome_read_path_integration.py`, `test_execution_outcome_status_route.py`, `..._recorder_integration.py`, `test_strategy_outcomes_and_opportunity_conflicts_routes.py`, `test_performance_queries.py`, `test_performance_intelligence.py`, `test_performance_analytics_routes.py`, `test_backtest_runner.py`, `..._regression.py`, `test_backtest_routes.py`, `test_execution_ledger.py` | 148 passed |
+| `python -m pytest tests -q --ignore=tests/test_main_execution_pipeline.py` | 1581 passed (124 s) |
+
+`test_main_execution_pipeline.py` was not edited and was excluded from the full run (owned by another Claude instance).
+The one-line index check against `trading_workspace` after migration: `CREATE UNIQUE INDEX uq_strategy_outcomes_non_backtest_opportunity ... (opportunity_id) WHERE (is_backtest IS FALSE)`.
+
+**What the new tests prove:** duplicate simulated and paper inserts raise `IntegrityError` naming the index and leave
+rows unchanged; three backtest rows with one ID across two runs plus one simulated row coexist; upgrade over existing
+rows leaves every row byte-identical; with two duplicated IDs (one also duplicated by a paper row) the upgrade exits
+non-zero, names both IDs and not the clean one, leaves revision `0016`, no index and all 7 rows, and succeeds once the
+operator resolves them; downgrade removes only this index (indexes on every table and constraints on `strategy_outcomes`
+otherwise identical, rows kept, a duplicate insert possible again).
+
+**Pre-existing duplicates:** none (sandbox DB had 0 `strategy_outcomes` rows; your own database was not accessible).
+Not covered: concurrent writers racing the index build, and frontend (no frontend change).
+<!-- END DELIVERY SECTION: outcome-unique-opportunity-guard -->
+
 <!-- BEGIN DELIVERY SECTION: main-pipeline-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `main-pipeline-outcome-recorded`
 
