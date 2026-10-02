@@ -28,6 +28,7 @@ from app.position_monitor.handoff import ObservationState
 from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed, PriceUpdated
+from tests.test_main_execution_pipeline import _wait_for
 
 NAME = "TEST_SIMULATED_EOD_INTEGRATION"
 UTC = timezone.utc
@@ -115,6 +116,23 @@ async def settle(bus, monitor, engine, portfolio):
     await engine._queue.join()
     await bus._critical_queue.join()
     await portfolio._queue.join()
+
+
+async def settle_lifespan(bus, monitor, engine, portfolio, *, timeout=10.0):
+    """Bounded `settle` for the real-lifespan test: repeat the ordered queue joins until a whole pass finds every
+    queue fully processed (downstream work can re-enter an earlier queue), failing after `timeout` instead of
+    hanging. Called through the TestClient portal, i.e. on the app's own event loop. The queues' `join()` covers
+    work already enqueued; it cannot see work that is only *scheduled* (timers, an `await` still running inside a
+    handler that has not yet enqueued), which is why callers first wait for a positive milestone."""
+    queues = (bus._normal_queue, monitor._queue, engine._queue, bus._critical_queue, portfolio._queue)
+
+    async def drain():
+        while True:
+            await settle(bus, monitor, engine, portfolio)
+            if not any(q._unfinished_tasks for q in queues):
+                return
+
+    await asyncio.wait_for(drain(), timeout)
 
 
 def rows(pid):
@@ -513,6 +531,7 @@ def test_real_lifespan_eod_and_fresh_venue_restart_block(monkeypatch):
     import app.position_monitor.engine as monitor_module
     from app.main import app as fastapi_app
     from app.event_bus.bus import get_event_bus
+    from app.execution_engine.engine import get_execution_engine
     from tests.test_main_execution_pipeline import _reset_singletons
 
     trade_id, symbol = seed(symbol="ZZEODLIFE")
@@ -539,6 +558,21 @@ def test_real_lifespan_eod_and_fresh_venue_restart_block(monkeypatch):
     class TimedMonitor(original_monitor):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, wall_clock=wall, pulse_interval_seconds=None, **kwargs)
+            # Test-local completion signals, appended only after the real handler has returned (or raised).
+            self.events_done = []  # event types the worker fully processed (held-symbol events only)
+            self.pulses_done = 0   # pulses the worker fully processed
+
+        def _process_event(self, queued):
+            try:
+                super()._process_event(queued)
+            finally:
+                self.events_done.append(queued.envelope.event_type)
+
+        def _process_pulse(self, pulse):
+            try:
+                super()._process_pulse(pulse)
+            finally:
+                self.pulses_done += 1
 
     monkeypatch.setattr(monitor_module, "PositionMonitor", TimedMonitor)
     created = []
@@ -564,22 +598,49 @@ def test_real_lifespan_eod_and_fresh_venue_restart_block(monkeypatch):
         return venue
 
     monkeypatch.setattr(venue_module, "SimulatedVenue", make_venue)
+    def request_state():
+        request, orders, fills = rows(pid)
+        return {"exit_reason": request and request.exit_reason, "fallback": request and request.fallback_reason,
+                "orders": [o.status for o in orders], "fills": len(fills)}
+
+    def observation_states(monitor):
+        return [(o.kind, o.state.name) for o in monitor.get_observations()]
+
+    def settled(client, monitor):
+        client.portal.call(settle_lifespan, get_event_bus(), monitor, get_execution_engine(),
+                           fastapi_app.state.world_view_portfolio_reader)
+
     with TestClient(fastapi_app) as client:
         assert client.get("/health/execution-startup").json()["status"] == "ready"
         bus = get_event_bus()
+        monitor = fastapi_app.state.position_monitor
         client.portal.call(bus.publish, make_envelope(EventType.PRICE_UPDATED,
             PriceUpdated(price=101, size=1, exchange_ts=OPENED + timedelta(hours=5)), symbol=symbol))
-        client.portal.call(asyncio.sleep, 0.05)
-        monitor = fastapi_app.state.position_monitor
+        # Milestone 1: the tick has been through the bus and the monitor worker (tick cached) before any pulse.
+        _wait_for(lambda: EventType.PRICE_UPDATED in monitor.events_done,
+                  "price event processed by the position monitor worker",
+                  describe=lambda: (monitor.events_done, bus.queue_depths()))
+        settled(client, monitor)
         assert monitor.enqueue_pulse()
-        client.portal.call(asyncio.sleep, 0.1)
+        # Milestone 2: pulse processed -> EOD observation acknowledged -> durable request + submitted close order.
+        _wait_for(lambda: monitor.pulses_done >= 1 and request_state()["exit_reason"] == "eod_flatten"
+                  and request_state()["orders"] == ["submitted"] and len(created[0]._orders) == 2,
+                  "EOD pulse processed, durable eod_flatten request and one submitted close order at the venue",
+                  describe=lambda: (monitor.pulses_done, request_state(), observation_states(monitor),
+                                    len(created[0]._orders)))
+        settled(client, monitor)  # negative assertions below only after the EOD work has settled
         request, orders, fills = rows(pid)
         assert request.exit_reason == "eod_flatten"
         assert len(orders) == 1 and orders[0].status == "submitted" and fills == []
         client.portal.call(bus.publish, make_envelope(EventType.CANDLE_CLOSED,
             CandleClosed(timeframe="1m", open=101, high=102, low=89, close=100, volume=1,
                          candle_ts=OPENED + timedelta(hours=5, minutes=1)), symbol=symbol))
-        client.portal.call(asyncio.sleep, 0.1)
+        # Milestone 3: candle processed by the monitor, protective (stop) observation acknowledged, fallback durable.
+        _wait_for(lambda: EventType.CANDLE_CLOSED in monitor.events_done and request_state()["fallback"] == "stop"
+                  and ("protective", "ACKNOWLEDGED") in observation_states(monitor),
+                  "candle processed, stop fallback recorded durably and its observation acknowledged",
+                  describe=lambda: (monitor.events_done, request_state(), observation_states(monitor)))
+        settled(client, monitor)  # "no second order" is asserted only after the fallback work has settled
         assert rows(pid)[0].fallback_reason == "stop"
         assert len(rows(pid)[1]) == 1
         assert len(created[0]._orders) == 2  # entry and exactly one EOD close
@@ -593,8 +654,12 @@ def test_real_lifespan_eod_and_fresh_venue_restart_block(monkeypatch):
         assert monitor.get_observations()[0].state is ObservationState.EXPIRED
         assert monitor.get_observations()[1].state is ObservationState.ACKNOWLEDGED
         assert rows(pid)[0].eod_expired_at is not None
-        monitor.enqueue_pulse()
-        client.portal.call(asyncio.sleep, 0.1)
+        assert monitor.enqueue_pulse()
+        # Milestone 4: the restart pulse has finished (it must find the restored EOD slot and do nothing) and every
+        # queue has drained; only then is "no extra order" meaningful.
+        _wait_for(lambda: monitor.pulses_done >= 1, "restart pulse processed by the position monitor worker",
+                  describe=lambda: (monitor.pulses_done, observation_states(monitor)))
+        settled(client, monitor)
         assert len(rows(pid)[1]) == 1 and len(created[1]._orders) == 2
     _reset_singletons()
     with TestClient(fastapi_app) as client:

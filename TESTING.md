@@ -1,3 +1,40 @@
+<!-- BEGIN DELIVERY SECTION: simulated-eod-lifespan-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `simulated-eod-lifespan-test-waits`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (project defaults), created fresh in the sandbox and migrated with `alembic upgrade head` (revision `0016`).
+No external or production database and no broker touched. Python 3.12.3, pytest 8.4.2. Verified on `main` `6e69993`
+(unchanged on `origin/main` at packaging). All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_simulated_eod_integration.py -q` (before edit) | 12 passed (4.8 s) |
+| `python -m pytest tests/test_simulated_eod_integration.py::test_real_lifespan_eod_and_fresh_venue_restart_block -q` x15 (before edit) | 15/15 passed (1.6-1.8 s each) |
+| same single test, after edit, 30 consecutive runs | 30/30 passed (~2 s each) |
+| `python -m pytest tests/test_simulated_eod_integration.py -q` (whole file, after edit) | 12 passed (4.7 s) |
+| same whole-file command, 5 more consecutive runs | 5/5 green |
+| `tests/test_simulated_eod_integration.py tests/test_position_monitor_eod.py tests/test_main_execution_pipeline.py tests/test_exit_*.py` | 122 passed (15.2 s) |
+
+The baseline did not fail without injected delay (the flake is timing-dependent and was not reproduced naturally in
+15 runs), so the evidence below is by injected delay and mutation.
+
+**Injected-delay check** (throwaway plugin outside the repo, `PYTHONPATH=/tmp/plug INJ_DELAY=<D> python -m pytest -p
+delayplug ...`; it delays, by `D` seconds, `PositionMonitor._process_event`/`_process_pulse`, `EventBus._safe_call`
+and `ExecutionEngine._service_exits`; "old" is `6e69993`'s file run from a temporary copy, removed afterwards):
+
+| Delay D | Old test | New test |
+|---|---|---|
+| 0 | passed | passed (1.8 s) |
+| 0.1 s | **failed** | passed (3.3 s) |
+| 0.3 s | **failed** | passed (7.9 s) |
+
+**Mutation check** (same plugin; production untouched; `_evaluate` stubbed to never produce a protective intent):
+the new test **failed** after the 10 s bound with a diagnostic naming the stop-fallback milestone and the observed
+state (`fallback: None`, only the EOD observation acknowledged).
+
+Not run: the full backend suite and the frontend checks (no frontend change).
+<!-- END DELIVERY SECTION: simulated-eod-lifespan-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `position-monitor-engine-test-waits`
 

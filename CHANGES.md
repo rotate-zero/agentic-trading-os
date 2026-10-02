@@ -1,3 +1,57 @@
+<!-- BEGIN DELIVERY SECTION: simulated-eod-lifespan-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `simulated-eod-lifespan-test-waits`
+
+Based on `main` `6e69993` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, schema, migration or frontend file was edited.** **No new decision number:**
+nothing new is decided; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file
+changed is `backend/tests/test_simulated_eod_integration.py`; `test_position_monitor_engine.py` (owned by another
+session) was not touched.
+
+- **Problem.** `test_real_lifespan_eod_and_fresh_venue_restart_block` synchronized its three real `TestClient`
+  lifespans with four fixed `portal.call(asyncio.sleep, 0.05 / 0.1 / 0.1 / 0.1)` guesses. Under a slow hand-off the
+  positive assertions (EOD request + submitted close order, stop fallback) could run before the work existed, and the
+  negative ones ("no second order", "restart pulse created no extra order") could pass without the work ever having
+  run.
+- **Edited** `backend/tests/test_simulated_eod_integration.py` (test-local only; no production seam added):
+  - `settle_lifespan(bus, monitor, engine, portfolio, timeout=10)` — a bounded wrapper around the file's existing
+    `settle()`: repeats the ordered queue joins (bus normal -> monitor -> engine -> bus critical -> portfolio) until a
+    whole pass leaves every queue with nothing unfinished, and fails after the timeout instead of hanging. Run on the
+    app's own loop via `client.portal.call`. Existing `settle()` is unchanged.
+  - `TimedMonitor` (already a test-local subclass) now records completion signals appended only after the real
+    handler returns or raises: `events_done` (event types the worker fully processed) and `pulses_done`.
+  - The test reuses `_wait_for` from `tests/test_main_execution_pipeline.py` (the same module it already imports
+    `_reset_singletons` from), with a `describe=` that reports queue depths, ledger rows and observation states on
+    timeout.
+  - **Milestones now waited on (positive signals, 10 s failure ceiling), then settled, then asserted:**
+    1. price event reached the monitor worker (`PRICE_UPDATED in events_done`) before the first pulse;
+    2. after `enqueue_pulse()` (now asserted to have been accepted): pulse processed, durable `eod_flatten` request,
+       exactly one `submitted` close order, and two orders at the venue; `fills == []` is asserted only after settle;
+    3. after the candle: candle processed, `fallback_reason == "stop"` durable and the protective observation
+       `ACKNOWLEDGED`; "still one order / two venue orders" is asserted only after settle;
+    4. second lifespan: `enqueue_pulse()` accepted, restart pulse processed (`pulses_done >= 1`), all queues drained,
+       and only then "no extra order".
+- **Unchanged.** Three real `TestClient` lifespans with `_reset_singletons()` between them, retained venue (second
+  lifespan reuses `created[0]` with a new bus) versus fresh venue (third), the `reconciliation_blocked` result,
+  `position_monitor is None`, the `expired` order with the fresh venue, `len(created[2]._orders) == 0`, the
+  teardown assertion on `_subscribed`/`_callbacks`, and every other substantive assertion. Only added assertions:
+  the two `enqueue_pulse()` return values (needed for the negative checks to mean anything).
+- **Uncovered product defect:** none found.
+- **Completion points that cannot be observed reliably within this scope (reported, not changed).**
+  1. `EventBus` has no public flush/idle signal and `PositionMonitor`/`ExecutionEngine`/`PortfolioState` expose no
+     public "queue drained" signal, so `settle_lifespan` reads their private queues (`_queue`, `_normal_queue`,
+     `_critical_queue`) and `asyncio.Queue._unfinished_tasks` (same private-queue precedent as the file's `settle`).
+     `join()` cannot see work that is only scheduled: the engine's 0.5 s idle `_service_exits` timer, or a handler
+     still awaiting before it enqueues. The test therefore always waits for a positive ledger/venue/observation
+     milestone first and settles second.
+  2. There is no positive "evaluated, nothing to do" signal. The restart-pulse check relies on the test-local
+     `pulses_done` wrapper around the private `_process_pulse` plus the drained queues; if that method were renamed
+     the test would fail loudly (not silently weaken).
+  3. The third (`reconciliation_blocked`) lifespan starts no engine or monitor, so `len(created[2]._orders) == 0` is
+     checked once startup has returned; there is no later work to wait for.
+  4. `test_lifespan_revalidates_proven_unsent_eod_reservation` still uses `asyncio.sleep(0.6)`; it is outside this
+     task and was not edited (related follow-up).
+<!-- END DELIVERY SECTION: simulated-eod-lifespan-test-waits -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-engine-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `position-monitor-engine-test-waits`
 
