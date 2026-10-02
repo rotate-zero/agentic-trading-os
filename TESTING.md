@@ -1,3 +1,35 @@
+<!-- BEGIN DELIVERY SECTION: main-pipeline-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `main-pipeline-outcome-recorded`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (project defaults), created fresh in the sandbox and migrated with `alembic upgrade head` (revision `0016`).
+No external or production database and no broker touched. Python 3.12.3. Verified on `main` `d473334` (unchanged on
+`origin/main` at packaging). All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_main_execution_pipeline.py -k position_monitor_places_durable_exit -q` (before edit) | 2 passed (2.6 s) |
+| same command, after edit (stop + target cases) | 2 passed (~2.2 s) |
+| same command, 20 consecutive runs | 20/20 passed (2.1-2.5 s each) |
+| `python -m pytest tests/test_main_execution_pipeline.py -q` (whole file) | 7 passed (2.7 s) |
+| `tests/test_main_execution_pipeline.py test_outcome_recorder.py test_outcome_recorder_event_path_integration.py test_execution_outcome_status_recorder_integration.py test_execution_outcome_status_route.py test_outcome_read_path_integration.py test_strategy_outcomes_and_opportunity_conflicts_routes.py test_simulated_eod_integration.py` | 92 passed (10.9 s) |
+
+After the final runs `strategy_outcomes` and `trades` hold 0 rows for `TEST_MAIN_EXECUTION_PIPELINE`.
+
+**Mutation checks** (throwaway pytest plugin outside the repo; production untouched):
+
+| Mutation | Result |
+|---|---|
+| `OutcomeRecorder.record_trade` returns `"skipped"` without recording | stop case **failed** after the 10 s bound: `timed out ... waiting for: OutcomeRecorder verdict for the closed trade (last observed: ((None, None, 0), []))` |
+| outcome `realized_r` shifted by +1.0 before it is written | both cases **failed** on the R assertion (`-0.5` vs `-1.5`, `3.5` vs `2.5`) |
+
+The second mutation first exposed a weakness in my own draft: ORM numeric columns are `Decimal`, and
+`pytest.approx` against a float only passed because the values matched exactly. The assertions now convert to float.
+
+Not run: the full backend suite and the frontend checks (no frontend change). Not covered: snapshot content,
+partial fills, the blocked-reason paths (covered by `test_outcome_recorder.py`), and a restart mid-recording.
+<!-- END DELIVERY SECTION: main-pipeline-outcome-recorded -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-eod-lifespan-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `simulated-eod-lifespan-test-waits`
 

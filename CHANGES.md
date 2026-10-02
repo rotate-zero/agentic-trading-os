@@ -1,3 +1,58 @@
+<!-- BEGIN DELIVERY SECTION: main-pipeline-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `main-pipeline-outcome-recorded`
+
+Based on `main` `d473334` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, model, migration or frontend file was edited** (models and migrations are owned by
+another Claude instance and were not touched). **No new decision number:** this proves behaviour already decided in
+#186; `INDEX.md`, `confirmed-decisions.md` and the archive list are untouched. The only code file changed is
+`backend/tests/test_main_execution_pipeline.py`.
+
+- **What this proves (next step of the existing chain).** The parametrized test
+  `test_position_monitor_places_durable_exit_and_closes_on_later_tick` (stop and target cases) already drives
+  `OpportunityCreated` through the real FastAPI lifespan, simulated entry, Position Monitor exit and a closed position.
+  It now continues into the OutcomeRecorder that the same lifespan started:
+
+```
+  PositionClosed (bus) --> running OutcomeRecorder --queue--> worker --> record_trade()
+      --> strategy_outcomes (1 row, is_backtest=false) + trades.outcome_id / outcome_status="recorded"
+      --> GET /intelligence/strategy-outcomes  and  GET /intelligence/execution-outcome-status
+```
+
+- **Edited** `backend/tests/test_main_execution_pipeline.py` (test-local; the recorder is never called directly, no
+  closed trade is seeded, no production seam added):
+  - Parameters gain `realized_r` (`-1.5` stop, `2.5` target) as an independent oracle; `caplog` captures the
+    recorder's own WARNING+ log.
+  - **Bounded wait** (`_wait_for`, 10 s ceiling) for the recorder verdict (`recorded`, `blocked` or `pending_retry`).
+    A blocked/retrying recorder therefore fails fast, and the failure message carries the recorder's log lines, which
+    is the only place a blocked reason code is exposed (#186).
+  - **Assertions against the ledger rows** (entry/close `Fill`, close `Order`, `Position`, `Trade.thesis`), not
+    against the outcome under test: exactly one `StrategyOutcomeRecord` for the trade; `trades.outcome_id` equals its
+    `outcome_id` and `outcome_status == "recorded"`; `is_backtest` false, no `backtest_run_id`;
+    `execution_mode`/`execution_venue`/`origin` = simulated/simulated/auto; trade identity (`opportunity_id`,
+    strategy name/version, symbol, direction); `exit_reason` equals the close order's (`stop` / `target`); entry and
+    exit price and qty equal the fills; `commission_total` is NULL (the simulated venue reports none, so P&L stays
+    gross); realized P&L equals `(exit - entry) * qty` and `positions.realized_pnl`; realized R equals the
+    ledger-derived value and the literal expectation; structural invalidation equals 90.
+  - **Read path.** `GET /intelligence/strategy-outcomes` (default `is_backtest=false`) lists the outcome exactly once
+    with matching id, mode, reason, prices, P&L and R; the same trade is absent from `?is_backtest=true`;
+    `GET /intelligence/execution-outcome-status` lists the trade as `recorded` with the same `outcome_id`.
+  - After the lifespan exits (shutdown drains the recorder) the outcome is asserted to still be exactly one and still
+    linked.
+  - **Cleanup (own rows only).** The file's existing `clean()` first nulls `trades.outcome_id` for this test's trades
+    (`strategy_name == TEST_MAIN_EXECUTION_PIPELINE`), then deletes only `strategy_outcomes` rows whose
+    `opportunity_id` is one of those trade ids, before the existing ledger deletes. It runs before and after every
+    test via the existing autouse fixture.
+- **Unchanged.** Every pre-existing assertion of the stop/target test, the other five tests in the file, the
+  recorder, the routes, models and migrations.
+- **Outcome / blocker.** The real path was **not blocked**: the running recorder recorded the outcome in both cases,
+  so there is no product defect to hand to Codex.
+- **Limitations.** The recorder's exit snapshot capture is real (`capture_strategy_outcome_snapshots` is patched only
+  for the Governor in this file); snapshot content and `snapshot_missing_reasons` are deliberately not asserted.
+  One-off observation, not reproduced: a single early check saw 2 leftover `strategy_outcomes` rows for this test's
+  strategy name; 41 later runs (20 + 6 + 15 full-file loops, each followed by a count) left 0, and I could not
+  identify the cause.
+<!-- END DELIVERY SECTION: main-pipeline-outcome-recorded -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-eod-lifespan-test-waits (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `simulated-eod-lifespan-test-waits`
 

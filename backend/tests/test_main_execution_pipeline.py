@@ -19,12 +19,13 @@ construct a "process died mid-fill" scenario against this venue
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import app.context_engine.engine as context_engine_module
 import app.context_engine.fundamentals_refresh as fundamentals_refresh_module
@@ -43,6 +44,7 @@ from app.core.market_clock import MarketClock
 from app.db.session import SessionLocal
 from app.event_bus.bus import get_event_bus
 from app.main import app as fastapi_app
+from app.models.trading_intelligence import StrategyOutcomeRecord
 from app.models.execution_ledger import (
     Fill,
     ExitRequest,
@@ -68,6 +70,14 @@ def clean():
     with SessionLocal.begin() as s:
         ids = select(Trade.trade_id).where(Trade.strategy_name == NAME)
         orders = select(Order.client_order_id).where(Order.trade_id.in_(ids))
+        # OutcomeRecorder rows are owned by this test's trades only: unlink first
+        # (trades.outcome_id -> strategy_outcomes), then delete just the outcomes
+        # whose opportunity_id is one of this test's trade ids.
+        s.query(Trade).filter(Trade.strategy_name == NAME, Trade.outcome_id.is_not(None)).update(
+            {Trade.outcome_id: None}, synchronize_session=False)
+        s.query(StrategyOutcomeRecord).filter(
+            StrategyOutcomeRecord.opportunity_id.in_(ids), StrategyOutcomeRecord.strategy_name == NAME,
+        ).delete(synchronize_session=False)
         fills = select(Fill.ledger_seq).where(Fill.client_order_id.in_(orders))
         s.query(PositionFillReceipt).filter(PositionFillReceipt.ledger_seq.in_(fills)).delete(synchronize_session=False)
         s.query(Fill).filter(Fill.client_order_id.in_(orders)).delete(synchronize_session=False)
@@ -388,13 +398,15 @@ def test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries
 
 
 @pytest.mark.parametrize(
-    ("trigger_price", "reason", "level", "fill_price", "realized_pnl"),
-    [(89.0, "stop", 90.0, 85.0, -150), (121.0, "target", 120.0, 125.0, 250)],
+    ("trigger_price", "reason", "level", "fill_price", "realized_pnl", "realized_r"),
+    [(89.0, "stop", 90.0, 85.0, -150, -1.5), (121.0, "target", 120.0, 125.0, 250, 2.5)],
 )
 def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
-    monkeypatch, trigger_price, reason, level, fill_price, realized_pnl
+    monkeypatch, caplog, trigger_price, reason, level, fill_price, realized_pnl, realized_r
 ):
     from app.position_monitor.engine import PositionMonitor
+
+    caplog.set_level(logging.INFO, logger="app.trading_intelligence.outcome_recorder")
 
     monkeypatch.setattr(MarketClock, "is_regular_session", lambda self, ts=None: True)
     monkeypatch.setattr(
@@ -530,8 +542,77 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
             assert len(s.scalars(select(PositionFillReceipt).where(PositionFillReceipt.position_id == position.position_id)).all()) == 2
             assert EventType.POSITION_CLOSED in [event.event_type for event in published]
 
+        # --- Next step: the RUNNING OutcomeRecorder (started by the real lifespan,
+        # woken by the PositionClosed above) records exactly one non-backtest outcome.
+        def outcome_state() -> tuple:
+            with SessionLocal() as s:
+                row = s.get(Trade, trade.trade_id)
+                count = s.scalar(select(func.count()).select_from(StrategyOutcomeRecord).where(
+                    StrategyOutcomeRecord.opportunity_id == trade.trade_id))
+            return row.outcome_status, row.outcome_id, count
+
+        def recorder_logs() -> list[str]:
+            # A blocked verdict keeps its reason code in the log only (decision #186).
+            return [r.getMessage() for r in list(caplog.records)
+                    if r.name == "app.trading_intelligence.outcome_recorder" and r.levelno >= logging.WARNING]
+
+        # Stop waiting on any verdict, so a blocked/retrying recorder fails fast with its reason.
+        _wait_for(lambda: outcome_state()[0] in {"recorded", "blocked", "pending_retry"},
+                  "OutcomeRecorder verdict for the closed trade",
+                  describe=lambda: (outcome_state(), recorder_logs()))
+        status, outcome_id, outcome_count = outcome_state()
+        assert status == "recorded", f"OutcomeRecorder did not record: status={status!r} logs={recorder_logs()}"
+        assert outcome_count == 1 and outcome_id is not None
+
+        with SessionLocal() as s:
+            outcome = s.scalar(select(StrategyOutcomeRecord).where(StrategyOutcomeRecord.opportunity_id == trade.trade_id))
+            ledger_trade = s.get(Trade, trade.trade_id)
+            entry_fill = s.scalar(select(Fill).where(Fill.client_order_id == order.client_order_id))
+            close_fill = s.scalar(select(Fill).where(Fill.client_order_id == close.client_order_id))
+            exit_order = s.scalar(select(Order).where(Order.client_order_id == close.client_order_id))
+            ledger_position = s.get(Position, position.position_id)
+            basis = float(ledger_trade.thesis["structural_invalidation"])
+            # Expected values come from the ledger rows, not from the outcome under test.
+            assert entry_fill.commission is None and close_fill.commission is None  # SimulatedVenue reports none
+            ledger_pnl = float((close_fill.price - entry_fill.price) * entry_fill.qty)
+            ledger_r = float(close_fill.price - entry_fill.price) / abs(float(entry_fill.price) - basis)
+
+            assert ledger_trade.outcome_id == outcome.outcome_id == outcome_id
+            assert ledger_trade.outcome_status == "recorded"
+            assert outcome.is_backtest is False and outcome.backtest_run_id is None
+            assert (outcome.execution_mode, outcome.execution_venue, outcome.origin) == ("simulated", "simulated", "auto")
+            assert (outcome.opportunity_id, outcome.strategy_name, outcome.strategy_version, outcome.symbol, outcome.direction) == (
+                ledger_trade.trade_id, NAME, "test_v1", SYMBOL, "BUY")
+            assert outcome.exit_reason == exit_order.exit_reason == reason
+            assert float(outcome.entry_price) == float(entry_fill.price) == 100.0
+            assert float(outcome.exit_price) == float(close_fill.price) == fill_price
+            assert outcome.entry_qty == outcome.exit_qty == entry_fill.qty == close_fill.qty == position.qty
+            assert outcome.commission_total is None  # no known fee: gross P&L, never a fabricated commission
+            assert float(outcome.realized_pnl) == pytest.approx(ledger_pnl) == pytest.approx(float(ledger_position.realized_pnl))
+            assert float(outcome.realized_pnl) == pytest.approx(realized_pnl)
+            assert float(outcome.realized_r) == pytest.approx(ledger_r) == pytest.approx(realized_r)
+            assert float(outcome.structural_invalidation) == basis == 90.0
+
+        # The existing strategy-outcomes read route (default is_backtest=false) shows it, exactly once.
+        body = client.get("/intelligence/strategy-outcomes", params={"limit": 500}).json()
+        listed = [o for o in body["outcomes"] if o["opportunity_id"] == str(trade.trade_id)]
+        assert len(listed) == 1
+        assert listed[0]["outcome_id"] == str(outcome_id) and listed[0]["is_backtest"] is False
+        assert (listed[0]["execution_mode"], listed[0]["exit_reason"]) == ("simulated", reason)
+        assert (listed[0]["entry_price"], listed[0]["exit_price"]) == (100.0, fill_price)
+        assert listed[0]["realized_pnl"] == pytest.approx(realized_pnl)
+        assert listed[0]["realized_r"] == pytest.approx(realized_r)
+        assert not [o for o in client.get("/intelligence/strategy-outcomes", params={"is_backtest": "true", "limit": 500}).json()["outcomes"]
+                    if o["opportunity_id"] == str(trade.trade_id)]
+        status_body = client.get("/intelligence/execution-outcome-status", params={"limit": 100}).json()
+        status_rows = [r for r in status_body["trades"] if r["trade_id"] == str(trade.trade_id)]
+        assert len(status_rows) == 1
+        assert (status_rows[0]["outcome_status"], status_rows[0]["outcome_id"]) == ("recorded", str(outcome_id))
+
     assert fastapi_app.state.position_monitor is None
     assert monitor._worker_task is None
+    # Lifespan shutdown drained the recorder: still exactly one outcome, still linked.
+    assert outcome_state() == ("recorded", outcome_id, 1)
 
 
 def test_position_monitor_unavailable_when_reconciliation_blocks_pipeline(monkeypatch):
