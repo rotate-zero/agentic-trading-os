@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 
 from app.broker_adapters.simulated_venue import SimulatedVenue
 from app.broker_adapters.order_venue import OrderInstruction
@@ -19,7 +21,9 @@ from app.execution_engine.exit_ledger import PostgresExitLedger
 from app.execution_engine.exit_ledger import ExitLedgerError
 from app.execution_engine.fill_ledger import PostgresFillLedger
 from app.execution_engine.postgres import PostgresOrderLedger
-from app.models.execution_ledger import ExitRequest, Fill, Order, PortfolioStateCursor, Position, PositionFillReceipt, Trade
+from app.models.execution_ledger import (ExitRequest, Fill, Order, PortfolioStateCursor, Position, PositionFillReceipt,
+                                         Trade, TradeReservation)
+from app.models.trading_intelligence import StrategyOutcomeRecord
 from app.portfolio_state.engine import PortfolioState
 from app.portfolio_state.postgres import PostgresPositionLedger
 from app.position_monitor.engine import PositionMonitor
@@ -28,6 +32,7 @@ from app.position_monitor.handoff import ObservationState
 from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
 from app.schemas.events.envelope import EventType
 from app.schemas.events.market_data import CandleClosed, PriceUpdated
+from app.trading_intelligence.outcome_recorder import OutcomeRecorder
 from tests.test_main_execution_pipeline import _wait_for
 
 NAME = "TEST_SIMULATED_EOD_INTEGRATION"
@@ -741,3 +746,202 @@ def test_lifespan_revalidates_proven_unsent_eod_reservation(monkeypatch, after_c
             assert orders[0].status == "submitted" and orders[0].exit_dispatch_started_at is not None
             assert len(created[0]._orders) == 2
             assert fastapi_app.state.position_monitor.get_observations()[0].state is ObservationState.ACKNOWLEDGED
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# EOD close -> EventBus -> running OutcomeRecorder -> one non-backtest outcome (decision #186)
+# ---------------------------------------------------------------------------------------------------------------
+# Everything below is local to the one case that uses it. The shared `seed()` above is reused as-is for the open
+# position, never modified: the EOD tests that do not care about outcomes keep their unattributed trade, which the
+# recorder would (correctly) block as `evidence_unavailable`.
+
+_RECORDER_TIMEOUT = 10.0  # upper bound for any single wait; the happy path takes milliseconds
+_BASIS = 90               # structural invalidation == position stop seeded by position_after_restore()
+
+
+def seed_attributed(symbol):
+    """The shared open position (BUY 5 @ 100) plus the attribution `OutcomeRecorder._build` reads.
+
+    Adds only what #186 requires of an auto simulated trade: the strict thesis (evidence, structural/final levels,
+    confidence), the decision record carrying the same immutable R basis and its two timestamps, and the durable
+    entry reservation (its `reference_price` feeds `slippage_entry`). Nothing about the outcome itself is seeded.
+    """
+    trade_id, symbol = seed(symbol=symbol)
+    with SessionLocal.begin() as s:
+        trade = s.get(Trade, trade_id)
+        trade.thesis = {"structural_invalidation": _BASIS, "structural_target": 120,
+                        "final_stop": _BASIS, "final_target": 120, "confidence": 0.7,
+                        "evidence": {"signal": "observed"}}
+        trade.decision_record = {"structural_invalidation": _BASIS,
+                                 "setup_detected_at": (OPENED - timedelta(minutes=10)).isoformat(),
+                                 "decided_at": (OPENED - timedelta(minutes=5)).isoformat()}
+        s.add(TradeReservation(trade_id=trade_id, client_order_id=f"{trade_id}:entry", qty=5,
+                               reference_price=Decimal("100")))
+    return trade_id, symbol
+
+
+@pytest.fixture
+def outcome_rows():
+    """Collects this test's trade ids; on teardown removes only the outcome-side rows created for them.
+
+    Runs before the autouse `clean_rows` teardown (it was set up later), so by then `trades.outcome_id`,
+    `strategy_outcomes` and `trade_reservations` no longer reference the trade that `cleanup()` deletes.
+    """
+    trade_ids: list = []
+    yield trade_ids
+    if trade_ids:
+        params = {"ids": trade_ids}
+        with SessionLocal.begin() as s:
+            s.execute(text("UPDATE trades SET outcome_id = NULL WHERE trade_id = ANY(:ids)"), params)
+            s.execute(text("DELETE FROM strategy_outcomes WHERE opportunity_id = ANY(:ids)"), params)
+            s.execute(text("DELETE FROM trade_reservations WHERE trade_id = ANY(:ids)"), params)
+
+
+@pytest.mark.asyncio
+async def test_eod_close_fill_is_recorded_once_by_running_outcome_recorder(caplog, outcome_rows):
+    """Attributed simulated trade -> real EOD close fill -> PositionClosed on the bus -> running recorder.
+
+        PriceUpdated -> PositionMonitor --pulse--> ExitIntent(eod_flatten) -> Execution Engine -> PostgresExitLedger
+          -> SimulatedVenue (accepts the close) --tick--> Fill -> Portfolio State.commit_fill (trade.status=closed)
+          -> PositionClosed on the EventBus -> OutcomeRecorder queue -> worker -> strategy_outcomes + trades.outcome_id
+
+    The close fill lands inside the EOD window (19:59:15 UTC, before the 20:00 close), i.e. the ordinary successful
+    flatten, not the late-fill case that the first test in this module covers. Nothing here calls `record_trade()` for
+    the recorder or writes an outcome: the recorder's own worker does, and the wrapper below only observes its result.
+    """
+    caplog.set_level(logging.INFO, logger="app.trading_intelligence.outcome_recorder")
+    trade_id, symbol = seed_attributed("ZZEODOUTCOME")
+    outcome_rows.append(trade_id)
+    wall = Clock()
+    bus = EventBus()
+    results: asyncio.Queue = asyncio.Queue()
+    scans: list = []
+    venue = SimulatedVenue(event_bus=bus, clock=VenueClock(wall))
+    await bus.start()
+    await venue.connect()
+    portfolio = PortfolioState("simulated", ledger=PostgresPositionLedger(SessionLocal), bus=bus)
+    await portfolio.start()
+    pid = await position_after_restore(portfolio, trade_id)
+    ledger = PostgresExitLedger(SessionLocal, clock=wall)
+    order_ledger = PostgresOrderLedger(SessionLocal)
+    engine = ExecutionEngine(bus, order_ledger, order_ledger, fill_ledger=PostgresFillLedger(SessionLocal),
+                             exit_ledger=ledger, portfolio_state=portfolio, venue_provider=Provider(venue))
+    monitor = PositionMonitor(bus, PortfolioStatePositionReader(portfolio), wall_clock=wall,
+                              pulse_interval_seconds=None, on_observation=engine.on_observation)
+    engine.bind_position_monitor(monitor)
+
+    # A real recorder on the real bus. Isolation: its startup scan is a database-wide query that would record any
+    # unrelated qualifying trade a shared development DB happens to hold, so the scan still runs (and is asserted
+    # to have run) but yields nothing, and the sweeper is parked. The only way this trade can be recorded is the
+    # PositionClosed event. Neither the scan nor the sweep is under test here.
+    recorder = OutcomeRecorder(bus, SessionLocal, sweep_interval_seconds=3600)
+    real_pending, real_record = recorder._pending_rows, recorder.record_trade
+
+    def startup_scan_sees_nothing(after):
+        scans.append(real_pending(after))
+        return []
+
+    async def observed_record_trade(recorded_trade_id):  # the worker calls self.record_trade(...)
+        result = await real_record(recorded_trade_id)
+        results.put_nowait((recorded_trade_id, result))
+        return result
+
+    recorder._pending_rows = startup_scan_sees_nothing
+    recorder.record_trade = observed_record_trade
+
+    def recorder_logs():  # a blocked verdict keeps its reason code in the log only (#186)
+        return [r.getMessage() for r in list(caplog.records)
+                if r.name == "app.trading_intelligence.outcome_recorder" and r.levelno >= logging.WARNING]
+
+    async def drain():
+        await settle_lifespan(bus, monitor, engine, portfolio)
+        await asyncio.wait_for(recorder._queue.join(), _RECORDER_TIMEOUT)
+
+    try:
+        await recorder.start()
+        assert len(scans) == 1  # the startup scan has run; the trade is open, so it could not have been recorded
+        engine.start()
+        monitor.start()
+        await bus.publish(make_envelope(EventType.PRICE_UPDATED,
+            PriceUpdated(price=101, size=1, exchange_ts=OPENED + timedelta(hours=5)), symbol=symbol))
+        await drain()
+        assert monitor.enqueue_pulse()
+        await drain()
+
+        # The genuine EOD close: durable eod_flatten request, one close order carrying the reason, accepted by the
+        # real venue, not filled yet; the trade is still open and nothing has been told to the recorder.
+        request, orders, fills = rows(pid)
+        assert request.exit_reason == "eod_flatten"
+        assert len(orders) == 1 and orders[0].status == "submitted" and fills == []
+        assert orders[0].exit_reason == "eod_flatten" and orders[0].position_effect == "close"
+        close_order_id = orders[0].client_order_id
+        assert await venue.get_order(close_order_id) is not None
+        with SessionLocal() as s:
+            assert s.get(Trade, trade_id).status == "open" and s.get(Trade, trade_id).outcome_status is None
+        assert results.empty()
+
+        # The venue fills the accepted close on the next delivered tick, still inside the EOD window.
+        wall.now = FLATTEN + timedelta(seconds=15)
+        await bus.publish(make_envelope(EventType.PRICE_UPDATED,
+            PriceUpdated(price=99, size=1, exchange_ts=wall.now), symbol=symbol))
+        # Bounded wait on the recorder worker's own verdict (a positive signal, never a fixed sleep).
+        verdict = await asyncio.wait_for(results.get(), timeout=_RECORDER_TIMEOUT)
+        assert verdict == (trade_id, "recorded"), f"recorder verdict {verdict!r}, logs={recorder_logs()}"
+        await drain()  # negative assertions below only after every queue has settled
+        assert results.empty()  # the worker did no further work for this trade
+
+        request, orders, fills = rows(pid)
+        with SessionLocal() as s:
+            outcomes = s.scalars(select(StrategyOutcomeRecord).where(
+                StrategyOutcomeRecord.opportunity_id == trade_id)).all()
+            non_backtest = s.scalar(select(func.count()).select_from(StrategyOutcomeRecord).where(
+                StrategyOutcomeRecord.opportunity_id == trade_id, StrategyOutcomeRecord.is_backtest.is_(False)))
+            trade = s.get(Trade, trade_id)
+            position = s.get(Position, pid)
+            entry_fill = s.scalar(select(Fill).where(Fill.client_order_id == f"{trade_id}:entry"))
+            close_fill = s.scalar(select(Fill).where(Fill.client_order_id == close_order_id))
+            close_order = s.scalar(select(Order).where(Order.client_order_id == close_order_id))
+
+            # Genuine EOD close: one order, one fill, from the venue's tick, inside the window.
+            assert len(orders) == len(fills) == 1 and fills[0].ledger_seq == close_fill.ledger_seq
+            assert close_order.status == "filled" and close_order.exit_reason == "eod_flatten"
+            assert close_fill.venue_ts == wall.now and FLATTEN <= close_fill.venue_ts < CLOSE
+            assert position.status == "closed" and position.qty == 0 and trade.status == "closed"
+            assert request.eod_expired_at is None  # a fill inside the window, not an expired late fill
+
+            # Exactly one non-backtest outcome, linked both ways.
+            assert len(outcomes) == non_backtest == 1
+            outcome = outcomes[0]
+            assert trade.outcome_status == "recorded"
+            assert trade.outcome_id == outcome.outcome_id
+            assert outcome.is_backtest is False and outcome.backtest_run_id is None
+            assert (outcome.opportunity_id, outcome.strategy_name, outcome.strategy_version, outcome.symbol,
+                    outcome.direction, outcome.origin) == (trade_id, NAME, "v1", symbol, "BUY", "auto")
+            assert (outcome.execution_mode, outcome.execution_venue) == ("simulated", "simulated")
+            assert outcome.exit_reason == close_order.exit_reason == "eod_flatten"
+
+            # Prices and quantities come from the actual fills; expected values are read from the ledger rows
+            # (and pinned to the scenario), never from the outcome under test. SimulatedVenue reports no fee.
+            assert entry_fill.commission is None and close_fill.commission is None
+            assert (float(entry_fill.price), entry_fill.qty) == (100.0, 5)
+            assert (float(close_fill.price), close_fill.qty) == (99.0, 5)
+            assert float(outcome.entry_price) == float(entry_fill.price) and outcome.entry_qty == entry_fill.qty
+            assert float(outcome.exit_price) == float(close_fill.price) and outcome.exit_qty == close_fill.qty
+            assert outcome.entry_filled_at == entry_fill.venue_ts and outcome.exit_filled_at == close_fill.venue_ts
+            assert outcome.commission_total is None  # no known fee: gross P&L, never a fabricated commission
+
+            # Realized P&L and R from the ledger: the closed position's own realized_pnl, and the fill-price move
+            # over the immutable structural risk (|entry - 90|).
+            ledger_pnl = float((close_fill.price - entry_fill.price) * entry_fill.qty)
+            ledger_r = float(close_fill.price - entry_fill.price) / abs(float(entry_fill.price) - _BASIS)
+            assert float(outcome.realized_pnl) == pytest.approx(float(position.realized_pnl)) == pytest.approx(ledger_pnl)
+            assert float(outcome.realized_pnl) == pytest.approx(-5.0)
+            assert float(outcome.realized_r) == pytest.approx(ledger_r) == pytest.approx(-0.1)
+            assert float(outcome.structural_invalidation) == _BASIS
+    finally:
+        await monitor.stop()
+        await engine.stop()
+        await portfolio.stop()
+        await recorder.stop()
+        await venue.disconnect()
+        await bus.stop()

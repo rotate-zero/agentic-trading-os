@@ -1,3 +1,66 @@
+<!-- BEGIN DELIVERY SECTION: simulated-eod-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `simulated-eod-outcome-recorded`
+
+Based on `main` `179fef3` (re-checked against `origin/main` before packaging: no newer commits). Test and docs only:
+**no production code, API contract, model, migration or frontend file was edited.** Position Monitor production code was
+not touched (another Claude instance is investigating it). **No new decision number:** this proves behaviour already
+decided in #185 (simulated EOD) and #186 (OutcomeRecorder); `INDEX.md`, `confirmed-decisions.md` and the archive list are
+untouched. The only code file changed is `backend/tests/test_simulated_eod_integration.py`.
+
+- **What this proves.** The EOD integration module already proved the exit half (monitor -> `eod_flatten` request ->
+  close order -> venue fill -> closed position). It never proved that the recorder turns that real EOD close into an
+  outcome. The new case continues the same real path into the OutcomeRecorder, on real PostgreSQL:
+
+```
+  PriceUpdated --> PositionMonitor --pulse--> ExitIntent(eod_flatten) --> Execution Engine --> PostgresExitLedger
+     (19:00 UTC)                                                              |  close order carries exit_reason
+                                                                              v
+                                                                       SimulatedVenue (accepts close)
+                                                                              |  next tick (99 @ 19:59:15, in window)
+                                                                              v
+  Fill --> Portfolio State.commit_fill --> position closed, trades.status="closed"
+                |
+                +--> PositionClosed on the EventBus --> running OutcomeRecorder (queue) --> worker
+                       --> record_trade() --> strategy_outcomes (1 row, is_backtest=false)
+                                              + trades.outcome_id / outcome_status="recorded"
+```
+
+- **Edited** `backend/tests/test_simulated_eod_integration.py` (additive: one case, one local seed helper, one local
+  cleanup fixture, and extra imports; no existing test, helper or the shared `seed()` / `cleanup()` was changed):
+  - `test_eod_close_fill_is_recorded_once_by_running_outcome_recorder`. A real `EventBus`, `SimulatedVenue`, Portfolio
+    State, Position Monitor, Execution Engine with `PostgresExitLedger` / order / fill ledgers, and a real
+    `OutcomeRecorder` started on the same bus. The recorder is never called directly and no outcome row is inserted: its
+    own worker records the trade after the bus delivers `PositionClosed`. The test only wraps `record_trade` on the
+    instance to *observe* its real result, and waits for that verdict with a 10 s bound (no fixed sleep).
+  - It asserts: a durable `eod_flatten` request and one submitted close order carrying `exit_reason="eod_flatten"` before
+    the fill, with the trade still open and the recorder silent; then, after the fill, exactly one outcome for the trade
+    (`is_backtest=false`, `backtest_run_id` NULL), `trades.outcome_id` equal to it, `outcome_status="recorded"`,
+    `exit_reason="eod_flatten"` equal to the close order's, entry/exit prices and quantities equal to the actual
+    `fills` rows (BUY 5 @ 100, close 5 @ 99, no commission, so `commission_total` is NULL), and realized P&L (-5.0) and
+    R (-0.1) equal to values computed from the ledger rows (`positions.realized_pnl`; fill-price move over
+    `|entry - 90|`), never from the outcome under test.
+  - The close fill is **inside** the EOD window (19:59:15 UTC, before the 20:00 close). That is the ordinary successful
+    flatten. The late-fill-after-close behaviour stays covered by `test_eod_attempt_then_real_late_fill_closes_once`.
+- **Local attributed seed.** `seed_attributed()` calls the unchanged shared `seed()` (open BUY 5 @ 100) and then adds only
+  what #186 requires of an auto simulated trade: the strict thesis (evidence, structural/final levels, confidence), a
+  decision record with the same R basis (90) and its two timestamps, and the durable entry reservation. Other EOD tests
+  keep their unattributed trade (which the recorder would correctly block as `evidence_unavailable`).
+- **Cleanup touches only this test's rows.** The `outcome_rows` fixture holds this test's trade id and, on teardown,
+  unlinks `trades.outcome_id`, then deletes `strategy_outcomes` (by `opportunity_id`) and `trade_reservations` (by
+  `trade_id`) for that id only. It tears down before the module's existing autouse `cleanup()`, which then removes the
+  remaining rows exactly as it already did.
+- **Recorder isolation.** The recorder's startup scan is database-wide, so, as in
+  `test_outcome_recorder_event_path_integration.py`, the scan still runs (asserted) but yields nothing and the sweeper is
+  parked at 3600 s. The only way this trade can be recorded is the bus event. Neither the scan nor the sweep is under test.
+- **Provenance.** `OutcomeRecorder`, the EOD ledger, Execution Engine, venue, Portfolio State and the Position Monitor
+  were all committed on the base; this delivery adds one test over them.
+- **Production defects found:** none. The real path recorded on the first run, so there is nothing to hand to Codex.
+- **Not covered here (by design):** blocked/retry verdicts, snapshot contents, the late-after-close fill, an EOD request
+  with a stop fallback, restart mid-recording, and the read routes (covered by `test_outcome_recorder.py`, the
+  event-path and route tests, and `test_main_execution_pipeline.py`). The entry fill is seeded, as in every other test in
+  this module; Portfolio State restores the position from it.
+<!-- END DELIVERY SECTION: simulated-eod-outcome-recorded -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-unique-opportunity-guard (backend migration + model + tests + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-unique-opportunity-guard`
 

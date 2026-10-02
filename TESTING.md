@@ -1,3 +1,36 @@
+<!-- BEGIN DELIVERY SECTION: simulated-eod-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `simulated-eod-outcome-recorded`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user
+`trading` (project defaults), created fresh in the sandbox and migrated with `alembic upgrade head` (revision `0017`).
+No external or production database and no broker touched. Python 3.12.3. Verified on `main` `179fef3` (unchanged on
+`origin/main` at packaging). All commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `python -m pytest tests/test_simulated_eod_integration.py -k recorded_once_by_running -q` | 1 passed (~2 s first run, 1.4-1.5 s after) |
+| same command, 5 consecutive runs | 5/5 passed |
+| `tests/test_simulated_eod_integration.py test_outcome_recorder.py test_outcome_recorder_event_path_integration.py test_execution_outcome_status_recorder_integration.py test_exit_ledger_eod_postgres.py test_position_monitor_eod.py test_outcome_read_path_integration.py` | 138 passed (9.6 s) |
+| `python -m pytest tests -q` (full backend suite) | 1589 passed (134.7 s) |
+
+After the runs, `trades`, `strategy_outcomes`, `trade_reservations`, `orders`, `fills`, `positions` and
+`position_fill_receipts` all held 0 rows, including after a deliberately failing mutation run. The sandbox database was
+empty, so this shows the cleanup works; that it removes *only* this test's rows holds by construction (every delete is keyed
+on this test's trade id), not because the database was empty.
+
+**Mutation checks** (throwaway plugin or temporary test copy outside the repo; production and the committed test untouched):
+
+| Mutation | Result |
+|---|---|
+| recorder ignores `PositionClosed` (bus wake-up cut), recorder wait shortened to 3 s | **failed** at the bounded wait for the recorder verdict (nothing else could record the trade) |
+| outcome `realized_r` shifted by +1.0 | **failed** on the R assertion (`0.9 == -0.1`) |
+| price the recorder normalises for the close fill shifted by +0.5 | **failed** on the exit-price assertion (`99.5 == 99.0`) |
+
+Not run: the frontend checks (no frontend change). Not covered: blocked/retry verdicts, snapshot contents, a fill after
+the 20:00 close, an EOD request with a stop fallback, restart mid-recording, and the read routes (see `CHANGES.md`).
+No production defect was found, so no reproduction is attached.
+<!-- END DELIVERY SECTION: simulated-eod-outcome-recorded -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-unique-opportunity-guard (backend migration + model + tests + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-unique-opportunity-guard`
 
