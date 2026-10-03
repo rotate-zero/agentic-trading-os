@@ -1,3 +1,26 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-scratch-removal (docs + removal of one mistakenly tracked scratch file; integrate alongside other sections, do not merge them) -->
+# CHANGES — `position-monitor-scratch-removal`
+
+Based on `main` `89f93ec` (re-checked against `origin/main` before committing: no newer commits). **Correction only; no production
+code, test, API contract, model, migration or frontend file other than the one removal below was edited.** **No new decision
+number** (slug only). Position Monitor production behaviour is unchanged.
+
+- **What went wrong.** The investigation handoff `position-monitor-dropped-trigger-investigation` said its reproduction harness
+  `backend/tests/scratch_dropped_trigger_repro.py` was scratch and must not be committed. Commit `89f93ec` ("Position monitor
+  dropped trigger investigation") nevertheless tracked it.
+- **What this commit does.** `git rm backend/tests/scratch_dropped_trigger_repro.py` in a new commit. History is not rewritten:
+  `89f93ec` stays as-is and the file remains retrievable with `git show 89f93ec:backend/tests/scratch_dropped_trigger_repro.py`.
+- **Why it must not live in the suite.** The harness characterizes the *current defect*: its assertions (for example "no
+  exit request without a second trigger") pass today and are expected to start failing when the dropped-trigger repair lands.
+  Its file name does not match `test_*.py`, so pytest never collected it (collection is 1589 tests with and without the
+  file), but a permanently-asserting-the-bug file in `tests/` is the wrong place for it either way.
+- **Where the copies went.** Copies were preserved *outside* the repository for the implementation agent: the file exactly as
+  committed in `89f93ec` (13 tests) and an extended version (17 tests) that adds the remaining loss paths. The implementation
+  should turn their behaviour into real regression tests in the existing test modules, not restore these files.
+- **Untouched.** `backend/tests/test_simulated_eod_integration.py` (the EOD outcome work is owned elsewhere), all shared design
+  documents, `confirmed-decisions.md`, `INDEX.md` and the archive.
+<!-- END DELIVERY SECTION: position-monitor-scratch-removal -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-eod-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `simulated-eod-outcome-recorded`
 

@@ -1,3 +1,21 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-scratch-removal (docs + removal of one mistakenly tracked scratch file; integrate alongside other sections, do not merge them) -->
+# TESTING — `position-monitor-scratch-removal`
+
+**Database target:** local PostgreSQL 16 (Ubuntu package) on `localhost:5432`, database `trading_workspace`, user `trading`
+(project defaults), created fresh in the sandbox and migrated with `alembic upgrade head` (revision `0017`). Python 3.12.3.
+Verified on `main` `89f93ec` (unchanged on `origin/main`). Commands run from `backend/`.
+
+| Command | Result |
+|---|---|
+| `git ls-files \| grep scratch` before the change | `backend/tests/scratch_dropped_trigger_repro.py` (tracked in `89f93ec`) |
+| `python -m pytest tests --collect-only -q` before the change | 1589 tests collected; the only line containing "scratch" is the unrelated `test_rebuild_from_ledger_recovers_open_position_from_scratch` |
+| same command after `git rm` | 1589 tests collected (unchanged: the file was never collected) |
+| `git ls-files \| grep scratch` after the change | no output |
+| preserved copy, run from outside-repo location (temporarily placed in `backend/tests/`, then removed): `python -m pytest tests/scratch_dropped_trigger_repro_v2.py -q -s -p no:cacheprovider` | 17 passed (46.7 s); every assertion characterizes today's behaviour |
+
+The full backend suite was **not** run for this correction (no executable code changed).
+<!-- END DELIVERY SECTION: position-monitor-scratch-removal -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-eod-outcome-recorded (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `simulated-eod-outcome-recorded`
 

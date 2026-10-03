@@ -1,0 +1,4 @@
+Preferred:   git am position-monitor-scratch-removal.patch      (from repo root; applies the deletion + both log sections)
+Manual:      copy CHANGES.md and TESTING.md to the repo root, then:
+             git rm backend/tests/scratch_dropped_trigger_repro.py
+Base:        main 89f93ec. Do NOT restore the scratch harness into the repo.
