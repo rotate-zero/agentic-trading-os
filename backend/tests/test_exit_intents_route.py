@@ -26,6 +26,9 @@ def test_exit_intents_route_sorts_observations_and_delegates_symbol_filter():
             self.filters.append(symbol)
             return tuple(intent for intent in intents if symbol is None or intent.symbol == symbol)
 
+        def protection_diagnostics(self):
+            return {"status": "degraded", "lost_window": True, "incident_counts": {"tick_overflow": 1}}
+
     app = FastAPI()
     app.include_router(router)
     app.state.position_monitor = monitor = Monitor()
@@ -42,3 +45,14 @@ def test_exit_intents_route_sorts_observations_and_delegates_symbol_filter():
     ]
     assert monitor.filters == [None, "AAA"]
     assert all_response.json()["intent_status"] == "observed_only"
+    assert all_response.json()["protection_diagnostics"]["incident_counts"] == {"tick_overflow": 1}
+
+
+def test_absent_monitor_diagnostics_are_unavailable():
+    app = FastAPI()
+    app.include_router(router)
+    app.state.position_monitor = None
+    with TestClient(app) as client:
+        body = client.get("/intelligence/exit-intents").json()
+    assert body["monitor_status"] == "unavailable"
+    assert body["protection_diagnostics"]["status"] == "unavailable"

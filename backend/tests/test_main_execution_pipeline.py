@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -418,9 +419,11 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
         monitor = fastapi_app.state.position_monitor
         assert isinstance(monitor, PositionMonitor)
         assert fastapi_app.state.world_view_portfolio_reader.get_snapshot() is not None
-        assert client.get("/intelligence/exit-intents").json() == {
+        initial = client.get("/intelligence/exit-intents").json()
+        assert {key: initial[key] for key in ("monitor_status", "intent_status", "exit_intents")} == {
             "monitor_status": "running", "intent_status": "observed_only", "exit_intents": [],
         }
+        assert initial["protection_diagnostics"]["status"] == "healthy"
 
         bus = get_event_bus()
         published: list[EventEnvelope] = []
@@ -495,7 +498,7 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
         response = client.get("/intelligence/exit-intents")
         assert response.status_code == 200
         body = response.json()
-        assert body == {
+        assert {key: body[key] for key in ("monitor_status", "intent_status", "exit_intents")} == {
             "monitor_status": "running", "intent_status": "observed_only",
             "exit_intents": [{
                 "position_id": str(position.position_id), "symbol": SYMBOL,
@@ -503,7 +506,8 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
                 "trigger_price": level, "trigger_ts": NOW.isoformat().replace("+00:00", "Z"),
             }],
         }
-        assert client.get("/intelligence/exit-intents?symbol=OTHER").json() == {
+        other = client.get("/intelligence/exit-intents?symbol=OTHER").json()
+        assert {key: other[key] for key in ("monitor_status", "intent_status", "exit_intents")} == {
             "monitor_status": "running", "intent_status": "observed_only", "exit_intents": [],
         }
         assert client.get(f"/intelligence/exit-intents?symbol={SYMBOL}").json() == body
@@ -624,7 +628,102 @@ def test_position_monitor_unavailable_when_reconciliation_blocks_pipeline(monkey
     monkeypatch.setattr("app.portfolio_state.reconciliation.reconcile_with_venue", discrepant_reconciliation)
     with TestClient(fastapi_app) as client:
         assert fastapi_app.state.position_monitor is None
-        assert client.get("/intelligence/exit-intents").json() == {
+        unavailable = client.get("/intelligence/exit-intents").json()
+        assert {key: unavailable[key] for key in ("monitor_status", "intent_status", "exit_intents")} == {
             "monitor_status": "unavailable", "intent_status": "observed_only", "exit_intents": [],
         }
+        assert unavailable["protection_diagnostics"]["status"] == "unavailable"
     assert fastapi_app.state.position_monitor is None
+
+
+def test_transient_portfolio_sync_failure_replays_first_breach_without_second_tick(monkeypatch):
+    from app.portfolio_state.postgres import PostgresPositionLedger
+    from app.portfolio_state.ports import PositionLedgerError
+    import app.position_monitor.engine as monitor_module
+
+    original_monitor = monitor_module.PositionMonitor
+
+    class NoPulseMonitor(original_monitor):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, pulse_interval_seconds=None, **kwargs)
+
+    monkeypatch.setattr(monitor_module, "PositionMonitor", NoPulseMonitor)
+
+    monkeypatch.setattr(MarketClock, "is_regular_session", lambda self, ts=None: True)
+    monkeypatch.setattr(
+        governor_engine_module, "capture_strategy_outcome_snapshots",
+        lambda symbol: StrategyOutcomeSnapshots(market_state={"trend_score": 1.0}, context={"news": []}),
+    )
+    entered, release = threading.Event(), threading.Event()
+    armed = [False]
+    original = PostgresPositionLedger.pending_fills
+
+    def fail_once(self, execution_mode, after_cursor):
+        if armed[0] and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "test ledger gate was not released"
+            raise PositionLedgerError("injected transient read failure")
+        return original(self, execution_mode, after_cursor)
+
+    monkeypatch.setattr(PostgresPositionLedger, "pending_fills", fail_once)
+    try:
+        with TestClient(fastapi_app) as client:
+            bus = get_event_bus()
+            monitor = fastapi_app.state.position_monitor
+            client.portal.call(bus.publish, _price_envelope())
+            client.portal.call(bus.publish, _opportunity_envelope())
+
+            def entry_order():
+                with SessionLocal() as s:
+                    trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
+                    return None if trade is None else s.scalar(select(Order).where(Order.trade_id == trade.trade_id))
+
+            _wait_for(lambda: (order := entry_order()) is not None and order.status == "submitted",
+                      "entry order submitted")
+            armed[0] = True
+            venue = broker_registry.get_execution_venue()
+            client.portal.call(venue.ingest_tick, SYMBOL, 100.0, NOW)
+            assert entered.wait(5)
+            assert fastapi_app.state.world_view_portfolio_reader.get_snapshot() is None
+            trigger = EventEnvelope(
+                event_type=EventType.PRICE_UPDATED, symbol=SYMBOL,
+                payload=PriceUpdated(price=89.0, size=100, exchange_ts=NOW).model_dump(mode="json"),
+            )
+            reversal = EventEnvelope(
+                event_type=EventType.PRICE_UPDATED, symbol=SYMBOL,
+                payload=PriceUpdated(price=100.0, size=100, exchange_ts=NOW).model_dump(mode="json"),
+            )
+            client.portal.call(bus.publish, trigger)
+            client.portal.call(bus.publish, reversal)
+            _wait_for(lambda: monitor.protection_diagnostics()["journaled_ticks"] >= 2,
+                      "both ticks journaled before ledger recovery")
+            release.set()
+
+            def exit_rows():
+                with SessionLocal() as s:
+                    trade = s.scalar(select(Trade).where(Trade.strategy_name == NAME))
+                    requests = s.scalars(select(ExitRequest).join(Position).where(
+                        Position.trade_id == trade.trade_id)).all()
+                    closes = s.scalars(select(Order).where(
+                        Order.trade_id == trade.trade_id, Order.position_effect == "close")).all()
+                    return requests, closes
+
+            _wait_for(lambda: len(exit_rows()[0]) == 1 and len(exit_rows()[1]) == 1,
+                      "replayed durable stop and one close order", describe=exit_rows)
+            requests, closes = exit_rows()
+            assert requests[0].exit_reason == "stop" and float(requests[0].trigger_price) == 90
+            assert requests[0].trigger_ts == NOW
+            _wait_for(lambda: exit_rows()[1][0].status == "submitted", "close order submitted")
+            assert len(exit_rows()[1]) == 1
+            assert monitor.protection_diagnostics()["incident_counts"]["snapshot_unavailable"] >= 1
+            _wait_for(lambda: fastapi_app.state.world_view_portfolio_reader.get_snapshot() is not None,
+                      "Portfolio State ready after close-order notification")
+            client.portal.call(bus.publish, trigger)  # duplicate breach after recovery
+            client.portal.call(monitor._queue.join)
+            client.portal.call(monitor._enqueue_replay, monitor._seq)
+            client.portal.call(monitor._queue.join)
+            client.portal.call(monitor._enqueue_replay, monitor._seq)
+            client.portal.call(monitor._queue.join)
+            assert tuple(map(len, exit_rows())) == (1, 1)
+    finally:
+        release.set()

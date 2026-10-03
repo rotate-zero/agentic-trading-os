@@ -621,10 +621,10 @@ def test_real_lifespan_eod_and_fresh_venue_restart_block(monkeypatch):
         monitor = fastapi_app.state.position_monitor
         client.portal.call(bus.publish, make_envelope(EventType.PRICE_UPDATED,
             PriceUpdated(price=101, size=1, exchange_ts=OPENED + timedelta(hours=5)), symbol=symbol))
-        # Milestone 1: the tick has been through the bus and the monitor worker (tick cached) before any pulse.
-        _wait_for(lambda: EventType.PRICE_UPDATED in monitor.events_done,
-                  "price event processed by the position monitor worker",
-                  describe=lambda: (monitor.events_done, bus.queue_depths()))
+        # Milestone 1: journal replay has evaluated this position's tick before any pulse.
+        _wait_for(lambda: monitor._progress.get(pid, 0) > 0,
+                  "price tick replayed by the position monitor worker",
+                  describe=lambda: (monitor._progress.get(pid, 0), bus.queue_depths()))
         settled(client, monitor)
         assert monitor.enqueue_pulse()
         # Milestone 2: pulse processed -> EOD observation acknowledged -> durable request + submitted close order.

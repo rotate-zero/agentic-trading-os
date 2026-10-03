@@ -238,6 +238,7 @@ async def test_unsupported_entry_year_skips_eod_logs_bounded_and_keeps_protectiv
             await pulse(monitor)  # must not raise or kill the worker
     assert kinds(monitor) == []
     assert sum("no EOD calendar coverage" in r.message for r in caplog.records) == 1  # bounded
+    wall.now = opened + timedelta(minutes=2)
     await feed(monitor, tick("AAPL", 90.0, opened + timedelta(minutes=2)))
     assert kinds(monitor) == ["protective"]
 
@@ -269,6 +270,18 @@ async def test_five_minute_old_post_opening_tick_is_eligible(make) -> None:
     await pulse(monitor)
     (obs,) = monitor.get_observations()
     assert (obs.intent.trigger_ts, obs.intent.trigger_price) == (stamp, 123.0)
+
+
+async def test_latest_eod_label_remains_owed_past_unowed_retention(make) -> None:
+    elapsed = [0.0]
+    monitor, _, _ = make([position(stop=None, target=None)], now=FLATTEN,
+                         monotonic_clock=lambda: elapsed[0], unowed_retention_seconds=60)
+    stamp = OPENED + timedelta(minutes=1)
+    await feed(monitor, tick("AAPL", 123.0, stamp))
+    elapsed[0] = 61
+    await pulse(monitor)
+    assert kinds(monitor) == ["eod"]
+    assert monitor.get_observations()[0].intent.trigger_ts == stamp
 
 
 async def test_pre_entry_same_day_tick_cannot_label(make) -> None:
@@ -377,9 +390,10 @@ async def test_tick_after_queued_pulse_is_later_work_even_when_cached_directly(m
     monitor._on_market_event(tick("AAPL", 101.0, FLATTEN - timedelta(seconds=5)))  # unheld -> cached at arrival
     reader.positions.append(position())
     await drain(monitor)
-    assert kinds(monitor) == []  # this pulse must not see the later arrival; retries next pulse
+    assert kinds(monitor) == ["eod"]
+    assert monitor.get_observations()[0].intent.trigger_price == 100.0  # earlier pulse boundary
     await pulse(monitor)
-    assert monitor.get_observations()[0].intent.trigger_price == 101.0
+    assert monitor.get_observations()[0].intent.trigger_price == 100.0
 
 
 # --- candles (A14) -------------------------------------------------------------------

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -26,6 +27,8 @@ from .snapshot import PortfolioSnapshot, build_snapshot
 logger = logging.getLogger(__name__)
 _STOP = object()
 _REFRESH = object()
+_RETRY_INITIAL_SECONDS = 0.25
+_RETRY_MAX_SECONDS = 5.0
 
 __all__ = ["PortfolioState", "PositionState", "InFlightOrder", "PortfolioSnapshot"]
 
@@ -49,6 +52,10 @@ class PortfolioState:
         self._worker_task: asyncio.Task | None = None
         self._subscribed = False
         self._accepting = False
+        self._retry_task: asyncio.Task | None = None
+        self._retry_delay = _RETRY_INITIAL_SECONDS
+        self._anomaly = False
+        self._last_failure_log: float | None = None
 
     def get_snapshot(self, symbol: str | None = None, *, trading_day: date | None = None) -> PortfolioSnapshot | None:
         """Detached snapshot for this mode, filtered when symbol is given.
@@ -111,6 +118,13 @@ class PortfolioState:
 
     async def stop(self) -> None:
         self._accepting = False
+        if self._retry_task is not None:
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
+            self._retry_task = None
         if self._subscribed and self._bus is not None:
             for event_type in (EventType.ORDER_APPROVED, EventType.ORDER_FILLED,
                                EventType.ORDER_STATUS_CHANGED, EventType.PRICE_UPDATED):
@@ -125,7 +139,7 @@ class PortfolioState:
 
     async def refresh(self) -> None:
         """Explicit ledger catch-up (also needed for cancellations: current
-        OrderStatusChanged only represents rejection). No polling is wired.
+        OrderStatusChanged only represents rejection).
         """
         if not self._accepting:
             raise RuntimeError("portfolio worker is not started")
@@ -164,19 +178,40 @@ class PortfolioState:
                     notification = schema.model_validate(item.payload)
                     self._unresolved_orders.add(notification.order_id)
                     await self._synchronize()
+                if item is not _STOP and self._ready:
+                    self._retry_delay = _RETRY_INITIAL_SECONDS
             except Exception:
                 self._ready = False
-                logger.exception("Portfolio State processing failed; snapshot unavailable until successful refresh")
+                now = time.monotonic()
+                if self._last_failure_log is None or now - self._last_failure_log >= 60:
+                    self._last_failure_log = now
+                    logger.exception("Portfolio State processing failed; snapshot unavailable")
+                if not self._anomaly:
+                    self._schedule_retry()
             finally:
                 self._queue.task_done()
 
+    def _schedule_retry(self) -> None:
+        if not self._accepting or (self._retry_task is not None and not self._retry_task.done()):
+            return
+        delay = self._retry_delay
+        self._retry_delay = min(self._retry_delay * 2, _RETRY_MAX_SECONDS)
+        self._retry_task = asyncio.create_task(self._retry_after(delay), name="portfolio-state-retry")
+
+    async def _retry_after(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        if self._accepting:
+            self._queue.put_nowait(_REFRESH)  # same accounting worker; no overlapping sync
+
     async def _synchronize(self) -> None:
         assert self._ledger is not None and self._bus is not None
+        self._anomaly = False
         self._ready = False
         self._install_state(await asyncio.to_thread(self._ledger.load_state, self.execution_mode))
         self._ready = False
         assert self._state is not None
         if self._state.problems:
+            self._anomaly = True
             raise PositionLedgerError("unresolved ledger anomalies: " + ", ".join(self._state.problems))
         fills = await asyncio.to_thread(self._ledger.pending_fills, self.execution_mode, self._state.cursor)
         last = self._state.cursor
@@ -224,6 +259,11 @@ class PortfolioState:
                 # Other-mode notifications are harmless wake-ups: only the
                 # mode-scoped read-back above supplies accounting inputs.
         self._ready = not self._state.problems and not self._unresolved_orders
+        if self._unresolved_orders:
+            # A notification with no durable order is an anomaly, not a
+            # transient failed ledger read. Keep IDs until a later real event
+            # or explicit refresh supplies the metadata.
+            self._anomaly = True
 
     # Existing reconciliation API. This is NOT a PositionLedgerPort adapter.
     def apply_fill(self, session, fill) -> PositionState | None:

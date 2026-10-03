@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-trigger-recovery -->
+# CHANGES — `position-monitor-trigger-recovery`
+
+Based on GitHub `main` `edc1543`, rechecked immediately before decision assignment. Decision #188. The scratch-removal handoff's `APPLY.txt` and patch were inspected: its log sections were already committed on this base, but the harness was still tracked. Removed only `backend/tests/scratch_dropped_trigger_repro.py`, preserving the earlier commit and its log history; no ZIP copy overwrote either log.
+
+- Position Monitor now journals every valid tick before a snapshot read, retaining arrival order, symbol, price and exchange timestamp. Its single worker replays through each queued candle, pulse or recovery item's arrival-sequence boundary. A first post-opening stop/target touch registers the existing pending observation; per-position progress advances only after that succeeds. A reversal cannot erase the touch, and stop still wins on a single event touching both levels.
+- Portfolio State now retries transient synchronization failures on its accounting worker with one delayed retry task and bounded exponential backoff (0.25–5 seconds). Genuine ledger anomalies and unresolved order IDs remain unavailable. Shutdown cancels delayed retry work.
+- Validated settings expose provisional defaults of 100 journaled symbols, 2,000 ticks per symbol and 60 seconds of monotonic retention for unowed ticks. Capacity loss and expiry retain sticky diagnostic evidence. `/intelligence/exit-intents` adds `protection_diagnostics` without removing existing fields; an absent monitor reports unavailable.
+- Tests moved useful scratch scenarios into the maintained monitor, Portfolio State, route and real-lifespan pipeline files. One EOD integration test's worker-completion wait now observes the journal replay cursor, because ticks no longer enter its old `_process_event` hook; its historical-candle assertions and policy were unchanged. Canonical execution architecture §6.6 and decision log/index document the new flows and limits.
+
+Retained eligible ticks preserve first-touch order while the process remains up and the journal has capacity. Overflow, expiry before a position becomes visible, or process downtime can remove that certainty. No entry blocking, external alert, emergency liquidation, or broker behavior was added.
+<!-- END DELIVERY SECTION: position-monitor-trigger-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-scratch-removal (docs + removal of one mistakenly tracked scratch file; integrate alongside other sections, do not merge them) -->
 # CHANGES — `position-monitor-scratch-removal`
 

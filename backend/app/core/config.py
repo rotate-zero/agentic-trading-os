@@ -3,6 +3,7 @@ Settings, env loading. Single source of truth for configuration —
 nothing else in the app should read os.environ directly.
 """
 from functools import lru_cache
+import math
 
 from pydantic import field_validator
 from pydantic import ValidationInfo
@@ -247,6 +248,25 @@ class Settings(BaseSettings):
     # Simulated EOD placement lead in seconds (1..900): read by Position Monitor's EOD timer
     # and by PostgresExitLedger, which stores the [close - lead, close) window on the EOD row.
     execution_eod_flatten_lead_seconds: int = 60
+
+    # Position Monitor's in-memory replay bounds; provisional operating defaults.
+    position_monitor_max_journal_symbols: int = 100
+    position_monitor_max_ticks_per_symbol: int = 2000
+    position_monitor_unowed_retention_seconds: float = 60.0
+
+    @field_validator("position_monitor_max_journal_symbols", "position_monitor_max_ticks_per_symbol", mode="before")
+    @classmethod
+    def _positive_journal_capacity(cls, value: object) -> object:
+        if isinstance(value, bool) or not str(value).isdigit() or int(value) <= 0:
+            raise ValueError("position monitor journal capacities must be positive integers")
+        return value
+
+    @field_validator("position_monitor_unowed_retention_seconds")
+    @classmethod
+    def _positive_journal_retention(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("position monitor unowed retention must be finite and positive")
+        return value
 
     @field_validator("execution_eod_flatten_lead_seconds", mode="before")
     @classmethod

@@ -1084,6 +1084,63 @@ WebSocket channel. The `observed_only` label describes the route's own read
 surface, not whether an observation was handed to Execution.
 EOD observations also reach the durable handoff; EX-12 is implemented for simulated auto trades in §6.7.1.
 
+**Trigger recovery as built (`position-monitor-trigger-recovery`).** The earlier
+held-symbol filter in the diagram above now applies only to candles. Every valid
+`PriceUpdated` enters an in-memory journal before a Portfolio State read. A
+`OrderFilled` notification marks its symbol as fill-pending until its position
+becomes visible; it is a diagnostic hint, while the ledger remains the source of
+accounting truth. Portfolio State retries transient synchronization failures on
+its existing worker with one coalesced retry task and 0.25–5 second backoff. It
+does not clear unresolved order IDs or treat a nonexistent order as healthy.
+
+```
+Event Bus PriceUpdated ──► Position Monitor journal ──► monitor worker
+Event Bus CandleClosed ───────────────────────────────► monitor worker
+Event Bus OrderFilled ──► fill-pending marker          │
+                                                      │ PositionReader snapshot
+Postgres fill ledger ──► Portfolio State worker ◄─────┘
+     │                   │ failed read: bounded retry   │ first touch after visibility
+     │                   └─ committed snapshot ─────────┤
+     └─ durable receipt ───────────────────────────────► Execution exit handoff
+                                                          │
+                                                          ▼
+                                                     exit_requests / close order
+GET /intelligence/exit-intents ◄── intents + protection diagnostics
+```
+
+```
+subscriber: validate tick ─► append(symbol, arrival seq, exchange ts, price, monotonic arrival)
+                             └─ coalesced replay wake-up
+worker: queued candle / EOD pulse / replay wake-up ─► sequence boundary
+       └─ read visible positions ─► for each position, replay eligible ticks
+          with seq <= boundary and exchange_ts >= opened_at, in arrival order
+          ├─ first stop/target touch ─► register PENDING observation ─► advance cursor
+          ├─ no touch ─► advance cursor
+          └─ read/register failure ─► retain cursor and tick for next wake-up
+       └─ EOD pulse uses the latest eligible tick inside its own boundary
+```
+
+The limits are configurable and validated: 100 symbols, 2,000 ticks per
+symbol, and 60 seconds of monotonic retention for unowed ticks are starting
+defaults, not measured guarantees. A tick is owed while a snapshot is
+unavailable, its symbol has a fill-pending marker, or a visible position has
+not yet safely evaluated it. The latest post-opening EOD label and the latest
+label before a queued pulse also remain owed while that open position has no
+observation. Owed ticks do not expire solely with time, but capacity may evict
+them. Per-position cursors and slots retire when a position disappears;
+fill markers are limited to the symbol capacity. Incident history retains 100
+records and cumulative cause counts preserve evidence after recovery.
+
+The additive `protection_diagnostics` object reports current snapshot
+availability, journal usage, fill-pending symbols, overflow, symbol-capacity
+loss, invisible fills, and a sticky `lost_window` flag. An absent monitor is
+`unavailable`. Loss of a retained window means the monitor can no longer prove
+which touch came first for a position that later appears. An in-memory journal
+cannot recover process downtime or guarantee protection after overflow; for
+retained eligible ticks, replay produces the first actionable touch in arrival
+order using its original exchange timestamp. This visibility change adds no
+entry block, external alert, emergency liquidation, or broker action.
+
 **As built (`simulated-protective-exits`).** A stop or target observation is
 handed to Execution Engine's queue. `PostgresExitLedger` commits one durable
 `exit_requests` row for the position. It cancels any unfinished entry first,

@@ -1,3 +1,17 @@
+<!-- BEGIN DELIVERY SECTION: position-monitor-trigger-recovery -->
+# TESTING — `position-monitor-trigger-recovery`
+
+GitHub `main` was `edc1543` at decision assignment. The configured local PostgreSQL development database (`trading_workspace` on `localhost:5432`, project defaults) started at Alembic `0014`; `backend/.venv/bin/alembic upgrade head` advanced it through existing migrations `0015`–`0017` for the integration tests. Tests create and clean their scoped records; no external database or broker account was used. The outside-repository ZIP was not present in the workspace; its committed `APPLY.txt` and patch were inspected, and the already-present log sections were preserved.
+
+| Check (from `backend/` unless noted) | Result |
+|---|---|
+| Combined focused monitor, Portfolio State, reader, exit ledger/handoff, route, Execution Engine, real-lifespan pipeline and EOD integration tests (`test_position_monitor_engine.py`, `test_position_monitor_eod.py`, `test_position_monitor_portfolio_reader.py`, `test_portfolio_worker.py`, `test_portfolio_state.py`, `test_governor_portfolio_state_reader.py`, `test_exit_intents_route.py`, `test_execution_engine.py`, `test_exit_ledger_postgres.py`, `test_exit_ledger_eod_postgres.py`, `test_main_execution_pipeline.py`, `test_simulated_eod_integration.py`, `test_execution_exit_requests_route.py`) | 234 passed |
+| `test_main_execution_pipeline.py::test_transient_portfolio_sync_failure_replays_first_breach_without_second_tick` (repeated after the combined run) | Passed against real PostgreSQL with EOD pulses disabled: one injected sync failure, breach then reversal while snapshot unavailable, automatic retry, original trigger timestamp, one durable request and one close order; a later duplicate breach and repeated recovery still leave one of each |
+| `git diff --check` | Passed |
+
+The monitor cases cover ready-flat and unavailable snapshots, worker read failure, no-pulse recovery, entry timestamp equality/pre-entry rejection, target-before-stop, candle and EOD ordering, duplicate observation suppression, per-position isolation, capacity and monotonic expiry, sticky lost-window diagnostics, invisible-fill markers, and failure before safe cursor advancement. The Portfolio State cases cover automatic retry, idempotency, unresolved-order degradation, shutdown and restart accounting. The EOD integration test's only edit replaces an obsolete tick `_process_event` wait with the replay cursor; historical-candle semantics are unchanged. The approximately 1,589-test suite was not run. Python 3.14's `asyncio.to_thread` callbacks stalled under the workspace sandbox; database-backed tests ran with approved unsandboxed execution.
+<!-- END DELIVERY SECTION: position-monitor-trigger-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-scratch-removal (docs + removal of one mistakenly tracked scratch file; integrate alongside other sections, do not merge them) -->
 # TESTING — `position-monitor-scratch-removal`
 

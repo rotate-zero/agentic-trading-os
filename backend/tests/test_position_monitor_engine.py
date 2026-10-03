@@ -17,17 +17,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 
 from app.core.market_clock import MarketClock
+from app.core.config import Settings
 from app.event_bus.bus import WILDCARD, EventBus
 from app.event_bus.events import make_envelope
 from app.position_monitor.engine import PositionMonitor, _Bar, _evaluate
 from app.position_monitor.ports import PositionView
 from app.schemas.events.envelope import EventEnvelope, EventType
+from app.schemas.events.execution import OrderFilled
 from app.schemas.events.market_data import CandleClosed, PriceUpdated
 
 # Tuesday 2026-09-22 — not a holiday, not a half-day (see core/market_clock.py's
@@ -37,6 +39,18 @@ _SESSION_CLOSE_UTC = datetime(2026, 9, 22, 20, 0, tzinfo=timezone.utc)
 _BEFORE_CLOSE = datetime(2026, 9, 22, 19, 59, tzinfo=timezone.utc)
 
 _FIXED_CLOCK = MarketClock()
+
+
+def test_journal_settings_defaults_and_validation() -> None:
+    settings = Settings(_env_file=None)
+    assert (settings.position_monitor_max_journal_symbols,
+            settings.position_monitor_max_ticks_per_symbol,
+            settings.position_monitor_unowed_retention_seconds) == (100, 2000, 60)
+    for field, bad in (("position_monitor_max_journal_symbols", 0),
+                       ("position_monitor_max_ticks_per_symbol", -1),
+                       ("position_monitor_unowed_retention_seconds", float("inf"))):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, **{field: bad})
 
 
 def _long_position(**overrides) -> PositionView:
@@ -70,8 +84,14 @@ def _short_position(**overrides) -> PositionView:
 @dataclass
 class _FakePositionReader:
     positions: list[PositionView] = field(default_factory=list)
+    unavailable: bool = False
+    fail_reads: int = 0
 
     def get_open_positions(self) -> tuple[PositionView, ...]:
+        if self.unavailable or self.fail_reads:
+            if self.fail_reads:
+                self.fail_reads -= 1
+            raise RuntimeError("snapshot unavailable")
         return tuple(self.positions)
 
 
@@ -138,6 +158,196 @@ async def _wait_for_intents(monitor: PositionMonitor, count: int, *, symbol: str
         f"{count} exit intent(s)" + ("" if symbol is None else f" for {symbol}"),
         observed=lambda: monitor.get_exit_intents(symbol),
     )
+
+
+async def _direct(monitor: PositionMonitor, *envelopes: EventEnvelope) -> None:
+    for envelope in envelopes:
+        monitor._on_market_event(envelope)
+    await asyncio.wait_for(monitor._queue.join(), 2)
+
+
+async def test_retained_reversal_replays_after_unavailable_snapshot_without_pulse() -> None:
+    pos = _long_position()
+    reader = _FakePositionReader([pos], unavailable=True)
+    calls = []
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              pulse_interval_seconds=None, recovery_interval_seconds=.01,
+                              on_observation=calls.append)
+    monitor.start()
+    try:
+        breach = _OPENED_AT + timedelta(seconds=1)
+        await _direct(monitor, _tick_envelope("AAPL", 94, breach),
+                      _tick_envelope("AAPL", 101, breach + timedelta(seconds=1)))
+        assert monitor.get_exit_intents() == ()
+        assert monitor.protection_diagnostics()["snapshot_unavailable"]
+        reader.unavailable = False
+        await _wait_for_intents(monitor, 1)
+        intent = monitor.get_exit_intents()[0]
+        assert (intent.exit_reason, intent.trigger_price, intent.trigger_ts) == ("stop", 95, breach)
+        await _direct(monitor, _tick_envelope("AAPL", 93, breach + timedelta(seconds=2)))
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert len(calls) == 1 and len(monitor.get_observations()) == 1
+        assert not monitor.protection_diagnostics()["snapshot_unavailable"]
+    finally:
+        await monitor.stop()
+
+
+async def test_ready_flat_then_visible_replays_in_arrival_order_with_entry_boundary() -> None:
+    opened = _OPENED_AT
+    pos = _long_position(opened_at=opened)
+    reader = _FakePositionReader([])
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              pulse_interval_seconds=None, recovery_interval_seconds=.01)
+    monitor.start()
+    try:
+        await _direct(monitor, _tick_envelope("AAPL", 90, opened - timedelta(microseconds=1)),
+                      _tick_envelope("AAPL", 111, opened),
+                      _tick_envelope("AAPL", 90, opened + timedelta(seconds=1)))
+        assert monitor.get_exit_intents() == ()
+        reader.positions.append(pos)
+        await _wait_for_intents(monitor, 1)
+        intent = monitor.get_exit_intents()[0]
+        assert (intent.exit_reason, intent.trigger_ts) == ("target", opened)
+    finally:
+        await monitor.stop()
+
+
+async def test_worker_read_failure_recovers_without_second_tick() -> None:
+    pos = _long_position()
+    reader = _FakePositionReader([pos], fail_reads=1)
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              pulse_interval_seconds=None, recovery_interval_seconds=.01)
+    monitor.start()
+    try:
+        ts = _OPENED_AT + timedelta(seconds=2)
+        await _direct(monitor, _tick_envelope("AAPL", 94, ts))
+        await _wait_for_intents(monitor, 1)
+        assert monitor.get_exit_intents()[0].trigger_ts == ts
+        assert monitor.protection_diagnostics()["incident_counts"]["snapshot_unavailable"] == 1
+    finally:
+        await monitor.stop()
+
+
+async def test_replay_respects_candle_and_pulse_sequence_boundaries() -> None:
+    pos = _long_position(stop=95, target=110)
+    reader = _FakePositionReader([pos])
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              pulse_interval_seconds=None)
+    monitor.start()
+    try:
+        await _direct(monitor, _tick_envelope("AAPL", 100, _OPENED_AT))
+        monitor._on_market_event(_candle_envelope("AAPL", o=100, h=111, low=99, c=100,
+                                                  ts=_OPENED_AT + timedelta(seconds=1)))
+        monitor._on_market_event(_tick_envelope("AAPL", 90, _OPENED_AT + timedelta(seconds=2)))
+        await monitor._queue.join()
+        assert monitor.get_exit_intents()[0].exit_reason == "target"
+        assert monitor.get_exit_intents()[0].trigger_ts == _OPENED_AT + timedelta(seconds=1)
+    finally:
+        await monitor.stop()
+
+
+async def test_journal_limits_expiry_and_symbol_isolation() -> None:
+    elapsed = [0.0]
+    reader = _FakePositionReader([])
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              monotonic_clock=lambda: elapsed[0], max_journal_symbols=2,
+                              max_ticks_per_symbol=2, unowed_retention_seconds=60,
+                              pulse_interval_seconds=None)
+    monitor.start()
+    try:
+        await _direct(monitor, *(_tick_envelope("AAPL", price, _OPENED_AT + timedelta(seconds=i))
+                                 for i, price in enumerate((100, 101, 102))))
+        assert monitor.protection_diagnostics()["incident_counts"]["tick_overflow"] == 1
+        await _direct(monitor, _tick_envelope("BBB", 100, _OPENED_AT),
+                      _tick_envelope("CCC", 100, _OPENED_AT))
+        diagnostic = monitor.protection_diagnostics()
+        assert diagnostic["journaled_symbols"] == 2
+        assert diagnostic["incident_counts"]["symbol_capacity_loss"] == 1
+        elapsed[0] = 61
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert monitor.protection_diagnostics()["journaled_ticks"] == 0
+        assert monitor.protection_diagnostics()["lost_window"]
+    finally:
+        await monitor.stop()
+
+
+async def test_owed_tick_survives_retention_while_snapshot_unavailable() -> None:
+    elapsed = [0.0]
+    pos = _long_position()
+    reader = _FakePositionReader([pos], unavailable=True)
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              monotonic_clock=lambda: elapsed[0], unowed_retention_seconds=60,
+                              pulse_interval_seconds=None)
+    monitor.start()
+    try:
+        await _direct(monitor, _tick_envelope("AAPL", 94, _OPENED_AT))
+        elapsed[0] = 120
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert monitor.protection_diagnostics()["journaled_ticks"] == 1
+        reader.unavailable = False
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert monitor.get_exit_intents()[0].trigger_ts == _OPENED_AT
+    finally:
+        await monitor.stop()
+
+
+async def test_failed_observation_registration_does_not_advance_position_progress(monkeypatch) -> None:
+    pos = _long_position()
+    monitor, _ = _make_monitor(EventBus(), [pos])
+    original = monitor._register
+    attempts = [0]
+
+    def fail_once(kind, intent):
+        attempts[0] += 1
+        if attempts[0] == 1:
+            raise RuntimeError("injected registration failure")
+        return original(kind, intent)
+
+    monkeypatch.setattr(monitor, "_register", fail_once)
+    monitor.start()
+    try:
+        await _direct(monitor, _tick_envelope("AAPL", 94, _OPENED_AT))
+        assert monitor._progress.get(pos.position_id, 0) == 0
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert attempts[0] == 2
+        assert monitor.get_exit_intents()[0].trigger_ts == _OPENED_AT
+    finally:
+        await monitor.stop()
+
+
+async def test_fill_pending_marker_preserves_tick_and_reports_invisible_fill() -> None:
+    elapsed = [0.0]
+    reader = _FakePositionReader([])
+    monitor = PositionMonitor(EventBus(), reader, wall_clock=lambda: _BEFORE_CLOSE,
+                              monotonic_clock=lambda: elapsed[0], unowed_retention_seconds=60,
+                              pulse_interval_seconds=None)
+    monitor.start()
+    try:
+        filled = make_envelope(
+            EventType.ORDER_FILLED,
+            OrderFilled(order_id="entry", side="BUY", qty=1, fill_price=100, fill_ts=_OPENED_AT),
+            symbol="AAPL",
+        )
+        await _direct(monitor, filled, _tick_envelope("AAPL", 94, _OPENED_AT))
+        elapsed[0] = 61
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        diagnostic = monitor.protection_diagnostics()
+        assert diagnostic["journaled_ticks"] == 1
+        assert diagnostic["incident_counts"]["fill_invisible"] == 1
+        assert diagnostic["fill_pending_symbols"] == ["AAPL"]
+        reader.positions.append(_long_position(opened_at=_OPENED_AT))
+        monitor._enqueue_replay(monitor._seq)
+        await monitor._queue.join()
+        assert monitor.get_exit_intents()[0].exit_reason == "stop"
+        assert monitor.protection_diagnostics()["fill_pending_symbols"] == []
+    finally:
+        await monitor.stop()
 
 
 async def _settle(bus: EventBus, monitor: PositionMonitor, *envelopes: EventEnvelope, timeout: float = 5.0) -> None:

@@ -269,6 +269,25 @@ async def test_commit_failure_publishes_nothing_and_retry_does_not_double_apply(
     assert len(events) == 1 and len(ledger.commits) == 2
 
 
+async def test_transient_commit_failure_recovers_automatically_without_another_event(setup):
+    ledger, clock, bus, engine, events = setup
+    ledger.order()
+    await engine.start()
+    ledger.fills.append(fill())
+    ledger.fail = True
+    await notify(bus, engine)
+    assert engine.get_snapshot() is None and ledger.commits == []
+    assert engine._retry_task is not None
+    ledger.fail = False
+    async with asyncio.timeout(3):
+        while engine.get_snapshot() is None:
+            await asyncio.sleep(.01)
+    assert engine.get_snapshot().positions["AAPL"].qty == 10
+    assert len(ledger.commits) == 1 and events == []
+    await engine.stop()
+    assert engine._retry_task is None
+
+
 async def test_commit_then_lost_ack_recovers_without_claiming_event_delivery(setup):
     ledger, clock, bus, engine, events = setup
     ledger.order()

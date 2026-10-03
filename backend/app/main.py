@@ -310,6 +310,9 @@ async def lifespan(app: FastAPI):
             position_monitor = PositionMonitor(
                 bus, PortfolioStatePositionReader(portfolio_state),
                 on_observation=execution_engine.on_observation,
+                max_journal_symbols=settings.position_monitor_max_journal_symbols,
+                max_ticks_per_symbol=settings.position_monitor_max_ticks_per_symbol,
+                unowed_retention_seconds=settings.position_monitor_unowed_retention_seconds,
             )
             with SessionLocal() as recovery_session:
                 recovery_rows = recovery_session.execute(

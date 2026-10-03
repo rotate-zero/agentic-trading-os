@@ -918,6 +918,13 @@ async def get_exit_intents_view(request: Request, symbol: str | None = Query(Non
     return {
         "monitor_status": "unavailable" if monitor is None else "running",
         "intent_status": "observed_only",
+        "protection_diagnostics": (
+            {"status": "unavailable", "snapshot_unavailable": True, "lost_window": None,
+             "journaled_symbols": 0, "journaled_ticks": 0, "fill_pending_symbols": [],
+             "incident_counts": {}, "recent_incidents": [], "limits": None}
+            if monitor is None else monitor.protection_diagnostics()
+            if hasattr(monitor, "protection_diagnostics") else {"status": "unavailable"}
+        ),
         "exit_intents": [
             {
                 "position_id": intent.position_id,

@@ -5,15 +5,15 @@ contract; design doc §6.6). See the package docstring
 (`position_monitor/__init__.py`) for the EX-5/EX-11 scoping call.
 
 Same subscribe -> own queue -> worker shape as every other engine in this
-codebase (decision #84's pattern). Deliberately no `DebounceScheduler`:
-coalescing ticks would risk missing the exact tick/candle that crossed a stop
-or target.
+codebase (decision #84's pattern). Valid ticks enter a bounded arrival-order
+journal before any position read. Only replay wake-ups are coalesced; tick
+observations themselves are never reduced to extrema.
 
 Two observation kinds, two independent slots per position
 ---------------------------------------------------------
-* **protective** (`stop` / `target`): event-driven, exactly as before. Ticks
-  and candles for held symbols are queued; stop is checked before target, so a
-  bar touching both resolves to `"stop"`.
+* **protective** (`stop` / `target`): ticks replay through the worker in
+  arrival order; candles are queued for held symbols. Stop is checked before
+  target, so one bar touching both resolves to `"stop"`.
 * **eod** (`eod_flatten`): timer-driven only. Candles never label it.
 
 Each slot is `PENDING` when created and `ACKNOWLEDGED` only after the consumer
@@ -36,17 +36,18 @@ otherwise emit EOD. A position on a covered holiday/weekend has no window; an
 unsupported entry year is skipped with a bounded-rate log. Neither stops
 event-driven stop/target evaluation.
 
-Tick cache and EOD eligibility
-------------------------------
+Tick journal and EOD eligibility
+--------------------------------
 Every valid `PriceUpdated` (aware `exchange_ts`, finite positive price, not
-later than wall time at ingest) is offered to a per-symbol cache that keeps
-the maximum exchange timestamp; on an equal timestamp the first received tick
-wins, and an older tick can never move it backwards. Ticks for symbols that
-are not held at arrival are cached in the subscriber callback (before the
-held-symbol filter); ticks for held symbols are cached when the worker reaches
-them in queue order, so a tick that arrives after a pulse is queued is later
-work. Each tick carries an arrival sequence; a pulse ignores a cached tick
-whose sequence is newer than its own and retries at the next pulse.
+later than wall time at ingest) is journaled with its arrival sequence before
+any snapshot read. The single worker replays only through the sequence bound
+of the item it handles. Per-position progress advances after evaluation or
+safe observation registration. A separate recovery timer wakes the worker
+without requiring a second tick or an EOD pulse.
+
+For EOD, the latest exchange timestamp among ticks within a pulse's arrival
+boundary wins (first received wins an equal-timestamp tie). The old diagnostic
+tick cache is retained, but pulse eligibility reads the ordered journal.
 
 An EOD label needs a tick for the position's symbol with
 `position.opened_at <= exchange_ts <= wall now` on the position's entry ET
@@ -54,15 +55,16 @@ trading day. There is no additional maximum age. With no such tick no slot is
 created; the miss is logged at a bounded rate and retried each pulse. Nothing
 is substituted (no entry price, wall time or candle).
 
-Held-symbol filtering mirrors decision #173's Portfolio State worker: one
-cheap `get_open_positions()` read in the subscriber callback decides whether to
-enqueue, and processing reads it again, fresh.
+Candles retain the held-symbol subscriber filter. Ticks do not: a ready-flat or
+unavailable snapshot cannot discard a first protective touch.
 """
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Literal
@@ -154,6 +156,19 @@ class _Pulse:
     seq: int
 
 
+@dataclass(frozen=True)
+class _Replay:
+    seq: int
+
+
+@dataclass(frozen=True)
+class _JournalTick:
+    price: float
+    ts: datetime
+    seq: int
+    arrived: float
+
+
 @dataclass
 class _Slot:
     sequence: int
@@ -230,6 +245,11 @@ class PositionMonitor:
         wall_clock: Callable[[], datetime] | None = None,
         eod_lead_seconds: int | None = None,
         pulse_interval_seconds: float | None = _DEFAULT_PULSE_INTERVAL_SECONDS,
+        max_journal_symbols: int = 100,
+        max_ticks_per_symbol: int = 2000,
+        unowed_retention_seconds: float = 60.0,
+        recovery_interval_seconds: float = 0.25,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """
         `on_exit_intent`: legacy, fire-and-forget, stop/target ONLY, unchanged
@@ -250,6 +270,13 @@ class PositionMonitor:
             raise ValueError("eod_lead_seconds must be an integer from 1 through 900")
         if pulse_interval_seconds is not None and pulse_interval_seconds <= 0:
             raise ValueError("pulse_interval_seconds must be positive or None")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
+               for value in (max_journal_symbols, max_ticks_per_symbol)):
+            raise ValueError("journal capacities must be positive integers")
+        if not math.isfinite(unowed_retention_seconds) or unowed_retention_seconds <= 0:
+            raise ValueError("unowed_retention_seconds must be finite and positive")
+        if not math.isfinite(recovery_interval_seconds) or recovery_interval_seconds <= 0:
+            raise ValueError("recovery_interval_seconds must be finite and positive")
 
         self._bus = bus
         self._position_reader = position_reader
@@ -259,12 +286,31 @@ class PositionMonitor:
         self._wall_clock = wall_clock or _utc_now
         self._eod_lead_seconds = eod_lead_seconds
         self._pulse_interval = pulse_interval_seconds
-        self._queue: asyncio.Queue[_QueuedEvent | _Pulse | object] = asyncio.Queue()
+        self._queue: asyncio.Queue[_QueuedEvent | _Pulse | _Replay | object] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._timer_task: asyncio.Task | None = None
+        self._recovery_task: asyncio.Task | None = None
         self._accepting = False
         self._seq = 0
         self._pulse_queued = False
+        self._pulse_pending_seq: int | None = None
+        self._replay_queued = False
+        self._max_symbols = max_journal_symbols
+        self._max_ticks = max_ticks_per_symbol
+        self._retention = unowed_retention_seconds
+        self._recovery_interval = recovery_interval_seconds
+        self._monotonic = monotonic_clock
+        self._journal: dict[str, deque[_JournalTick]] = {}
+        self._progress: dict[UUID, int] = {}
+        self._visible: dict[UUID, PositionView] = {}
+        self._snapshot_unavailable = False
+        self._fill_pending: dict[str, float] = {}
+        self._reported_invisible: set[str] = set()
+        self._incidents: deque[dict[str, object]] = deque(maxlen=100)
+        self._incident_counts: dict[str, int] = {}
+        self._lost_window = False
+        self._last_loss_log: dict[str, float] = {}
+        self._last_unavailable_log: float | None = None
 
         self._tick_cache: dict[str, _CachedTick] = {}
         # Control slots, one per (position, kind). A slot's existence is the
@@ -285,7 +331,9 @@ class PositionMonitor:
         self._accepting = True
         self._bus.subscribe(EventType.PRICE_UPDATED, self._on_market_event)
         self._bus.subscribe(EventType.CANDLE_CLOSED, self._on_market_event)
+        self._bus.subscribe(EventType.ORDER_FILLED, self._on_market_event)
         self._worker_task = asyncio.create_task(self._worker_loop(), name="position-monitor")
+        self._recovery_task = asyncio.create_task(self._recovery_loop(), name="position-monitor-recovery")
         if self._pulse_interval is not None:
             self._timer_task = asyncio.create_task(self._timer_loop(), name="position-monitor-timer")
 
@@ -293,6 +341,7 @@ class PositionMonitor:
         self._accepting = False
         self._bus.unsubscribe(EventType.PRICE_UPDATED, self._on_market_event)
         self._bus.unsubscribe(EventType.CANDLE_CLOSED, self._on_market_event)
+        self._bus.unsubscribe(EventType.ORDER_FILLED, self._on_market_event)
         if self._timer_task is not None:
             self._timer_task.cancel()
             try:
@@ -300,6 +349,13 @@ class PositionMonitor:
             except asyncio.CancelledError:
                 pass
             self._timer_task = None
+        if self._recovery_task is not None:
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
         if self._worker_task is not None and not self._worker_task.done():
             await self._queue.put(_STOP_SENTINEL)
             try:
@@ -312,6 +368,8 @@ class PositionMonitor:
             self._queue.get_nowait()
             self._queue.task_done()
         self._pulse_queued = False
+        self._pulse_pending_seq = None
+        self._replay_queued = False
 
     def enqueue_pulse(self) -> bool:
         """Put one timer pulse on the same queue as market events. Coalesced:
@@ -320,7 +378,8 @@ class PositionMonitor:
         if not self._accepting or self._pulse_queued:
             return False
         self._pulse_queued = True
-        self._queue.put_nowait(_Pulse(seq=self._next_seq()))
+        self._pulse_pending_seq = self._next_seq()
+        self._queue.put_nowait(_Pulse(seq=self._pulse_pending_seq))
         return True
 
     async def _timer_loop(self) -> None:
@@ -328,6 +387,17 @@ class PositionMonitor:
         while True:
             await asyncio.sleep(self._pulse_interval)
             self.enqueue_pulse()
+
+    async def _recovery_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._recovery_interval)
+            if self._journal or self._fill_pending or self._snapshot_unavailable:
+                self._enqueue_replay(self._seq)
+
+    def _enqueue_replay(self, seq: int) -> None:
+        if self._accepting and not self._replay_queued:
+            self._replay_queued = True
+            self._queue.put_nowait(_Replay(seq))
 
     # --- read surfaces ---------------------------------------------------------
 
@@ -340,6 +410,21 @@ class PositionMonitor:
         if symbol is not None:
             values = (intent for intent in values if intent.symbol == symbol)
         return tuple(values)
+
+    def protection_diagnostics(self) -> dict[str, object]:
+        """Bounded, additive visibility; counters retain loss evidence after recovery."""
+        return {
+            "status": "degraded" if self._snapshot_unavailable or self._fill_pending or self._lost_window else "healthy",
+            "snapshot_unavailable": self._snapshot_unavailable,
+            "lost_window": self._lost_window,
+            "journaled_symbols": len(self._journal),
+            "journaled_ticks": sum(map(len, self._journal.values())),
+            "fill_pending_symbols": sorted(self._fill_pending),
+            "incident_counts": dict(self._incident_counts),
+            "recent_incidents": list(self._incidents),
+            "limits": {"symbols": self._max_symbols, "ticks_per_symbol": self._max_ticks,
+                       "unowed_retention_seconds": self._retention},
+        }
 
     def get_observations(self, symbol: str | None = None) -> tuple[Observation, ...]:
         """Every slot (pending, acknowledged, expired) in creation order."""
@@ -424,19 +509,24 @@ class PositionMonitor:
         if not self._accepting or envelope.symbol is None:
             return
         seq = self._next_seq()
-        is_tick = envelope.event_type == EventType.PRICE_UPDATED
+        if envelope.event_type == EventType.PRICE_UPDATED:
+            self._journal_tick(envelope, seq)
+            return
+        if envelope.event_type == EventType.ORDER_FILLED:
+            if envelope.symbol not in self._fill_pending and len(self._fill_pending) >= self._max_symbols:
+                oldest = min(self._fill_pending, key=self._fill_pending.get)
+                del self._fill_pending[oldest]
+                self._reported_invisible.discard(oldest)
+                self._incident("fill_marker_overflow", oldest, lost=True)
+            self._fill_pending.setdefault(envelope.symbol, self._monotonic())
+            self._enqueue_replay(seq)
+            return
         try:
             held_symbols = {p.symbol for p in self._position_reader.get_open_positions()}
-        except Exception:  # noqa: BLE001 — e.g. snapshot unavailable; never lose a tick's cache offer
-            logger.exception("PositionMonitor: positions unavailable in subscriber; event dropped")
-            if is_tick:
-                self._cache_tick(envelope, seq)
+        except Exception:  # noqa: BLE001
+            self._record_unavailable()
             return
         if envelope.symbol not in held_symbols:
-            if is_tick:
-                # Cached before the held-symbol filter drops it, so a position
-                # opened just after can still be labelled from this tick.
-                self._cache_tick(envelope, seq)
             return  # cheap early drop, rechecked at processing time
         self._queue.put_nowait(_QueuedEvent(seq=seq, envelope=envelope.model_copy(deep=True)))
 
@@ -451,8 +541,14 @@ class PositionMonitor:
                     break
                 try:
                     if isinstance(item, _Pulse):
-                        self._pulse_queued = False
-                        self._process_pulse(item)
+                        try:
+                            self._process_pulse(item)
+                        finally:
+                            self._pulse_queued = False
+                            self._pulse_pending_seq = None
+                    elif isinstance(item, _Replay):
+                        self._replay_queued = False
+                        self._replay_through(item.seq)
                     else:
                         self._process_event(item)  # type: ignore[arg-type]
                 except Exception:  # noqa: BLE001 — one bad event must not kill the worker
@@ -464,12 +560,15 @@ class PositionMonitor:
 
     def _process_event(self, queued: _QueuedEvent) -> None:
         envelope = queued.envelope
-        if envelope.event_type == EventType.PRICE_UPDATED:
-            self._cache_tick(envelope, queued.seq)  # in queue order for held symbols
+        self._replay_through(queued.seq)
         bar = _bar_from_envelope(envelope)
         if bar is None:
             return
-        positions = [p for p in self._position_reader.get_open_positions() if p.symbol == envelope.symbol]
+        try:
+            positions = [p for p in self._position_reader.get_open_positions() if p.symbol == envelope.symbol]
+        except Exception:  # noqa: BLE001
+            self._record_unavailable()
+            return
         for position in positions:
             if not self._protective_open(position.position_id):
                 continue
@@ -478,14 +577,15 @@ class PositionMonitor:
                 self._register("protective", intent)
 
     def _process_pulse(self, pulse: _Pulse) -> None:
+        self._replay_through(pulse.seq)
         now = self._wall_clock()
         if now.tzinfo is None or now.utcoffset() is None:
             logger.error("PositionMonitor: wall clock returned a naive datetime; pulse skipped")
             return
         try:
             positions = self._position_reader.get_open_positions()
-        except Exception:  # noqa: BLE001 — e.g. snapshot unavailable; retry next pulse
-            logger.exception("PositionMonitor: positions unavailable for pulse")
+        except Exception:  # noqa: BLE001
+            self._record_unavailable()
             return
         for position in positions:
             pid = position.position_id
@@ -537,6 +637,156 @@ class PositionMonitor:
         self._seq += 1
         return self._seq
 
+    def _incident(self, cause: str, symbol: str | None = None, *, lost: bool = False) -> None:
+        self._incident_counts[cause] = self._incident_counts.get(cause, 0) + 1
+        self._incidents.append({"cause": cause, "symbol": symbol, "at": self._wall_clock().isoformat()})
+        self._lost_window |= lost
+        if lost:
+            now = self._monotonic()
+            last = self._last_loss_log.get(cause)
+            if last is None or now - last >= 60:
+                self._last_loss_log[cause] = now
+                logger.error("PositionMonitor: retained price window lost cause=%s symbol=%s", cause, symbol)
+
+    def _record_unavailable(self) -> None:
+        if not self._snapshot_unavailable:
+            self._incident("snapshot_unavailable")
+            now = self._monotonic()
+            if self._last_unavailable_log is None or now - self._last_unavailable_log >= 60:
+                self._last_unavailable_log = now
+                logger.error("PositionMonitor: position snapshot unavailable; retained ticks await recovery")
+        self._snapshot_unavailable = True
+
+    def _journal_tick(self, envelope: EventEnvelope, seq: int) -> None:
+        assert envelope.symbol is not None
+        try:
+            tick = PriceUpdated.model_validate(envelope.payload)
+        except ValidationError:
+            return
+        ts = tick.exchange_ts
+        now = self._wall_clock()
+        if (ts.tzinfo is None or ts.utcoffset() is None or now.tzinfo is None
+                or ts > now or not math.isfinite(tick.price) or tick.price <= 0):
+            return
+        symbol = envelope.symbol
+        if symbol not in self._journal and len(self._journal) >= self._max_symbols:
+            # Discard an unowed symbol first. Either choice records loss of
+            # first-touch certainty for a position that may appear later.
+            victim = None
+            for candidate, ticks in self._journal.items():
+                eod_candidates = self._eod_candidate_seqs(candidate)
+                if not any(self._owed(candidate, item, eod_candidates) for item in ticks):
+                    victim = candidate
+                    break
+            if victim is None:
+                victim = next(iter(self._journal))
+            del self._journal[victim]
+            self._tick_cache.pop(victim, None)
+            self._incident("symbol_capacity_loss", victim, lost=True)
+        entries = self._journal.setdefault(symbol, deque())
+        if len(entries) >= self._max_ticks:
+            entries.popleft()
+            self._incident("tick_overflow", symbol, lost=True)
+        entries.append(_JournalTick(tick.price, ts, seq, self._monotonic()))
+        self._cache_tick(envelope, seq)
+        self._enqueue_replay(seq)
+
+    def _eod_candidate_seqs(self, symbol: str) -> set[int]:
+        ticks = self._journal.get(symbol, ())
+        candidates: set[int] = set()
+        for position in self._visible.values():
+            if (position.symbol != symbol or not self._protective_open(position.position_id)
+                    or (position.position_id, "eod") in self._slots):
+                continue
+            eligible = [item for item in ticks if item.ts >= position.opened_at]
+            if eligible:
+                candidates.add(max(eligible, key=lambda item: (item.ts, -item.seq)).seq)
+            if self._pulse_pending_seq is not None:
+                prior = [item for item in eligible if item.seq <= self._pulse_pending_seq]
+                if prior:
+                    candidates.add(max(prior, key=lambda item: (item.ts, -item.seq)).seq)
+        return candidates
+
+    def _owed(self, symbol: str, tick: _JournalTick, eod_candidates: set[int] | None = None) -> bool:
+        if self._snapshot_unavailable or symbol in self._fill_pending:
+            return True
+        if tick.seq in (self._eod_candidate_seqs(symbol) if eod_candidates is None else eod_candidates):
+            return True
+        for position in self._visible.values():
+            if position.symbol != symbol or tick.ts < position.opened_at or not self._protective_open(position.position_id):
+                continue
+            if tick.seq > self._progress.get(position.position_id, 0):
+                return True
+        return False
+
+    def _prune_journal(self) -> None:
+        now = self._monotonic()
+        for symbol, ticks in tuple(self._journal.items()):
+            eod_candidates = self._eod_candidate_seqs(symbol)
+            kept = deque()
+            expired = 0
+            for tick in ticks:
+                if now - tick.arrived >= self._retention and not self._owed(symbol, tick, eod_candidates):
+                    expired += 1
+                else:
+                    kept.append(tick)
+            if expired:
+                # Expiry after an extant position safely evaluated the ticks
+                # does not erase its first-touch evidence. A flat symbol may
+                # still acquire a delayed fill with an earlier opened_at.
+                self._incident("unowed_expiry", symbol,
+                               lost=not any(p.symbol == symbol for p in self._visible.values()))
+            if kept:
+                self._journal[symbol] = kept
+            else:
+                del self._journal[symbol]
+                self._tick_cache.pop(symbol, None)
+
+    def _replay_through(self, boundary: int) -> None:
+        try:
+            positions = self._position_reader.get_open_positions()
+        except Exception:  # noqa: BLE001
+            self._record_unavailable()
+            return
+        self._snapshot_unavailable = False
+        current = {p.position_id: p for p in positions}
+        for pid in tuple(self._visible):
+            if pid not in current:
+                self._progress.pop(pid, None)
+                self._eod_tick_floor.pop(pid, None)
+                self._closed_positions.discard(pid)
+                self._last_logged = {key: value for key, value in self._last_logged.items() if key[0] != pid}
+                for kind in ("protective", "eod"):
+                    self._slots.pop((pid, kind), None)
+                self._exit_intents.pop(pid, None)
+        self._visible = current
+        for position in positions:
+            self._fill_pending.pop(position.symbol, None)
+            self._reported_invisible.discard(position.symbol)
+            if not self._protective_open(position.position_id):
+                continue
+            for tick in self._journal.get(position.symbol, ()):
+                if tick.seq > boundary:
+                    break
+                if tick.seq <= self._progress.get(position.position_id, 0):
+                    continue
+                if tick.ts >= position.opened_at:
+                    bar = _Bar(tick.price, tick.price, tick.price, tick.ts)
+                    intent = _evaluate(position, bar)
+                    if intent is not None:
+                        self._register("protective", intent)
+                # Progress follows safe registration, never precedes it.
+                self._progress[position.position_id] = tick.seq
+                if not self._protective_open(position.position_id):
+                    break
+        for symbol, started in tuple(self._fill_pending.items()):
+            if self._monotonic() - started >= self._retention and symbol not in self._reported_invisible:
+                self._reported_invisible.add(symbol)
+                self._incident("fill_invisible", symbol)
+        self._prune_journal()
+        if any(ticks and ticks[-1].seq > boundary for ticks in self._journal.values()):
+            self._enqueue_replay(self._seq)
+
     def _protective_open(self, position_id: UUID) -> bool:
         return position_id not in self._closed_positions and (position_id, "protective") not in self._slots
 
@@ -559,9 +809,11 @@ class PositionMonitor:
             self._tick_cache[envelope.symbol] = _CachedTick(price=tick.price, ts=ts, seq=seq)
 
     def _eligible_tick(self, position: PositionView, now: datetime, pulse_seq: int) -> _CachedTick | None:
-        tick = self._tick_cache.get(position.symbol)
-        if tick is None or tick.seq > pulse_seq:
-            return None  # arrived after this pulse was queued: later work
+        eligible = (tick for tick in self._journal.get(position.symbol, ()) if tick.seq <= pulse_seq)
+        latest = max(eligible, key=lambda tick: (tick.ts, -tick.seq), default=None)
+        if latest is None:
+            return None
+        tick = _CachedTick(latest.price, latest.ts, latest.seq)
         if not position.opened_at <= tick.ts <= now:
             return None
         if self._clock.trading_day(tick.ts) != self._clock.trading_day(position.opened_at):
