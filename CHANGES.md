@@ -1,3 +1,41 @@
+<!-- BEGIN DELIVERY SECTION: execution-panel-refresh-recovery (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-panel-refresh-recovery`
+
+Integrated uncommitted on local `main` `8eb099a` after fetching GitHub `origin/main` at `edc1543`. The newer local Position Monitor recovery commit changed shared documentation, so the component patch was applied separately and the documentation hunks were merged into the existing files. The Position Monitor delivery section and decision #188 were preserved. One stale positions-section comment in the component was also corrected to reflect the new Refresh behavior.
+
+Based on `main` `edc1543` (re-checked against `origin/main` before packaging: no newer commits). Frontend and docs only:
+**no backend, API contract, `api-client.ts`, Position Monitor, Portfolio State, simulated venue or protection-diagnostic
+file was edited.** **No new decision number** was needed after integration; the delivery slug identifies this change.
+Changed code file: `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`.
+
+- **Problem.** "Recent simulated orders", "Recent simulated fills", "Startup status" and "Observed exit triggers" disabled
+  Refresh while loading, so a hung request left no way to ask for a fresh snapshot. The positions, recorded-exit-requests
+  and outcome-recording sections already allowed it.
+- **Fix.** Refresh is never disabled in those four sections. Each section already owned a per-run `active` flag cleared by
+  the effect cleanup, so a newer Refresh supersedes the earlier request and an older success or failure is dropped; that
+  guard is unchanged and now actually reachable mid-flight. Collapse/unmount runs the same cleanup.
+- **Filters (orders, fills).** Apply, Clear and the symbol box are also enabled while loading, so a hung filtered request
+  can be replaced by another or cleared filter. Refresh still refetches the *applied* symbol (not unapplied box text);
+  orders and fills keep independent state; Apply with an unchanged applied symbol issues no request (use Refresh).
+- **Response-ordering bug found in the filter path.** A settled result is now tagged with the symbol it was requested for
+  and shown only while that equals the applied symbol, otherwise the section reads as loading. Previously, in the render
+  between Apply/Clear and the effect that starts the new fetch, the previous filter's rows (or "No simulated orders for
+  <new symbol>.") could be shown for a result fetched under the old filter.
+- **Unchanged.** Loading/error/empty/populated states stay distinct (a failure is never an empty ledger or "Position Monitor
+  unavailable"); manual fetching only; no polling, trading action, global state or cancellation (a superseded request still
+  completes and its response is discarded).
+- **Docs.** `docs/architecture/execution-engine-design.md`: new "Refresh recovery" subsection with data-flow and
+  request-lifecycle diagrams after the fills symbol-filter section; two now-stale sentences corrected (fills filter
+  "Controls are disabled while loading"; positions "Unlike the orders and fills sections...").
+
+```
+ Refresh / Apply / Clear / collapse ──► effect cleanup: previous run.active = false
+                                           └─► new run: settled = loading ─► fetch(requested symbol)
+ older response ──► run.active false ─► dropped        newest response ──► settled = {requested, ready|error}
+ render: settled.symbol !== appliedSymbol ? loading : settled
+```
+<!-- END DELIVERY SECTION: execution-panel-refresh-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: position-monitor-trigger-recovery -->
 # CHANGES — `position-monitor-trigger-recovery`
 

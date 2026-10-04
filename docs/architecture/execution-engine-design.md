@@ -670,8 +670,9 @@ has a symbol box with Apply and Clear, and `fetchExecutionFills(symbol?)` sends
 `?symbol=<encoded>` only when a symbol is applied; with none, the request is the
 unfiltered default 50 as before. It follows the orders section's filter: the box
 uppercases as typed, Apply and Enter trim and uppercase, and an empty value means
-no filter (never `symbol=`). Refresh keeps the last applied symbol. Controls are
-disabled while loading, and a response for a superseded filter is ignored. The
+no filter (never `symbol=`). Refresh keeps the last applied symbol. A response for
+a superseded filter is ignored (controls stay enabled mid-flight — see
+`execution-panel-refresh-recovery` below). The
 empty text distinguishes an empty ledger from "no fills for this symbol". The
 section's state is independent of the orders section's, so neither filter
 refetches or changes the other. The server still hard-scopes to simulated fills
@@ -698,6 +699,53 @@ Clear ──► input "" + appliedSymbol undefined ──► unfiltered fetch
        └─ 200 ──► [] ──► "No simulated fills recorded yet." (no filter) / "...for X." (filtered)
                   └─ rows ──► render in server order, keyed by ledger_seq
 superseded filter or collapse ──► cleanup marks the run inactive; late response ignored
+```
+
+**Refresh recovery (as built, `execution-panel-refresh-recovery`; frontend only, no decision
+number assigned — slug only).** "Recent simulated orders", "Recent simulated fills", "Startup
+status" and "Observed exit triggers" used to disable Refresh while their request was loading, so
+one hung request left no way to ask for a fresh snapshot. The other sections (positions, recorded
+exit requests, simulated outcome recording) already allowed it. All four now behave like them:
+
+| Rule | As built |
+|---|---|
+| Refresh | Always enabled. Each click bumps that section's `refreshKey`; the effect cleanup marks the previous run inactive, so an older success **or** failure is discarded and can never replace the newer request's loading state, result or error. |
+| Collapse / unmount | The same cleanup runs; a response arriving after collapse is ignored, and re-expanding mounts a fresh section that fetches again. |
+| Orders / fills filter | Apply, Clear and the symbol box stay enabled mid-flight (needed so a hung *filtered* request can be replaced by a different or cleared filter). Refresh refetches the **applied** symbol, never the unapplied text in the box. Apply with an unchanged applied symbol issues no request (use Refresh). The two sections' filter state stays independent. |
+| Filter match | A settled result carries the symbol it was requested for and is displayed only while that equals the applied symbol; otherwise the section reads as loading. This closes the render between Apply/Clear and its effect starting the new fetch, which previously showed the old rows (or "No simulated orders for <new symbol>.") for a result that was fetched for the previous filter. |
+| States | Unchanged: loading, error, empty and populated stay distinct. A failed request is never shown as an empty ledger or as "Position Monitor unavailable". |
+| Not added | No polling, no request cancellation (a superseded request still completes in the browser and its response is dropped), no shared or global state, no API-contract change. `api-client.ts` is untouched. |
+
+```
+                          ExecutionLifecyclePanel (frontend only; no backend, API or contract change)
+ expand ──► mounts, per section, its own load state + refreshKey (no state shared between sections)
+
+ StartupStatusLine ─────────► GET /health/execution-startup
+ ObservedExitTriggers ──────► GET /intelligence/exit-intents
+ RecentSimulatedOrders ─────► GET /intelligence/execution-orders[?symbol=X]   (appliedSymbol, own)
+ RecentSimulatedFills ──────► GET /intelligence/execution-fills[?symbol=X]    (appliedSymbol, own)
+   Refresh / Apply / Clear in one section re-run only that section's request
+```
+
+```
+ per section (orders / fills shown; startup status and exit triggers are the same without a filter)
+
+ Refresh ──► refreshKey++ ┐
+ Apply ───► appliedSymbol ├─► effect cleanup: previous run.active = false
+ Clear ───► appliedSymbol ┘        │
+ collapse / unmount ───────────────┘ (cleanup only)
+                                   ▼
+                    new run: active = true; requested = appliedSymbol; settled = loading
+                                   ▼
+                           fetch(requested) ───────────────┐
+                              │ resolves / rejects          │ (older runs may still resolve later)
+                              ▼                             ▼
+                  run.active ? settled = {requested, ready|error}     run.active false ──► dropped
+                              ▼
+        render: settled.symbol !== appliedSymbol ? loading : settled
+                 ├─ loading  ──► "Loading …" (Refresh/Apply/Clear still enabled)
+                 ├─ error    ──► "Could not fetch …: <message>"   (never the empty state)
+                 └─ ready    ──► empty text (filter-aware) or rows
 ```
 
 **As built (`execution-positions-route`; decision number assigned at integration).** `GET /intelligence/execution-positions` is the
@@ -836,9 +884,10 @@ commissions.
 Loading, empty ("No simulated positions recorded yet.") and request failure have
 distinct displays. Each effect run owns an `active` flag that its cleanup clears,
 so a response that arrives after collapse/unmount, or after a newer Refresh has
-superseded it, is discarded — success and failure alike. Unlike the orders and
-fills sections, Refresh here stays enabled while a request is in flight, so a
-slow request can be superseded rather than waited out.
+superseded it, is discarded — success and failure alike. Refresh here stays
+enabled while a request is in flight, so a slow request can be superseded rather
+than waited out (the orders, fills, startup-status and exit-trigger sections now
+follow the same rule — `execution-panel-refresh-recovery` above).
 
 The snapshot is independent of everything else in the panel: it is not merged
 into the WebSocket activity feed (`useOrderLifecycle`), does not read or write

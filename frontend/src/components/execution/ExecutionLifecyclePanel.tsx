@@ -209,10 +209,13 @@ function ExecutionLifecycleBody() {
   );
 }
 
+// `symbol` on a settled result is the filter that request was made for. The
+// section only shows a result whose `symbol` equals the currently applied
+// filter, so a result for a superseded filter can never be displayed.
 type ExecutionOrdersLoad =
   | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "ready"; data: ExecutionOrdersWireShape };
+  | { kind: "error"; symbol: string | undefined; message: string }
+  | { kind: "ready"; symbol: string | undefined; data: ExecutionOrdersWireShape };
 
 function RecentSimulatedOrders() {
   const [refreshKey, setRefreshKey] = useState(0);
@@ -222,24 +225,36 @@ function RecentSimulatedOrders() {
   // bumps refreshKey) naturally keeps whatever filter was last applied.
   const [symbolInput, setSymbolInput] = useState("");
   const [appliedSymbol, setAppliedSymbol] = useState<string | undefined>(undefined);
-  const [load, setLoad] = useState<ExecutionOrdersLoad>({ kind: "loading" });
+  const [settled, setLoad] = useState<ExecutionOrdersLoad>({ kind: "loading" });
 
   useEffect(() => {
     let active = true;
+    const requestedSymbol = appliedSymbol;
     setLoad({ kind: "loading" });
-    fetchExecutionOrders(appliedSymbol)
+    fetchExecutionOrders(requestedSymbol)
       .then((data) => {
-        if (active) setLoad({ kind: "ready", data });
+        if (active) setLoad({ kind: "ready", symbol: requestedSymbol, data });
       })
       .catch((error: unknown) => {
-        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+        if (active) {
+          setLoad({ kind: "error", symbol: requestedSymbol, message: error instanceof Error ? error.message : "Request failed" });
+        }
       });
-    // Same stale-request guard as before, now also keyed on appliedSymbol:
-    // switching the filter quickly (or Refresh firing mid-flight) lets each
-    // effect run's own closure ignore a response that arrives after a newer
-    // one has already superseded it.
+    // Runs on unmount (collapse) and before every re-run (Refresh, Apply,
+    // Clear): the superseded request's success or failure finds
+    // active === false and is dropped, so it can never replace the newer
+    // request's loading state, result or error. Refresh and the filter
+    // controls stay enabled mid-flight so a hung request can be superseded.
+    // The request itself is not aborted; its late response is just ignored.
     return () => { active = false; };
   }, [refreshKey, appliedSymbol]);
+
+  // A settled result is shown only for the filter it was requested for. In
+  // the render between an Apply/Clear and its effect starting the new fetch
+  // (appliedSymbol already changed, `settled` not yet reset), this reads as
+  // loading instead of showing the previous filter's rows or empty message.
+  const load: ExecutionOrdersLoad =
+    settled.kind !== "loading" && settled.symbol !== appliedSymbol ? { kind: "loading" } : settled;
 
   const applyFilter = () => setAppliedSymbol(normalizeSymbolFilter(symbolInput));
   const clearFilter = () => {
@@ -254,8 +269,7 @@ function RecentSimulatedOrders() {
         <h2 className="font-mono text-[11px] font-semibold text-text-primary">Recent simulated orders</h2>
         <button
           onClick={() => setRefreshKey((key) => key + 1)}
-          disabled={load.kind === "loading"}
-          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Refresh
         </button>
@@ -265,22 +279,20 @@ function RecentSimulatedOrders() {
           value={symbolInput}
           onChange={(e) => setSymbolInput(e.target.value.toUpperCase())}
           onKeyDown={(e) => e.key === "Enter" && applyFilter()}
-          disabled={load.kind === "loading"}
           placeholder="Filter symbol"
           aria-label="Filter simulated orders by symbol"
           maxLength={12}
-          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary placeholder:text-text-muted outline-none focus:border-signal"
         />
         <button
           onClick={applyFilter}
-          disabled={load.kind === "loading"}
-          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Apply
         </button>
         <button
           onClick={clearFilter}
-          disabled={load.kind === "loading" || !canClear}
+          disabled={!canClear}
           className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:bg-base-bg disabled:opacity-50"
         >
           Clear
@@ -315,10 +327,13 @@ function RecentSimulatedOrders() {
   );
 }
 
+// `symbol` on a settled result is the filter that request was made for. The
+// section only shows a result whose `symbol` equals the currently applied
+// filter, so a result for a superseded filter can never be displayed.
 type ExecutionFillsLoad =
   | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "ready"; data: ExecutionFillsWireShape };
+  | { kind: "error"; symbol: string | undefined; message: string }
+  | { kind: "ready"; symbol: string | undefined; data: ExecutionFillsWireShape };
 
 function RecentSimulatedFills() {
   const [refreshKey, setRefreshKey] = useState(0);
@@ -328,22 +343,32 @@ function RecentSimulatedFills() {
   // last-applied symbol.
   const [symbolInput, setSymbolInput] = useState("");
   const [appliedSymbol, setAppliedSymbol] = useState<string | undefined>(undefined);
-  const [load, setLoad] = useState<ExecutionFillsLoad>({ kind: "loading" });
+  const [settled, setLoad] = useState<ExecutionFillsLoad>({ kind: "loading" });
 
   useEffect(() => {
     let active = true;
+    const requestedSymbol = appliedSymbol;
     setLoad({ kind: "loading" });
-    fetchExecutionFills(appliedSymbol)
+    fetchExecutionFills(requestedSymbol)
       .then((data) => {
-        if (active) setLoad({ kind: "ready", data });
+        if (active) setLoad({ kind: "ready", symbol: requestedSymbol, data });
       })
       .catch((error: unknown) => {
-        if (active) setLoad({ kind: "error", message: error instanceof Error ? error.message : "Request failed" });
+        if (active) {
+          setLoad({ kind: "error", symbol: requestedSymbol, message: error instanceof Error ? error.message : "Request failed" });
+        }
       });
     // Stale-response guard keyed on both refreshKey and appliedSymbol, as in
-    // RecentSimulatedOrders: a response for a superseded filter is ignored.
+    // RecentSimulatedOrders: a response for a superseded request (newer
+    // Refresh or a changed filter) is ignored, and nothing is disabled
+    // mid-flight, so a hung request can always be replaced.
     return () => { active = false; };
   }, [refreshKey, appliedSymbol]);
+
+  // Same filter-match rule as RecentSimulatedOrders: a settled result for a
+  // superseded filter is never displayed.
+  const load: ExecutionFillsLoad =
+    settled.kind !== "loading" && settled.symbol !== appliedSymbol ? { kind: "loading" } : settled;
 
   const applyFilter = () => setAppliedSymbol(normalizeSymbolFilter(symbolInput));
   const clearFilter = () => {
@@ -358,8 +383,7 @@ function RecentSimulatedFills() {
         <h2 className="font-mono text-[11px] font-semibold text-text-primary">Recent simulated fills</h2>
         <button
           onClick={() => setRefreshKey((key) => key + 1)}
-          disabled={load.kind === "loading"}
-          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Refresh
         </button>
@@ -369,22 +393,20 @@ function RecentSimulatedFills() {
           value={symbolInput}
           onChange={(e) => setSymbolInput(e.target.value.toUpperCase())}
           onKeyDown={(e) => e.key === "Enter" && applyFilter()}
-          disabled={load.kind === "loading"}
           placeholder="Filter symbol"
           aria-label="Filter simulated fills by symbol"
           maxLength={12}
-          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+          className="min-w-0 flex-1 rounded border border-base-border bg-base-bg px-1.5 py-0.5 font-mono text-[10px] text-text-primary placeholder:text-text-muted outline-none focus:border-signal"
         />
         <button
           onClick={applyFilter}
-          disabled={load.kind === "loading"}
-          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Apply
         </button>
         <button
           onClick={clearFilter}
-          disabled={load.kind === "loading" || !canClear}
+          disabled={!canClear}
           className="shrink-0 rounded px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:bg-base-bg disabled:opacity-50"
         >
           Clear
@@ -466,7 +488,7 @@ function PositionRow({ position }: { position: ExecutionPositionWireShape }) {
 // deliberately NOT the WebSocket feed below and NOT the live World View
 // portfolio: no mark price, unrealized P&L or exposure exists here, and
 // nothing in this section polls or merges with those surfaces. Refresh stays
-// enabled while a request is in flight (unlike the orders/fills sections) so a
+// enabled while a request is in flight so a
 // slow or hung request can be superseded; the effect cleanup discards the
 // superseded response either way.
 function RecentSimulatedPositions() {
@@ -565,8 +587,7 @@ function StartupStatusLine() {
         <h2 className="font-mono text-[11px] font-semibold text-text-primary">Startup status</h2>
         <button
           onClick={() => setRefreshKey((key) => key + 1)}
-          disabled={load.kind === "loading"}
-          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Refresh
         </button>
@@ -631,8 +652,7 @@ function ObservedExitTriggers() {
         <h2 className="font-mono text-[11px] font-semibold text-text-primary">Observed exit triggers</h2>
         <button
           onClick={() => setRefreshKey((key) => key + 1)}
-          disabled={load.kind === "loading"}
-          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg disabled:opacity-50"
+          className="rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
         >
           Refresh
         </button>
