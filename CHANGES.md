@@ -1,3 +1,21 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-lifespan-recovery (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-recorder-lifespan-recovery`
+
+Base: GitHub `main` `445e9d43c906df806bfe3a7d541a3a763d81350f` (re-checked against `origin/main` before packaging: no newer commits). Test-only plus documentation: **no production source, migration, schema, `conftest.py`, existing test or frontend file changed.** No decision number is assigned; decisions #179, #186 and #187 define the behavior under test.
+
+New code file: `backend/tests/test_outcome_recorder_lifespan_recovery.py`.
+
+- **Gap closed.** `test_outcome_recorder_restart_recovery.py` proves a freshly constructed `OutcomeRecorder` recovers durable work, but builds the recorder by hand, so `main.py`'s startup ordering was unproven. `test_execution_startup_status_route.py` already covers recorder-startup failure and the blocked-state response. The new module drives the **real FastAPI lifespan** (via `TestClient`) against real PostgreSQL and proves the production order: reconciliation completes, then the recorder starts, then its startup scan recovers the trade.
+- **Two tests.** (1) A consistent, eligible closed simulated trade is seeded before the lifespan. Entering the real lifespan records exactly one linked outcome (`outcome_status = 'recorded'`) with the existing honest missing-snapshot contract (all four snapshot columns NULL, reason `recorder_unavailable`); no `PositionClosed` or `OrderFilled` is published, the test never calls the recorder's scan or `record_trade`, and the execution ledger is unchanged. A second, fresh lifespan (loop-bound singletons reset) leaves the outcome unchanged and creates no duplicate, using a duplicate-closure `skipped` verdict as the barrier. (2) With an injected reconciliation discrepancy (the established pattern) and an eligible trade pending, the recorder is never constructed or started, and the trade remains unrecorded and still pending.
+- **Observation without substitution.** `reconcile_with_venue`, `OutcomeRecorder.start/stop/_pending_rows/record_trade` and `EventBus.publish` are wrapped by functions that delegate to the originals and only append to a per-lifespan trace, which is how the test asserts `reconcile` finishes before `recorder.start` and `recorder.scan`. Waits are bounded polls with a deadline and a report of the last observed trace; there is no fixed sleep.
+- **Shutdown before cleanup.** Fixture order (`trace` depends on `seeded`) makes the recorder-worker-ended assertions run before any seeded row is deleted; the tests also assert `stop()` began and finished after the last verdict.
+- **Controlled inputs.** `MarketClock.is_regular_session` pinned true; recorder sweep interval 3600 s and snapshot lag 1 s through the real settings (env, settings cache cleared); external providers blanked by `conftest.py`.
+- **Seed completed, not weakened.** The real lifespan rebuilds Portfolio State through `PostgresPositionLedger`, which requires the applied-fill cursor to equal the last receipt and each receipt's trading day to be the ET day of its fill. The shared `_seed` helper writes neither, so the module adds the cursor and the clock's own trading day. The ledger's checks were not touched and no production defect was found.
+- **Isolation.** Autouse guard fails unless `trades` is empty and the Portfolio State cursor is untouched (disposable database at Alembic head). Cleanup deletes only the seeded `trade_id`s' rows, children first, and restores the cursor.
+- **Not proven (stated in the docs too).** Two sequential in-process lifespans are not a process crash or multi-process coverage.
+- **Docs.** `docs/architecture/execution-engine-design.md` §6.7.1 gains subsection **N** (with a component data-flow diagram and an internal startup/recovery flow diagram), and subsection M's "does not prove" paragraph now points to it.
+<!-- END DELIVERY SECTION: outcome-recorder-lifespan-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-restart-recovery-tests (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-restart-recovery-tests`
 

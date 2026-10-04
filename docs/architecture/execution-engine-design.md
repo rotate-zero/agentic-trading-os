@@ -2807,7 +2807,7 @@ paging. Not verified against a running backend with real recorder rows (see `TES
 
 Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL entry and exit snapshots, each with a reason code in `snapshot_missing_reasons`, and the entry-side reason is `recorder_unavailable`; nothing is fabricated and nothing survives from the previous recorder. Price and P&L formulas are not re-tested here.
 
-**What this does not prove.** This is a restart of the recorder *object* over a live database. It is **not** a process crash and **not** a full app-lifespan recovery: the `main.py` ordering (reconciliation and `portfolio_state.refresh()` before the recorder subscribes, §6.7.1 C7) is not exercised, no event loop or bus is torn down and rebuilt as a process would, and no second process contends for the row lock. The periodic sweep is parked in these tests and is covered by its own suite. Test isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows, children first, after every recorder worker has been stopped.
+**What this does not prove.** This is a restart of the recorder *object* over a live database. It is **not** a process crash and **not** a full app-lifespan recovery: the `main.py` ordering (reconciliation and `portfolio_state.refresh()` before the recorder subscribes, §6.7.1 C7) is not exercised, no event loop or bus is torn down and rebuilt as a process would, and no second process contends for the row lock. (The `main.py` ordering has since been exercised through the real lifespan by subsection N below; the process-crash and second-process limits stand.) The periodic sweep is parked in these tests and is covered by its own suite. Test isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows, children first, after every recorder worker has been stopped.
 
 **Scan to worker to ledger (the path the tests drive)**
 
@@ -2855,6 +2855,76 @@ Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL
                                              worker verdict "skipped" (the barrier) ───────────► status, outcome_id and
                                                                                                  every column unchanged,
                                                                                                  no second row
+```
+
+#### N. Lifespan-recovery verification (`outcome-recorder-lifespan-recovery`; decisions #179, #186 and #187 are the behavior, no new decision number)
+
+**Test evidence only.** No production source, migration, schema, `conftest.py`, existing test or frontend file changed. `backend/tests/test_outcome_recorder_lifespan_recovery.py` runs the **real FastAPI lifespan** (`main.py`, via `TestClient`) against a real PostgreSQL database and proves that the production startup order recovers an eligible closed simulated trade from durable rows alone. Subsection M proved this for a hand-built recorder object; it could not show *when* `main.py` starts the recorder relative to reconciliation. `test_execution_startup_status_route.py` already covers the recorder-startup-failure case and the blocked-state *response*; this module does not repeat either.
+
+| Case | What the test establishes |
+|---|---|
+| **Recovery through the real lifespan** | A consistent closed trade (approved, simulated, auto, `outcome_id` and `outcome_status` NULL, closed position, applied-fill receipts, Portfolio State cursor) is persisted *before* the lifespan. Entering it, `reconcile_with_venue` runs to completion (real, delegated, no discrepancy) **before** `OutcomeRecorder.start()` begins and before its startup scan. The scan's real query returns exactly that trade; the worker's real `record_trade()` returns `recorded`. Afterwards there is exactly one `strategy_outcomes` row, linked by `trades.outcome_id`, `outcome_status = 'recorded'`, `is_backtest = false`, with the C3 snapshot contract: all four snapshot columns NULL, each with reason `recorder_unavailable`. Nothing published `PositionClosed` or `OrderFilled` on the bus, the test never calls `record_trade()`, `scan()` or `_startup_scan()`, and the execution ledger (position, orders, fills, receipts, cursor) is identical before and after: recovery changes only the outcome link. |
+| **Recorder shutdown before cleanup** | Leaving the lifespan runs `OutcomeRecorder.stop()` (queue drained, worker task finished, not cancelled, no exception, sweeper gone) after the last verdict. Fixture order makes this a precondition of cleanup: the trace fixture asserts every recorder worker has ended *before* the seeding fixture deletes any row. |
+| **Fresh lifespan leaves it unchanged** | After the first lifespan, loop-bound singletons are reset and a second real lifespan is entered. Reconciliation again precedes the recorder; the startup scan returns an empty page (the recorded trade is no longer pending) and no verdict is produced. A duplicate `PositionClosed` is then published as a **barrier**: with one FIFO worker its `skipped` verdict proves anything the scan could have queued has been processed. Status, `outcome_id` and every `strategy_outcomes` column are identical, exactly one outcome still exists, and the ledger is unchanged. |
+| **Blocked reconciliation** | With an eligible trade pending, `reconcile_with_venue` is replaced by an injected discrepancy report (the established pattern of `test_main_execution_pipeline.py` and `test_execution_startup_status_route.py`). The lifespan fails closed (decision #179): `GET /health/execution-startup` reports `reconciliation_blocked` with a count of 2, and `OutcomeRecorder` is **never constructed or started**: no start, scan, verdict or stop is recorded. The recorder start is synchronous inside the lifespan, so with the client entered "never started" is final. A closure event published afterwards is drained by the bus (bus-idle barrier) and reaches no recorder. The trade stays unrecorded (`outcome_id`, `outcome_status` NULL, no outcome row), is still discoverable by the real pending query, and its ledger is unchanged. |
+
+**Observation, not substitution.** In the recovery case the observed methods (`reconcile_with_venue`, `OutcomeRecorder.start/stop/_pending_rows/record_trade`, `EventBus.publish`) are wrapped by functions that delegate to the originals, return their real results and only append to a per-lifespan trace. Synchronization is bounded and event-based: the test thread polls with a deadline (reporting the last observed trace on timeout) for the worker's verdict; no fixed sleep decides any outcome. Controlled inputs: `MarketClock.is_regular_session` is pinned true, the recorder sweep interval is parked at 3600 s so only the startup scan can act, and the recorder snapshot lag is 1 s so a recovered closure is deterministically too old to snapshot. Finnhub/Polygon are blanked by `conftest.py`, so no external provider is contacted.
+
+**Seed consistency, as found.** The real lifespan rebuilds Portfolio State through `PostgresPositionLedger`, which refuses a ledger whose applied-fill cursor differs from the last receipt, or whose receipt trading day is not the ET day of the fill. The shared recorder seed (`_seed`) satisfies the recorder's own checks but writes neither a cursor nor an ET trading day, so this module completes it (cursor = last receipt's `ledger_seq`; receipt trading day from `MarketClock.trading_day`). These are the ledger's intended consistency checks, not a production defect.
+
+**What this does not prove.** Two sequential in-process lifespans are not a process crash or `kill -9`, and not two processes: `SimulatedVenue` and every cached singleton are rebuilt, nothing else is carried over, and no second process contends for the row lock. Only the closed-trade startup-scan path is driven; entry-snapshot capture, the periodic sweep and the other blocked-outcome reasons have their own suites. Isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty and the Portfolio State cursor is untouched (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows (children first) and restores the cursor.
+
+**Component data flow (what the tests drive and observe)**
+
+```
+  test (seeds, observes)                    main.py lifespan                         PostgreSQL ledger (authoritative)
+  ──────────────────────                    ────────────────                         ─────────────────────────────────
+  seed BEFORE lifespan ─────────────────────────────────────────────────────────►  trades: closed, outcome NULL
+   (trade, orders, fills, receipts,                                                  positions · receipts · fills · orders
+    position, cursor)                                                                portfolio_state_cursor = last receipt
+                                       SimulatedVenue.connect()
+                                       PortfolioState.start() ◄─── rebuild from ───  receipts + cursor (strict checks)
+                                       reconcile_with_venue(session, venue, state) ◄  non-terminal orders (none here)
+        wrapper: reconcile:begin/end ◄──────────┤  discrepancy? ── no ──► workers start ──► status "ready"
+                                                │                    └─ yes ─► log CRITICAL, stop, status
+                                                │                              "reconciliation_blocked" (no recorder)
+                                                ▼  (clean path only)
+                                       OutcomeRecorder(bus, SessionLocal).start()
+        wrapper: recorder.start ◄──────────────┤   subscribe · spawn worker · _startup_scan
+        wrapper: recorder.scan  ◄── real _pending_rows ── pages of (closed_at, trade_id) ───────────────────────────────┐
+                                                │   enqueue("close", trade_id)                                         │
+                                                ▼                                                                      │
+                                       worker ─► record_trade() ─ SELECT ... FOR UPDATE ─► build outcome ─► one commit ──┘
+        wrapper: recorder.verdict ◄─────────────┘                    strategy_outcomes row + trades.outcome_id + 'recorded'
+        wrapper: EventBus.publish ◄── (asserts no PositionClosed / OrderFilled was replayed)
+  shutdown: bus stops ► authorizer ► execution engine ► Portfolio State ► OutcomeRecorder.stop() ► venue disconnect
+        wrapper: recorder.stop ◄────────────────┘   (worker task ended before any fixture deletes a row)
+```
+
+**Internal startup and recovery flow (per lifespan)**
+
+```
+ lifespan #1 (eligible trade pending)                                         lifespan #2 (fresh singletons)
+ ───────────────────────────────────                                          ────────────────────────────
+ rebuild Portfolio State from ledger                                          rebuild Portfolio State from ledger
+        │                                                                            │
+        ▼                                                                            ▼
+ reconcile_with_venue ── discrepancy ──► BLOCKED: recorder never built;       reconcile_with_venue (clean)
+        │ clean                          trade stays pending, unrecorded              │
+        ▼                                (scenario "blocked reconciliation")          ▼
+ refresh Portfolio State, start authorizer / engine / monitor, status "ready"  start workers, status "ready"
+        │                                                                            │
+        ▼                                                                            ▼
+ OutcomeRecorder.start()                                                      OutcomeRecorder.start()
+   _startup_scan: real query lists the trade                                    _startup_scan: query lists nothing
+        │ enqueue once                                                                │ (outcome already linked)
+        ▼                                                                            ▼
+ worker: record_trade ─► recorded ─► exactly 1 outcome, linked                barrier: duplicate PositionClosed
+        │                                                                     worker verdict "skipped"
+        ▼                                                                            │
+ stop(): queue drained, worker ended ─► ledger unchanged except outcome link         ▼
+                                                                              state, outcome_id, every column unchanged;
+                                                                              still exactly 1 outcome; stop() clean
 ```
 
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)

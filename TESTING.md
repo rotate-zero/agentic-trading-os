@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-lifespan-recovery (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-recorder-lifespan-recovery`
+
+Base: GitHub `main` `445e9d43c906df806bfe3a7d541a3a763d81350f`; Python 3.13.16, pytest 8.4.2, pytest-asyncio 0.24.0.
+
+**Database target.** A disposable local PostgreSQL 16 cluster on `localhost:5432` (database `olr_lifespan_recovery`, role `trading`, outside the repository), created for this run and migrated from empty with `alembic upgrade head` to revision `0017 (head)`. It held no trades, outcomes or non-zero Portfolio State cursor before or after the runs below. Finnhub/Polygon were blanked by `conftest.py`; no external service was contacted.
+
+- `python -m pytest tests/test_outcome_recorder_lifespan_recovery.py -v` — **2 passed, 0 failed, 0 skipped** (about 2 s). Six further consecutive runs: 2 passed each time.
+- Directly relevant set, serial, one process — the new module with `tests/test_main_execution_pipeline.py`, `tests/test_execution_startup_status_route.py`, `tests/test_outcome_recorder.py`, `tests/test_outcome_recorder_restart_recovery.py`, `tests/test_outcome_recorder_event_path_integration.py` and `tests/test_execution_outcome_status_recorder_integration.py`: **49 passed, 0 failed, 0 skipped.** Afterwards the database again held 0 trades, 0 outcomes and cursor 0.
+- The roughly 1,600-test backend suite was **not** run.
+- `git diff --check`: clean (the new file was marked intent-to-add so it is covered), in the working clone and again on the clean-checkout verification below.
+
+**Negative controls** (temporary edits to `backend/app/main.py` in the working clone, restored from a copy; not part of the delivery):
+1. The `await outcome_recorder.start()` call removed: the recovery test fails with the bounded 10 s timeout waiting for the worker verdict, reporting the trace (`reconcile:begin`, `reconcile:end`, no recorder events); no hang.
+2. The recorder started inside the reconciliation-blocked branch: the blocked test fails on its "no recorder events" assertion.
+3. The recorder started before `SimulatedVenue` is built, i.e. before reconciliation: both tests fail (the recovery test on its reconcile-before-recorder order assertion; the blocked test on the recorder events).
+
+**Limits.** Two sequential in-process lifespans over a live database; not a process crash, `kill -9` or multi-process lock contention. The database is local and disposable, not the project's configured PostgreSQL service. The guard makes the module refuse to run against a database that already holds trades. Only the closed-trade startup-scan path is driven; entry-snapshot capture, the periodic sweep and the other blocked-outcome reasons are covered by their own suites.
+
+**Delivery check.** `origin/main` was re-fetched immediately before packaging: still `445e9d43…`, no newer commits. The ZIP (complete files only: `CHANGES.md`, `TESTING.md`, `docs/architecture/execution-engine-design.md`, `backend/tests/test_outcome_recorder_lifespan_recovery.py`) was built outside the repository; its top level is the project root, with no enclosing folder and no other entries. It was extracted outside a fresh clone of GitHub `main` at `445e9d43…` and copied over the project root. `git status --short` then showed exactly the three modified documents and the one new test file, all byte-identical to the verified working tree, and `git diff --check` was clean. On that clean checkout, the new module with `tests/test_execution_startup_status_route.py` and `tests/test_outcome_recorder_restart_recovery.py` ran **9 passed, 0 failed, 0 skipped**. No file is deleted or renamed, so the delivery is copy-only.
+<!-- END DELIVERY SECTION: outcome-recorder-lifespan-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-restart-recovery-tests (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-recorder-restart-recovery-tests`
 
