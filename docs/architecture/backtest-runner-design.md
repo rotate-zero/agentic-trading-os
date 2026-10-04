@@ -1140,3 +1140,53 @@ async route: wrap list in existing response key → JSON response
 This changes scheduling only. It adds no cache, query, table, or frontend
 behavior. A blocked history read leaves the event loop available to serve an
 independent `/health` request.
+
+---
+
+### Backtest Results refresh recovery (task `backtest-results-refresh-recovery`)
+
+Frontend-only; no backend, API contract, `WorkspaceContext.tsx`, dependency or lockfile change, and no decision number (the delivery slug identifies it). Changed: `BacktestResultsPanel.tsx`, `useBacktestOutcomes.ts`, `useBacktestSweepOutcomes.ts`, `useBacktestRuns.ts`.
+
+**Problem (reproduced before editing).** (1) The panel's Refresh button was disabled while loading, so a hung request left no way to ask again. (2) Each hook's `load()` created its own cancellation flag, but manual `refetch()` callers discarded the cleanup function, so a manual Refresh never cancelled the request it replaced; an older response could overwrite a newer one. (3) Hook state was not tied to the filter it was fetched for, so after Apply/Clear/tab switch the previous filter's rows, run metadata, sweep strip, error or empty message stayed on screen (including for the render before the new effect started). (4) `useBacktestRuns` reported "No run metadata found" before any request for the new run_id had started.
+
+**Behavior now.**
+
+| Situation | Result |
+|---|---|
+| Refresh while a request is pending | Enabled; starts a newer request that supersedes every older one |
+| Older success/failure after a newer request started | Discarded; data, error and loading unchanged |
+| Filter changes (Apply, Clear, follow-latest, auto-follow, run/sweep tab switch), hook disabled, unmount/collapse | Outstanding requests invalidated |
+| Render after a filter change, before the effect | Loading with no rows, no metadata, no strip, no error, no empty message from the old filter |
+| Refresh under the same filter | Rows already shown for that filter stay until the newer result arrives |
+| Failure | Error state with no rows; never rendered as zero outcomes |
+| Sweep load | Still exactly two requests (runs + outcomes) applied or discarded as one unit; zero-outcome pairs stay visible in the runs strip |
+
+**Mechanism (same shape in all three hooks).** Each hook keeps one request counter in a ref. `load()` takes the next number; a response is applied only if its number is still the latest. The effect cleanup advances the counter, which invalidates in-flight work on filter change, disable and unmount. Settled state is stored as a snapshot tagged with the request key it was fetched for (`limit`+`backtestRunId`; `sweepId`+`limit`; `runId`) and the hook returns it only while that key is current; otherwise it returns `loading: true` (when active) with empty data. Because this is derived at render time, no stale frame exists between a filter change and the effect. Independent run and sweep filters, and the auto/manual mode logic, are unchanged. Fetches are not cancelled: a superseded request completes and its response is discarded. No polling, trading control, global store or fetching framework was added.
+
+**Component data flow.**
+
+```
+ WorkspaceContext (lastBacktestRunId / lastBacktestSweepId)  -- unchanged
+        │ auto mode only
+        ▼
+ BacktestResultsBody ── appliedRunId ───────────┬──► useBacktestOutcomes(limit, runId, enabled)
+   (Apply / Clear / follow-latest /             │       └─► GET /intelligence/strategy-outcomes
+    tab switch / Refresh)                       └──► RunMetadataCard ► useBacktestRuns(runId)
+        │                                                   └─► GET /intelligence/backtest-runs?run_id
+        └─ appliedSweepId ─────────────────────────► useBacktestSweepOutcomes(sweepId, limit)
+                                                        ├─► GET /intelligence/backtest-runs?sweep_id
+                                                        └─► GET /intelligence/strategy-outcomes?sweep_id
+ hooks ── { rows, runs/metadata, loading, error, refetch } for the CURRENT key only ──► OutcomesListSection
+```
+
+**Internal request lifecycle (each hook).**
+
+```
+ load() [mount, key change, Refresh]
+   id = ++latest ; snapshot = { key, rows: same key ? kept : [], error: null, loading: true }
+   fetch ──► response / failure
+              id !== latest ?  ─ yes ─► discard (no state change)
+                               └ no ──► snapshot = { key, rows | [], error | null, loading: false }
+ effect cleanup [key change, disabled, unmount]:  latest += 1   (in-flight work becomes stale)
+ render:  snapshot.key === currentKey ? snapshot : { loading: active, rows: [], error: null }
+```

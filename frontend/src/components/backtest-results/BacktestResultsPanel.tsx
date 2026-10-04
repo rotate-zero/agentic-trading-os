@@ -387,14 +387,18 @@ function OutcomesListSection({
       </div>
 
       <div className="flex shrink-0 items-center justify-between border-t border-base-border px-2 py-1">
+        {/* Never disabled while loading: a hung request must stay
+            recoverable. Each press starts a newer request that supersedes
+            every older one (see the hooks' request-ordering notes). */}
         <button
           onClick={refetch}
-          disabled={loading}
-          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
+          title={loading ? "Request in flight — press to start a fresh one" : "Reload results"}
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
         >
-          {loading ? "…" : "Refresh"}
+          Refresh
         </button>
         <span className="font-mono text-[9px] text-text-muted">
+          {loading ? "loading… · " : ""}
           {outcomes.length} row{outcomes.length === 1 ? "" : "s"}
         </span>
       </div>

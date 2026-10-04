@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
   fetchBacktestRuns,
@@ -57,6 +57,34 @@ import {
 // already give for this exact table family: no relevant event exists in
 // `backend/app/schemas/events/`. `refetch()` exposed for a manual
 // "Refresh" control, same as those two hooks.
+//
+// Request ordering and filter association (task
+// `backtest-results-refresh-recovery`): a load is the PAIR of requests
+// above and is superseded as a unit. Every load — effect-driven or manual
+// `refetch()` — takes the next number from one per-hook counter and its
+// pair is applied only while that number is still the latest, so an older
+// pair's success or failure (whichever request of the pair settles
+// first) never changes `runs`, `outcomes`, `error` or `loading`. The
+// counter is advanced on `sweepId`/`limit` change, when `sweepId` becomes
+// unset and on unmount. Settled state is stored with the key it was
+// fetched for and returned only while that key is current, so a previous
+// sweep's runs strip, rows, error or empty state never shows under a new
+// `sweepId`, including in the render before the next effect runs.
+// Refetching the SAME key keeps its runs/outcomes visible until the newer
+// pair settles. The one-pair-per-load rule (exactly two requests) is
+// unchanged. The underlying fetches are not cancelled; their late
+// responses are discarded.
+interface SweepSnapshot {
+  key: string;
+  runs: BacktestRunWireShape[];
+  outcomes: StrategyOutcomeWireShape[];
+  error: string | null;
+  loading: boolean;
+}
+
+const NO_RUNS: BacktestRunWireShape[] = [];
+const NO_OUTCOMES: StrategyOutcomeWireShape[] = [];
+
 export function useBacktestSweepOutcomes(params?: { sweepId?: string; limit?: number }): {
   runs: BacktestRunWireShape[];
   outcomes: StrategyOutcomeWireShape[];
@@ -64,58 +92,69 @@ export function useBacktestSweepOutcomes(params?: { sweepId?: string; limit?: nu
   error: string | null;
   refetch: () => void;
 } {
-  const [runs, setRuns] = useState<BacktestRunWireShape[]>([]);
-  const [outcomes, setOutcomes] = useState<StrategyOutcomeWireShape[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
   const sweepId = params?.sweepId;
   const limit = params?.limit ?? 500;
+  // Same "nothing to show without a real filter value" posture
+  // useBacktestRuns.ts already takes for an unset runId — unlike
+  // useBacktestOutcomes.ts's own "no filter = show everything" default,
+  // there is no "every sweep merged together" view that would mean
+  // anything here. null = inactive.
+  const requestKey = sweepId ? JSON.stringify([sweepId, limit]) : null;
+
+  const [snapshot, setSnapshot] = useState<SweepSnapshot | null>(null);
+  const latestRequestRef = useRef(0);
 
   const load = useCallback(() => {
-    if (!sweepId) {
-      // Same "nothing to show without a real filter value" posture
-      // useBacktestRuns.ts already takes for an unset runId — unlike
-      // useBacktestOutcomes.ts's own "no filter = show everything"
-      // default, there is no "every sweep merged together" view that
-      // would mean anything here.
-      setRuns([]);
-      setOutcomes([]);
-      setLoading(false);
-      setError(null);
-      return () => {};
+    const requestId = ++latestRequestRef.current;
+    if (requestKey === null || !sweepId) {
+      setSnapshot(null);
+      return;
     }
 
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
+    setSnapshot((prev) => ({
+      key: requestKey,
+      runs: prev?.key === requestKey ? prev.runs : [],
+      outcomes: prev?.key === requestKey ? prev.outcomes : [],
+      error: null,
+      loading: true,
+    }));
 
     Promise.all([
       fetchBacktestRuns(limit, undefined, undefined, sweepId),
       fetchStrategyOutcomes(limit, /* isBacktest */ true, undefined, sweepId),
     ])
       .then(([runsWire, outcomesWire]) => {
-        if (cancelled) return;
-        setRuns(runsWire.backtest_runs);
-        setOutcomes(outcomesWire.outcomes);
-        setLoading(false);
+        if (requestId !== latestRequestRef.current) return;
+        setSnapshot({
+          key: requestKey,
+          runs: runsWire.backtest_runs,
+          outcomes: outcomesWire.outcomes,
+          error: null,
+          loading: false,
+        });
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (requestId !== latestRequestRef.current) return;
         const detail = err instanceof ApiError ? err.message : String(err);
         console.error(`useBacktestSweepOutcomes: fetch failed — ${detail}`);
-        setRuns([]);
-        setOutcomes([]);
-        setError(detail);
-        setLoading(false);
+        setSnapshot({ key: requestKey, runs: [], outcomes: [], error: detail, loading: false });
       });
+  }, [requestKey, sweepId, limit]);
 
+  useEffect(() => {
+    load();
     return () => {
-      cancelled = true;
+      // sweepId/limit change, sweepId unset or unmount: invalidate anything in flight.
+      latestRequestRef.current += 1;
     };
-  }, [sweepId, limit]);
+  }, [load]);
 
-  useEffect(() => load(), [load]);
-
-  return { runs, outcomes, loading, error, refetch: load };
+  const current = requestKey !== null && snapshot?.key === requestKey ? snapshot : null;
+  return {
+    runs: current?.runs ?? NO_RUNS,
+    outcomes: current?.outcomes ?? NO_OUTCOMES,
+    loading: requestKey !== null && (current?.loading ?? true),
+    error: current?.error ?? null,
+    refetch: load,
+  };
 }

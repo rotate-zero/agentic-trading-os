@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "../services/api-client";
 
 /**
@@ -81,56 +81,95 @@ import { ApiError, fetchStrategyOutcomes, type StrategyOutcomeWireShape } from "
  * `loading` still resolves to `false` in this state (never left stuck at
  * its initial `true`) — a disabled hook isn't "still loading," it's
  * simply not asked to do anything right now.
+ *
+ * Request ordering and filter association (task
+ * `backtest-results-refresh-recovery`): every load — the effect-driven
+ * one and a manual `refetch()` alike — takes the next number from one
+ * per-hook request counter, and a response is applied only if its number
+ * is still the latest. A newer request therefore supersedes every older
+ * one, including a hung request replaced by Refresh; an older success or
+ * failure never touches data, error or loading. The counter is also
+ * advanced when the filter changes, when the hook becomes disabled and on
+ * unmount (effect cleanup), so none of those can be overtaken by a late
+ * response. Settled state is stored together with the request key
+ * (`limit` + `backtestRunId`) it was fetched for and is returned only
+ * while that key is still the current one — including in the render
+ * between a filter change and the effect that starts the next fetch — so
+ * previous-filter rows, errors and empty messages never appear under a new
+ * filter; that render reports `loading` with no rows instead. A refetch
+ * for the SAME key keeps its rows on screen until the newer result
+ * arrives. Cancellation of the underlying `fetch` is not implemented: a
+ * superseded request still completes and its response is discarded.
  */
+interface OutcomesSnapshot {
+  key: string;
+  outcomes: StrategyOutcomeWireShape[];
+  error: string | null;
+  loading: boolean;
+}
+
+const NO_OUTCOMES: StrategyOutcomeWireShape[] = [];
+
 export function useBacktestOutcomes(params?: { limit?: number; backtestRunId?: string; enabled?: boolean }): {
   outcomes: StrategyOutcomeWireShape[];
   loading: boolean;
   error: string | null;
   refetch: () => void;
 } {
-  const [outcomes, setOutcomes] = useState<StrategyOutcomeWireShape[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
   const limit = params?.limit;
   const backtestRunId = params?.backtestRunId;
   const enabled = params?.enabled ?? true;
+  // null = inactive; otherwise identifies the filter this hook is
+  // currently responsible for.
+  const requestKey = enabled ? JSON.stringify([limit ?? null, backtestRunId ?? null]) : null;
+
+  const [snapshot, setSnapshot] = useState<OutcomesSnapshot | null>(null);
+  const latestRequestRef = useRef(0);
 
   const load = useCallback(() => {
-    if (!enabled) {
-      setLoading(false);
-      return () => {};
+    const requestId = ++latestRequestRef.current;
+    if (requestKey === null) {
+      setSnapshot(null);
+      return;
     }
 
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
+    setSnapshot((prev) => ({
+      key: requestKey,
+      outcomes: prev?.key === requestKey ? prev.outcomes : [],
+      error: null,
+      loading: true,
+    }));
 
     fetchStrategyOutcomes(limit, /* isBacktest */ true, backtestRunId)
       .then((wire) => {
-        if (cancelled) return;
-        setOutcomes(wire.outcomes);
-        setLoading(false);
+        if (requestId !== latestRequestRef.current) return;
+        setSnapshot({ key: requestKey, outcomes: wire.outcomes, error: null, loading: false });
       })
       .catch((err: unknown) => {
-        if (cancelled) return;
+        if (requestId !== latestRequestRef.current) return;
         const detail = err instanceof ApiError ? err.message : String(err);
         console.error(`useBacktestOutcomes: fetch failed — ${detail}`);
         // Cleared rather than left stale, same reasoning
         // usePerformanceAnalytics.ts gives for its own failure path — a
         // failed refetch (e.g. a mistyped run_id) shouldn't leave a
         // previous successful result on screen underneath a new error.
-        setOutcomes([]);
-        setError(detail);
-        setLoading(false);
+        setSnapshot({ key: requestKey, outcomes: [], error: detail, loading: false });
       });
+  }, [requestKey, limit, backtestRunId]);
 
+  useEffect(() => {
+    load();
     return () => {
-      cancelled = true;
+      // Filter change, disable or unmount: invalidate anything in flight.
+      latestRequestRef.current += 1;
     };
-  }, [limit, backtestRunId, enabled]);
+  }, [load]);
 
-  useEffect(() => load(), [load]);
-
-  return { outcomes, loading, error, refetch: load };
+  const current = requestKey !== null && snapshot?.key === requestKey ? snapshot : null;
+  return {
+    outcomes: current?.outcomes ?? NO_OUTCOMES,
+    loading: requestKey !== null && (current?.loading ?? true),
+    error: current?.error ?? null,
+    refetch: load,
+  };
 }

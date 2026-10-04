@@ -16,6 +16,21 @@ New code file: `backend/tests/test_outcome_recorder_lifespan_recovery.py`.
 - **Docs.** `docs/architecture/execution-engine-design.md` §6.7.1 gains subsection **N** (with a component data-flow diagram and an internal startup/recovery flow diagram), and subsection M's "does not prove" paragraph now points to it.
 <!-- END DELIVERY SECTION: outcome-recorder-lifespan-recovery -->
 
+<!-- BEGIN DELIVERY SECTION: backtest-results-refresh-recovery (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `backtest-results-refresh-recovery`
+
+Base: GitHub `main` `1989a43` (`outcome-recorder-lifespan-recovery`; implemented on `445e9d4`, then rebased onto `1989a43` and re-checked against `origin/main` before packaging: no newer commits). That delivery touched only a backend test, `execution-engine-design.md`, `CHANGES.md` and `TESTING.md`, all preserved. Frontend and docs only: **no backend, `ExecutionLifecyclePanel`, `WorkspaceContext`, `api-client.ts`, dependency or lockfile change.** No decision number is assigned; the delivery slug identifies the change.
+
+Changed code files: `frontend/src/components/backtest-results/BacktestResultsPanel.tsx`, `frontend/src/hooks/useBacktestOutcomes.ts`, `frontend/src/hooks/useBacktestSweepOutcomes.ts`, `frontend/src/hooks/useBacktestRuns.ts`.
+
+- **Problem.** Refresh was disabled while loading, so a hung request could not be replaced; manual `refetch()` discarded the cleanup of its own load, so an older response could overwrite a newer one; and the previous filter's rows, run metadata, sweep strip, error or empty message stayed visible under a newly applied filter (also in the render before the next effect).
+- **Refresh.** `OutcomesListSection` never disables Refresh. The footer shows "loading…" beside the row count instead of changing the button label.
+- **Supersession.** `useBacktestOutcomes`, `useBacktestSweepOutcomes` and `useBacktestRuns` take a number from a per-hook request counter on every load, manual Refresh included, and apply a response only if it is still the latest. The sweep hook supersedes its two-request pair as a unit (still exactly two requests per load). Effect cleanup advances the counter, so filter change, disable/inactive and unmount/collapse invalidate outstanding requests.
+- **Current-filter association.** Settled state is stored with the request key it belongs to and returned only while that key is current; otherwise the hook reports loading with empty data and no error. `useBacktestRuns` also no longer reports "no run found" before its request for the current run_id has started. Same-key Refresh keeps existing rows until the newer result arrives.
+- **Unchanged.** Independent run/sweep filters, auto-follow/manual modes, honest loading/error/empty/populated states (a failure is never zero outcomes), zero-outcome sweep pairs visible in the runs strip, manual fetching only. Fetches are not cancelled; superseded responses are discarded.
+- **Docs.** `docs/architecture/backtest-runner-design.md` gains "Backtest Results refresh recovery" with a component data-flow diagram and a request-lifecycle diagram.
+<!-- END DELIVERY SECTION: backtest-results-refresh-recovery -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-restart-recovery-tests (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-restart-recovery-tests`
 
