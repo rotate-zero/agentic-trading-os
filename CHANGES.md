@@ -1,3 +1,22 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-ledger-contention (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-recorder-ledger-contention`
+
+Base: GitHub `main` `17cda43e8c815330436248b4bf74f2685d51f74e` (re-checked against `origin/main` before packaging: no newer commits). Test-only plus documentation: **no production source, migration, schema, `conftest.py`, existing test or frontend file changed.** No new decision number (decisions #186 and #187 are the behavior under test).
+
+New code file: `backend/tests/test_outcome_recorder_ledger_contention.py`.
+
+- **Gap closed.** `test_known_fees_and_concurrent_wakeups` runs two recorders under `asyncio.gather`, but nothing forces or observes a database wait, so the two writers may simply run one after the other. The new module makes two independent transactions contend for the same closed trade and proves the wait from PostgreSQL's lock tables (`pg_locks`, `pg_blocking_pids`, `pg_stat_activity`), not from elapsed time.
+- **Two contenders.** Each recorder has its own SQLAlchemy engine (own pool, own backends) with `lock_timeout`, `statement_timeout` and `idle_in_transaction_session_timeout` set on its connections. Backend pids are recorded on connection checkout so the lock evidence is attributed to recorder A or B.
+- **Scenario 1 — writer commits, competitor waits.** A is held inside its real `ledger_transaction` after `LOCK TABLE`, `SELECT ... FOR UPDATE`, the real `_build` and the staged outcome INSERT. The test shows A holding `ShareRowExclusiveLock` on `trades`, `orders` and `trade_reservations`, starts B, and waits until `pg_locks` shows B's ungranted request blocked by A's pid. Released, A returns `recorded` and B `skipped`; one outcome, linked; A built and wrote once, B never built or wrote.
+- **Scenario 2 — writer rolls back.** Same hold, but a narrow test-only wrapper raises `SQLAlchemyError` after the outcome INSERT is staged and flushed, before commit. A's transaction rolls back (A returns `pending_retry`); B is granted the locks and records the trade with its own real build and write. A's `_mark_retry` queues behind B and finds the trade already linked, so it cannot downgrade `recorded`; the test reads the state right after that call. A's rolled-back outcome id exists nowhere, exactly one outcome exists, and further attempts from either recorder return `skipped` with no further build or write.
+- **Lock actually observed.** The production transaction locks tables before the row, so the competitor waits at the table lock. The run observed B waiting for `ShareRowExclusiveLock` on relation `trades` (first table in the `LOCK TABLE` list), `wait_event = Lock/relation`, blocked by A. No row-lock wait occurs or is required.
+- **Real vs. test-only.** Real: `ledger_transaction`, the SQL locks, `_build`, the outcome writer, the `trades.outcome_id` link. Test-only: a wrapper that calls the real writer and then holds/raises; counters that call the real `_build` / `_mark_retry`; the snapshot-capture stub (snapshots are not under test).
+- **Bounded and joined.** Every wait has a timeout; lock-evidence polling has a deadline (the poll interval is not evidence); the release barrier is set and both tasks are joined in `finally`; engines are disposed before cleanup so open transactions cannot block the deletes.
+- **Isolation.** Disposable database migrated to Alembic head; cleanup deletes only the seeded `trade_id`s' rows, children first.
+- **Not proven (stated in the docs too).** Two independent database sessions in one process; not multi-process, not crash recovery. The test does not independently prove the `FOR UPDATE` row lock (see TESTING.md, control 3).
+- **Docs.** `docs/architecture/execution-engine-design.md` §6.7.1 gains subsection **O** (component data-flow diagram and internal transaction/commit/rollback flow diagram); the "no second process" notes in subsections M and N point to it.
+<!-- END DELIVERY SECTION: outcome-recorder-ledger-contention -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-lifespan-recovery (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-lifespan-recovery`
 

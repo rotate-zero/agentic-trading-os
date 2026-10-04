@@ -2807,7 +2807,7 @@ paging. Not verified against a running backend with real recorder rows (see `TES
 
 Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL entry and exit snapshots, each with a reason code in `snapshot_missing_reasons`, and the entry-side reason is `recorder_unavailable`; nothing is fabricated and nothing survives from the previous recorder. Price and P&L formulas are not re-tested here.
 
-**What this does not prove.** This is a restart of the recorder *object* over a live database. It is **not** a process crash and **not** a full app-lifespan recovery: the `main.py` ordering (reconciliation and `portfolio_state.refresh()` before the recorder subscribes, §6.7.1 C7) is not exercised, no event loop or bus is torn down and rebuilt as a process would, and no second process contends for the row lock. (The `main.py` ordering has since been exercised through the real lifespan by subsection N below; the process-crash and second-process limits stand.) The periodic sweep is parked in these tests and is covered by its own suite. Test isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows, children first, after every recorder worker has been stopped.
+**What this does not prove.** This is a restart of the recorder *object* over a live database. It is **not** a process crash and **not** a full app-lifespan recovery: the `main.py` ordering (reconciliation and `portfolio_state.refresh()` before the recorder subscribes, §6.7.1 C7) is not exercised, no event loop or bus is torn down and rebuilt as a process would, and no second process contends for the row lock. (The `main.py` ordering has since been exercised through the real lifespan by subsection N below; the process-crash and second-process limits stand. Contention between two independent database sessions in one process has been exercised by subsection O below; multi-process contention still stands.) The periodic sweep is parked in these tests and is covered by its own suite. Test isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows, children first, after every recorder worker has been stopped.
 
 **Scan to worker to ledger (the path the tests drive)**
 
@@ -2872,7 +2872,7 @@ Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL
 
 **Seed consistency, as found.** The real lifespan rebuilds Portfolio State through `PostgresPositionLedger`, which refuses a ledger whose applied-fill cursor differs from the last receipt, or whose receipt trading day is not the ET day of the fill. The shared recorder seed (`_seed`) satisfies the recorder's own checks but writes neither a cursor nor an ET trading day, so this module completes it (cursor = last receipt's `ledger_seq`; receipt trading day from `MarketClock.trading_day`). These are the ledger's intended consistency checks, not a production defect.
 
-**What this does not prove.** Two sequential in-process lifespans are not a process crash or `kill -9`, and not two processes: `SimulatedVenue` and every cached singleton are rebuilt, nothing else is carried over, and no second process contends for the row lock. Only the closed-trade startup-scan path is driven; entry-snapshot capture, the periodic sweep and the other blocked-outcome reasons have their own suites. Isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty and the Portfolio State cursor is untouched (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows (children first) and restores the cursor.
+**What this does not prove.** Two sequential in-process lifespans are not a process crash or `kill -9`, and not two processes: `SimulatedVenue` and every cached singleton are rebuilt, nothing else is carried over, and no second process contends for the row lock (two in-process database sessions are exercised by subsection O). Only the closed-trade startup-scan path is driven; entry-snapshot capture, the periodic sweep and the other blocked-outcome reasons have their own suites. Isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty and the Portfolio State cursor is untouched (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows (children first) and restores the cursor.
 
 **Component data flow (what the tests drive and observe)**
 
@@ -2926,6 +2926,82 @@ Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL
                                                                               state, outcome_id, every column unchanged;
                                                                               still exactly 1 outcome; stop() clean
 ```
+
+#### O. Ledger-lock contention verification (`outcome-recorder-ledger-contention`; decisions #186 and #187 are the behavior, no new decision number)
+
+**Test evidence only.** No production source, migration, schema, `conftest.py`, existing test or frontend file changed. `backend/tests/test_outcome_recorder_ledger_contention.py` proves, on a real PostgreSQL database, that `record_trade()` stays atomic and idempotent when two independent database transactions genuinely contend for the **same** closed trade. The older `test_known_fees_and_concurrent_wakeups` runs two recorders under `asyncio.gather` but neither forces nor observes a database wait; here the wait is established from PostgreSQL's lock tables (`pg_locks`, `pg_blocking_pids`, `pg_stat_activity`), never from elapsed time.
+
+**Which lock is waited on.** `ledger_transaction` takes `LOCK TABLE trades, orders, trade_reservations IN SHARE ROW EXCLUSIVE MODE` first and `SELECT ... FOR UPDATE` on the trade row second (§6.7.1 D). A competitor therefore queues at the **table** lock, on the first table in the list, and never reaches the row lock while another writer holds the tables. The tests assert exactly that and nothing stronger: an **ungranted** `ShareRowExclusiveLock` request on a ledger relation, `wait_event_type = Lock`, whose `pg_blocking_pids` contains recorder A's backend. Observed in the validation runs: relation `trades`. No row-lock wait occurs, and none is required.
+
+| Scenario | What the test establishes |
+|---|---|
+| **1. Writer commits, competitor waits** | Recorder A (own engine, own backends) is held inside its real `ledger_transaction` after the production locks, `SELECT ... FOR UPDATE`, the real `_build` and the staged and flushed outcome INSERT. `pg_locks` shows A holding granted `ShareRowExclusiveLock` on `trades`, `orders` and `trade_reservations`. Recorder B (a second engine) is started for the same trade and polled, with a deadline, until `pg_locks` shows its ungranted request blocked by A. While A is held, B has built and written nothing, neither task has finished, no outcome is committed and the trade is still unlinked. After A is released and commits: A `recorded`, B `skipped`, exactly one `strategy_outcomes` row (A's), linked by `trades.outcome_id`, `outcome_status = 'recorded'`; A built and wrote once, B never built or wrote. |
+| **2. Writer rolls back** | Identical hold, but a narrow test-only wrapper raises `SQLAlchemyError` after the outcome INSERT is staged and flushed and before commit. `ledger_transaction` rolls A back; `record_trade` reports `pending_retry` and calls `_mark_retry`. B, already queued, is granted the table locks, finds an unlinked closed trade, performs its own real build and write, and commits: B `recorded`. A's `_mark_retry` queues behind B, finds `outcome_id` set and changes nothing; the test reads the trade immediately after that call and sees `recorded` with B's outcome, so the retry marker cannot downgrade it. A's rolled-back outcome id is absent from the database (no orphan), exactly one outcome exists, and further `record_trade()` calls from either recorder return `skipped` with no further build, write or retry. |
+
+**Real versus test-only.** Real: `ledger_transaction` (isolation level, `SET LOCAL`, `LOCK TABLE`), `SELECT ... FOR UPDATE`, `OutcomeRecorder._build`, the outcome writer and the link to `trades.outcome_id`. Test-only: a wrapper around the writer that calls the real function and then holds or raises; counters around `_build` and `_mark_retry` that call the real methods; and the snapshot-capture stub (snapshots are not under test). Each contender is a separate SQLAlchemy engine (own pool, own PostgreSQL backends) whose connections carry `lock_timeout`, `statement_timeout` and `idle_in_transaction_session_timeout`; backend pids are recorded on checkout so lock evidence is attributed to A or B.
+
+**Bounded synchronization.** Every wait has a timeout. Lock evidence is polled against a deadline (the poll interval is not evidence). The release barrier is set and both tasks are joined in `finally`, and both engines are disposed before cleanup so no open transaction can block the deletes. Cleanup removes only the seeded `trade_id`s' rows, children first, in a disposable database migrated to Alembic head.
+
+**What this does not prove.** Two independent database sessions in one process are not two processes, a process crash or `kill -9`. The module does not independently prove the `FOR UPDATE` row lock: because every writer going through `ledger_transaction` already queues on the table lock, removing `.with_for_update()` in a scratch copy leaves both tests green (TESTING.md, control 3). Scenario 2 relies on PostgreSQL granting released table locks to the already-queued waiter before A's follow-up `LOCK TABLE` queues, which is what makes "A's retry marker finds a recorded trade" deterministic.
+
+**Component data flow (what the tests drive and observe)**
+
+```
+  test (seeds, holds, observes)        recorder A (engine A)                    PostgreSQL                       recorder B (engine B)
+  ─────────────────────────────        ─────────────────────                    ──────────                       ─────────────────────
+  seed closed trade  ───────────────────────────────────────────────────────►  trades · orders · fills ·
+                                                                                positions · receipts
+  create task A ─────────────────────► record_trade(trade_id)
+                                         _close_candidate (read)
+                                         ledger_transaction: BEGIN
+                                           LOCK TABLE trades, orders,  ──────► A holds ShareRowExclusive ×3
+                                                trade_reservations
+                                           SELECT trade FOR UPDATE
+                                           _build()  (real, counted)
+                                           writer: stage + flush INSERT ─────► uncommitted strategy_outcomes row
+                                           [HOLD: staged.set(); wait release]
+  observe: A granted ×3  ◄──────────────────────────────────────────────────── pg_locks / pg_stat_activity
+  create task B ──────────────────────────────────────────────────────────────────────────────────────────────► record_trade(trade_id)
+                                                                                                                  _close_candidate (read: still unlinked)
+                                                                                                                  LOCK TABLE trades, ...
+                                                                                A ◄── blocks ── B  (ungranted ShareRowExclusive on 'trades',
+                                                                                                    wait_event Lock/relation, blockers = [A])
+  observe: B blocked by A  ◄───────────────────────────────────────────────── pg_locks, pg_blocking_pids
+  assert: B built 0, wrote 0; nothing committed
+  release.set() ─────────────────────► scenario 1: commit  ─────────────────► A's locks released, B granted
+                                       scenario 2: raise SQLAlchemyError ───► ROLLBACK, B granted
+  join A, B (bounded)                                                                                             scenario 1: re-check -> "skipped"
+                                                                                                                  scenario 2: real _build + write + commit
+  assert: one outcome, linked; counters; rolled-back id absent; further attempts "skipped"
+```
+
+**Internal transaction, commit and rollback flow (`_record_locked` as contended)**
+
+```
+ recorder A                                                 recorder B (same trade_id)
+ ──────────                                                 ───────────────────────────
+ BEGIN; SET isolation READ COMMITTED; SET LOCAL sync_commit
+ LOCK TABLE trades, orders, trade_reservations  ── granted        LOCK TABLE trades, ...  ── WAITS (table lock)
+ SELECT trade ... FOR UPDATE
+   outcome_id NULL, status closed ──► _build ──► writer stages INSERT, flush
+                                      [test holds A here; B's wait is observed in pg_locks]
+        │
+        ├─ scenario 1: set trade.outcome_id, status 'recorded'; COMMIT
+        │       locks released ──────────────────────────────────────►  granted
+        │       return "recorded"                                        SELECT trade ... FOR UPDATE (sees committed row)
+        │                                                                 outcome_id set ──► return "skipped"   (no _build, no write)
+        │
+        └─ scenario 2: SQLAlchemyError (injected, after the INSERT, before commit)
+                ROLLBACK: INSERT discarded, no outcome_id link, locks released ──►  granted
+                record_trade: log, call _mark_retry                         SELECT trade ... FOR UPDATE: unlinked, closed
+                  _mark_retry: ledger_transaction                           _build ──► writer ──► link, 'recorded'; COMMIT
+                    LOCK TABLE ... ── queues BEHIND B                       return "recorded"
+                    granted after B commits
+                    outcome_id already set ──► no change (no downgrade)
+                return "pending_retry"
+ any later record_trade(trade_id), either recorder: _close_candidate sees a linked trade ──► "skipped"
+```
+
 
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 

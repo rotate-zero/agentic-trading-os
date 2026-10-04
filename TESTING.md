@@ -1,3 +1,29 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-ledger-contention (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-recorder-ledger-contention`
+
+Base: GitHub `main` `17cda43e8c815330436248b4bf74f2685d51f74e`; Python 3.12.3, pytest 8.4.2, pytest-asyncio 0.24.0.
+
+**Database target.** A disposable local PostgreSQL 16.15 cluster on `localhost:5432` (database `trading_workspace`, role `trading`, outside the repository), created for this run and migrated from empty with `alembic upgrade head` to revision `0017`. It held 0 `trades` and 0 `strategy_outcomes` rows before and after every run. This is not the project's configured PostgreSQL service.
+
+- `python -m pytest tests/test_outcome_recorder_ledger_contention.py -v` — **2 passed, 0 failed, 0 skipped** (about 1 s). Twenty-five further consecutive runs: 2 passed each time.
+- Related set, serial, one process — the new module with `tests/test_outcome_recorder.py`, `tests/test_outcome_recorder_restart_recovery.py`, `tests/test_outcome_recorder_event_path_integration.py`, `tests/test_outcome_recorder_lifespan_recovery.py`, `tests/test_execution_outcome_status_recorder_integration.py` — **36 passed, 0 failed, 0 skipped**.
+- The roughly 1,600-test backend suite was **not** run.
+- `git diff --check`: clean (the new file was marked intent-to-add so it is covered), in the working clone and again on the clean-checkout verification.
+
+**Contention is observed, not assumed.** With `-s` each scenario prints the lock evidence taken from `pg_locks` / `pg_stat_activity` while A is still held: B's backend has an ungranted `ShareRowExclusiveLock` request on relation `trades`, `wait_event = Lock/relation`, and `pg_blocking_pids` names A's backend. A is shown holding granted `ShareRowExclusiveLock` on `trades`, `orders` and `trade_reservations`. At that moment B has built and written nothing and neither task has finished. The lock waited on is the table lock (the production order is table lock, then row lock); no row-lock wait is required or asserted.
+
+**Negative controls** (temporary edits in a scratch copy of `backend/`, outside the working clone; not part of the delivery):
+1. `LOCK TABLE` removed from `ledger_transaction` and `.with_for_update()` removed from `_record_locked` (no serialization): scenario 1 fails at its precondition that A holds `ShareRowExclusiveLock` on the ledger tables (`holds set()`), so unserialized transactions cannot pass.
+2. Only `LOCK TABLE` removed (row lock kept): same failure, so the table-before-row order is pinned and a row-lock-only design is detected.
+3. Only `.with_for_update()` removed (table lock kept): **both tests still pass.** The table lock alone serializes every writer that goes through `ledger_transaction`, so this module does not independently prove the row lock; it is not claimed to.
+4. `trade.outcome_id is not None` dropped from the post-lock re-check (serialization intact, idempotence broken): scenario 1 fails — B returns `blocked` (the partial unique index rejects its second outcome) instead of `skipped`.
+5. `_mark_retry` made to downgrade unconditionally: scenario 2 fails — final status is `pending_retry` instead of `recorded`.
+
+**Limits.** Two independent database sessions (separate engines and backends) in one test process; not multi-process contention, not a process crash or `kill -9`. Scenario 2 relies on PostgreSQL granting released table locks to the already-queued waiter before A's follow-up `LOCK TABLE` queues; this held in every run and is what makes the "A's retry marker finds a recorded trade" assertion deterministic. The database is local and disposable.
+
+**Delivery check.** `origin/main` was re-fetched immediately before packaging: still `17cda43e…`, no newer commits. The ZIP (complete files only: `CHANGES.md`, `TESTING.md`, `docs/architecture/execution-engine-design.md`, `backend/tests/test_outcome_recorder_ledger_contention.py`) was extracted outside a fresh clone of the base and copied over it; `git status --short` listed exactly those four paths, `git diff --check` was clean, and the new module (2 passed) and the related set (36 passed) were re-run there.
+<!-- END DELIVERY SECTION: outcome-recorder-ledger-contention -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-lifespan-recovery (backend test + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `outcome-recorder-lifespan-recovery`
 
