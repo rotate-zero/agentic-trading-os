@@ -1,3 +1,20 @@
+<!-- BEGIN DELIVERY SECTION: execution-panel-protection-diagnostics (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `execution-panel-protection-diagnostics`
+
+Base: GitHub `main` `3eb727fca82bf40678af32502a6d08c96c416666` (re-checked against `origin/main` before packaging: no newer commits). Frontend and docs only: **no backend, package manifest/lock, tsconfig or decision-archive file changed.** No decision number is assigned; the change is a read-only view over behavior already recorded in decisions #178, #184, #185 and #188, and the delivery slug identifies it.
+
+Changed code files: `frontend/src/components/execution/ExecutionLifecyclePanel.tsx`, `frontend/src/services/api-client.ts`.
+
+- **Problem.** `GET /intelligence/exit-intents` already returns an additive `protection_diagnostics` object (decision #188), but `ExitIntentsWireShape` omitted it and the Execution panel ignored it, so a degraded snapshot, pending fills or a lost price-history window were invisible in the UI. The section caption also still said no exit order had been placed, which stopped being true once simulated exits were wired (#184, #185).
+- **Wire types.** `api-client.ts` adds `ProtectionDiagnosticsWireShape`, `ProtectionIncidentWireShape` and `ProtectionLimitsWireShape`, and an optional `protection_diagnostics` on `ExitIntentsWireShape`. Every field except `status` is optional so an older backend that omits the object, or sends only `{ status }`, still works. `fetchExitIntents` itself is unchanged.
+- **New component pieces (all in the panel file, none exported).** `readProtectionDiagnostics(raw: unknown)` turns the response into a `ProtectionView` (`missing`, `unavailable` or `reported`); each unreported field stays `null` and is shown as "not reported", never as `0`, "none" or healthy. `ProtectionDiagnosticsSummary` renders it: a status line, position-snapshot availability, fills awaiting visibility, tick-journal usage with limits, retained-price-history state, cumulative incident counts, and a collapsed "Recent incidents" list (newest 25). `ObservedExitTriggers` renders it above the trigger list.
+- **Status wording.** "No degradation reported in this snapshot" is not a guarantee of protection and says so. Evidence of degradation (`status: degraded`, `snapshot_unavailable`, `lost_window`, pending fills) wins over a contradictory `healthy`. `lost_window: true` stays visible after the snapshot recovers and is described as lost retained price history, so first-touch certainty cannot be established; it does not claim an order failed or a position is unprotected. With a lost window or unavailable snapshot, the "no observed exit triggers" line adds that a touch may not have been observed.
+- **Monitor absent.** The route's fallback diagnostics contain placeholder zeros; they are not rendered. Only "Position Monitor unavailable." shows.
+- **Caption.** Now: "Observed triggers are monitor observations. Check recorded exit requests, orders and fills for execution progress."
+- **Unchanged.** One existing request per section, manual Refresh (enabled while loading), the latest-request guard and the collapse/unmount guard. No new request, polling, WebSocket subscription, trading control, global store or dependency.
+- **Docs.** `docs/architecture/execution-engine-design.md` §6.6 gains the panel behavior table plus a component data-flow diagram and a render/request-flow diagram, placed after the existing `protection_diagnostics` paragraph. Neighboring text and all historical log text are unchanged.
+<!-- END DELIVERY SECTION: execution-panel-protection-diagnostics -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
 # CHANGES — `simulated-venue-invalid-tick-guard`
 

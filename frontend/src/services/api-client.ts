@@ -313,9 +313,43 @@ export interface ExitIntentWireShape {
   trigger_ts: string;
 }
 
+// Additive Position Monitor protection diagnostics (decisions #188, #178),
+// mirrored from PositionMonitor.protection_diagnostics() and the route's
+// monitor-absent fallback. "unavailable" comes only from the route (monitor
+// absent, or a monitor without diagnostics) and may then carry placeholder
+// zeros that are NOT measurements; an older backend may omit the whole object
+// or send just `{ status }`. Every field except `status` is therefore optional
+// and nothing derived from a missing field may read as healthy.
+// `lost_window` is true once retained price history was lost and then stays
+// true after the snapshot recovers; null/absent means unknown, not false.
+export interface ProtectionIncidentWireShape {
+  cause: string;
+  symbol?: string | null;
+  at?: string | null;
+}
+
+export interface ProtectionLimitsWireShape {
+  symbols: number;
+  ticks_per_symbol: number;
+  unowed_retention_seconds: number;
+}
+
+export interface ProtectionDiagnosticsWireShape {
+  status: "healthy" | "degraded" | "unavailable";
+  snapshot_unavailable?: boolean;
+  lost_window?: boolean | null;
+  journaled_symbols?: number;
+  journaled_ticks?: number;
+  fill_pending_symbols?: string[];
+  incident_counts?: Record<string, number>;
+  recent_incidents?: ProtectionIncidentWireShape[];
+  limits?: ProtectionLimitsWireShape | null;
+}
+
 export interface ExitIntentsWireShape {
   monitor_status: "unavailable" | "running";
   intent_status: "observed_only";
+  protection_diagnostics?: ProtectionDiagnosticsWireShape;
   exit_intents: ExitIntentWireShape[];
 }
 

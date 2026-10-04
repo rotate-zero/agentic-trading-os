@@ -1222,6 +1222,63 @@ retained eligible ticks, replay produces the first actionable touch in arrival
 order using its original exchange timestamp. This visibility change adds no
 entry block, external alert, emergency liquidation, or broker action.
 
+**Execution panel protection diagnostics (as built, `execution-panel-protection-diagnostics`; frontend only,
+no decision number assigned — slug only).** The Execution panel's "Observed exit triggers" section now shows the
+`protection_diagnostics` object that `GET /intelligence/exit-intents` already returns (decisions #178, #188). It
+reuses that section's single request, its manual Refresh and its latest-request guard
+(`execution-panel-refresh-recovery`); no request, polling, WebSocket subscription, trading control, global store,
+backend change or dependency was added. `ExitIntentsWireShape` gained an optional `protection_diagnostics` whose
+fields other than `status` are all optional, so an older backend that omits the object, or sends only
+`{ status }`, still renders. The section's old caption ("no exit order has been placed and the position has not
+been closed") was stale once simulated exits were wired (decisions #184, #185); it now reads "Observed triggers
+are monitor observations. Check recorded exit requests, orders and fills for execution progress." This endpoint
+establishes no execution progress; recorded exit requests, orders and fills stay in their own sections.
+
+| Input from the response | What the panel shows |
+|---|---|
+| Object absent, not an object, or `status` not recognised | "Protection diagnostics were not reported by this backend, so protection status is unknown." Never healthy. |
+| `status: "unavailable"` (route fallback: monitor absent or without diagnostics) | One line saying diagnostics are unavailable. The fallback's placeholder zeros are **not** measurements and are not rendered. Monitor `unavailable` shows only "Position Monitor unavailable." |
+| `status: "degraded"`, or any of `snapshot_unavailable: true`, `lost_window: true`, a non-empty `fill_pending_symbols` | "Degraded". A contradictory `status: "healthy"` beside such evidence is also shown as degraded. |
+| `status: "healthy"` with nothing degraded | "No degradation reported in this snapshot", plus a note that this is not a guarantee positions are protected. If any field was not reported the label adds "(some fields not reported)". |
+| `lost_window: true` | Kept visible, even when `snapshot_unavailable` is `false`: retained price history was lost, so first-touch certainty cannot be established for affected positions. The text says this is not evidence an order failed or a position is unprotected. `false` reads "no loss recorded by this monitor"; `null` or absent reads "unknown (not reported)". |
+| `journaled_symbols`, `journaled_ticks`, `limits` | Journal usage and limits. A missing or `null` value reads "not reported", never `0`. |
+| `incident_counts` | Cumulative counts, largest first, as "N × label" for the known causes (`snapshot_unavailable`, `fill_invisible`, `tick_overflow`, `symbol_capacity_loss`, `unowed_expiry`, `fill_marker_overflow`) and the raw code for any other. Absent reads "not reported"; `{}` reads "none recorded". |
+| `recent_incidents` | A collapsed list, newest first, at most 25 rows. A missing timestamp or symbol renders as an em dash or "no symbol". |
+
+Every backend string is rendered as React text, never as markup. Diagnostics render beside the trigger list, not
+inside it, so a degraded snapshot with zero observed triggers shows both; when price history is lost or the
+snapshot is unavailable, the "no observed exit triggers" line adds that a touch may not have been observed.
+
+```
+Position Monitor (memory) ──► protection_diagnostics() ─┐
+                          └─► get_exit_intents() ───────┤
+                                                        ▼
+                               GET /intelligence/exit-intents  (monitor absent: status "unavailable" fallback)
+                                                        │ fetchExitIntents()   (one request, unchanged)
+                                                        ▼
+                               ObservedExitTriggers  (own load state, own Refresh)
+                                 ├─ readProtectionDiagnostics(raw: unknown) ─► ProtectionView
+                                 │       └─► ProtectionDiagnosticsSummary    (status · snapshot · pending fills ·
+                                 │                                           journal/limits · lost window · counts ·
+                                 │                                           collapsed recent incidents)
+                                 └─ exit_intents ─► trigger rows (unchanged)
+not read by this section: exit_requests · orders · fills · the WebSocket feed · any trading control
+```
+
+```
+mount / Refresh ─► setLoad(loading) ─► fetchExitIntents()
+   (cleanup marks the previous run inactive: a superseded success or failure is dropped; same after collapse/unmount)
+   ├─ rejected / non-2xx ─► error message (no diagnostics shown)
+   └─ 200 ─► monitor_status
+        ├─ "unavailable" ─► "Position Monitor unavailable." only
+        └─ "running" ─► readProtectionDiagnostics(protection_diagnostics)
+              ├─ absent / unrecognised ─► "not reported by this backend"
+              ├─ "unavailable" ─► "diagnostics unavailable"
+              └─ healthy | degraded ─► summary (fields not reported stay "not reported"; lost_window stays flagged)
+           then: exit_intents empty ─► "running — no observed exit triggers"   else ─► one row per intent
+Refresh stays enabled in every state, including loading.
+```
+
 **As built (`simulated-protective-exits`).** A stop or target observation is
 handed to Execution Engine's queue. `PostgresExitLedger` commits one durable
 `exit_requests` row for the position. It cancels any unfinished entry first,

@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: execution-panel-protection-diagnostics (frontend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `execution-panel-protection-diagnostics`
+
+Base: GitHub `main` `3eb727fca82bf40678af32502a6d08c96c416666`; Node v22.22.2. Frontend-only delivery, so no backend pytest or full-suite run was made.
+
+- `npx tsc -b` (in `frontend/`): no errors.
+- `npm run build` (`tsc -b && vite build`): passed; only the existing chunk-size warning was printed.
+- `git diff --check`: clean. `frontend/tsconfig.tsbuildinfo` churn from the builds was restored and `frontend/dist` is git-ignored, so neither is in the delivery.
+- **Temporary harness, kept outside the repo** (`/tmp/harness`, not delivered): esbuild bundled the real `ExecutionLifecyclePanel` with the repo's own React 18.3 and ran it in jsdom 24 with a mocked `fetch` whose `/intelligence/exit-intents` calls were individually resolved or rejected by the test, a stub `WebSocket`, and every other endpoint left permanently loading. **23 scenarios passed (23/23)**: caption replaced; loading with Refresh enabled; healthy; degraded snapshot; pending fills; sticky `lost_window` after the snapshot recovered; `healthy` contradicted by `lost_window`; zero triggers with degraded diagnostics; populated triggers; monitor unavailable with the route's placeholder zeros; diagnostics absent; running with `{status: "unavailable"}`; minimal `{status: "healthy"}`; unrecognized or garbage `protection_diagnostics` (five inputs); `null` limits and `lost_window`; unknown cause code with missing symbol/timestamp and a markup-looking string (rendered as text, no element created, incident list collapsed by default); incident list capped at the newest 25; network failure and HTTP 503; a hung request followed by Refresh with a late success and a late failure ignored; a superseded request failing first and an older success unable to override the error; Refresh from the ready state; collapse while hung with late success/failure ignored and re-expand refetching; full unmount followed by late resolve/reject. Any `console.error` fails a scenario; none occurred.
+- **Negative control.** The same harness against the unmodified baseline component: 17 of 23 scenarios failed (6 passed — loading with Refresh enabled, monitor unavailable, request failure, superseded request failing first, collapse/re-expand and unmount, none of which this delivery changes). So the harness does detect missing diagnostics.
+- **Limits.** jsdom, not a real browser: no layout, Tailwind rendering or visual check of the panel width, and the `<details>` toggle was not clicked. The other sections were held in their loading state, so cross-section interaction was not exercised. Responses are fabricated from the backend shapes read in `engine.py` and `intelligence.py`, not captured from a running backend; the backend route test `test_exit_intents_route.py` was read, not run. No permanent frontend test framework was added.
+<!-- END DELIVERY SECTION: execution-panel-protection-diagnostics -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
 # TESTING — `simulated-venue-invalid-tick-guard`
 

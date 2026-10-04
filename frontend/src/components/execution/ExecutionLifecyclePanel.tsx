@@ -629,6 +629,240 @@ type ExitIntentLoad =
 
 const EXIT_REASON_LABEL = { stop: "Stop", target: "Target", eod_flatten: "EOD" } as const;
 
+// Known Position Monitor incident causes (PositionMonitor._incident, decision
+// #188). Anything else is shown as its raw code so a newer backend's cause is
+// never hidden or mislabelled. Rendered only as React text (never as markup).
+const PROTECTION_CAUSE_LABEL: Record<string, string> = {
+  snapshot_unavailable: "Position snapshot became unavailable",
+  fill_invisible: "Fill not yet visible in the position snapshot",
+  tick_overflow: "Tick journal overflowed for a symbol",
+  symbol_capacity_loss: "Journal symbol capacity reached; a symbol's ticks were evicted",
+  unowed_expiry: "Unowed ticks expired from the journal",
+  fill_marker_overflow: "Fill-pending marker capacity reached",
+};
+
+const MAX_COUNT_ROWS = 20;
+const MAX_INCIDENT_ROWS = 25;
+const MAX_TEXT_CHARS = 64;
+
+function causeLabel(cause: string): string {
+  return PROTECTION_CAUSE_LABEL[cause] ?? cause;
+}
+
+function clipText(value: string): string {
+  return value.length > MAX_TEXT_CHARS ? `${value.slice(0, MAX_TEXT_CHARS)}…` : value;
+}
+
+// A missing or unparseable timestamp renders as an em dash, never as "now".
+function formatOptionalTime(value: unknown): string {
+  return typeof value === "string" ? formatTriggerTime(value) : "—";
+}
+
+type ProtectionIncidentView = { cause: string; symbol: string | null; at: unknown };
+
+// What the panel is allowed to say about protection diagnostics. Built from
+// `unknown` because older backends omit the object or send only part of it;
+// each field is null when it was not reported, and null is displayed as
+// "not reported" — never as zero, "none" or healthy.
+type ProtectionView =
+  | { kind: "missing" }
+  | { kind: "unavailable" }
+  | {
+      kind: "reported";
+      degraded: boolean;
+      incomplete: boolean;
+      snapshotUnavailable: boolean | null;
+      lostWindow: boolean | null;
+      pendingSymbols: string[] | null;
+      journalSymbols: number | null;
+      journalTicks: number | null;
+      limits: { symbols: number; ticksPerSymbol: number; retentionSeconds: number } | null;
+      counts: Array<[string, number]> | null;
+      incidents: ProtectionIncidentView[] | null;
+    };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function countOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+// Pure so the state mapping stays separate from the markup. Contradictory input
+// (status "healthy" next to a lost window, a pending fill or an unavailable
+// snapshot) resolves to degraded; absent fields only mark the view incomplete.
+function readProtectionDiagnostics(raw: unknown): ProtectionView {
+  if (!isRecord(raw)) return { kind: "missing" };
+  if (raw.status === "unavailable") return { kind: "unavailable" };
+  if (raw.status !== "healthy" && raw.status !== "degraded") return { kind: "missing" };
+
+  const snapshotUnavailable = typeof raw.snapshot_unavailable === "boolean" ? raw.snapshot_unavailable : null;
+  const lostWindow = typeof raw.lost_window === "boolean" ? raw.lost_window : null;
+  const pendingSymbols = Array.isArray(raw.fill_pending_symbols)
+    ? raw.fill_pending_symbols.filter((symbol): symbol is string => typeof symbol === "string")
+    : null;
+  const journalSymbols = countOrNull(raw.journaled_symbols);
+  const journalTicks = countOrNull(raw.journaled_ticks);
+
+  let limits: { symbols: number; ticksPerSymbol: number; retentionSeconds: number } | null = null;
+  if (isRecord(raw.limits)) {
+    const symbols = countOrNull(raw.limits.symbols);
+    const ticksPerSymbol = countOrNull(raw.limits.ticks_per_symbol);
+    const retentionSeconds = countOrNull(raw.limits.unowed_retention_seconds);
+    if (symbols !== null && ticksPerSymbol !== null && retentionSeconds !== null) {
+      limits = { symbols, ticksPerSymbol, retentionSeconds };
+    }
+  }
+
+  let counts: Array<[string, number]> | null = null;
+  if (isRecord(raw.incident_counts)) {
+    counts = Object.entries(raw.incident_counts)
+      .filter((entry): entry is [string, number] => countOrNull(entry[1]) !== null)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  }
+
+  let incidents: ProtectionIncidentView[] | null = null;
+  if (Array.isArray(raw.recent_incidents)) {
+    incidents = raw.recent_incidents
+      .filter(isRecord)
+      .map((item) => ({
+        cause: typeof item.cause === "string" ? item.cause : "unknown",
+        symbol: typeof item.symbol === "string" && item.symbol !== "" ? item.symbol : null,
+        at: item.at,
+      }));
+  }
+
+  const degraded =
+    raw.status === "degraded" ||
+    snapshotUnavailable === true ||
+    lostWindow === true ||
+    (pendingSymbols !== null && pendingSymbols.length > 0);
+  const incomplete =
+    snapshotUnavailable === null || lostWindow === null || pendingSymbols === null ||
+    journalSymbols === null || journalTicks === null || counts === null;
+
+  return {
+    kind: "reported", degraded, incomplete, snapshotUnavailable, lostWindow, pendingSymbols,
+    journalSymbols, journalTicks, limits, counts, incidents,
+  };
+}
+
+function ProtectionDiagnosticsSummary({ view }: { view: ProtectionView }) {
+  if (view.kind === "missing") {
+    return (
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted" data-testid="protection-diagnostics-missing">
+        Protection diagnostics were not reported by this backend, so protection status is unknown.
+      </p>
+    );
+  }
+  if (view.kind === "unavailable") {
+    return (
+      <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted" data-testid="protection-diagnostics-unavailable">
+        Protection diagnostics unavailable — no Position Monitor figures to show.
+      </p>
+    );
+  }
+
+  const shownCounts = view.counts === null ? [] : view.counts.slice(0, MAX_COUNT_ROWS);
+  const hiddenCounts = view.counts === null ? 0 : view.counts.length - shownCounts.length;
+  const newestIncidents = view.incidents === null ? [] : view.incidents.slice(-MAX_INCIDENT_ROWS).reverse();
+  const hiddenIncidents = view.incidents === null ? 0 : view.incidents.length - newestIncidents.length;
+
+  return (
+    <div className="px-2 pb-1.5 font-mono text-[10px] text-text-muted" data-testid="protection-diagnostics">
+      <div data-testid="protection-status" className={view.degraded ? "text-bear" : "text-text-primary"}>
+        {view.degraded
+          ? "Protection diagnostics: degraded"
+          : "Protection diagnostics: no degradation reported in this snapshot"}
+        {!view.degraded && view.incomplete && " (some fields not reported)"}
+      </div>
+      {!view.degraded && (
+        <div>A snapshot with no degradation is not a guarantee that positions are protected.</div>
+      )}
+      <div data-testid="protection-snapshot">
+        Position snapshot:{" "}
+        {view.snapshotUnavailable === null
+          ? "not reported"
+          : view.snapshotUnavailable
+            ? "unavailable — retained ticks await recovery"
+            : "available"}
+      </div>
+      <div data-testid="protection-pending">
+        Fills awaiting visibility:{" "}
+        {view.pendingSymbols === null
+          ? "not reported"
+          : view.pendingSymbols.length === 0
+            ? "none"
+            : view.pendingSymbols.map(clipText).join(", ")}
+      </div>
+      <div data-testid="protection-journal">
+        Tick journal:{" "}
+        {view.journalSymbols === null || view.journalTicks === null
+          ? "not reported"
+          : `${view.journalTicks} tick${view.journalTicks === 1 ? "" : "s"} across ${view.journalSymbols} symbol${view.journalSymbols === 1 ? "" : "s"}`}
+        {" · "}
+        {view.limits === null
+          ? "limits not reported"
+          : `limits ${view.limits.symbols} symbols, ${view.limits.ticksPerSymbol} ticks per symbol, ${view.limits.retentionSeconds}s retention for unowed ticks`}
+      </div>
+      <div
+        data-testid="protection-lost-window"
+        className={view.lostWindow === true ? "text-bear" : undefined}
+      >
+        Retained price history:{" "}
+        {view.lostWindow === true
+          ? "lost at some point and this stays flagged even after the snapshot recovers. First-touch certainty cannot be established for positions affected by the loss. This is not evidence that an order failed or that a position is unprotected."
+          : view.lostWindow === false
+            ? "no loss recorded by this monitor"
+            : "unknown (not reported)"}
+      </div>
+      <div data-testid="protection-incident-counts">
+        Incidents (cumulative):{" "}
+        {view.counts === null ? (
+          "not reported"
+        ) : view.counts.length === 0 ? (
+          "none recorded"
+        ) : (
+          <ul className="mt-0.5 space-y-0.5">
+            {shownCounts.map(([cause, count]) => (
+              <li key={cause} title={cause} className="break-all">
+                {count} × {clipText(causeLabel(cause))}
+              </li>
+            ))}
+            {hiddenCounts > 0 && <li>+{hiddenCounts} more cause{hiddenCounts === 1 ? "" : "s"}</li>}
+          </ul>
+        )}
+      </div>
+      {view.incidents !== null && view.incidents.length > 0 && (
+        <details className="mt-0.5" data-testid="protection-recent-incidents">
+          <summary className="cursor-pointer text-signal">Recent incidents ({view.incidents.length})</summary>
+          <ul className="mt-0.5 space-y-0.5">
+            {newestIncidents.map((incident, index) => (
+              <li key={index} className="break-all" title={incident.cause}>
+                <time>{formatOptionalTime(incident.at)}</time>
+                {" · "}
+                {incident.symbol === null ? "no symbol" : clipText(incident.symbol)}
+                {" · "}
+                {clipText(causeLabel(incident.cause))}
+              </li>
+            ))}
+            {hiddenIncidents > 0 && <li>{hiddenIncidents} older retained incident{hiddenIncidents === 1 ? "" : "s"} not shown</li>}
+          </ul>
+        </details>
+      )}
+    </div>
+  );
+}
+
+// "Observed exit triggers" is a read of the running Position Monitor's
+// in-memory observations plus its additive protection diagnostics (decisions
+// #178, #188) from the single GET /intelligence/exit-intents request. Neither
+// says anything about execution progress: recorded exit requests, orders and
+// fills have their own sections. Manual Refresh only; the effect cleanup
+// discards a superseded or post-unmount response, and Refresh stays enabled
+// while a request is in flight. Diagnostics render independently of the trigger
+// list: they can be degraded while there are zero observed triggers.
 function ObservedExitTriggers() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [load, setLoad] = useState<ExitIntentLoad>({ kind: "loading" });
@@ -646,6 +880,15 @@ function ObservedExitTriggers() {
     return () => { active = false; };
   }, [refreshKey]);
 
+  const protection: ProtectionView | null =
+    load.kind === "ready" && load.data.monitor_status === "running"
+      ? readProtectionDiagnostics(load.data.protection_diagnostics)
+      : null;
+  const priceHistoryAtRisk =
+    protection !== null &&
+    protection.kind === "reported" &&
+    (protection.lostWindow === true || protection.snapshotUnavailable === true);
+
   return (
     <section className="border-b border-base-border" aria-label="Observed exit triggers">
       <div className="flex items-center justify-between px-2 py-1.5">
@@ -658,15 +901,19 @@ function ObservedExitTriggers() {
         </button>
       </div>
       <p className="px-2 pb-1.5 font-mono text-[10px] text-text-muted">
-        Observed trigger only — no exit order has been placed and the position has not been closed.
+        Observed triggers are monitor observations. Check recorded exit requests, orders and fills for execution progress.
       </p>
       {load.kind === "loading" && <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Loading exit triggers…</p>}
       {load.kind === "error" && <p className="px-2 pb-2 font-mono text-[10px] text-bear">Could not fetch exit triggers: {load.message}</p>}
       {load.kind === "ready" && load.data.monitor_status === "unavailable" && (
         <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Position Monitor unavailable.</p>
       )}
+      {protection !== null && <ProtectionDiagnosticsSummary view={protection} />}
       {load.kind === "ready" && load.data.monitor_status === "running" && load.data.exit_intents.length === 0 && (
-        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">Position Monitor running — no observed exit triggers.</p>
+        <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">
+          Position Monitor running — no observed exit triggers.
+          {priceHistoryAtRisk && " Lost or unavailable price history means a touch may not have been observed."}
+        </p>
       )}
       {load.kind === "ready" && load.data.monitor_status === "running" && load.data.exit_intents.map((intent) => (
         <div key={intent.position_id} className="border-t border-base-border px-2 py-1.5 font-mono text-[10px]">
