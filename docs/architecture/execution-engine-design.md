@@ -2795,6 +2795,68 @@ outcome time. `outcome_id` and `outcome_status` are reported as stored and are n
 "Recorded" row with "no outcome link" is shown as stored). A `limit` of 50 bounds the list only; there is no
 paging. Not verified against a running backend with real recorder rows (see `TESTING.md`).
 
+#### M. Restart-recovery verification (`outcome-recorder-restart-recovery-tests`; decisions #186 and #187 are the behavior, no new decision number)
+
+**Test evidence only.** No production source, migration, schema or existing test changed. `backend/tests/test_outcome_recorder_restart_recovery.py` proves, on a real PostgreSQL database and through the recorder's real `start()` → `_startup_scan` → `_pending_rows` → queue → worker → `record_trade()` chain, that a **freshly constructed** `OutcomeRecorder` recovers work a previous, cleanly stopped recorder left behind, using only durable rows. It adds what the single-recorder suites (startup scan, paged scan, periodic sweep, direct-call retry, event-driven write) did not cover: C7's recovery claim across a recorder-object boundary.
+
+| Case | What the test establishes |
+|---|---|
+| **Closure missed while no recorder ran** | Recorder A is started and cleanly stopped (its worker task has ended). An eligible closed, strategy-attributed simulated trade is then persisted with `outcome_id` and `outcome_status` NULL. A new recorder B's real discovery query lists exactly that trade before B starts. B's own startup scan finds it and its worker writes exactly one `strategy_outcomes` row, linked by `trades.outcome_id` with `outcome_status = 'recorded'`. No `PositionClosed` is published, the test never calls `record_trade()` or `scan()`, and B's periodic sweep is parked. |
+| **Durable `pending_retry` survives a restart** | With A running, a bus-delivered `PositionClosed` makes the real worker hit one injected `SQLAlchemyError` raised from the outcome-writer seam *after* the outcome insert and flush. The durable result is `pending_retry`, `outcome_id` NULL and no outcome row (the insert rolled back with the unit of work). After A stops and the real writer is restored, a new recorder B recovers the same trade to exactly one linked outcome from its startup scan alone: no replayed event, no direct recorder call. `pending_retry` is still discoverable by the real query. |
+| **Already recorded stays unchanged** | After each recovery, a further fresh recorder starts over the recorded trade. Its real discovery query no longer lists the trade and its startup scan enqueues nothing. A duplicate `PositionClosed` published *after* that scan is then handled by its worker as `skipped`. Because the queue is FIFO with one worker, that verdict is the barrier: anything the scan could have enqueued has already been processed, so a premature check cannot pass. Status, `outcome_id` and every `strategy_outcomes` column are identical afterwards, and no second row exists. |
+
+Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL entry and exit snapshots, each with a reason code in `snapshot_missing_reasons`, and the entry-side reason is `recorder_unavailable`; nothing is fabricated and nothing survives from the previous recorder. Price and P&L formulas are not re-tested here.
+
+**What this does not prove.** This is a restart of the recorder *object* over a live database. It is **not** a process crash and **not** a full app-lifespan recovery: the `main.py` ordering (reconciliation and `portfolio_state.refresh()` before the recorder subscribes, §6.7.1 C7) is not exercised, no event loop or bus is torn down and rebuilt as a process would, and no second process contends for the row lock. The periodic sweep is parked in these tests and is covered by its own suite. Test isolation: the recorder's startup query is database-wide, so the module refuses to run unless `trades` is empty (a disposable database migrated to Alembic head); cleanup removes only the seeded `trade_id`s' rows, children first, after every recorder worker has been stopped.
+
+**Scan to worker to ledger (the path the tests drive)**
+
+```
+   recorder A (stopped)              PostgreSQL ledger (durable, authoritative)          recorder B (new object)
+   ────────────────────             ────────────────────────────────────────           ────────────────────────
+   queue, _queued, cursor,     ┌──► trades: approved, closed, simulated, auto,           start()
+   in-memory snapshots         │      outcome_id NULL, status NULL | pending_retry          │
+   do NOT survive              │    positions · position_fill_receipts · orders · fills     ▼
+                               │              ▲                                         _startup_scan
+                               │              │ pages of (closed_at, trade_id)            │  real _pending_rows,
+                               └──────────────┼──────────────────────────────────────────┘  database-wide
+                                              │                                            ▼
+                                              │                                      enqueue("close", trade_id)
+                                              │ reads + SELECT ... FOR UPDATE              │ (de-duplicated)
+                                              │                                            ▼
+                                              └─────────────────────────────────────  worker ─► record_trade()
+                                                                                           │
+                       strategy_outcomes row + trades.outcome_id + status='recorded' ◄─────┘ one commit
+                       (no PositionClosed event, no direct call, sweep parked: none of them is the trigger)
+```
+
+**Internal restart-recovery flow**
+
+```
+ durable state left by recorder A                     fresh recorder B                       checks
+ ─────────────────────────────────                    ────────────────                       ──────
+ case 1: closed trade, no verdict yet  ─┐
+ case 2: writer fault ─► insert rolled  ├─► B's real discovery query lists the trade ────────► pending before start
+         back ─► status pending_retry  ─┘          │
+                                                   ▼
+                                           B.start(): subscribe, spawn worker, startup scan
+                                                   │ trade_id queued once
+                                                   ▼
+                                           worker: record_trade(trade_id)
+                                             ├─ ok ──────────────► recorded ──► exactly 1 outcome, linked
+                                             ├─ transient error ─► pending_retry (next scan retries)
+                                             └─ already linked ──► skipped
+                                                   │
+                                           B.stop(): queue drained, worker task ended ───────► restart boundary
+                                                   ▼
+                                           fresh recorder C over the recorded trade
+                                             startup scan: nothing enqueued
+                                             duplicate PositionClosed published after the scan
+                                             worker verdict "skipped" (the barrier) ───────────► status, outcome_id and
+                                                                                                 every column unchanged,
+                                                                                                 no second row
+```
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**

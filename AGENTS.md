@@ -132,3 +132,10 @@ When handing work back:
 * identify any useful follow-up work, but do not implement it automatically.
 
 Do not claim completion if implementation, documentation, or required validation is still unfinished.
+
+## 11. Delivery format
+
+* Deliver complete project files at their project-root-relative paths. The ZIP's top level is the project root, with no enclosing folder, and Saqib extracts it outside the repository and copies it over the project root.
+* Exclude `_delivery/`, patches, standalone documentation sections, packaging helpers, and generated build files.
+* Resolve integration before handoff. Do not transfer patch application or documentation assembly to Saqib.
+* Parallel implementation is allowed, but overlapping deliveries (including shared documentation) must be finalized sequentially. After the first delivery is pushed, the second instance must fetch the updated `main`, preserve the first delivery, and regenerate its ZIP.

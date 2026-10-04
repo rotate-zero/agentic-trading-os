@@ -1,3 +1,24 @@
+<!-- BEGIN DELIVERY SECTION: outcome-recorder-restart-recovery-tests (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-recorder-restart-recovery-tests`
+
+Base: GitHub `main` `1ae3582b28fc45f69b3bfd6447f978b18edded7f`; Python 3.13.16, pytest 8.4.2, pytest-asyncio 0.24.0.
+
+**Database target.** A disposable local PostgreSQL 16 cluster on `127.0.0.1:55432` (database `trading_test`, outside the repository), created for this run and migrated from empty with `alembic upgrade head` to revision `0017 (head)`. Before the tests it held 0 rows in `trades`, `strategy_outcomes` and `positions`; after every run all ledger tables were empty again. No development, external or production database, and no broker or market-data account, was touched. Environment used for every command: `POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_DB=trading_test POSTGRES_USER=trading POSTGRES_PASSWORD=trading`, run from `backend/`.
+
+- `python3 -m pytest tests/test_outcome_recorder_restart_recovery.py -v` — **2 passed, 0 failed, 0 skipped** (about 1 s). Eight consecutive repeat runs: 2 passed each time.
+- Combined serial set — `python3 -m pytest tests/test_outcome_recorder.py tests/test_outcome_recorder_event_path_integration.py tests/test_execution_outcome_status_recorder_integration.py tests/test_outcome_read_path_integration.py tests/test_execution_outcome_status_route.py tests/test_outcome_recorder_restart_recovery.py -rs -q` — **57 passed, 0 failed, 0 skipped** (3.6 s). No skip summary was printed, so the real database was exercised.
+- `git diff --check`: clean (the new file was marked intent-to-add so it is covered).
+- The roughly 1,600-test backend suite was **not** run.
+- **Delivery check.** The ZIP (complete files only: `AGENTS.md`, `CHANGES.md`, `TESTING.md`, `docs/architecture/execution-engine-design.md`, `backend/tests/test_outcome_recorder_restart_recovery.py`) was extracted outside a fresh clone of the base and copied over its root; `git status --short` listed exactly those five paths, `git diff --check` was clean, no existing line was removed, and the new module and the combined set above were re-run from that checkout with the results stated here.
+
+**Negative controls** (temporary edits to `outcome_recorder.py` in a scratch clone, reverted with `git checkout`; not part of the delivery):
+1. `_startup_scan` returns immediately: both tests fail.
+2. The startup scan runs the real query but enqueues nothing: both tests fail with the bounded 10 s `TimeoutError` while waiting for the worker verdict (no hang), and cleanup still left the tables empty.
+3. `_pending_rows` excludes `pending_retry`: the retry-survives-restart test fails at its "pending before start" assertion; the other test still passes.
+
+**Limits.** This is a recorder-object restart over a live database, not a process crash or app-lifespan recovery. The database is local and disposable, not the project's configured PostgreSQL service. The guard makes the module fail (not skip) against any database that already holds trades, so it cannot be run against a populated development database. No production defect was found, so no blocked or failing case is reported.
+<!-- END DELIVERY SECTION: outcome-recorder-restart-recovery-tests -->
+
 <!-- BEGIN DELIVERY SECTION: execution-panel-protection-diagnostics (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-panel-protection-diagnostics`
 
