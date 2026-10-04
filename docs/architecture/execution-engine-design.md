@@ -949,6 +949,38 @@ collapse / unmount ──► cleanup marks run inactive; a late response or late
 - **Session guard:** rejects outside the regular session in v1 (`MarketClock`). **Injectable** tick source and clock for tests, plus a partial-fill injector so the partial path is exercised even though v1 fills whole.
 - **Parity with the backtest, stated not assumed:** the Backtest Runner fills at the *next candle's open* and exits *at the stop/target price*; a tick-driven venue fills at the *observed tick* and exits at the tick that breached the level. The delta is recorded, not hidden (EX-8).
 
+**Tick eligibility at the venue boundary (as built, `simulated-venue-invalid-tick-guard`; no new decision number).** `SimulatedVenue.ingest_tick()` is the shared boundary for direct injection and parsed `PriceUpdated` EventBus delivery. It rejects a price unless it is a finite, strictly positive number, and rejects an exchange timestamp unless it is a usable timezone-aware `datetime`. This is necessary even for EventBus delivery: `PriceUpdated`'s schema accepts non-finite/nonpositive prices and naive timestamps. The check runs before the venue reads pending orders, checks a limit crossing, advances a partial-fill plan, constructs an update, or invokes a callback. A rejected tick leaves every pending order on its symbol unchanged: status, filled/leaves quantity, plan index, fill history and numbering, and pending membership. The next valid qualifying tick uses the same next tranche and fill ID it would have used without the invalid tick.
+
+```
+direct ingest_tick() ──────────────────────────────────────┐
+PriceUpdated ─► EventBus ─► parse venue payload ──────────┤
+                                                           ▼
+                                            SimulatedVenue.ingest_tick()
+                                                           │
+                                              tick eligibility check
+                                                │           │
+                                          reject│           │accept
+                                                ▼           ▼
+                                       bounded warning   pending orders by symbol
+                                       no book change     ─► acceptance-order matching
+                                       no callback            ─► _apply_fill()
+                                                               ─► OrderUpdate callback
+                                                               ─► Execution / ledger accounting
+```
+
+```
+ingest_tick(symbol, price, exchange_ts)
+  ├─ non-finite / nonpositive price ──────────────────────► return unchanged
+  ├─ naive / unusable exchange_ts ────────────────────────► return unchanged
+  └─ eligible tick
+       └─ for each pending order on symbol, in acceptance order
+            ├─ no market/limit match ─────────────────────► keep pending
+            └─ match ─► consume next planned quantity ─► assign :f<n>
+                         └─ append fill, update status/pending, dispatch callback
+```
+
+Invalid input produces at most one venue-wide warning per 60 monotonic seconds, without a per-tick traceback. An unparseable bus payload or missing envelope symbol is also ignored through this bounded warning path; EventBus processing continues. Valid offset-aware `exchange_ts` values are reported unchanged, without normalization. This input guard adds no tick recency limit, arrival deduplication, out-of-order filter, timestamp-versus-order-acceptance comparison, or fill-session policy. The existing placement session guard and market/limit matching rules remain as before.
+
 ### 6.5 Portfolio State Engine (`portfolio_state/`)
 
 **Built in decisions #172–#174; integration remains partial.** Portfolio State owns position accounting, in-flight exposure, marks, and daily realized amounts. It is a cache over the ledger, never the record (I5/I12). Decision #173 revises #172's package with Saqib's approval; the same database-free arithmetic now serves both the event worker and the retained Session/reconciliation API.

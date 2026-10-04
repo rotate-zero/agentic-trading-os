@@ -1,19 +1,23 @@
 """
 SimulatedVenue behavior — the venue half of decision
 decision #172 (EX-1/EX-3/EX-8). No database involved; this
-is the venue's own in-memory order/fill book, exercised directly via
-`ingest_tick()` rather than through the real Event Bus (§6.4's
-"injectable tick source").
+is the venue's own in-memory order/fill book, exercised via direct
+`ingest_tick()` calls and real PriceUpdated EventBus delivery.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
 from app.broker_adapters.order_venue import OrderInstruction
 from app.broker_adapters.simulated_venue import SimulatedVenue
 from app.core.market_clock import MarketClock
+from app.event_bus.bus import EventBus
+from app.event_bus.events import make_envelope
+from app.schemas.events.envelope import EventEnvelope, EventType
+from app.schemas.events.market_data import PriceUpdated
 
 
 class _FixedClock(MarketClock):
@@ -30,6 +34,14 @@ class _FixedClock(MarketClock):
 
 def _ts(hour: int = 10, minute: int = 0) -> datetime:
     return datetime(2026, 9, 22, hour, minute, tzinfo=timezone.utc)
+
+
+class _BrokenTimezone(tzinfo):
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        raise ValueError("invalid offset")
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        return None
 
 
 @pytest.fixture
@@ -210,3 +222,147 @@ async def test_get_positions_is_derived_and_reconciliation_only(venue: Simulated
     assert positions[0].qty == 10
     assert positions[0].side == "BUY"
     assert positions[0].avg_cost == 100.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("price", "exchange_ts"),
+    [
+        pytest.param(float("nan"), _ts(), id="nan"),
+        pytest.param(float("inf"), _ts(), id="positive-infinity"),
+        pytest.param(float("-inf"), _ts(), id="negative-infinity"),
+        pytest.param(0.0, _ts(), id="zero"),
+        pytest.param(-1.0, _ts(), id="negative"),
+        pytest.param(100.0, datetime(2026, 9, 22, 10), id="naive-timestamp"),
+        pytest.param(100.0, datetime(2026, 9, 22, 10, tzinfo=_BrokenTimezone()), id="broken-timezone"),
+        pytest.param(100.0, None, id="missing-timestamp"),
+    ],
+)
+async def test_invalid_tick_preserves_all_pending_orders_and_next_tranche(
+    price: float, exchange_ts: datetime,
+) -> None:
+    venue = SimulatedVenue(
+        clock=_FixedClock(regular_session=True),
+        partial_fill_planner=lambda instruction: [2, 3],
+    )
+    await venue.connect()
+    updates = []
+    venue.on_order_update(updates.append)
+    instructions = [
+        OrderInstruction(client_order_id="market", symbol="AAPL", side="BUY", qty=5),
+        OrderInstruction(client_order_id="buy-limit", symbol="AAPL", side="BUY", qty=5,
+                         order_type="limit", limit_price=100.0),
+        OrderInstruction(client_order_id="sell-limit", symbol="AAPL", side="SELL", qty=5,
+                         order_type="limit", limit_price=100.0),
+    ]
+    for instruction in instructions:
+        await venue.place_order(instruction)
+
+    pending_before = list(venue._pending_by_symbol["AAPL"])
+    venue.ingest_tick("AAPL", price, exchange_ts)
+    assert updates == []
+    assert venue._pending_by_symbol["AAPL"] == pending_before
+    for instruction in instructions:
+        report = await venue.get_order(instruction.client_order_id)
+        assert report is not None
+        assert (report.status, report.filled_qty, report.leaves_qty) == ("submitted", 0, 5)
+        assert venue._orders[instruction.client_order_id].plan_index == 0
+        assert await venue.get_fills(instruction.client_order_id) == []
+    assert len(await venue.list_open_orders()) == len(instructions)
+
+    valid_ts = datetime(2026, 9, 22, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    venue.ingest_tick("AAPL", 100.0, valid_ts)
+    assert len(updates) == len(instructions)
+    for update in updates:
+        assert (update.status, update.fill_qty, update.cumulative_qty, update.leaves_qty) == (
+            "partially_filled", 2, 2, 3,
+        )
+        assert update.venue_fill_id == f"{update.client_order_id}:f1"
+        assert update.venue_ts.isoformat() == valid_ts.isoformat()
+
+    venue.ingest_tick("AAPL", 100.0, _ts(10, 1))
+    for instruction in instructions:
+        fills = await venue.get_fills(instruction.client_order_id)
+        assert [fill.venue_fill_id for fill in fills] == [
+            f"{instruction.client_order_id}:f1", f"{instruction.client_order_id}:f2",
+        ]
+        assert [fill.fill_qty for fill in fills] == [2, 3]
+        report = await venue.get_order(instruction.client_order_id)
+        assert report is not None
+        assert (report.status, report.filled_qty, report.leaves_qty) == ("filled", 5, 0)
+
+
+@pytest.mark.asyncio
+async def test_invalid_tick_between_partial_fills_preserves_next_fill_number() -> None:
+    venue = SimulatedVenue(
+        clock=_FixedClock(regular_session=True),
+        partial_fill_planner=lambda instruction: [2, 3, 5],
+    )
+    await venue.connect()
+    updates = []
+    venue.on_order_update(updates.append)
+    await venue.place_order(OrderInstruction(client_order_id="partial", symbol="AAPL", side="BUY", qty=10))
+    venue.ingest_tick("AAPL", 100.0, _ts())
+
+    venue.ingest_tick("AAPL", 0.0, _ts(10, 1))
+    report = await venue.get_order("partial")
+    assert report is not None
+    assert (report.status, report.filled_qty, report.leaves_qty) == ("partially_filled", 2, 8)
+    assert venue._orders["partial"].plan_index == 1
+    assert venue._pending_by_symbol["AAPL"] == ["partial"]
+    assert [fill.venue_fill_id for fill in await venue.get_fills("partial")] == ["partial:f1"]
+    assert len(updates) == 1
+
+    venue.ingest_tick("AAPL", 101.0, _ts(10, 2))
+    assert [fill.venue_fill_id for fill in await venue.get_fills("partial")] == ["partial:f1", "partial:f2"]
+    assert [fill.fill_qty for fill in await venue.get_fills("partial")] == [2, 3]
+    assert (await venue.get_order("partial")).leaves_qty == 5
+
+
+@pytest.mark.asyncio
+async def test_event_bus_invalid_ticks_do_not_consume_order_or_stop_delivery() -> None:
+    bus = EventBus()
+    venue = SimulatedVenue(event_bus=bus, clock=_FixedClock(regular_session=True))
+    await venue.connect()
+    await bus.start()
+    updates = []
+    venue.on_order_update(updates.append)
+    try:
+        await venue.place_order(OrderInstruction(client_order_id="bus-market", symbol="AAPL", side="BUY", qty=1))
+        for tick in (
+            PriceUpdated(price=float("nan"), size=1, exchange_ts=_ts()),
+            PriceUpdated(price=0.0, size=1, exchange_ts=_ts()),
+            PriceUpdated(price=100.0, size=1, exchange_ts=datetime(2026, 9, 22, 10)),
+        ):
+            await bus.publish(make_envelope(EventType.PRICE_UPDATED, tick, symbol="AAPL"))
+        await bus.publish(EventEnvelope(
+            event_type=EventType.PRICE_UPDATED,
+            symbol="AAPL",
+            payload={"price": 100.0, "size": 1, "exchange_ts": "unparseable"},
+        ))
+        await asyncio.wait_for(bus._normal_queue.join(), timeout=1)
+        assert updates == []
+        assert (await venue.get_order("bus-market")).status == "submitted"
+        assert await venue.get_fills("bus-market") == []
+
+        offset_ts = datetime(2026, 9, 22, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        await bus.publish(make_envelope(
+            EventType.PRICE_UPDATED, PriceUpdated(price=100.0, size=1, exchange_ts=offset_ts), symbol="AAPL",
+        ))
+        await asyncio.wait_for(bus._normal_queue.join(), timeout=1)
+        assert len(updates) == 1
+        assert updates[0].venue_fill_id == "bus-market:f1"
+        assert updates[0].venue_ts.isoformat() == offset_ts.isoformat()
+    finally:
+        await venue.disconnect()
+        await bus.stop()
+
+
+def test_repeated_invalid_ticks_log_once_without_traceback(venue: SimulatedVenue, caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level("WARNING", logger="app.broker_adapters.simulated_venue"):
+        venue.ingest_tick("AAPL", float("nan"), _ts())
+        venue.ingest_tick("AAPL", 0.0, _ts())
+        venue.ingest_tick("AAPL", 100.0, datetime(2026, 9, 22, 10))
+    warnings = [record for record in caplog.records if "ignored invalid tick" in record.message]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is None

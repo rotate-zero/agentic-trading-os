@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
+# TESTING — `simulated-venue-invalid-tick-guard`
+
+Base: GitHub `main` `98075f59a4d22cf59a27eccde74caac6dadb7884`. Focused test-first run before the venue fix: `./.venv/bin/pytest -q tests/test_simulated_venue.py -k invalid_tick` produced **8 failed**, 10 deselected. Each failure demonstrated an invalid tick consuming or advancing an order; the EventBus case also consumed a market order. No production code was changed before this red run.
+
+After the fix, `./.venv/bin/pytest -q --disable-warnings tests/test_simulated_venue.py` passed **21/21**. The venue tests cover NaN, both infinities, zero, negative price, naive/missing/broken-timezone timestamps, all same-symbol pending market and crossing-limit orders, unchanged status/quantities/plan index/fill history/pending list/callback count, the next valid tranches and sequential `:f1`/`:f2` IDs, offset-aware timestamp preservation, EventBus continuation after bad values or an unparseable payload, and bounded warning output without traceback.
+
+The configured PostgreSQL 18 cluster on port 5432 was down. Starting that service required root/sudo credentials unavailable to this session, so a disposable PostgreSQL 18 cluster was initialized under `backend/.simulated-venue-validation/` on localhost:55432. It contains only a `trading_workspace` development test database, migrated through existing Alembic revision `0017`; no external database or broker account was used. With `POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432`, the selected venue, Execution Engine, entry lifecycle, reconciliation, simulated protective-session retry, simulated EOD integration and main execution pipeline files passed **96/96** in 9.51 seconds. The first combined attempt at the unavailable default database was interrupted after 29 passing tests; it is not counted as validation. The full backend suite was not run.
+
+`git diff --check` passed. Pytest emitted existing dependency/runtime deprecation warnings; `--disable-warnings` suppressed their display in the successful runs. The temporary database is stopped and removed after validation. No migration was added by this delivery.
+<!-- END DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
+
 <!-- BEGIN DELIVERY SECTION: execution-panel-refresh-recovery (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `execution-panel-refresh-recovery`
 

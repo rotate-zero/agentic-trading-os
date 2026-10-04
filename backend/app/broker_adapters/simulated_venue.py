@@ -59,6 +59,8 @@ behavior, design doc §6.4).
 from __future__ import annotations
 
 import logging
+import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -89,6 +91,8 @@ def _fill_whole(instruction: OrderInstruction) -> list[int]:
 
 
 PartialFillPlanner = Callable[[OrderInstruction], list[int]]
+
+_INVALID_TICK_LOG_INTERVAL_SECONDS = 60.0
 
 
 @dataclass
@@ -129,6 +133,7 @@ class SimulatedVenue(OrderVenue):
         # is open on the same symbol.
         self._pending_by_symbol: dict[str, list[str]] = {}
         self._callbacks: list[OrderUpdateCallback] = []
+        self._last_invalid_tick_log_at: float | None = None
 
     # --- OrderVenue identity ------------------------------------------------
 
@@ -280,7 +285,13 @@ class SimulatedVenue(OrderVenue):
         """Direct tick injection for tests, and the internal path the
         `PriceUpdated` bus subscription (when `event_bus` is given)
         feeds through. Matches every pending order on `symbol`, in
-        acceptance order, against this single tick."""
+        acceptance order, against this single tick. Invalid input is
+        discarded before even reading the pending-order book."""
+        reason = self._invalid_tick_reason(price, exchange_ts)
+        if reason is not None:
+            self._log_invalid_tick(symbol, reason)
+            return
+
         pending_ids = list(self._pending_by_symbol.get(symbol, []))
         for client_order_id in pending_ids:
             order = self._orders.get(client_order_id)
@@ -290,16 +301,45 @@ class SimulatedVenue(OrderVenue):
                 continue
             self._apply_fill(order, price, exchange_ts)
 
+    @staticmethod
+    def _invalid_tick_reason(price: float, exchange_ts: datetime) -> str | None:
+        if isinstance(price, bool) or not isinstance(price, (int, float)):
+            return "price must be finite and positive"
+        try:
+            if not math.isfinite(price) or price <= 0:
+                return "price must be finite and positive"
+        except (OverflowError, TypeError, ValueError):
+            return "price must be finite and positive"
+        if not isinstance(exchange_ts, datetime):
+            return "exchange timestamp must be an aware datetime"
+        try:
+            if exchange_ts.utcoffset() is None:
+                return "exchange timestamp must be an aware datetime"
+            exchange_ts.isoformat()
+        except Exception:  # noqa: BLE001 — malformed custom tzinfo must not reach a fill
+            return "exchange timestamp is unusable"
+        return None
+
+    def _log_invalid_tick(self, symbol: str | None, reason: str) -> None:
+        now = time.monotonic()
+        if (
+            self._last_invalid_tick_log_at is not None
+            and now - self._last_invalid_tick_log_at < _INVALID_TICK_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_invalid_tick_log_at = now
+        logger.warning("SimulatedVenue ignored invalid tick for symbol=%s: %s", symbol, reason)
+
     def _on_price_updated_envelope(self, envelope: EventEnvelope) -> None:
         if not self._connected:
             return
         if envelope.symbol is None:
-            logger.warning("PriceUpdated envelope with no symbol — ignored by SimulatedVenue")
+            self._log_invalid_tick(None, "missing symbol")
             return
         try:
             tick = PriceUpdated.model_validate(envelope.payload)
         except Exception:  # noqa: BLE001 — malformed payload must not crash the venue
-            logger.exception("SimulatedVenue could not parse PriceUpdated payload")
+            self._log_invalid_tick(envelope.symbol, "unparseable PriceUpdated payload")
             return
         self.ingest_tick(envelope.symbol, tick.price, tick.exchange_ts)
 

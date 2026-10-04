@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
+# CHANGES — `simulated-venue-invalid-tick-guard`
+
+Base: GitHub `main` `98075f59a4d22cf59a27eccde74caac6dadb7884`. This parallel delivery changes only `SimulatedVenue`, its maintained venue tests, and the matching §6.4 architecture text. No decision number is assigned; the existing simulated-venue decisions and the delivery slug identify the behavior.
+
+- `SimulatedVenue.ingest_tick()` now checks for a finite positive numeric price and a usable timezone-aware exchange timestamp before reading pending orders or matching a market/limit order. Direct calls and parsed `PriceUpdated` EventBus delivery share the guard.
+- An invalid tick leaves all same-symbol orders, partial-fill plan progress, fill history/IDs, pending membership and callbacks untouched. A later valid qualifying tick consumes the original next tranche. Valid offset-aware timestamps pass through unchanged.
+- Rejected ticks, malformed bus payloads and missing envelope symbols use a single venue-wide warning bounded to once per 60 monotonic seconds, without per-tick tracebacks; the EventBus continues processing.
+- No event schema, `OrderVenue` contract, Execution Engine, Position Monitor, Portfolio State, session-placement rule, backend route, frontend or migration changed. No recency, deduplication, out-of-order, timestamp-versus-acceptance or new fill-session policy was added.
+
+The §6.4 architecture addition includes the tick input-to-callback flow and the venue's reject/accept paths. Tests cover the invalid value matrix, pending market and crossing-limit orders, partial-fill continuity, EventBus continuation, bounded logging and unchanged offset timestamps.
+<!-- END DELIVERY SECTION: simulated-venue-invalid-tick-guard -->
+
 <!-- BEGIN DELIVERY SECTION: execution-panel-refresh-recovery (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `execution-panel-refresh-recovery`
 
