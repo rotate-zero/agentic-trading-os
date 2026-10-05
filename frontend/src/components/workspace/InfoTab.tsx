@@ -9,6 +9,7 @@ import { usePerformanceAnalytics } from "../../hooks/usePerformanceAnalytics";
 import { useContextSnapshot } from "../../hooks/useContextSnapshot";
 import { useMarketState } from "../../hooks/useMarketState";
 import { useWorldView } from "../../hooks/useWorldView";
+import { PortfolioStateSummary } from "./PortfolioStateSummary";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
@@ -771,6 +772,7 @@ function GeneralContent() {
       <RecentClosedTrades />
       <StrategyPerformanceSummary />
       <WorldViewSummary />
+      <PortfolioStateSummary />
       <div className="text-[11px] uppercase tracking-wide text-text-muted">Notes</div>
       <p className="text-xs leading-relaxed text-text-muted">
         General mode isn't tied to any single connector — it's the scrollable, market-wide view. Select a

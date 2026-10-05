@@ -1078,6 +1078,107 @@ Only a successful newly applied closure commit can publish `PositionClosed`, on 
 
 **At decision #173, not yet wired:** complete status notifications, authorizer/order/fill persistence integration, governor/World View adapters, live startup, position-monitor exits, and OutcomeRecorder recovery. Later deliveries wired entry persistence, World View reads, startup, and simulated stop/target exits; OutcomeRecorder and complete status notifications remain open. Adapter tests exercise real PostgreSQL transactions, concurrent writers/consumers, restart accounting, migration safety, and the event worker. They do not prove durable event delivery. Details: later as-built notes in §§6.3–6.6 and `TESTING.md`.
 
+#### Portfolio details — read route and Info-tab section (`live-portfolio-details`; decisions #172, #173 and #177 are the behavior, no new decision number)
+
+**As built.** `GET /intelligence/portfolio-state` is a read-only, system-wide projection of the running Portfolio State's
+`get_snapshot()`, and the Info tab's General view shows it in an expandable **Portfolio details** section beneath the
+compact World View summary. It exposes values the snapshot already holds; it adds no accounting, no cash/buying-power
+source, no fee estimate and no mark. The compact World View portfolio slot (decision #177) is unchanged.
+
+| Rule | As built |
+|---|---|
+| Source | The lifespan-installed `app.state.world_view_portfolio_reader` — the one running `PortfolioState`. No second instance, no lifecycle code, no `main.py` change. |
+| Read | Exactly one `reader.get_snapshot()` (no arguments, so system-wide; any `symbol` query parameter is ignored) per request. It is synchronous and I/O-free, so it runs on the event loop like World View's own portfolio read. No database read, no `refresh()`/reconciliation, no ledger write, no event published. |
+| Availability | `{"portfolio": null}` when the reader is absent or the snapshot is `None` (not restored, blocked ledger, accounting backlog/failure, unresolved order metadata). A restored flat account is a **populated** object with empty `positions`/`exposures`/`marks`. |
+| Response | `{"portfolio": {execution_mode, trading_day, snapshot_time, open_position_count, in_flight_order_count, positions[], exposures[], marks[], realized_profit_today, realized_loss_today, realized_pnl_today, reported_fees_today, fees_today, unknown_fee_count_today, unrealized_pnl, open_risk, buying_power}}`. |
+| `positions[]` | `position_id, symbol, side, qty, avg_entry_price, stop, target, opened_at` — filled positions only. |
+| `exposures[]` | `symbol, direction, qty, avg_entry_price, stop, mark, unrealized_pnl, is_in_flight`. `is_in_flight = false` is held exposure; `true` is the **remaining** quantity of a pending entry order (`avg_entry_price` is then that order's reference price). A partly filled entry appears twice: its filled part as held, only the unfilled remainder as pending. Exit orders add no exposure row (they only count in `in_flight_order_count`). |
+| `marks[]` | `symbol, price, as_of` for held symbols that have a mark; `snapshot_time` is the snapshot's own value (newest of the ledger time and the marks). |
+| Decimals | Every money/price field is a **fixed-point exact string** (`format(value, "f")`: `Decimal("1E-7")` becomes `"0.0000001"`, trailing zeros kept, never a float). Quantities and counts stay integers. |
+| Unavailable values | `null`, never `0`: an unmarked exposure makes `mark`, its `unrealized_pnl`, the total `unrealized_pnl` and `open_risk` null (totals are all-or-nothing, as built by `build_snapshot`); a missing stop makes `open_risk` null; incomplete ledger history makes every daily amount and `unknown_fee_count_today` null; any unknown fee makes `fees_today` null while `reported_fees_today` keeps the known charges; `realized_pnl_today` is null unless both profit and loss are known; `buying_power` is always null (no cash source exists). |
+
+**Data flow between components**
+
+```text
+ PositionLedgerPort ──► PortfolioState worker ──► committed read cache + memory-only marks   [unchanged; sole writer]
+ (restart / fills)        (#173/#174, one instance, started by main.py's lifespan)
+                                      │ get_snapshot()   synchronous, no I/O, detached values
+                                      ▼
+                  app.state.world_view_portfolio_reader   (#177; cleared before the worker stops)
+                          │                                   │
+                          │ get_snapshot()                    │ get_snapshot()  (once per request)
+                          ▼                                   ▼
+      GET /intelligence/world-view                GET /intelligence/portfolio-state
+      compact slot (#177, unchanged)              _project_portfolio_state()  ── copies values, computes nothing
+                          │                                   │ JSON {"portfolio": null | {...}}
+                          ▼                                   ▼
+          WorldViewSummary (useWorldView)         fetchPortfolioState() ► usePortfolioState(expanded)
+                                                              ▼
+                                       PortfolioStateSummary — "Portfolio details" (InfoTab, General view)
+
+ not touched: PostgreSQL / ledger · refresh() / rebuild_from_ledger() · EventBus · Position Monitor · Execution Engine
+```
+
+**Internal read flow**
+
+```text
+GET /intelligence/portfolio-state
+   │
+   ▼
+reader = request.app.state.world_view_portfolio_reader  (getattr default None)
+   ├─ reader is None ─────────────────────────────────────────────► {"portfolio": null}
+   ▼
+snapshot = reader.get_snapshot()            one call, system-wide
+   ├─ None (not restored / blocked / backlog / unresolved order) ──► {"portfolio": null}
+   ▼
+_project_portfolio_state(snapshot)          pure copy, no arithmetic
+   ├─ scalars     execution_mode · trading_day · as_of · counts (len of positions / in_flight)
+   ├─ positions   PositionState        ─► id, symbol, side, qty, avg price, stop, target, opened_at
+   ├─ exposures   OpenExposure rows    ─► held (is_in_flight=false) and pending-entry remainder (true)
+   ├─ marks       {symbol: (price, ts)} ─► [{symbol, price, as_of}]
+   ├─ daily       profit · loss · realized_pnl (property) · reported fees · fees · unknown-fee count
+   ├─ totals      unrealized_pnl · open_risk · buying_power (None)
+   └─ every Decimal ─► exact fixed-point string; every None ─► null
+   ▼
+{"portfolio": {...}}                        a restored flat account has empty lists, not null
+```
+
+**Frontend.** `fetchPortfolioState()` and the `PortfolioState*WireShape` types in `api-client.ts`; the hook
+`usePortfolioState(enabled)`; the component `PortfolioStateSummary.tsx`, mounted by `InfoTab.tsx`'s `GeneralContent`
+directly after `WorldViewSummary`.
+
+```text
+click "▸ Portfolio details" ──► expanded = true ──► hook effect ──► load()  (counter++ · loading · error cleared)
+   ├─ success, portfolio === null ──► "Portfolio unavailable — the execution pipeline is not running or its snapshot is not ready."
+   ├─ success, positions = exposures = 0 ──► summary amounts + "Flat — no open positions or pending entries."
+   ├─ success, otherwise ──► header (mode · trading day · snapshot · counts), summary amounts,
+   │        "Held exposure — filled positions" rows, then
+   │        "Pending-entry exposure — remaining quantity of unfilled entry orders" rows
+   └─ failure ──► data cleared, "Couldn't load portfolio details — <message>"   (never the unavailable or flat state)
+Refresh ──► load() again (disabled while a request is pending; the previous data stays visible, dimmed, as "Refreshing…")
+collapse ──► counter++ (pending response discarded) · data, error and loading cleared
+unmount / newer request ──► counter++ ; a late success or failure changes nothing
+```
+
+| UI rule | As built |
+|---|---|
+| Wording | "Simulated portfolio from the running Portfolio State — not a connected real-money account. Loads on expansion and Refresh; not a live feed." The mode is shown as "Simulated"; any other mode string is shown verbatim as "<mode> (unrecognised mode)". |
+| Amounts | Printed exactly as sent (no parsing to float, no rounding); `null` is "—" with a reason beside it ("needs every exposure marked", "needs mark and stop on every exposure", "history incomplete", "incomplete — N unknown", "unavailable until every fee is known", "no cash source"). A negative amount is tinted bear, a positive one bull; `null` is neutral. |
+| Held vs pending | Two separate groups with their own headings; held rows say "Avg", pending rows say "Ref" (the order's reference price). Each row shows the mark with its `as_of` time, or "no mark yet". |
+| Polling | None. Loaded on expansion and on manual Refresh only; no WebSocket channel carries portfolio changes. |
+| Existing summary | `WorldViewSummary` and its compact Portfolio row are untouched. |
+
+**Limits.** The values are a point-in-time read of an in-memory cache: marks come from `PriceUpdated` ticks for held symbols
+only (a pending-only symbol has no mark, so its unrealized P&L is unknown), and the cache is null while an accounting
+backlog or an unresolved order is pending, so the section can show "unavailable" for a moment after a fill. Daily amounts
+use the snapshot's MarketClock trading day (ET). The section describes the simulated mode only; paper/live portfolios have
+no source here. Not verified against a running backend with a live simulated session (see `TESTING.md`).
+
+**Verification.** `backend/tests/test_portfolio_state_route.py` (restored in-memory `PortfolioState` fixtures, no database):
+unavailable versus flat, marked and unmarked positions, short sign, pending-entry exposure, partial fills, exit orders,
+daily rows and unknown fees, incomplete history, exact decimals, one snapshot per request, no ledger or mutator access.
+The frontend hook/section behavior was checked with a throwaway jsdom harness (not committed). See `TESTING.md`.
+
 ### 6.6 Position Monitor-lite (`position_monitor/`)
 
 **As built (`position-monitor-portfolio-reader`, then `position-monitor-observer-wiring`).** `PortfolioStatePositionReader` implements

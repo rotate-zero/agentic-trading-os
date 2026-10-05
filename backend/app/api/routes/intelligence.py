@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -920,6 +921,85 @@ async def get_world_view(request: Request, symbol: str | None = Query(None)):
     from app.world_view import WorldView
 
     return await WorldView(getattr(request.app.state, "world_view_portfolio_reader", None)).snapshot(symbol)
+
+
+def _dec(value: Decimal | None) -> str | None:
+    """Exact decimal string (fixed-point, never exponent form); None stays None."""
+    return None if value is None else format(value, "f")
+
+
+def _project_portfolio_state(snapshot: Any) -> dict[str, Any]:
+    """Shape one detached `PortfolioSnapshot` for the wire.
+
+    Pure projection: every value is copied from the snapshot, nothing is
+    computed here. `Decimal` -> exact string, unavailable (`None`) -> `null`.
+    `realized_pnl_today` is the snapshot's own property (null unless both
+    profit and loss are known). `buying_power` is the snapshot's own field,
+    always `None` today (no cash source exists).
+    """
+    return {
+        "execution_mode": snapshot.execution_mode,
+        "trading_day": snapshot.trading_day.isoformat(),
+        "snapshot_time": snapshot.as_of.isoformat(),
+        "open_position_count": snapshot.open_position_count,
+        "in_flight_order_count": snapshot.in_flight_count,
+        "positions": [
+            {
+                "position_id": str(p.position_id),
+                "symbol": p.symbol,
+                "side": p.side,
+                "qty": p.qty,
+                "avg_entry_price": _dec(p.avg_price),
+                "stop": _dec(p.stop),
+                "target": _dec(p.target),
+                "opened_at": p.opened_at.isoformat(),
+            }
+            for p in snapshot.positions.values()
+        ],
+        "exposures": [
+            {
+                "symbol": e.symbol,
+                "direction": e.direction,
+                "qty": e.qty,
+                "avg_entry_price": _dec(e.avg_entry_price),
+                "stop": _dec(e.stop),
+                "mark": _dec(e.mark),
+                "unrealized_pnl": _dec(e.unrealized_pnl),
+                "is_in_flight": e.is_in_flight,
+            }
+            for e in snapshot.exposures
+        ],
+        "marks": [
+            {"symbol": symbol, "price": _dec(price), "as_of": ts.isoformat()}
+            for symbol, (price, ts) in snapshot.marks.items()
+        ],
+        "realized_profit_today": _dec(snapshot.realized_profit_today),
+        "realized_loss_today": _dec(snapshot.realized_loss_today),
+        "realized_pnl_today": _dec(snapshot.realized_pnl_today),
+        "reported_fees_today": _dec(snapshot.reported_fees_today),
+        "fees_today": _dec(snapshot.fees_today),
+        "unknown_fee_count_today": snapshot.unknown_fee_count_today,
+        "unrealized_pnl": _dec(snapshot.unrealized_pnl),
+        "open_risk": _dec(snapshot.open_risk),
+        "buying_power": _dec(snapshot.buying_power),
+    }
+
+
+@router.get("/portfolio-state")
+async def get_portfolio_state(request: Request) -> dict[str, Any]:
+    """Read-only detail projection of the running Portfolio State snapshot.
+
+    Reuses the lifespan-installed `app.state.world_view_portfolio_reader`
+    (the one running `PortfolioState`); no second instance, no database
+    read, no refresh/reconciliation, no ledger write. Exactly one
+    system-wide `get_snapshot()` per request (it is synchronous and I/O-free,
+    so it runs on the event loop like World View's own portfolio read).
+    `{"portfolio": null}` means the reader or its snapshot is unavailable; a
+    restored flat account is a populated object with empty `positions`.
+    """
+    reader = getattr(request.app.state, "world_view_portfolio_reader", None)
+    snapshot = None if reader is None else reader.get_snapshot()
+    return {"portfolio": None if snapshot is None else _project_portfolio_state(snapshot)}
 
 
 @router.get("/exit-intents")

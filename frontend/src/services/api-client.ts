@@ -1838,3 +1838,74 @@ export async function fetchWorldView(symbol?: string): Promise<WorldViewSnapshot
   }
   return (await res.json()) as WorldViewSnapshotWireShape;
 }
+
+// Matches GET /intelligence/portfolio-state exactly (`live-portfolio-details`),
+// verified against `_project_portfolio_state` in
+// backend/app/api/routes/intelligence.py. A read-only projection of the
+// running Portfolio State snapshot. Every money/price field is an exact
+// decimal string (never a number) so no precision is lost in transit;
+// `null` means the value is unavailable (unmarked position, incomplete daily
+// history, unknown fee, no cash source) and must never be shown as zero.
+// `portfolio: null` = the reader or its snapshot is unavailable; a restored
+// flat account is a populated object with empty `positions`/`exposures`.
+export interface PortfolioStatePositionWireShape {
+  position_id: string;
+  symbol: string;
+  side: string;
+  qty: number;
+  avg_entry_price: string;
+  stop: string | null;
+  target: string | null;
+  opened_at: string;
+}
+
+export interface PortfolioStateExposureWireShape {
+  symbol: string;
+  direction: string;
+  qty: number;
+  avg_entry_price: string | null;
+  stop: string | null;
+  mark: string | null;
+  unrealized_pnl: string | null;
+  // false = held (filled) position; true = remaining quantity of a pending entry order.
+  is_in_flight: boolean;
+}
+
+export interface PortfolioStateMarkWireShape {
+  symbol: string;
+  price: string;
+  as_of: string;
+}
+
+export interface PortfolioStateWireShape {
+  execution_mode: string;
+  trading_day: string;
+  snapshot_time: string;
+  open_position_count: number;
+  in_flight_order_count: number;
+  positions: PortfolioStatePositionWireShape[];
+  exposures: PortfolioStateExposureWireShape[];
+  marks: PortfolioStateMarkWireShape[];
+  realized_profit_today: string | null;
+  realized_loss_today: string | null;
+  realized_pnl_today: string | null;
+  reported_fees_today: string | null;
+  fees_today: string | null;
+  unknown_fee_count_today: number | null;
+  unrealized_pnl: string | null;
+  open_risk: string | null;
+  buying_power: string | null;
+}
+
+export interface PortfolioStateResponseWireShape {
+  portfolio: PortfolioStateWireShape | null;
+}
+
+/** GET /intelligence/portfolio-state — system-wide, takes no parameters. */
+export async function fetchPortfolioState(): Promise<PortfolioStateResponseWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/portfolio-state`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as PortfolioStateResponseWireShape;
+}
