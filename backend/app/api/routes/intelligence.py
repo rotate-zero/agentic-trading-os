@@ -446,7 +446,7 @@ async def get_opportunities_snapshot(symbol: str | None = Query(None)) -> dict[s
 
 @router.get("/strategy-outcomes")
 async def get_strategy_outcomes(
-    limit: int = Query(50, le=500),
+    limit: int = Query(50, ge=1, le=500, description="Cap on returned rows, 1-500 inclusive."),
     is_backtest: bool = Query(False),
     backtest_run_id: str | None = Query(None),
     sweep_id: str | None = Query(None),
@@ -461,9 +461,15 @@ async def get_strategy_outcomes(
     (`app/trading_intelligence/performance.py`, a separate, still-in-
     flight parallel track as of this delivery) this route does not import
     from or depend on. This is "show me what's actually in the table,"
-    most recent `exit_filled_at` first, capped by `limit` — same
-    `Query(default, le=cap)` shape GET /series already uses for `count`,
-    not GET /opportunities' shape (which has no such param at all).
+    most recent `exit_filled_at` first, capped by `limit`.
+
+    **Limit and ordering (task `outcome-read-limit-ordering`).** `limit`
+    is `Query(50, ge=1, le=500)`: zero, negative, above-cap and malformed
+    values are rejected by FastAPI with 422 before `_fetch_strategy_
+    outcomes` runs. Rows are ordered `exit_filled_at DESC, outcome_id
+    DESC`; `outcome_id` is only a deterministic tie-breaker for equal
+    timestamps (random UUIDs carry no chronology), so a limit that cuts
+    through a tied group returns a repeatable subset.
 
     Rows are validated through the existing `schemas.performance.
     StrategyOutcome` Pydantic contract (`model_validate(row,
@@ -599,7 +605,10 @@ def _fetch_strategy_outcomes(limit, is_backtest, backtest_run_uuid, sweep_uuid):
     try:
         rows = session.execute(
             query.where(*filters)
-            .order_by(StrategyOutcomeRecord.exit_filled_at.desc())
+            .order_by(
+                StrategyOutcomeRecord.exit_filled_at.desc(),
+                StrategyOutcomeRecord.outcome_id.desc(),
+            )
             .limit(limit)
         ).scalars().all()
         return [
@@ -753,7 +762,7 @@ async def get_expectancy_by_session_type_view(
 
 @router.get("/backtest-runs")
 async def get_backtest_runs(
-    limit: int = Query(50, le=500),
+    limit: int = Query(50, ge=1, le=500, description="Cap on returned rows, 1-500 inclusive."),
     run_id: str | None = Query(None),
     strategy_name: str | None = Query(None),
     sweep_id: str | None = Query(None),
@@ -796,10 +805,13 @@ async def get_backtest_runs(
     delivery (see that schema's own docstring, and `BacktestRunRecord`'s,
     for the correction).
 
-    Ordered by `created_at` descending — `backtests` has no
-    `exit_filled_at`-equivalent field, so `created_at` is this table's own
-    natural recency ordering, matching GET /strategy-outcomes' own
-    "most-recent-first" convention at the equivalent field for its table.
+    Ordered by `created_at` descending, then `run_id` descending —
+    `backtests` has no `exit_filled_at`-equivalent field, so `created_at`
+    is this table's own natural recency ordering, matching GET
+    /strategy-outcomes' own "most-recent-first" convention. `run_id` is
+    only a deterministic tie-breaker for equal timestamps (random UUIDs
+    carry no chronology). `limit` is `Query(50, ge=1, le=500)`; invalid
+    values are rejected with 422 before `_fetch_backtest_runs` runs.
 
     **Filters, all optional, all applied as an AND (never blended):**
     - `run_id` — exact match on the primary key. This is the direct
@@ -887,7 +899,7 @@ def _fetch_backtest_runs(limit, run_uuid, strategy_name, sweep_uuid):
         rows = session.execute(
             select(BacktestRunRecord)
             .where(*filters)
-            .order_by(BacktestRunRecord.created_at.desc())
+            .order_by(BacktestRunRecord.created_at.desc(), BacktestRunRecord.run_id.desc())
             .limit(limit)
         ).scalars().all()
         return [

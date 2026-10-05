@@ -51,13 +51,14 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from app.api.routes import intelligence as intelligence_routes
 from app.db.session import SessionLocal
 from app.event_bus.bus import get_event_bus
 from app.event_bus.events import make_envelope
@@ -163,7 +164,9 @@ def _make_outcome_record(exit_filled_at: datetime, **overrides) -> StrategyOutco
     return StrategyOutcomeRecord(**fields)
 
 
-def _insert_backtest_run(*, sweep_id: "uuid.UUID | None" = None) -> "uuid.UUID":
+def _insert_backtest_run(
+    *, sweep_id: "uuid.UUID | None" = None, run_id: "uuid.UUID | None" = None
+) -> "uuid.UUID":
     """Inserts one real `backtests` row, scoped to `_STRATEGY_NAME` for
     this file's own cleanup, and returns its real generated `run_id`.
     Needed because `strategy_outcomes.backtest_run_id` is a real,
@@ -175,7 +178,7 @@ def _insert_backtest_run(*, sweep_id: "uuid.UUID | None" = None) -> "uuid.UUID":
     in this codebase already proving this exact FK relationship."""
     session = SessionLocal()
     try:
-        row = BacktestRunRecord(
+        fields = dict(
             sweep_id=sweep_id or uuid.uuid4(),
             strategy_name=_STRATEGY_NAME,
             strategy_version="orb_v1",
@@ -188,6 +191,9 @@ def _insert_backtest_run(*, sweep_id: "uuid.UUID | None" = None) -> "uuid.UUID":
             walk_forward_fold=1,
             is_holdout=False,
         )
+        if run_id is not None:
+            fields["run_id"] = run_id
+        row = BacktestRunRecord(**fields)
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -647,6 +653,132 @@ def test_strategy_outcomes_run_and_sweep_filters_are_and_combined():
     assert [o["outcome_id"] for o in ours] == [str(matching_id)]
     assert inconsistent.status_code == 200
     assert inconsistent.json() == {"outcomes": []}
+
+
+# --- Task outcome-read-limit-ordering — limit bounds and tie-break order ---
+#
+# `limit` is `Query(50, ge=1, le=500)`; ordering is `exit_filled_at DESC,
+# outcome_id DESC`. The outcome_id tie-breaker is a deterministic
+# stability rule only — random UUIDs carry no chronology. Tied-timestamp
+# tests below use fixed UUID literals whose DESC order differs from their
+# insertion order, so neither insertion order nor an unordered scan can
+# satisfy them by accident.
+
+_TIE_TS = datetime(2099, 5, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _tie_id(n: int) -> uuid.UUID:
+    """Fixed UUIDs; Postgres and Python both order uuid bytewise."""
+    return uuid.UUID(f"00000000-0000-4000-8000-0000000000{n:02x}")
+
+
+@pytest.mark.parametrize("bad_limit", ["0", "-1", "501", "100000", "abc", "1.5", ""])
+def test_strategy_outcomes_invalid_limit_is_422_and_never_reaches_database_helper(monkeypatch, bad_limit):
+    calls: list[tuple] = []
+    monkeypatch.setattr(intelligence_routes, "_fetch_strategy_outcomes", lambda *a: calls.append(a) or [])
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/strategy-outcomes", params={"limit": bad_limit})
+
+    assert resp.status_code == 422
+    assert calls == []
+
+
+@pytest.mark.parametrize("params,expected_limit", [({}, 50), ({"limit": 1}, 1), ({"limit": 500}, 500)])
+def test_strategy_outcomes_valid_boundary_and_default_limits_reach_helper(monkeypatch, params, expected_limit):
+    calls: list[tuple] = []
+    monkeypatch.setattr(intelligence_routes, "_fetch_strategy_outcomes", lambda *a: calls.append(a) or [])
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/strategy-outcomes", params=params)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"outcomes": []}
+    assert [call[0] for call in calls] == [expected_limit]
+
+
+def test_strategy_outcomes_existing_filter_validation_still_400_with_valid_limit():
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/strategy-outcomes", params={"limit": 1, "backtest_run_id": str(uuid.uuid4())})
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_tied_timestamps_order_by_outcome_id_desc_and_limit_cuts_tied_group():
+    # Insertion order 2, 3, 1 is neither ascending nor descending by id.
+    _insert([
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(n))
+        for n in (2, 3, 1)
+    ])
+    older_id = uuid.uuid4()
+    _insert([_make_outcome_record(exit_filled_at=_TIE_TS - timedelta(hours=1), outcome_id=older_id)])
+
+    with TestClient(app) as client:
+        full = client.get("/intelligence/strategy-outcomes", params={"limit": 4})
+        cut = client.get("/intelligence/strategy-outcomes", params={"limit": 2})
+        cut_one = client.get("/intelligence/strategy-outcomes", params={"limit": 1})
+
+    assert [o["outcome_id"] for o in full.json()["outcomes"]] == [
+        str(_tie_id(3)), str(_tie_id(2)), str(_tie_id(1)), str(older_id),
+    ]
+    # The limit cuts through the three-row tied group: highest ids win.
+    assert [o["outcome_id"] for o in cut.json()["outcomes"]] == [str(_tie_id(3)), str(_tie_id(2))]
+    assert [o["outcome_id"] for o in cut_one.json()["outcomes"]] == [str(_tie_id(3))]
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_selected_backtest_run_ties_ordered_and_limit_applies_after_filter():
+    run_id, other_run = uuid.uuid4(), uuid.uuid4()
+    _insert_backtest_run(run_id=run_id)
+    _insert_backtest_run(run_id=other_run)
+    # A same-timestamp row in another run and a live row with a higher id
+    # must be filtered out BEFORE the limit, not consume a slot.
+    _insert([
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(5), is_backtest=True, backtest_run_id=other_run),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(6), is_backtest=False),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(2), is_backtest=True, backtest_run_id=run_id),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(4), is_backtest=True, backtest_run_id=run_id),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(1), is_backtest=True, backtest_run_id=run_id),
+    ])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 2, "is_backtest": "true", "backtest_run_id": str(run_id)},
+        )
+
+    assert resp.status_code == 200
+    assert [o["outcome_id"] for o in resp.json()["outcomes"]] == [str(_tie_id(4)), str(_tie_id(2))]
+
+
+@pytest.mark.skipif(not _db_available(), reason="real Postgres not reachable")
+def test_strategy_outcomes_sweep_spanning_runs_ties_are_globally_ordered_and_limit_cuts_once():
+    sweep_id = uuid.uuid4()
+    run_a, run_b = uuid.uuid4(), uuid.uuid4()
+    _insert_backtest_run(sweep_id=sweep_id, run_id=run_a)
+    _insert_backtest_run(sweep_id=sweep_id, run_id=run_b)
+    excluded_run = uuid.uuid4()
+    _insert_backtest_run(run_id=excluded_run)  # different (random) sweep
+    _insert([
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(1), is_backtest=True, backtest_run_id=run_a),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(4), is_backtest=True, backtest_run_id=run_b),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(2), is_backtest=True, backtest_run_id=run_b),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(3), is_backtest=True, backtest_run_id=run_a),
+        _make_outcome_record(exit_filled_at=_TIE_TS, outcome_id=_tie_id(9), is_backtest=True, backtest_run_id=excluded_run),
+    ])
+
+    with TestClient(app) as client:
+        resp = client.get(
+            "/intelligence/strategy-outcomes",
+            params={"limit": 3, "is_backtest": "true", "sweep_id": str(sweep_id)},
+        )
+
+    assert resp.status_code == 200
+    rows = resp.json()["outcomes"]
+    # One global ordering across both runs, one limit over the whole sweep.
+    assert [o["outcome_id"] for o in rows] == [str(_tie_id(4)), str(_tie_id(3)), str(_tie_id(2))]
+    assert {o["backtest_run_id"] for o in rows} == {str(run_a), str(run_b)}
 
 
 # --- GET /intelligence/opportunity-conflicts --------------------------------

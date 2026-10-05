@@ -44,6 +44,7 @@ from app.backtest_runner.context_provider import FixtureBacktestContextProvider
 from app.backtest_runner.fixture_provider import FixtureCandleProvider
 from app.backtest_runner.runner import BacktestRunner
 from app.broker_adapters.base import Candle
+from app.api.routes import intelligence as intelligence_routes
 from app.db.session import SessionLocal
 from app.main import app
 from app.models.trading_intelligence import BacktestRunRecord
@@ -346,3 +347,75 @@ def test_route_rejects_malformed_sweep_id():
         resp = client.get("/intelligence/backtest-runs", params={"sweep_id": "not-a-uuid"})
 
     assert resp.status_code == 400
+
+
+# --- Task outcome-read-limit-ordering — limit bounds and tie-break order ---
+#
+# `limit` is `Query(50, ge=1, le=500)`; ordering is `created_at DESC,
+# run_id DESC`. run_id is only a deterministic tie-breaker (random UUIDs
+# carry no chronology). Tie tests use fixed UUID literals whose DESC order
+# differs from insertion order.
+
+_TIE_TS = datetime(2099, 6, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _tie_id(n: int) -> uuid.UUID:
+    return uuid.UUID(f"00000000-0000-4000-8000-0000000000{n:02x}")
+
+
+@pytest.mark.parametrize("bad_limit", ["0", "-1", "501", "100000", "abc", "1.5", ""])
+def test_route_invalid_limit_is_422_and_never_reaches_database_helper(monkeypatch, bad_limit):
+    calls: list[tuple] = []
+    monkeypatch.setattr(intelligence_routes, "_fetch_backtest_runs", lambda *a: calls.append(a) or [])
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/backtest-runs", params={"limit": bad_limit})
+
+    assert resp.status_code == 422
+    assert calls == []
+
+
+@pytest.mark.parametrize("params,expected_limit", [({}, 50), ({"limit": 1}, 1), ({"limit": 500}, 500)])
+def test_route_valid_boundary_and_default_limits_reach_helper(monkeypatch, params, expected_limit):
+    calls: list[tuple] = []
+    monkeypatch.setattr(intelligence_routes, "_fetch_backtest_runs", lambda *a: calls.append(a) or [])
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/backtest-runs", params=params)
+
+    assert resp.status_code == 200
+    assert resp.json() == {"backtest_runs": []}
+    assert [call[0] for call in calls] == [expected_limit]
+
+
+def test_route_tied_created_at_orders_by_run_id_desc_and_limit_cuts_tied_group():
+    # Insertion order 2, 3, 1 is neither ascending nor descending by id.
+    for n in (2, 3, 1):
+        _insert_backtest_run(run_id=_tie_id(n), created_at=_TIE_TS)
+    older = _insert_backtest_run(created_at=_TIE_TS - timedelta(hours=1))
+
+    with TestClient(app) as client:
+        params = {"strategy_name": _STRATEGY_NAME}
+        full = client.get("/intelligence/backtest-runs", params={**params, "limit": 4})
+        cut = client.get("/intelligence/backtest-runs", params={**params, "limit": 2})
+        cut_one = client.get("/intelligence/backtest-runs", params={**params, "limit": 1})
+
+    ids = lambda r: [row["run_id"] for row in r.json()["backtest_runs"]]  # noqa: E731
+    assert ids(full) == [str(_tie_id(3)), str(_tie_id(2)), str(_tie_id(1)), str(older.run_id)]
+    assert ids(cut) == [str(_tie_id(3)), str(_tie_id(2))]
+    assert ids(cut_one) == [str(_tie_id(3))]
+
+
+def test_route_limit_applies_after_sweep_filter_with_tied_created_at():
+    sweep_id = uuid.uuid4()
+    for n in (2, 4, 1):
+        _insert_backtest_run(run_id=_tie_id(n), created_at=_TIE_TS, sweep_id=sweep_id)
+    # Same timestamp, higher id, different sweep: must be filtered out
+    # BEFORE the limit rather than consume a slot.
+    _insert_backtest_run(run_id=_tie_id(9), created_at=_TIE_TS)
+
+    with TestClient(app) as client:
+        resp = client.get("/intelligence/backtest-runs", params={"sweep_id": str(sweep_id), "limit": 2})
+
+    assert resp.status_code == 200
+    assert [row["run_id"] for row in resp.json()["backtest_runs"]] == [str(_tie_id(4)), str(_tie_id(2))]

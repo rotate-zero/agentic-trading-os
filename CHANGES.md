@@ -1,3 +1,18 @@
+<!-- BEGIN DELIVERY SECTION: outcome-read-limit-ordering (backend + tests + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `outcome-read-limit-ordering`
+
+Base: GitHub `main` `54c884b4d0842ef39a04ff37c8e0dea652e18217` (re-checked against `origin/main` before packaging: no newer commits). No decision number is assigned: the delivery slug identifies it, and the canonical log and `docs/decisions/INDEX.md` were not touched.
+
+Changed code file: `backend/app/api/routes/intelligence.py` (only `GET /intelligence/strategy-outcomes`, `GET /intelligence/backtest-runs` and their `_fetch_*` helpers). Changed tests: `backend/tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`, `backend/tests/test_backtest_runs_route.py`.
+
+- **Problem.** Both routes declared `limit: int = Query(50, le=500)` with no lower bound, so `limit=0` returned an empty page and a negative limit reached PostgreSQL as an invalid `LIMIT`. Strategy outcomes were ordered only by `exit_filled_at DESC` and backtest runs only by `created_at DESC`, so rows with equal timestamps came back in an unspecified order and a `limit` cutting through a tied group could pick different rows between calls.
+- **Limit.** Both routes now declare `Query(50, ge=1, le=500)`. The default stays 50. Zero, negative, above-500 and non-integer values are rejected by FastAPI with HTTP 422 before the route body, so the `_fetch_*` helper (and the database) is never reached. 1 and 500 are accepted.
+- **Ordering.** Strategy outcomes: `exit_filled_at DESC, outcome_id DESC`. Backtest runs: `created_at DESC, run_id DESC`. The UUID is a deterministic tie-breaker only; random UUIDs carry no chronology and the docs and docstrings say so.
+- **Unchanged.** Filtering is still applied in the WHERE clause before ordering and `LIMIT` is applied once to the final filtered population (including a sweep spanning several runs). Response schemas, existing filters, 400 validation for UUID and contradictory filters, `is_backtest` isolation and sweep semantics are untouched. No frontend, schema, migration, writer, performance-aggregation or execution-policy change.
+- **Tests.** Invalid limits (`0`, `-1`, `501`, `100000`, `abc`, `1.5`, empty) give 422 with the helper never called; omitted/1/500 reach the helper as 50/1/500. Tie tests seed fixed UUID literals whose descending order differs from insertion order and assert the exact order, a limit cutting through the tied group, a selected backtest run, a sweep spanning two runs (with an excluded run and a live row holding higher ids), and backtest-run ties filtered by sweep. The test helper `_insert_backtest_run` gained an optional `run_id`.
+- **Docs.** `docs/architecture/backtest-runner-design.md` gains subsection "Read-endpoint limit validation and deterministic ordering" with an endpoint-to-query data-flow diagram and a validation/filter/order/limit diagram.
+<!-- END DELIVERY SECTION: outcome-read-limit-ordering -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-results-request-safety (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `scanner-results-request-safety`
 

@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: outcome-read-limit-ordering (backend + tests + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `outcome-read-limit-ordering`
+
+Base `54c884b4d0842ef39a04ff37c8e0dea652e18217`. Disposable PostgreSQL 16 database `trading_workspace` created for this run and migrated with `alembic upgrade head` (to 0017). Tests ran serially.
+
+- **Baseline (untouched base).** `tests/test_backtest_runs_route.py` + `tests/test_strategy_outcomes_and_opportunity_conflicts_routes.py`: 27 passed.
+- **After the change.** The same two modules: 53 passed, 0 failed, 0 skipped (26 new test cases, including parametrized ones).
+- **Related read coverage.** `tests/test_intelligence_history_read_concurrency.py`, `tests/test_outcome_read_path_integration.py`, `tests/test_performance_analytics_routes.py`: 13 passed.
+- **Regression check.** With the new tests applied to the original `intelligence.py`: 9 failed, 44 passed. The failures are invalid `limit=0` / `limit=-1` accepted (both routes), and all five tie tests (outcomes: tied order, selected run, sweep; runs: tied order, sweep-filtered limit). The 501, non-integer and boundary cases already behaved correctly on the base and pass on both. Source restored afterwards.
+- **Not run.** Full backend suite (not requested); frontend (untouched).
+- **Delivery check.** The ZIP was extracted over a clean checkout of the base above; `git diff --check` is clean and the two route modules pass (53) there. `origin/main` was re-fetched immediately before packaging: unchanged.
+<!-- END DELIVERY SECTION: outcome-read-limit-ordering -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-results-request-safety (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `scanner-results-request-safety`
 

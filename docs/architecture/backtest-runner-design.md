@@ -1143,6 +1143,52 @@ independent `/health` request.
 
 ---
 
+### Read-endpoint limit validation and deterministic ordering (task `outcome-read-limit-ordering`)
+
+No decision number (the delivery slug identifies it). Changes only the `limit` contract and the ORDER BY of `GET /intelligence/strategy-outcomes` and `GET /intelligence/backtest-runs`; response shapes, filters, `is_backtest` isolation, sweep semantics and the worker-thread read boundary above are unchanged.
+
+- `limit` is `Query(50, ge=1, le=500)` on both routes (default 50). `0`, negatives, values above 500 and non-integers are rejected by FastAPI with 422 before the route body runs, so `_fetch_strategy_outcomes` / `_fetch_backtest_runs` and the database are never reached.
+- Strategy outcomes order by `exit_filled_at DESC, outcome_id DESC`; backtest runs by `created_at DESC, run_id DESC`. The UUID only makes equal-timestamp ordering repeatable (so a `limit` cutting through a tied group returns the same rows every time); it is not a chronological signal.
+- Filters are WHERE predicates, so they apply before ordering. `LIMIT` is applied once to the final filtered population, including a sweep that spans several runs.
+
+Data flow between components:
+
+```
+HTTP client
+   │  GET /intelligence/strategy-outcomes?limit&is_backtest&backtest_run_id&sweep_id
+   │  GET /intelligence/backtest-runs?limit&run_id&strategy_name&sweep_id
+   ▼
+FastAPI parameter layer ── limit not int in [1, 500] ──► HTTP 422 (route and helper not run)
+   │ valid
+   ▼
+async route (intelligence.py): UUID / contradictory-filter checks ──► HTTP 400
+   │ valid
+   ▼
+asyncio.to_thread(_fetch_strategy_outcomes | _fetch_backtest_runs)
+   │
+   ▼
+worker session (SessionLocal) ──► PostgreSQL: strategy_outcomes [JOIN backtests for sweep_id] | backtests
+   │  rows
+   ▼
+Pydantic StrategyOutcome | BacktestRun → model_dump(json) → {"outcomes": [...]} | {"backtest_runs": [...]}
+```
+
+Internal flow inside each `_fetch_*` query:
+
+```
+limit (already 1..500)
+   │
+   ▼
+WHERE filters ──────────────► ORDER BY ───────────────────────────────► LIMIT n ──► rows
+ outcomes: is_backtest,        outcomes: exit_filled_at DESC, outcome_id DESC   (once, after filter
+   [backtest_run_id],          runs:     created_at DESC,    run_id DESC         and order; never
+   [sweep_id via JOIN]                                                            per run)
+ runs: [run_id],[strategy_name],
+   [sweep_id]
+```
+
+---
+
 ### Backtest Results refresh recovery (task `backtest-results-refresh-recovery`)
 
 Frontend-only; no backend, API contract, `WorkspaceContext.tsx`, dependency or lockfile change, and no decision number (the delivery slug identifies it). Changed: `BacktestResultsPanel.tsx`, `useBacktestOutcomes.ts`, `useBacktestSweepOutcomes.ts`, `useBacktestRuns.ts`.
