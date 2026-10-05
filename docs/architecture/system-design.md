@@ -192,6 +192,71 @@ BrokerPanel "Subscribe <SYM>" click ──► subscribe(symbol)
 
 Deliberately local component state for this panel's own collapsed/widthPx chrome (not threaded through `WorkspaceContext.tsx`) — same reasoning `BacktestPanel.tsx`/`BacktestResultsPanel.tsx` already established for themselves: the real connection state lives on the backend and is independently, correctly re-polled by every mounted instance of this panel regardless of which Main Window it's in, so there's no correctness gap from keeping just the resize/collapse chrome unsynced.
 
+**Broker panel request safety (task `broker-panel-request-safety`; no decision number — it hardens the decision #144 panel without changing its contracts).** `useBrokerStatus.ts` + `BrokerPanel.tsx` originally let overlapping `GET /broker/status` reads finish out of order and overwrite newer state or errors, kept applying completions after unmount, relied on a disabled button (not a synchronous guard) against duplicate actions, dropped a row permanently on a failed unsubscribe, and cleared the subscribe input even if the user had typed something else meanwhile. Endpoints, the 10 s poll, backend error text, and the "failed status read ≠ confirmed disconnect" distinction are unchanged; the subscription list stays local to the panel.
+
+Data flow between the affected components (new/changed pieces marked `*`):
+
+```
+BrokerPanel.tsx                              useBrokerStatus.ts
+┌──────────────────────────┐   actions       ┌─────────────────────────────────────────┐
+│ Connect / Disconnect     │ ──────────────► │ connect() disconnect() subscribe()      │
+│ Subscribe form (Enter /  │ (never trusts   │ unsubscribe()                           │
+│  button) — UI guard only │  its own        │   * synchronous guards:                 │
+│ × per row                │  disabled)      │     connectionOpRef  ("connect"|       │
+│                          │                 │       "disconnect"|null)                │
+│                          │ ◄────────────── │     symbolOpRef      (token | null)     │
+│ * disabled = `mutating`  │  connected,     │   * statusSeqRef  (read identity)       │
+│ * input cleared only if  │  statusError,   │   * mountedRef                          │
+│   it still equals the    │  subscribedSymbols (confirmed list minus the            │
+│   submitted value        │  mutating, unsubscribingSymbol, ...  pending-unsub row)  │
+└──────────────────────────┘                 └───────────────┬─────────────────────────┘
+                                                              │ fetch()  (api-client.ts, unchanged)
+                                                              ▼
+                              GET /broker/status (10 s poll + post-action read)
+                              POST /broker/connect | disconnect
+                              POST /broker/subscribe?symbol= | unsubscribe?symbol=
+```
+
+Internal flow of the hook:
+
+```
+STATUS READS                                   MUTATIONS
+refetchStatus()                                connect()/disconnect()
+  id = ++statusSeqRef                            refused (returns, sends nothing) if connectionOpRef set
+  GET /broker/status                             connectionOpRef = kind ; ++statusSeqRef   ← reads begun before
+    │                                            POST …                                       this action die here
+    ├─ settles: apply ONLY IF mounted            ├─ confirmed disconnect / "connected":
+    │   AND id == statusSeqRef                   │     resetSubscriptions()
+    │   (success, error AND end of loading)      ├─ failed: connectError / disconnectError;
+    │   else: dropped silently                   │     list untouched
+    ├─ ok:  prev true → false (external drop)    └─ finally: release ref; if mounted → refetchStatus()
+    │         → resetSubscriptions()
+    │       connected = wire ; statusError = null
+    └─ err: statusError only; connected and the
+            list are KEPT (no fresh read ≠ disconnected)
+
+resetSubscriptions()  (confirmed disconnect | confirmed new connection | poll-detected drop)
+  symbolOpRef = null  ← detaches any pending subscribe/unsubscribe: its late result changes nothing
+  clear pending flags ; confirmedSymbols = []
+
+subscribe(sym) / unsubscribe(sym)
+  refused if connectionOpRef set OR symbolOpRef set   (one symbol action at a time)
+  symbolOpRef = op          ← set synchronously, before the first await
+  subscribe:   success + op still current → append to confirmed list, resolve true
+               otherwise (rejected / detached / unmounted) → resolve false
+  unsubscribe: row only HIDDEN while pending (confirmed list not edited)
+               success + op current → remove from confirmed list
+               failure + op current → symbolActionError ; row reappears in its original position
+               op detached → nothing
+  finally: release symbolOpRef only if it is still this op
+
+unmount: mountedRef = false ; clearInterval ; every completion above checks mountedRef first
+```
+
+Mutation compatibility (what the hook refuses synchronously): `connect`/`disconnect` refuse while another `connect`/`disconnect` is pending; `subscribe`/`unsubscribe` refuse while a `connect`/`disconnect` or another symbol action is pending. `connect`/`disconnect` are deliberately **not** refused during a symbol action — a hung subscribe must not trap the user — they supersede it as described above. A failed `disconnect` supersedes nothing, so a subscribe that lands afterwards is still recorded. The panel disables Connect/Disconnect, the row ×, and Subscribe from the same `mutating` state, but the hook guards hold even when two events fire before React re-renders (repeated Enter).
+
+Known limits: requests are not cancelled (a superseded POST may still complete on the backend; the UI only stops reporting it, and a subscribe superseded by a failed-then-retried disconnect is not recorded locally); a status read slower than the 10 s poll interval is always superseded and never shown, so a backend that slow leaves the panel on its last reading/"Checking…"; the panel still reads connection state from `GET /broker/status`, which reports any streaming provider (provider-identity question documented in `ibkr-broker-panel-validation.md` P1, out of scope here).
+
 ### 4.2 Market Data Engine
 The only module allowed to talk to a broker for data.
 

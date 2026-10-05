@@ -39,23 +39,32 @@ function StatusIndicator({ connected, loading }: { connected: boolean | null; lo
 
 function SubscribeForm({
   connected,
-  subscribing,
+  busy,
   symbolActionError,
   onSubscribe,
 }: {
   connected: boolean;
-  subscribing: boolean;
+  /** Any broker action pending (the hook refuses a second one anyway). */
+  busy: boolean;
   symbolActionError: string | null;
   onSubscribe: (symbol: string) => Promise<boolean>;
 }) {
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Mirrors `input` synchronously (state is stale inside an async handler):
+  // lets the post-await check see what the field holds NOW.
+  const latestInputRef = useRef("");
 
   const handleSubscribe = async () => {
-    const symbol = input.trim();
+    if (busy) return; // UI-level guard; the hook's synchronous guard is the real one
+    const submitted = input;
+    const symbol = submitted.trim();
     if (!symbol) return;
     const ok = await onSubscribe(symbol);
-    if (ok) {
+    // Clear only if the field still holds what was submitted — text typed
+    // while the request was pending belongs to the next subscribe.
+    if (ok && latestInputRef.current === submitted) {
+      latestInputRef.current = "";
       setInput("");
       inputRef.current?.focus();
     }
@@ -68,7 +77,11 @@ function SubscribeForm({
         <input
           ref={inputRef}
           value={input}
-          onChange={(e) => setInput(e.target.value.toUpperCase())}
+          onChange={(e) => {
+            const next = e.target.value.toUpperCase();
+            latestInputRef.current = next;
+            setInput(next);
+          }}
           onKeyDown={(e) => e.key === "Enter" && handleSubscribe()}
           placeholder={connected ? "e.g. NVDA" : "Connect first"}
           maxLength={6}
@@ -77,7 +90,7 @@ function SubscribeForm({
         />
         <button
           onClick={handleSubscribe}
-          disabled={!connected || subscribing || !input.trim()}
+          disabled={!connected || busy || !input.trim()}
           className="rounded border border-base-border px-2 py-1 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
         >
           Subscribe
@@ -103,7 +116,7 @@ export function BrokerPanel() {
     disconnectError,
     disconnect,
     subscribedSymbols,
-    subscribing,
+    mutating,
     symbolActionError,
     subscribe,
     unsubscribe,
@@ -158,14 +171,14 @@ export function BrokerPanel() {
               <div className="flex gap-1">
                 <button
                   onClick={() => void connect()}
-                  disabled={connecting || connected === true}
+                  disabled={connecting || disconnecting || connected === true}
                   className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
                 >
                   {connecting ? "Connecting…" : "Connect"}
                 </button>
                 <button
                   onClick={() => void disconnect()}
-                  disabled={disconnecting || connected !== true}
+                  disabled={connecting || disconnecting || connected !== true}
                   className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
                 >
                   {disconnecting ? "…" : "Disconnect"}
@@ -207,7 +220,8 @@ export function BrokerPanel() {
                   <button
                     onClick={() => void unsubscribe(s)}
                     title={`Unsubscribe ${s}`}
-                    className="rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear"
+                    disabled={mutating}
+                    className="rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear disabled:opacity-50"
                   >
                     ×
                   </button>
@@ -224,7 +238,7 @@ export function BrokerPanel() {
 
             <SubscribeForm
               connected={connected === true}
-              subscribing={subscribing}
+              busy={mutating}
               symbolActionError={symbolActionError}
               onSubscribe={subscribe}
             />
