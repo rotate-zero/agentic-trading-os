@@ -1236,3 +1236,59 @@ Frontend-only; no backend, API contract, `WorkspaceContext.tsx`, dependency or l
  effect cleanup [key change, disabled, unmount]:  latest += 1   (in-flight work becomes stale)
  render:  snapshot.key === currentKey ? snapshot : { loading: active, rows: [], error: null }
 ```
+
+---
+
+### Backtest Results CSV export (task `backtest-results-csv-export`)
+
+Frontend-only; no backend, API contract, hook, `api-client.ts`, `WorkspaceContext.tsx`, dependency or lockfile change, and no decision number (the delivery slug identifies it). Changed: `BacktestResultsPanel.tsx`; new: `outcomesCsv.ts` (same folder).
+
+**What it does.** `OutcomesListSection` (shared by the run_id and sweep_id views) shows a **Download loaded rows** button that serializes the `outcomes` array it is already rendering. No request is made and no state is added.
+
+**Loaded-row limitation.** The export is the *loaded subset* for the applied filter, in displayed order. The panel's request limit stays 500 (`OUTCOMES_LIMIT`); a run or sweep with more outcomes yields a file with only the newest loaded rows. The panel states this next to the button. There is no pagination or export-all path.
+
+| Situation | Export |
+|---|---|
+| Loading (first load, Refresh of the same filter, render right after a filter change/tab switch) | Disabled |
+| Error | Disabled |
+| Empty result (including a sweep whose runs all recorded zero outcomes, or no sweep applied) | Disabled |
+| Settled, successful, non-empty | Enabled; file = exactly the displayed rows |
+
+**Why previous-filter rows cannot be exported.** `useBacktestOutcomes` / `useBacktestSweepOutcomes` return rows only for the current request key (see "Backtest Results refresh recovery" above), so the `outcomes` array, `loading`, `error` and the applied identifier passed to the section all belong to the same render. The click handler repeats the gate and reads the same props.
+
+**Component data flow.**
+
+```
+ BacktestResultsBody
+   run_id view   ── useBacktestOutcomes(limit 500, appliedRunId) ──► outcomes ─┐
+   sweep_id view ── useBacktestSweepOutcomes(appliedSweepId)      ──► outcomes ─┤  (current key only)
+   exportMode ("run" | "sweep") + exportId (applied identifier) ────────────────┤
+                                                                                 ▼
+                                                              OutcomesListSection
+                                                       list rows ◄── outcomes ──► [Download loaded rows]
+                                                                                 │ click (gate re-checked)
+                                                                                 ▼
+                                      outcomesCsv.ts: outcomesToCsv(outcomes) + outcomesCsvFilename(mode, id)
+                                                                                 ▼
+                                                                  downloadCsvFile(filename, csv)
+                                                                                 ▼
+                                                                    browser saves the file
+```
+
+**Internal export flow (`outcomesCsv.ts`).**
+
+```
+ outcomesToCsv(outcomes)
+   header row  ◄── OUTCOME_CSV_COLUMNS (fixed order = contract)
+   per outcome, per column by kind:
+     number    ─ null/undefined/non-finite → ""   │ number → String(value)   (never protected, never rounded)
+     timestamp ─ ISO-8601 string → verbatim       │ other parseable → toISOString() │ else verbatim
+     text      ─ null → ""  │ leading = + - @ TAB CR → prefix "'"
+   escape: , " CR LF → "..." with "" doubling;  join "," ; records end CRLF
+
+ downloadCsvFile(name, csv)
+   Blob(BOM + csv) → URL.createObjectURL → hidden <a download> appended → click
+   finally: anchor.remove(); setTimeout(revokeObjectURL, 10 s)
+```
+
+**File contract.** Columns, in order: `outcome_id, backtest_run_id, symbol, strategy_name, strategy_version, direction, entry_filled_at, exit_filled_at, entry_price, exit_price, realized_r, exit_reason, realized_pnl, entry_qty, exit_qty, holding_seconds, commission_total, slippage_entry, final_stop, final_target, structural_invalidation, structural_target, confidence_at_signal, trading_day, opportunity_id, origin` (names equal the wire fields; JSON blobs excluded; run-level settings such as `config_hash` are not included). Filename `backtest-outcomes-<run|sweep>-<id>.csv`, or `backtest-outcomes-run-unfiltered.csv`; the id is reduced to `[A-Za-z0-9._-]` and capped at 64 characters. Formula protection applies to text cells only, so negative numbers stay numeric. Known limits: a protected text cell differs from the original by one leading apostrophe; no real-browser/spreadsheet verification was possible in the delivery environment.

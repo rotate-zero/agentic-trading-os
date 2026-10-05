@@ -4,6 +4,7 @@ import { useBacktestRuns } from "../../hooks/useBacktestRuns";
 import { useBacktestSweepOutcomes } from "../../hooks/useBacktestSweepOutcomes";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../services/api-client";
+import { downloadCsvFile, outcomesCsvFilename, outcomesToCsv, type ExportMode } from "./outcomesCsv";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -354,6 +355,8 @@ function OutcomesListSection({
   refetch,
   emptyMessage,
   extraContent,
+  exportMode,
+  exportId,
 }: {
   outcomes: StrategyOutcomeWireShape[];
   loading: boolean;
@@ -361,7 +364,23 @@ function OutcomesListSection({
   refetch: () => void;
   emptyMessage: string;
   extraContent?: React.ReactNode;
+  exportMode: ExportMode;
+  exportId: string | undefined;
 }) {
+  // CSV export (task `backtest-results-csv-export`). `outcomes`, `loading`
+  // and `error` come from hooks that return data only for the CURRENT
+  // filter key (never a previous filter's rows, including in the render
+  // before the next effect), and `exportId` is the applied identifier of
+  // that same render — so rows and filename can never disagree. Export is
+  // available only for a settled, successful, non-empty load; the click
+  // handler re-checks the same condition and exports exactly the
+  // `outcomes` array being displayed, in displayed order.
+  const canExport = !loading && !error && outcomes.length > 0;
+  const handleExport = () => {
+    if (!canExport) return;
+    downloadCsvFile(outcomesCsvFilename(exportMode, exportId), outcomesToCsv(outcomes));
+  };
+
   return (
     <>
       <div className="flex-1 overflow-y-auto p-2">
@@ -400,6 +419,26 @@ function OutcomesListSection({
         <span className="font-mono text-[9px] text-text-muted">
           {loading ? "loading… · " : ""}
           {outcomes.length} row{outcomes.length === 1 ? "" : "s"}
+        </span>
+      </div>
+
+      <div className="flex shrink-0 flex-col gap-1 border-t border-base-border px-2 py-1">
+        <button
+          type="button"
+          onClick={handleExport}
+          disabled={!canExport}
+          title={
+            canExport
+              ? "Download the rows currently loaded in this view as a CSV file"
+              : "Available once rows have loaded without error"
+          }
+          className="self-start rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted enabled:hover:border-signal enabled:hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Download loaded rows
+        </button>
+        <span className="font-mono text-[9px] leading-snug text-text-muted">
+          CSV of the {outcomes.length} row{outcomes.length === 1 ? "" : "s"} loaded for this filter, in the order
+          shown — not necessarily every outcome (this panel loads at most {OUTCOMES_LIMIT}).
         </span>
       </div>
     </>
@@ -698,6 +737,8 @@ function BacktestResultsBody() {
               ? `No backtest outcomes found for run_id "${appliedRunId}".`
               : "No backtest outcomes recorded yet."
           }
+          exportMode="run"
+          exportId={appliedRunId}
           extraContent={
             appliedRunId ? (
               <div className="mb-2">
@@ -717,6 +758,8 @@ function BacktestResultsBody() {
               ? `No backtest outcomes found for sweep_id "${appliedSweepId}" (its own runs may have honestly recorded zero each — see the sweep summary above).`
               : "No sweep_id applied yet."
           }
+          exportMode="sweep"
+          exportId={appliedSweepId}
           extraContent={
             appliedSweepId ? (
               <RunsInSweepStrip runs={sweepRuns} outcomeCountByRunId={outcomeCountByRunId} loading={sweepLoading} />
