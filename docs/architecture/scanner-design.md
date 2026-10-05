@@ -572,3 +572,69 @@ Frontend-only; no backend, `api-client.ts`, `useScannerUniverse`, `WorkspaceCont
 ```
 
 **Verification.** See `TESTING.md` (`scanner-results-request-safety`): a throwaway jsdom + React harness kept outside the repository, controllable deferred `fetch` responses and fake timers against the real hook and `ScannerPanel`; 61 checks pass, 25 fail on the unchanged base.
+
+## 17. Ninth update — Scanner universe mutation recovery (`scanner-universe-mutation-recovery`)
+
+Frontend-only; no backend, `api-client.ts`, `useScannerState`, ranking, scoring, `WorkspaceContext.tsx`, dependency or lockfile change, and no decision number (the delivery slug identifies it). Changed: `frontend/src/hooks/useScannerUniverse.ts` and `UniverseTab` in `frontend/src/components/scanner/ScannerPanel.tsx`; `ResultsTab` (§16) is unchanged. Ticker validation, the idempotent `POST`/`DELETE /scanner/universe` semantics, server symbol ordering and panel layout are unchanged.
+
+**Problem (reproduced against the base before editing).** (1) `useScannerUniverse` had no request-order or unmount guard. (2) A failed optimistic delete set `error`, then the reconciliation GET succeeded and cleared it, so the failure vanished. (3) A failed initial GET rendered "Universe is empty". (4) Add was disabled while pending, but Enter still submitted again and removes overlapped. (5) A rejected write and a failed reload shared one `error`, so a successful write followed by a failed GET looked like a failed write. (6) A delayed add completion cleared text typed meanwhile. (7) A late completion after a tab switch still started a reconciliation read.
+
+**Behavior now.**
+
+| Situation | Result |
+|---|---|
+| Older read settles after a newer read, or after a mutation started | Discarded: list, `loading`, `loadError` untouched |
+| Add/remove while another mutation is pending (click, Enter, same tick) | Ignored by a synchronous ref guard; nothing is sent; controls disabled and labelled |
+| Failed DELETE | Row restored; `mutationError` set and kept through the reconciliation GET; cleared when the next mutation starts |
+| Successful write, reload fails | `staleAfterWrite`: "Change saved, but reloading … may be out of date"; last confirmed list kept; not a write failure |
+| Read fails after a successful load | Last confirmed list kept, `loadError` shown, Retry re-reads; success clears it |
+| Initial load / initial failure / empty / populated | "Loading universe…" / error + Retry (no "empty" message) / "Universe is empty" / rows — four distinct states |
+| Unmount, collapse, tab switch | Late read and write completions change nothing and start no reconciliation read; a request already sent is **not cancelled** and may still complete on the backend |
+| Text typed during a pending add | Preserved; the field is cleared only if it still holds the submitted text |
+
+**Mechanism.** One read counter in a ref (same pattern as §16): first load, Retry and each reconciliation read take the next number and apply only if still latest and mounted; starting a mutation advances the counter. A second ref, `mutatingRef`, is set before the first `await` (render-late state could not stop two same-tick calls) and released when the write settles, so a new mutation may start during the reconciliation read and supersedes it. The confirmed list is never edited optimistically: the pending-remove row is merely filtered out of what the hook returns. Manual `refresh()` is a no-op while a mutation is pending (its own reconciliation read follows). Settled state is one object (`confirmed, hasLoaded, loading, loadError, staleAfterWrite, mutationError, mutation`).
+
+**Diagram 1 — component data flow.**
+
+```
+ ScannerPanel (tab state; Universe tab mounted/unmounted)  -- Results tab / useScannerState unchanged (§16)
+        │ Universe tab mounted
+        ▼
+ UniverseTab ──► useScannerUniverse()
+   input text, Add / Enter / ×, Retry           │ read(afterWrite)  : mount, Retry, after every write
+   shows: loading | initial failure |           │ mutate(kind, sym) : POST add, DELETE remove
+          empty | rows + mutationError +        ▼
+          reload warning + pending line   fetchScannerUniverse / addScannerUniverseSymbol /
+        ▲                                 removeScannerUniverseSymbol   [api-client.ts, unchanged]
+        │                                         │
+        └── { symbols, hasLoaded, loading,        ▼
+              loadError, staleAfterWrite,   GET / POST / DELETE /scanner/universe  [backend, unchanged]
+              mutationError, pendingAdd,
+              pendingRemove, mutating, addSymbol, removeSymbol, refresh }
+ Universe tab unmounts: counter advanced, mounted=false; requests already sent still complete server-side.
+```
+
+**Diagram 2 — mutation and reconciliation inside `useScannerUniverse`.**
+
+```
+ mutate(kind, sym)
+   mutatingRef set?  ── yes ──► return false (nothing sent)
+   mutatingRef = true ; latestRead += 1 ; mutation = {kind, sym} ; mutationError = null
+   await write()   [remove: row hidden in the returned list only]
+      ├─ ok    ─► ok = true
+      └─ error ─► failure = message
+   mutatingRef = false
+   unmounted? ── yes ──► return ok (no state, no read)
+   mutation = null ; mutationError = failure
+   ok && remove ? confirmed -= sym          (failed remove: row simply reappears)
+   read(afterWrite = ok) ; return ok
+ read(afterWrite)
+   id = ++latestRead ; loading = true ; GET /scanner/universe
+      ├─ ok    ─► id stale or unmounted ? discard
+      │             : confirmed = list ; hasLoaded ; loading=false ; loadError=null ; staleAfterWrite=false
+      └─ error ─► id stale or unmounted ? discard
+                    : loading=false ; loadError=msg ; staleAfterWrite ||= afterWrite   (list + mutationError kept)
+ refresh() = read(false), ignored while mutatingRef
+```
+
+**Verification.** See `TESTING.md` (`scanner-universe-mutation-recovery`): a throwaway jsdom + React harness kept outside the repository with controllable deferred `fetch` responses against the real hook and `ScannerPanel`; 94 checks pass, 33 fail on the unchanged base.

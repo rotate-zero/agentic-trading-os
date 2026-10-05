@@ -118,33 +118,63 @@ function ResultsTab() {
 }
 
 function UniverseTab() {
-  const { symbols, loading, error, pendingAdd, addSymbol, removeSymbol } = useScannerUniverse();
+  const {
+    symbols,
+    hasLoaded,
+    loading,
+    loadError,
+    staleAfterWrite,
+    mutationError,
+    pendingAdd,
+    pendingRemove,
+    mutating,
+    addSymbol,
+    removeSymbol,
+    refresh,
+  } = useScannerUniverse();
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleAdd = async () => {
-    const symbol = input.trim();
+    // `mutating` is render-late; the hook's own synchronous guard is what
+    // really stops a second Enter / click in the same tick.
+    if (mutating) return;
+    const submitted = input;
+    const symbol = submitted.trim();
     if (!symbol) return;
     const ok = await addSymbol(symbol);
     if (ok) {
-      setInput("");
+      // Only clear what was actually submitted — text typed while the add
+      // was pending is kept.
+      setInput((current) => (current === submitted ? "" : current));
       inputRef.current?.focus();
     }
   };
 
+  const initialLoading = !hasLoaded && !loadError;
+  const initialFailure = !hasLoaded && loadError !== null;
+
   return (
     <>
       <div className="flex-1 overflow-y-auto">
-        {symbols.length === 0 && !loading && (
+        {initialLoading && <div className="px-2 py-3 font-mono text-[11px] text-text-muted">Loading universe…</div>}
+        {initialFailure && (
+          <div className="px-2 py-3 font-mono text-[11px] text-bear">Failed to load the universe: {loadError}</div>
+        )}
+        {hasLoaded && symbols.length === 0 && !loadError && !loading && (
           <div className="px-2 py-3 font-mono text-[11px] text-text-muted">Universe is empty — add a symbol below.</div>
+        )}
+        {hasLoaded && symbols.length === 0 && loadError && (
+          <div className="px-2 py-3 font-mono text-[11px] text-text-muted">The last loaded universe was empty.</div>
         )}
         {symbols.map((s) => (
           <div key={s.symbol} className="flex items-center justify-between border-b border-base-border px-2 py-1.5">
             <span className="font-mono text-xs text-text-primary">{s.symbol}</span>
             <button
               onClick={() => removeSymbol(s.symbol)}
+              disabled={mutating}
               title={`Remove ${s.symbol} from the universe`}
-              className="rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear"
+              className="rounded px-1 font-mono text-[11px] text-text-muted hover:bg-base-bg hover:text-bear disabled:opacity-50"
             >
               ×
             </button>
@@ -153,7 +183,18 @@ function UniverseTab() {
       </div>
 
       <div className="shrink-0 border-t border-base-border p-2">
-        {error && <div className="mb-1 font-mono text-[10px] text-bear">{error}</div>}
+        {mutationError && <div className="mb-1 font-mono text-[10px] text-bear">{mutationError}</div>}
+        {loadError && hasLoaded && (
+          <div className="mb-1 font-mono text-[10px] text-bear">
+            {staleAfterWrite ? "Change saved, but reloading the universe failed" : "Failed to reload the universe"}:{" "}
+            {loadError} — showing the last loaded list{staleAfterWrite ? ", which may be out of date" : ""}.
+          </div>
+        )}
+        {(pendingAdd || pendingRemove !== null || (loading && hasLoaded)) && (
+          <div className="mb-1 font-mono text-[9px] text-text-muted">
+            {pendingAdd ? "Adding…" : pendingRemove !== null ? `Removing ${pendingRemove}…` : "Reloading…"}
+          </div>
+        )}
         <div className="flex gap-1">
           <input
             ref={inputRef}
@@ -166,11 +207,20 @@ function UniverseTab() {
           />
           <button
             onClick={handleAdd}
-            disabled={pendingAdd || !input.trim()}
+            disabled={mutating || !input.trim()}
             className="rounded border border-base-border px-2 py-1 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
           >
-            Add
+            {pendingAdd ? "Adding…" : "Add"}
           </button>
+          {loadError && (
+            <button
+              onClick={refresh}
+              disabled={mutating}
+              className="rounded border border-base-border px-2 py-1 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
+            >
+              Retry
+            </button>
+          )}
         </div>
       </div>
     </>
