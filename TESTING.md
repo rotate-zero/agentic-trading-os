@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: world-view-read-concurrency (backend test + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `world-view-read-concurrency`
+
+Base `9ea37b442b7d6601c60ae76d621c3877feefd5e3`, Python 3.13 virtualenv from `backend/requirements.txt` plus pytest and pytest-asyncio. No PostgreSQL, application lifespan, external provider or broker was used or needed by the new module.
+
+- **New module.** `tests/test_world_view_read_concurrency.py`: 6 passed (3 test functions; the contract test is parametrized over 4 portfolio modes). Repeated 8 times in a row: 6 passed each time (about 1.5 s per run).
+- **Related database-independent tests.** `tests/test_world_view_portfolio.py`, `tests/test_performance_analytics_route_concurrency.py`, `tests/test_intelligence_history_read_concurrency.py` together with the new module: 14 passed, 0 failed.
+- **Regression check (offload removed).** With `await asyncio.to_thread(_read_performance)` temporarily replaced by `_read_performance()` in `backend/app/world_view/composite.py`: 6 failed, 0 passed (about 35 s because each blocked read waits for its 3 s give-up). The responsiveness test fails with the blocked read on the event loop (`TimeoutError: test never released the hourly_win_rates read`). The production file was restored byte for byte (`git diff` clean for `backend/app`) and is not part of this delivery.
+- **Not run.** `tests/test_world_view.py` (real-PostgreSQL integration; skipped without a reachable database) and the full backend suite were not run (not requested); frontend untouched.
+- **Limitation.** These tests use doubles for the performance queries, so they prove event-loop responsiveness, concurrent isolation and the response contract only. They do **not** validate SQL correctness; the real aggregation queries are covered by the PostgreSQL-backed World View and outcome read-path tests.
+- **Delivery check.** See the final response for the base SHA and the clean-checkout verification of the ZIP (extract onto a fresh clone of the base, `git status --short` lists exactly the manifest, `git diff --check` clean, new module passes there).
+<!-- END DELIVERY SECTION: world-view-read-concurrency -->
+
 <!-- BEGIN DELIVERY SECTION: broker-panel-request-safety (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `broker-panel-request-safety`
 

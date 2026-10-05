@@ -1,3 +1,21 @@
+<!-- BEGIN DELIVERY SECTION: world-view-read-concurrency (backend test + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `world-view-read-concurrency`
+
+Base: GitHub `main` `9ea37b442b7d6601c60ae76d621c3877feefd5e3` (`Broker panel request safety`, Instance 1's `broker-panel-request-safety`, is already on this base: its code and its `CHANGES.md`/`TESTING.md` sections were inspected and are preserved untouched; `origin/main` re-checked before packaging: no newer commits). Test-only plus documentation: **no production code, endpoint contract, frontend, dependency or lockfile change.** No decision number is assigned (test-only coverage of behavior already covered by decisions #150 and the portfolio projection); the delivery slug identifies the change.
+
+New file: `backend/tests/test_world_view_read_concurrency.py` (6 test cases).
+
+- **Gap closed.** `WorldView.snapshot()` already runs the synchronous Performance Intelligence reads through `asyncio.to_thread(_read_performance)`, but nothing proved that a blocked read leaves the event loop serving other requests, or that concurrent requests stay isolated. Existing WorldView tests cover response content and the portfolio projection only.
+- **What is real and what is controlled.** The real `GET /intelligence/world-view` route, the real `WorldView` facade and the real `_read_performance()` run through `httpx.ASGITransport` (no application lifespan). Only sources are doubles: symbol-scoped Market State and Context stubs; gated stand-ins for `get_win_rate_by_hour` / `get_expectancy_by_session_type` that block inside the worker thread; and the Portfolio State reader (absent, unavailable, or a restored database-free `PortfolioState`). No PostgreSQL, providers or broker is needed.
+- **Check 1 — responsiveness.** While one request is blocked inside a performance read, `/health` answers 200 before the read is released, with the World View request still pending; the read ran on a worker thread, not the event-loop thread.
+- **Check 2 — concurrency.** Two requests (`AAA`, `BBB`) both reach a blocked read, in two distinct worker threads, before release; both then complete, each with its own symbol-scoped `market_state` and `context` envelopes and the complete system-wide `performance`.
+- **Check 3 — contract after release (parametrized portfolio: absent reader, unavailable snapshot, restored flat account, restored open position).** Exact top-level keys; distinct, never-blended `performance.live` and `performance.backtest` rows (including a `session_type: null` group); an omitted `symbol` echoed as `null`; `symbol` scoping only Market State and Context; `portfolio` `null` only when unavailable, a non-null empty-positions object for a restored flat account, and decimal strings for an open position; four reads per request (both queries for both populations).
+- **Determinism and cleanup.** The blocked worker signals the loop with `call_soon_threadsafe` into `asyncio.Event`s; every wait is bounded (5 s test side, 3 s worker give-up); no arbitrary sleeps. Each test releases the gate and settles (waits, then cancels and drains) its requests in a `finally`; the fixture releases once more at teardown.
+- **Regression proof.** Replacing `await asyncio.to_thread(_read_performance)` with a direct `_read_performance()` call in `backend/app/world_view/composite.py` made all 6 cases fail (the responsiveness test among them: the loop is blocked until the worker gives up). The production file was restored before packaging and is not in this delivery.
+- **Docs.** `docs/architecture/trading-intelligence-architecture.md` §15 gains a short note naming the new test as the guard for the off-loop performance read, with its limits. No architecture or diagram change.
+- **Limit.** Mocked concurrency coverage proves event-loop behavior and the response contract only. It does **not** validate SQL correctness; that remains with the real-PostgreSQL World View and outcome read-path tests.
+<!-- END DELIVERY SECTION: world-view-read-concurrency -->
+
 <!-- BEGIN DELIVERY SECTION: broker-panel-request-safety (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `broker-panel-request-safety`
 
