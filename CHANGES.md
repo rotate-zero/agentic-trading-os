@@ -1,3 +1,19 @@
+<!-- BEGIN DELIVERY SECTION: scanner-results-request-safety (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `scanner-results-request-safety`
+
+Base: GitHub `main` `8e5d4f5474ceea389bf0ece685c461e4a6bb4fd9` (`Outcome recorder ledger contention`, Instance 1's delivery, is already on this base and its `CHANGES.md`, `TESTING.md` and `execution-engine-design.md` sections are preserved; re-checked against `origin/main` before packaging: no newer commits). Frontend and docs only: **no backend, `api-client.ts`, `useScannerUniverse`, `WorkspaceContext`, other panel, dependency or lockfile change.** No decision number is assigned; the delivery slug identifies the change.
+
+Changed code files: `frontend/src/hooks/useScannerState.ts`, `frontend/src/components/scanner/ScannerPanel.tsx`.
+
+- **Problem.** No request-order or unmount guard in `useScannerState`; the 15 s poll overlapped outstanding requests; Refresh was disabled while loading, so a hung request could not be replaced; an older request's `finally` could clear `loading` while a newer one was pending; the previous symbols override's rows, skipped symbols, error and timestamp stayed visible under a new override.
+- **Supersession.** Every load (mount, poll, manual Refresh) takes the next number from a per-hook request counter and its response is applied only if still the latest, so only the newest request can update results, skipped, universe, error, loading and `lastUpdated`. Override change and unmount advance the counter and clear the interval.
+- **Polling.** Still a 15 s `setInterval`; a tick is skipped while the newest request is pending. Manual Refresh is never skipped and the button is never disabled ("loading…" is shown beside it instead).
+- **Current-query association.** Settled state carries the request key (`omitted` or the symbols array contents) and is returned only while that key is current, including in the render before the effect. A new array with identical contents is the same query: no refetch, polling not restarted. Omitted and empty-array overrides stay distinct, as in `fetchScannerState`.
+- **Failure handling.** Under the same query a failed refresh keeps the last successful rows, skipped symbols, universe and `lastUpdated` and sets an explicit error (panel notes "showing last successful result"); initial loading, genuine empty and failure stay distinct.
+- **Unchanged.** Ranking and scoring, backend query semantics, universe editing, panel layout, WebSocket-free polling design. Fetches are not cancelled; superseded responses are discarded.
+- **Docs.** `docs/architecture/scanner-design.md` gains §16 with a component data-flow diagram and a request-lifecycle/polling diagram.
+<!-- END DELIVERY SECTION: scanner-results-request-safety -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-recorder-ledger-contention (backend test + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `outcome-recorder-ledger-contention`
 

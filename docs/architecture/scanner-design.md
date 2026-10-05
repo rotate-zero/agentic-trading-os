@@ -502,3 +502,73 @@ normalizeMainWindow(w: MainWindowState) -> MainWindowState
 **No decision number assigned**, per this project's own standing instruction and the precedent §13/§14 already set: this backfills a documented gap using the identical `??`-default pattern `normalizeMainWindow` already applies to `lastBacktestRunId`/`lastBacktestSweepId` two lines above it — nothing about the Scanner panel's fields, defaults, or contract is new or changed, only a pre-existing restoration bug is corrected.
 
 **Later restoration update:** The separate Feature Engine gap called out in §12 and §15 is now fixed in `normalizeMainWindow()` with the same nullish backfill pattern for its collapsed state, width, and selected symbol. See `system-design.md` §4.11 for the current session restoration flow.
+
+---
+
+## 16. Eighth update — Scanner results request safety (`scanner-results-request-safety`)
+
+Frontend-only; no backend, `api-client.ts`, `useScannerUniverse`, `WorkspaceContext.tsx`, dependency or lockfile change, and no decision number (the delivery slug identifies it). Changed: `frontend/src/hooks/useScannerState.ts`, `frontend/src/components/scanner/ScannerPanel.tsx`. Ranking, scoring, `GET /scanner/state` query semantics (omitted `symbols` = persisted universe, explicit `symbols` = override, empty array sends no parameter exactly as before), the 15-second interval, universe editing and panel layout are unchanged.
+
+**Problem (reproduced against the base before editing).** (1) `useScannerState` had no request-order or unmount guard, so a slow older response could overwrite a newer ranking, error or timestamp. (2) The 15-second poll fired regardless of an outstanding request and stacked requests behind a slow backend. (3) Refresh was disabled while `loading`, so a hung request could not be replaced. (4) An older request's `finally` cleared `loading` while a newer request was still pending. (5) After a symbols-override change, the previous override's rows, skipped symbols, error and timestamp stayed visible until the new response arrived. (6) A failed refresh left the old rows with no indication beyond the error and, in the same render path, could not be told apart from "no data yet".
+
+**Behavior now.**
+
+| Situation | Result |
+|---|---|
+| Manual Refresh while a request is pending | Always enabled; starts a newer request that supersedes every older one |
+| Older success or failure after a newer request started | Discarded: results, skipped, universe, error, loading and `lastUpdated` untouched |
+| Older request settles while the newest is pending | `loading` stays true |
+| 15 s poll tick while the newest request is pending | Skipped; resumes on the first tick after it settles |
+| Symbols-override change, unmount, collapse / tab switch | Interval cleared, outstanding requests invalidated |
+| Render after an override change, before the effect | Loading with no rows, skipped, universe, error or timestamp from the previous override |
+| New array, identical contents | Same query: no refetch, polling not restarted |
+| Refresh under the same query | Existing rows, skipped, universe and `lastUpdated` stay until the newer result settles |
+| Failure under the same query | Last successful rows and `lastUpdated` kept; explicit `error` set (panel adds "showing last successful result"); cleared by the next success |
+| Failure with no prior success for the query | Empty rows plus `error` |
+| Initial load / genuine empty / failure | `loading` with no data / `!loading`, no error, no rows / `error` — three distinct states |
+
+**Mechanism.** One request counter in a ref, as in the Backtest Results hooks (`backtest-results-refresh-recovery`). `load()` takes the next number and applies its response only if still the latest. The effect cleanup advances the counter and clears the interval. Settled state is stored as a snapshot tagged with the request key (`"omitted"` or the JSON of the symbols array) and returned only while that key is current. A separate ref marks the newest request pending, read by the poll tick only; manual Refresh ignores it. Fetches are not cancelled: a superseded request completes and its response is discarded. No fetching framework or polling service was added.
+
+**Diagram 1 — component data flow.**
+
+```
+ WorkspaceContext (scannerCollapsed / scannerWidthPx) -- unchanged
+        │
+        ▼
+ ScannerPanel ── Results tab mounted ──► ResultsTab ──► useScannerState(symbols?)
+   (collapse / Universe tab unmounts                          │  request key = "omitted" | JSON(symbols)
+    ResultsTab: timer cleared,                                │  load() from: mount, 15 s poll, Refresh
+    in-flight work invalidated)                               ▼
+                                                  fetchScannerState(symbols)  [api-client.ts, unchanged]
+                                                              │
+                                                              ▼
+                                                    GET /scanner/state  [backend, unchanged]
+ ResultsTab ◄── { results, skipped, universe, loading, error, lastUpdated, refresh }
+                for the CURRENT key only ── Refresh button never disabled
+
+ Universe tab ──► useScannerUniverse  (independent, unchanged)
+```
+
+**Diagram 2 — request lifecycle and polling inside `useScannerState`.**
+
+```
+ load()   [mount | override change | poll tick (only if !pending) | manual Refresh (always)]
+   id = ++latest ; pending = true
+   snapshot = same key ? { ...prev, loading: true }
+                       : { key, empty data, error: null, ts: null, loading: true }
+   fetchScannerState(symbols)
+      ├─ success ─► id !== latest ? discard
+      │                          : pending=false; snapshot = { key, wire data, error: null, ts: now, loading: false }
+      └─ failure ─► id !== latest ? discard
+                                 : pending=false;
+                                   same key ? { ...prev, error, loading: false }   (rows + ts kept)
+                                            : { key, empty data, error, ts: null, loading: false }
+
+ effect:  load(); interval = setInterval(tick, 15 000)      tick: if (!pending) load()
+ cleanup [override change | unmount]:  clearInterval ; latest += 1 ; pending = false
+
+ render:  snapshot.key === currentKey ? snapshot
+                                      : { loading: true, no rows, no error, no timestamp }
+```
+
+**Verification.** See `TESTING.md` (`scanner-results-request-safety`): a throwaway jsdom + React harness kept outside the repository, controllable deferred `fetch` responses and fake timers against the real hook and `ScannerPanel`; 61 checks pass, 25 fail on the unchanged base.

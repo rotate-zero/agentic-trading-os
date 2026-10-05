@@ -81,7 +81,12 @@ function ResultsTab() {
   return (
     <>
       <div className="flex-1 overflow-y-auto">
-        {error && <div className="px-2 py-3 font-mono text-[11px] text-bear">Failed to load: {error}</div>}
+        {error && (
+          <div className="px-2 py-3 font-mono text-[11px] text-bear">
+            Failed to load: {error}
+            {lastUpdated && results.length > 0 && " — showing last successful result"}
+          </div>
+        )}
         {!error && results.length === 0 && !loading && (
           <div className="px-2 py-3 font-mono text-[11px] text-text-muted">
             No symbols scored yet — waiting on at least one recorded 1m candle.
@@ -97,13 +102,15 @@ function ResultsTab() {
         </div>
       )}
       <div className="flex shrink-0 items-center justify-between border-t border-base-border px-2 py-1">
+        {/* Never disabled: pressing it while a request is pending starts a
+            newer one that supersedes it (recovery from a hung request). */}
         <button
           onClick={refresh}
-          disabled={loading}
-          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
         >
-          {loading ? "…" : "Refresh"}
+          Refresh
         </button>
+        {loading && <span className="font-mono text-[9px] text-text-muted">loading…</span>}
         {lastUpdated && <span className="font-mono text-[9px] text-text-muted">Updated {lastUpdated.toLocaleTimeString()}</span>}
       </div>
     </>
