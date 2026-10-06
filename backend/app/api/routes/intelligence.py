@@ -59,12 +59,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.context_engine.engine import get_context_engine
 from app.core.config import get_settings
+from app.execution_engine.authorization_history import read_execution_authorizations
 from app.feature_engine.engine import get_feature_engine
 from app.feature_engine.historical import compute_series
 from app.market_state_engine.engine import get_market_state_engine
@@ -1121,6 +1122,25 @@ def _fetch_execution_orders(symbol: str | None, limit: int) -> list[dict[str, An
         ]
     finally:
         session.close()
+
+
+@router.get("/execution-authorizations")
+async def get_execution_authorizations(
+    limit: int = Query(50, ge=1, le=500, description="Most recent recorded authorization attempts, 1-500."),
+    symbol: str | None = Query(None, description="Exact match on trades.symbol."),
+    decision: Literal["approved", "rejected"] | None = Query(None),
+) -> dict[str, Any]:
+    """Recent persisted authorization attempts, including rejected modes.
+
+    Trade is the durable source. An approved decision does not prove that an
+    order was placed or filled. No mode filter is applied: rejected attempts
+    retain their recorded null or unsupported requested mode. The worker owns
+    its read-only snapshot; FastAPI rejects malformed parameters before it runs.
+    """
+    rows = await asyncio.to_thread(
+        read_execution_authorizations, symbol=symbol, decision=decision, limit=limit,
+    )
+    return {"authorizations": rows}
 
 
 @router.get("/execution-orders")

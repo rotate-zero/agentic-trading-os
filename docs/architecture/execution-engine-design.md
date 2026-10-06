@@ -369,6 +369,41 @@ OpportunityCreated ─► AuthorizerStub ─ rules 0-6 ─┬─ rejected ─►
       replay of the same accepted id: stored evidence equal? ─ yes ─► existing identity │ no ─► LedgerCommitError("conflicting evidence")
 ```
 
+**Recorded authorization history (`execution-authorization-history`).** `GET /intelligence/execution-authorizations` is a read-only projection of the existing `trades` ledger, where both approved and rejected attempts are committed before publication. It is distinct from the Execution panel's current-browser-session WebSocket activity. No approved-mode filter is applied: a rejected audit row can have a null or unsupported requested `execution_mode`, and it has no accepted opportunity ID or execution venue. The response returns `trade_id` for every row and `opportunity_id` only for approvals; neither approval nor a displayed row proves that an order was placed or filled.
+
+The route accepts an optional exact `symbol`, optional `decision` (`approved` or `rejected`), and `limit` 1–500 (default 50). Results are ordered by `trades.created_at DESC, trades.trade_id DESC`. It returns only trade/opportunity IDs, symbol, strategy name/version, requested mode, venue, decision, recorded reason codes, UTC creation time, and three curated `limits_snapshot` keys. Missing reasons remain `null` or the stored empty list; missing limit keys remain `null`. The two USD limits are exact JSONB numeric text strings, with no float conversion; the position count is an integer. No thesis, decision-input JSON, snapshots or unrelated limit keys are dumped.
+
+**Component data flow.**
+
+```
+ OpportunityCreated ─► AuthorizerStub ─► PostgresTradeLedger ─► trades
+                                      commit approval/rejection first │
+                                                                      │ read only
+ ExecutionLifecyclePanel                                              ▼
+   ├─ WebSocket activity (current browser session)       GET /intelligence/execution-authorizations
+   ├─ orders / fills / positions (their existing routes)               │
+   └─ Recorded authorizations ─► typed client ─► route ─► worker-owned snapshot query
+                                   ▲                         │
+                                   └──── curated recent rows ┘
+```
+
+**Internal read and request flow.**
+
+```
+ panel opens ─► section expands ─► useExecutionAuthorizations(filter="all")
+                                 └─ no request while the section is collapsed
+ filter change / Refresh ─► request generation advances ─► GET with decision?; limit defaults to 50
+    ├─ route validates decision + limit before helper
+    └─ asyncio.to_thread(read_execution_authorizations)
+         └─ worker opens Session ─► REPEATABLE READ + PostgreSQL READ ONLY
+              └─ SELECT trades + JSONB text limit keys; exact filters; timestamp/UUID order; LIMIT
+                   └─ UTC/curated serialization ─► close transaction + Session
+ latest response ─► rows or error; same-filter rows survive a failed Refresh
+ older response / collapsed section / unmount ─► ignored
+```
+
+The panel labels the rows as a bounded recent subset, shows raw rejection codes and UTC timestamps, and separates loading, error and empty states. It keeps existing event, order, fill, position, startup, exit and outcome sections independent. This projection neither changes authorization policy nor retries, edits or reconsiderations of decisions.
+
 ### 6.3 Execution Engine (`execution_engine/`)
 
 **What it is.** The only module that talks to a venue (I1). It turns an authorization (or a reduce-only exit intent) into a durable, idempotent order, sends it, and turns every venue update into ledger state and an `OrderFilled` — deduplicated, persisted first, published second.

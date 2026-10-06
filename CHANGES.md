@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: execution-authorization-history -->
+# CHANGES — `execution-authorization-history`
+
+Base: `main` `37579f0` (clean at start; latest remote `main` matched). This read-only delivery uses the existing `trades` schema and authorizer persistence; it changes no trading policy, Governor rule, database migration or broker path. No new architectural decision number was needed.
+
+- Added `GET /intelligence/execution-authorizations`: an offloaded, worker-owned, PostgreSQL read-only snapshot over Trade rows. It includes approvals and rejections, including rejected attempts with null or unsupported requested modes. Optional exact symbol and approved/rejected filters, 1–500 limit (default 50), stable creation-time/UUID descending order, UTC timestamps, faithful recorded reasons, and a curated three-key limits projection are returned. Missing evidence remains null and monetary limit values remain exact strings.
+- Added a collapsed-by-default **Recorded authorizations** section to the Execution panel. It requests only when opened, supports all/approved/rejected filters and manual Refresh, labels its 50-row recent subset, and explains that approval does not guarantee an order or fill. It keeps same-filter rows visible after a failed refresh and ignores obsolete or post-unmount responses. The existing event and execution sections remain independent.
+- Added PostgreSQL route tests and exercised the real frontend hook/component and panel integration with controlled responses. Updated `TESTING.md` and `docs/architecture/execution-engine-design.md` with the contract and flow diagrams.
+
+The route observes decisions already recorded by the Governor; it creates or revises none. There is no paging beyond the bounded recent tail.
+<!-- END DELIVERY SECTION: execution-authorization-history -->
+
 <!-- BEGIN DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
 # CHANGES — `strategy-to-simulated-execution-acceptance`
 

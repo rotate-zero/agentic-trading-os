@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: execution-authorization-history -->
+# TESTING — `execution-authorization-history`
+
+Base `37579f0`; Python 3.14 and PostgreSQL 18 on `localhost:55432`. A separate `execution_authorization_history_test` database was created and migrated to Alembic `0017`; the tests inserted and removed only their marked Trade fixtures. No live broker, provider or production database was contacted. The full backend suite was not run.
+
+- **PostgreSQL route/query validation:** `POSTGRES_HOST=localhost POSTGRES_PORT=55432 POSTGRES_USER=rotate_zero POSTGRES_PASSWORD=<local-test-password> POSTGRES_DB=execution_authorization_history_test ./.venv/bin/pytest -q tests/test_execution_authorizations_route.py` — **8 passed**. Fixtures covered approved decisions; rejected decisions with null and unsupported requested modes; exact and combined symbol/decision filters; unknown/empty selection; tied timestamps and UUID tie-break; UTC conversion; default 50 and limits 1/500, with 0/501/invalid decision rejected before helper invocation; missing reasons/limits; a high-precision JSONB numeric limit returned as an exact string; curated fields; the worker thread and PostgreSQL `transaction_read_only=on`; rows unchanged after the read; and an intentionally blocked helper while `/health` remained responsive.
+- **Targeted serial regression run:** the new test plus `test_execution_orders_route.py`, `test_execution_fills_route.py`, `test_execution_positions_route.py`, `test_governor_evidence_postgres.py`, and `test_governor_rules.py` — **124 passed**. Python 3.14 dependency deprecation warnings remained; there were no test failures.
+- **Actual frontend behavior:** a temporary jsdom/React `act` harness in `/tmp` bundled the real `RecordedAuthorizations`, `useExecutionAuthorizations` and `api-client.ts`, replacing only `fetch` with controlled responses. **36 assertions passed:** no fetch while collapsed; loading versus populated and empty; faithful reason codes, UTC and exact limit text; same-filter rows retained on a failed Refresh; reverse-order filter and refresh completions ignored; collapse and unmount completions ignored. A second harness rendered the real `ExecutionLifecyclePanel` with a stub WebSocket and held unrelated fetches pending: **13 assertions passed**, including preservation of neighboring sections and authorization fetch only after its own expansion. Neither harness is part of the repository.
+- **Frontend build:** `npm run build` passed (`tsc -b` and Vite). Vite's existing large-chunk advisory remains. The build-modified tracked `frontend/tsconfig.tsbuildinfo` was restored; generated `dist/` is excluded.
+
+**Limits:** The frontend harness used controlled HTTP responses and jsdom, not a real browser or a frontend-to-PostgreSQL request. The route returns a bounded recent tail with no pagination. It displays persisted decisions only; an approved row is not evidence of an order or fill. No trading policy, authorizer writer or broker path was exercised by this delivery.
+<!-- END DELIVERY SECTION: execution-authorization-history -->
+
 <!-- BEGIN DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
 # TESTING — `strategy-to-simulated-execution-acceptance`
 

@@ -386,6 +386,48 @@ export async function fetchExecutionStartupStatus(): Promise<ExecutionStartupSta
   return (await res.json()) as ExecutionStartupStatusWireShape;
 }
 
+// Durable Trade decisions, including rejections with null or unsupported
+// requested modes. Monetary limit strings are kept exact; missing recorded
+// limits remain null. This history says nothing about order/fill completion.
+export interface ExecutionAuthorizationWireShape {
+  trade_id: string;
+  opportunity_id: string | null;
+  symbol: string;
+  strategy_name: string;
+  strategy_version: string;
+  execution_mode: string | null;
+  execution_venue: string | null;
+  decision: "approved" | "rejected";
+  reasons: string[] | null;
+  created_at: string;
+  limits_snapshot: {
+    max_concurrent_positions: number | null;
+    fixed_notional_usd: string | null;
+    daily_loss_cap_usd: string | null;
+  };
+}
+
+export interface ExecutionAuthorizationsWireShape {
+  authorizations: ExecutionAuthorizationWireShape[];
+}
+
+export async function fetchExecutionAuthorizations(options: {
+  symbol?: string;
+  decision?: "approved" | "rejected";
+  limit?: number;
+} = {}): Promise<ExecutionAuthorizationsWireShape> {
+  const params = new URLSearchParams();
+  if (options.symbol !== undefined) params.set("symbol", options.symbol);
+  if (options.decision !== undefined) params.set("decision", options.decision);
+  if (options.limit !== undefined) params.set("limit", String(options.limit));
+  const suffix = params.size > 0 ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-authorizations${suffix}`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionAuthorizationsWireShape;
+}
+
 // GET /intelligence/execution-orders (decision #181). The route returns
 // only persisted simulated orders, newest ledger ID first, default limit 50.
 // `symbol` (this delivery) is an exact, case-sensitive match on

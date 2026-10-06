@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
+import { RecordedAuthorizations } from "./RecordedAuthorizations";
 import {
   fetchExecutionExitRequests,
   fetchExecutionFills,
@@ -1227,6 +1228,7 @@ export function ExecutionLifecyclePanel() {
 
         {!collapsed && <StartupStatusLine />}
         {!collapsed && <ObservedExitTriggers />}
+        {!collapsed && <RecordedAuthorizations />}
         {!collapsed && <RecordedExitRequests />}
         {!collapsed && <RecentSimulatedOrders />}
         {!collapsed && <RecentSimulatedFills />}
