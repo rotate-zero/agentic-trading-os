@@ -1374,3 +1374,45 @@ Backend and frontend; no migration, dependency, `BacktestRunner`, engine, execut
 - The live-provider guard is checked before the read and again before the runner is built; as on the IBKR path, `BacktestRunner.run()` awaits its producer start before installing the replay engines, so a provider connecting inside that short interval is not caught.
 - Whether `1d` rows are being recorded is up to the recorder configuration; an unrecorded daily series degrades regime scores rather than failing.
 - Synthetic or sparse stored data proves plumbing only, never real-market profitability.
+
+
+### Backtest run history (task `backtest-run-history`)
+
+Frontend-only; no backend, API contract, `api-client.ts`, `WorkspaceContext.tsx`, `BacktestPanel` or dependency change, and no decision number (the route it reads is decision #136's). New: `RecentBacktestRuns.tsx`, `useRecentBacktestRuns.ts`; changed: `BacktestResultsPanel.tsx`. `useBacktestRuns` (one `run_id` -> one run) is unchanged.
+
+**What it does.** A collapsible **Recent runs** section in the Backtest Results panel lists up to 50 saved runs (`GET /intelligence/backtest-runs?limit=50`, server order, newest first) so a fixture, IBKR or stored-candle run can be reopened after a browser refresh. Each row shows strategy, symbols, creation time, replay range and `data_version` verbatim (provenance is never relabeled; fixture data is not described as real market data) and a **View results** button. Rows contain run settings only: no profitability or outcome count is shown or inferred.
+
+**Selection semantics.** View results sets the filter type to `run_id`, mode to `manual`, and the input/applied run_id to the chosen run. The existing `useBacktestRuns` and `useBacktestOutcomes` hooks then load that run's metadata and outcomes, and the CSV button exports exactly those loaded rows. It never calls `setLastBacktestRunId`/`setLastBacktestSweepId`, so an older run cannot become the shared "latest completed run", and manual mode keeps a run finishing elsewhere from replacing it. Follow latest, manual UUID entry, sweep browsing and Refresh are unchanged.
+
+**Component data flow.**
+
+```
+ WorkspaceContext.lastBacktestRunId / lastBacktestSweepId (set only by BacktestPanel, read-only here)
+        │ refreshKey = "<run>|<sweep>"
+        ▼
+ BacktestResultsBody ──► RecentBacktestRuns (open?) ──► RecentRunsList ──► useRecentBacktestRuns ──► fetchBacktestRuns(50)
+        ▲                                                   │ View results(runId)
+        └────────── viewRecentRun(runId) ◄──────────────────┘
+        │ filterType=run_id, mode=manual, runIdInput=appliedRunId=runId
+        ▼
+ useBacktestRuns(runId) -> metadata card      useBacktestOutcomes(runId) -> outcomes list -> CSV export
+```
+
+**Internal flow and states.**
+
+```
+ request k = ++counter; keep list; loading=true            effect cleanup: counter += 1 (refreshKey change / unmount)
+ response for k: k == counter ? apply : discard             (a stale success OR failure is discarded)
+```
+
+| History state | Shown |
+|---|---|
+| First load, no list yet | "Loading recent runs…" |
+| Reload with a list on screen | List kept, "refreshing…" |
+| Failure | "Failed to load recent runs: …"; list cleared; never presented as empty |
+| Success, zero rows | "No saved backtest runs found." |
+| Success | Rows plus "Showing up to 50 recent runs … not the complete history" |
+
+A history failure is local to the section: the selected run's metadata/outcomes, UUID entry and CSV export are unaffected. **Refresh runs** is never disabled while pending; each press supersedes earlier requests. The list reloads when the workspace reports a newly completed run or sweep (changed `refreshKey`), with no polling or WebSocket; while collapsed the list is unmounted and nothing is fetched, and expanding it loads fresh data.
+
+**Limits.** 50 most recent runs only, no paging/search; completions in another tab are not detected (use Refresh runs); validated with controlled stub responses in a jsdom harness, not a real browser or backend.

@@ -5,6 +5,7 @@ import { useBacktestSweepOutcomes } from "../../hooks/useBacktestSweepOutcomes";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../services/api-client";
 import { downloadCsvFile, outcomesCsvFilename, outcomesToCsv, type ExportMode } from "./outcomesCsv";
+import { RecentBacktestRuns } from "./RecentBacktestRuns";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -564,6 +565,20 @@ function BacktestResultsBody() {
     setAppliedRunId(lastBacktestRunId ?? undefined);
   };
 
+  // Recent runs -> "View results" (task `backtest-run-history`). A
+  // deliberate manual selection: switch to run_id mode and apply the run's
+  // ID exactly as if it had been pasted and Applied, so the existing
+  // hooks load its metadata and outcomes. It never calls
+  // setLastBacktestRunId — browsing an old run must not become the shared
+  // "latest completed run" — and "manual" mode keeps a run finishing
+  // elsewhere from replacing it. Sweep state is left untouched.
+  const viewRecentRun = (runId: string) => {
+    setFilterType("run_id");
+    setMode("manual");
+    setRunIdInput(runId);
+    setAppliedRunId(runId);
+  };
+
   const applySweepFilter = () => {
     const trimmed = sweepIdInput.trim();
     setSweepMode("manual");
@@ -608,6 +623,15 @@ function BacktestResultsBody() {
           sweep_id
         </button>
       </div>
+
+      {/* History reloads when the workspace reports a newly completed
+          run or sweep (the same shared values this panel already follows);
+          no polling, no WebSocket. */}
+      <RecentBacktestRuns
+        refreshKey={`${lastBacktestRunId ?? ""}|${lastBacktestSweepId ?? ""}`}
+        selectedRunId={filterType === "run_id" ? appliedRunId : undefined}
+        onViewResults={viewRecentRun}
+      />
 
       {filterType === "run_id" && (
         <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">

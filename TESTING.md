@@ -1,3 +1,28 @@
+<!-- BEGIN DELIVERY SECTION: backtest-run-history (frontend + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `backtest-run-history`
+
+Base `0ae188a47a24738f9f3c557cb10d4a2fb549ae58`, Node v22.22.2 with `npm ci` in `frontend/`. No backend code changed and the backend suite was **not** run (not requested). The repo has no frontend test runner and none was added.
+
+- **Harness (outside the repository, not part of the delivery).** A jsdom + React 18 `act` harness bundled with esbuild the real `BacktestResultsPanel`, `RecentBacktestRuns`, `useRecentBacktestRuns`, `useBacktestRuns`, `useBacktestOutcomes`, `useBacktestSweepOutcomes`, `outcomesCsv.ts` and `api-client.ts`. Only two things are replaced: `fetch` (a controllable stub that records every URL and lets a test hold, answer, reorder or fail each request) and `WorkspaceContext` (a small store exposing `lastBacktestRunId`/`lastBacktestSweepId` and recording any call to `setLastBacktestRunId`/`setLastBacktestSweepId`). **77 checks passed, 0 failed.**
+- **Covered.**
+  - *Section:* collapsed by default; no history request until expanded; exactly one `limit=50` request on expand; collapsing hides rows.
+  - *Rows:* server order preserved (a deliberately non-chronological list is not re-sorted); symbols, replay range and creation time shown; `fixture:…`, `stored:postgres:candles:1m-1d` and `ibkr:…` `data_version` strings shown verbatim; "Showing up to 50 recent runs"; no profit/loss/outcome-count text; no "real market data" wording.
+  - *Selecting an older run while following latest:* one metadata and one outcomes request for that run, run_id tab active, "(manually set)", its 3 outcomes loaded, selected row marked **Viewing**, input holds the ID, `setLastBacktestRunId`/`setLastBacktestSweepId` never called and the workspace value unchanged.
+  - *From sweep mode:* View results switches to the run_id tab and applies the run; no row is marked selected while in sweep mode.
+  - *Zero-outcome run:* metadata still shown, honest "No backtest outcomes found for run_id …", "0 rows", CSV button disabled.
+  - *Empty history:* "No saved backtest runs found.", no error, not stuck loading.
+  - *History failure:* error shown (not as empty); a run can still be entered by UUID and viewed; a failure after a run is already selected leaves that run on screen; Refresh runs recovers.
+  - *Repeated refresh, reverse order:* Refresh enabled while pending; three requests answered third, first, second leave only the third's data; an older failure arriving late is ignored; a newer failure is not overwritten by an older success.
+  - *Unmount:* a success and a failure completing after unmount log nothing.
+  - *Another run finishing:* with B manually selected, a new `lastBacktestRunId` leaves B selected, requests no outcomes/metadata for the new run, refreshes history exactly once (new run first), a sweep completion refreshes it once more, and no further requests follow (no polling).
+  - *Preserved:* Follow latest returns to auto and the latest run; manual UUID Apply; outcomes Refresh refetches; sweep tab still makes its two requests and renders the sweep strip.
+  - *CSV:* after selecting an older run the download is named `backtest-outcomes-run-<that run_id>.csv` and contains exactly that run's 3 loaded rows (header + 3), no other run's rows.
+- **Regression proof (temporary edits, restored, not in the delivery).** Removing the request-ordering guards failed 5 checks; making View results also call `setLastBacktestRunId` failed 3; leaving View results in auto (follow-latest) mode failed 5; making the refresh key constant (no refresh on completion) failed 4.
+- **Frontend build.** `npx tsc -b` clean and `npx vite build` clean (existing chunk-size advisory only). The build-modified tracked `tsconfig.tsbuildinfo` was restored and is not in the delivery.
+- **Not verified.** No real browser, no real backend (every response was a controlled stub, so behavior against an actual `GET /intelligence/backtest-runs` response is as typed in `api-client.ts`, not exercised end to end), and layout/visual appearance was not inspected. React 18 ignores state updates on unmounted components without a warning, so the unmount check can only observe the hook's guard through its failure logging, not a suppressed state update directly. Cross-tab completion is not simulated.
+- `git diff --check` clean; extracted-ZIP verification is reported in the handoff.
+<!-- END DELIVERY SECTION: backtest-run-history -->
+
 <!-- BEGIN DELIVERY SECTION: stored-candle-backtest (backend + frontend + tests + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `stored-candle-backtest`
 

@@ -1,3 +1,54 @@
+<!-- BEGIN DELIVERY SECTION: backtest-run-history (frontend + docs; integrate alongside other sections, do not merge them) -->
+# CHANGES — `backtest-run-history`
+
+Base: GitHub `main` `0ae188a47a24738f9f3c557cb10d4a2fb549ae58` (`Stored candle backtest`, whose `CHANGES.md`/`TESTING.md` sections are preserved below). Frontend-only: no backend, API-contract, `api-client.ts`, `WorkspaceContext.tsx`, `BacktestPanel`, stored-candle acquisition, execution, migration, dependency or lockfile change, and the existing single-run `useBacktestRuns` hook is untouched. No decision number is assigned: the work is a read-only consumer of the existing `GET /intelligence/backtest-runs` (decision #136) and creates no new architectural decision (the canonical log, `INDEX.md` and `archive/` still end at #188); the delivery slug identifies the change.
+
+New code files: `frontend/src/hooks/useRecentBacktestRuns.ts`, `frontend/src/components/backtest-results/RecentBacktestRuns.tsx`. Changed code file: `frontend/src/components/backtest-results/BacktestResultsPanel.tsx`.
+
+- **Problem.** After a browser refresh the Backtest Results panel could only show a run whose `run_id` was still in workspace state or pasted from elsewhere; saved fixture, IBKR and stored-candle runs were otherwise unreachable from the UI.
+- **User flow.** Open Backtest Results, expand **Recent runs** (collapsed by default), pick a row and press **View results**. The panel switches to the `run_id` tab, puts that ID in the filter as a *manual* selection ("Showing run_id=… (manually set)"), and the existing run metadata card and outcomes list load for it; **Download loaded rows** then exports that run's loaded outcomes. The selected row shows **Viewing**. Works from the `sweep_id` tab too (the sweep selection is left as it was).
+- **What a row shows.** Strategy name, symbols (`symbol_universe`), creation time, replay date range and `data_version`, plus **View results**. `data_version` is the run's own provenance string, rendered verbatim (for example `fixture:<scenario>`, or the stored-candle label) and never relabeled, so fixture data is not presented as real market data. Rows are in the server's returned order (newest first); the client does not re-sort, filter or de-duplicate.
+- **Honest scope text.** The section says "Showing up to 50 recent runs … not the complete history". The list is one `fetchBacktestRuns(50)` call; there is no paging.
+- **No inference from metadata.** Rows carry run *settings* only. No profitability, win/loss or outcome count is shown or derived; outcomes appear only after View results, from the existing outcomes read.
+- **Shared state untouched.** View results never calls `setLastBacktestRunId`/`setLastBacktestSweepId`, so browsing an old run does not make it the "latest completed run" that `BacktestPanel` and Follow latest read.
+- **Preserved.** Follow latest run/sweep, manual UUID entry and Apply/Clear, sweep browsing, outcomes **Refresh** (still enabled while pending) and CSV export behave as before; they are the same code paths, and View results simply drives the existing run_id filter state (`setFilterType("run_id")`, manual mode, input and applied ID).
+- **History has its own states.** Loading ("Loading recent runs…"), error ("Failed to load recent runs: …", never shown as empty), and empty ("No saved backtest runs found."). The history error lives only in the history list, so it cannot block viewing an already selected run or entering a UUID by hand. On failure the list is cleared rather than left stale; a manual refresh while a list is on screen keeps it visible with "refreshing…".
+- **Refresh runs.** A button inside the section, never disabled while a request is pending. Every load (mount, button, completion refresh) takes a number from one per-hook counter and only the latest number may update state, so overlapping or reordered responses (including a late failure) are discarded; the counter also advances on unmount so a completion after unmount applies nothing. Fetches themselves are not cancelled, only their results are ignored.
+- **Refresh on completion, no polling.** The panel passes `lastBacktestRunId|lastBacktestSweepId` from the existing workspace state as an opaque `refreshKey`. When a newly completed run or sweep is reported, the open list reloads once (the new run appears in server order). The selection is not changed. There is no timer, no WebSocket and no new shared state. While the section is collapsed nothing is fetched (the list component is not mounted); expanding it loads fresh data, so a completion that happened while collapsed is picked up then.
+
+**Data flow.**
+
+```
+ BacktestPanel (existing)                 WorkspaceContext (unchanged)
+   run/sweep finishes ── setLastBacktestRunId/SweepId ──► lastBacktestRunId, lastBacktestSweepId
+                                                              │ read-only
+                                                              ▼
+ BacktestResultsPanel > BacktestResultsBody
+   refreshKey = "<runId>|<sweepId>" ───────────────► RecentBacktestRuns ──(expanded)──► RecentRunsList
+   viewRecentRun(runId) ◄── onViewResults ◄──────────────────────────────── View results   │
+        │                                                                  useRecentBacktestRuns
+        │ setFilterType("run_id"); setMode("manual");                              │ fetchBacktestRuns(50)
+        │ setRunIdInput(runId); setAppliedRunId(runId)                             ▼
+        ▼                                                          GET /intelligence/backtest-runs?limit=50
+ existing hooks, unchanged:  useBacktestRuns({runId}) ──► metadata card
+                             useBacktestOutcomes({backtestRunId}) ──► outcomes list ──► CSV export
+ (no call to setLastBacktestRunId anywhere on this path)
+```
+
+**Internal flow of `useRecentBacktestRuns`.**
+
+```
+ mount / refreshKey change / Refresh runs
+   requestId = ++latest ; keep previous list, loading=true, error=null
+   fetchBacktestRuns(50) ─► then: requestId === latest ? set {runs (server order), loading=false} : drop
+                         └► catch: requestId === latest ? set {runs=[], error, loading=false} : drop
+ effect cleanup (refreshKey change or unmount): latest += 1   ← anything in flight is now stale
+```
+
+- **Limits.** The cap is 50 and there is no paging or search, so older runs need their `run_id`. Completion of a run in another browser tab or by another operator is not detected (the workspace state is not shared across tabs); use **Refresh runs**. The first 500 outcomes of a viewed run are loaded as before. Rows show settings of whatever the server stored; they say nothing about whether a run produced outcomes or was profitable.
+- **Docs.** `docs/architecture/backtest-runner-design.md` gains "Backtest run history (task `backtest-run-history`)" with the flow diagrams, state table and limits.
+<!-- END DELIVERY SECTION: backtest-run-history -->
+
 <!-- BEGIN DELIVERY SECTION: stored-candle-backtest (backend + frontend + tests + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `stored-candle-backtest`
 
