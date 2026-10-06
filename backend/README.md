@@ -353,7 +353,7 @@ Exits non-zero with a clear message if anything's wrong (most commonly: uvicorn 
 
 ## Simulated-MVP acceptance
 
-One command demonstrates the already-built simulated execution lifecycle (seeded opportunity -> authorizer -> execution -> `SimulatedVenue` -> Portfolio State -> stop/target/EOD exits -> restart -> `strategy_outcomes`) against PostgreSQL through the real FastAPI lifespan, with clear PASS/FAIL per milestone:
+One command demonstrates the simulated execution lifecycle against PostgreSQL through the real FastAPI lifespan, with PASS/FAIL per milestone. S1–S5 retain seeded opportunities, stop/target/EOD exits and restart checks. S6 adds a real registered Gap strategy evaluated by the lifespan-installed `StrategyScheduler`, followed by simulated entry, protective closure and one recorded outcome:
 
 ```bash
 cd backend
@@ -361,7 +361,7 @@ createdb mvp_acceptance && POSTGRES_DB=mvp_acceptance alembic upgrade head      
 POSTGRES_DB=mvp_acceptance python scripts/simulated_mvp_acceptance.py --database mvp_acceptance
 ```
 
-The database must be explicitly selected (`--database` must equal `POSTGRES_DB` and the name must contain `acceptance`, `disposable`, `scratch` or `test`), migrated to head, and empty; anything else is refused before any worker starts, and nothing is ever truncated or cleaned. Finnhub/Polygon are disabled and no IBKR Gateway or credentials are needed. Exit code `0` = PASS, `1` = a milestone failed (named in the output), `2` = a precondition failed. A finished run leaves its rows as evidence: create a fresh database to run again. This proves the downstream simulated lifecycle from seeded opportunities only; it does not prove strategy profitability, ranking, live-feed coverage or real broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.12.
+The database must be explicitly selected (`--database` must equal `POSTGRES_DB` and the name must contain `acceptance`, `disposable`, `scratch` or `test`), migrated to head, and empty; anything else is refused before any worker starts, and nothing is ever truncated or cleaned. Finnhub/Polygon are disabled and no IBKR Gateway or credentials are needed. Exit code `0` = PASS, `1` = a milestone failed (named in the output), `2` = a precondition failed. A finished run leaves its rows as evidence: create a fresh database to run again. S6 uses controlled feature, market-state, context, price and clock inputs; it does not prove candle acquisition, FeatureEngine calculations, live-feed operation, profitability, ranking or real broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.12.
 
 ## Running tests
 

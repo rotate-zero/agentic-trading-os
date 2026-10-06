@@ -1,3 +1,22 @@
+<!-- BEGIN DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
+# TESTING — `strategy-to-simulated-execution-acceptance`
+
+Base `7a27e67`; local PostgreSQL 18 on `localhost:55432`, Python 3.14. Disposable databases were separately created and migrated to Alembic `0017`; the acceptance command's empty-database preconditions ran before any application worker. No provider, broker, credentials or full backend suite was used.
+
+**Acceptance command** (from `backend/`, on a newly created and migrated empty fixture):
+
+```bash
+POSTGRES_HOST=localhost POSTGRES_PORT=55432 POSTGRES_USER=rotate_zero POSTGRES_PASSWORD=<local-test-password> POSTGRES_DB=strategy_simulated_acceptance_verified_test ./.venv/bin/python scripts/simulated_mvp_acceptance.py --database strategy_simulated_acceptance_verified_test
+```
+
+- Final code: `RESULT: PASS — 88 milestones passed` (S1–S5 preserved; S6 ×20), 64 public API reads across nine routes. S6 observed Gap v1 `OpportunityCreated`, a persisted approval and order, entry fill and open Portfolio State position, target observation and closing fill, and one linked Gap v1 outcome. The negative setup symbol produced no event, trade, order or position after the bounded queue barrier.
+- Required fault check: temporarily changed only the scheduler's opportunity publish condition to false, then ran the same command on a separate fresh migrated database with `--timeout 10`. S1–S5 passed and S6 failed at `S6.6 Gap evaluate() causes StrategyScheduler to publish OpportunityCreated` with `events=0` (exit 1). The production scheduler source was restored and `git diff --exit-code -- backend/app/strategy_engine/scheduler.py` was clean.
+- Directly affected tests, serially on a separate migrated test database: `pytest -q tests/test_simulated_mvp_acceptance.py tests/test_gap_strategy.py tests/test_strategy_scheduler.py tests/test_main_execution_pipeline.py tests/test_outcome_recorder_event_path_integration.py tests/test_outcome_recorder_lifespan_recovery.py` — **77 passed**. Existing Python 3.14 `pytest_asyncio`/FastAPI deprecation warnings only.
+- An earlier diagnostic run placed S6 on S4's trading day; the Governor correctly rejected it with `projected_loss_exceeds_daily_cap`. S6 now uses the next regular day, preserving that risk rule.
+
+**Limits.** Controlled feature and market-state payloads bypass candle acquisition and FeatureEngine calculations. ContextEngine is real, but provider keys are blank. The simulated venue, injected clocks, fixed entry snapshot and prior S4 restart book retention remain as documented in execution-engine-design.md §6.12. No live-feed, profitability, ranking or real broker claim follows from this run. Evidence databases are retained; the command refuses a rerun against them.
+<!-- END DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
+
 <!-- BEGIN DELIVERY SECTION: backtest-selection-performance-summary -->
 # TESTING — `backtest-selection-performance-summary`
 

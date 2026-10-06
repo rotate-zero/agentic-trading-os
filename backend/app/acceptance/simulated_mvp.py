@@ -1,24 +1,25 @@
-"""Simulated-MVP acceptance: one command, five scenarios, PASS/FAIL.
+"""Simulated-MVP acceptance: one command, six scenarios, PASS/FAIL.
 
 WHAT THIS PROVES
     That the already-built downstream simulated execution lifecycle works end to end against a real
     PostgreSQL database, driven through the REAL FastAPI lifespan (`app.main`), from seeded
-    `OpportunityCreated` events:
+    `OpportunityCreated` events (S1-S5) and one real StrategyScheduler/Gap signal (S6):
 
         OpportunityCreated -> AuthorizerStub -> ExecutionEngine -> SimulatedVenue -> Portfolio State
         -> Position Monitor (stop / target / simulated EOD) -> ExecutionEngine exit -> close fill
         -> OutcomeRecorder -> strategy_outcomes
 
 WHAT THIS DOES NOT PROVE
-    Strategy profitability, opportunity ranking, live-feed coverage or real broker execution. The
-    opportunities, the market ticks and the clock are CONTROLLED INPUTS; nothing here proves that a
-    live system would ever produce those opportunities or those prices.
+    Candle acquisition, FeatureEngine calculations, strategy profitability, opportunity ranking,
+    live-feed coverage or real broker execution. The S1-S5 opportunities and all feature, market-state,
+    price and clock values are CONTROLLED INPUTS; nothing here proves that live data would produce the
+    S6 setup or these prices.
 
 HOW IT STAYS HONEST
     * No ledger or outcome row is ever inserted by this module. Every row it reads was written by the
       application's own workers (the authorizer, execution engine, Portfolio State, OutcomeRecorder).
-    * The only things substituted are inputs (opportunities, prices, wall clock) and the venue/monitor/
-      exit-ledger *clock*. The components themselves are the production classes.
+    * The only things substituted are controlled inputs (including S6 FeaturesUpdated/MarketStateChanged),
+      wall clock, and the venue/monitor/exit-ledger *clock*. The components are production classes.
     * The database must be an explicitly selected, disposable, migrated and EMPTY PostgreSQL database.
       The module never truncates, deletes or cleans anything; a populated database is refused.
 
@@ -50,10 +51,11 @@ from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Sequence
 
 SCOPE_STATEMENT = (
-    "Scope: this proves the downstream SIMULATED lifecycle from seeded opportunities "
-    "(authorizer -> execution -> SimulatedVenue -> Portfolio State -> Position Monitor -> OutcomeRecorder) "
-    "against PostgreSQL. It does NOT prove strategy profitability, ranking, live-feed coverage or real "
-    "broker execution."
+    "Scope: seeded opportunities (S1-S5) and a real StrategyScheduler/Gap opportunity (S6) reach the "
+    "SIMULATED authorizer -> execution -> SimulatedVenue -> Portfolio State -> Position Monitor -> "
+    "OutcomeRecorder against PostgreSQL. Controlled feature, market-state, context, price and clock inputs "
+    "do NOT prove candle acquisition, FeatureEngine calculations, live-feed coverage, strategy profitability, "
+    "ranking or real broker execution."
 )
 
 # A database name must contain one of these to be accepted as disposable. This is a guard against
@@ -80,6 +82,7 @@ STRATEGY_VERSION = "acceptance_v1"
 SESSION_DAY_1 = datetime(2026, 9, 16, 14, 0, tzinfo=timezone.utc)         # 10:00 ET
 SESSION_CLOSE_DAY_1 = datetime(2026, 9, 16, 20, 0, tzinfo=timezone.utc)   # 16:00 ET
 SESSION_DAY_2 = datetime(2026, 9, 17, 14, 0, tzinfo=timezone.utc)
+SESSION_DAY_3 = datetime(2026, 9, 18, 14, 0, tzinfo=timezone.utc)
 
 ENTRY_PRICE = 100.0
 STOP_LEVEL = 95.0       # structural_invalidation of every seeded opportunity
@@ -93,6 +96,11 @@ SYMBOL_STOP = "ZZACCS"      # scenario 2 entry, closed by stop
 SYMBOL_EOD = "ZZACCE"       # scenario 3
 SYMBOL_RESTART = "ZZACCR"   # scenario 4
 SYMBOL_REJECTED = "ZZACCX"  # scenario 5 negative control (no reference price -> rejected)
+SYMBOL_GAP_ABSENT = "ZZACGN"  # scenario 6 negative control: no gap feature keys
+SYMBOL_GAP = "ZZACGP"         # scenario 6 real Gap opportunity
+GAP_STRATEGY = "Gap"
+GAP_VERSION = "gap_v1"
+GAP_TARGET = 110.0             # close 100, regular_open/stop 95, default target_r_multiple=2
 
 
 # =================================================================================================
@@ -449,7 +457,9 @@ class Acceptance:
         import app.execution_engine.exit_ledger as exit_module
         import app.governor.engine as governor_module
         import app.position_monitor.engine as monitor_module
+        import app.strategy_engine.scheduler as scheduler_module
         import app.trading_intelligence.outcome_recorder as recorder_module
+        from app.context_engine.engine import get_context_engine
         from app.core.market_clock import MarketClock
         from app.db.session import SessionLocal
         from app.event_bus.bus import get_event_bus
@@ -457,18 +467,24 @@ class Acceptance:
         from app.models.execution_ledger import ExitRequest, Fill, Order, Position, Trade
         from app.models.trading_intelligence import StrategyOutcomeRecord
         from app.schemas.events.envelope import EventEnvelope, EventType
+        from app.schemas.events.features import FeatureSet
         from app.schemas.events.market_data import PriceUpdated
+        from app.schemas.events.market_state import MarketState
         from app.services import broker_registry
         from app.strategy_engine.base_strategy import Opportunity
+        from app.strategy_engine.gap_strategy import GapStrategy, default_config as gap_default_config
         from app.trading_intelligence.state_snapshot import StrategyOutcomeSnapshots
 
         self.d = SimpleNamespace(
             venue_module=venue_module, exit_module=exit_module, governor_module=governor_module,
-            monitor_module=monitor_module, recorder_module=recorder_module, MarketClock=MarketClock,
+            monitor_module=monitor_module, recorder_module=recorder_module, scheduler_module=scheduler_module,
+            get_context_engine=get_context_engine, GapStrategy=GapStrategy, gap_default_config=gap_default_config,
+            MarketClock=MarketClock,
             SessionLocal=SessionLocal, get_event_bus=get_event_bus, app=fastapi_app, Fill=Fill,
             ExitRequest=ExitRequest, Order=Order, Position=Position, Trade=Trade,
             Outcome=StrategyOutcomeRecord, EventEnvelope=EventEnvelope, EventType=EventType,
-            PriceUpdated=PriceUpdated, broker_registry=broker_registry, Opportunity=Opportunity,
+            PriceUpdated=PriceUpdated, FeatureSet=FeatureSet, MarketState=MarketState,
+            broker_registry=broker_registry, Opportunity=Opportunity,
             StrategyOutcomeSnapshots=StrategyOutcomeSnapshots,
         )
 
@@ -586,6 +602,27 @@ class Acceptance:
             status="actionable", setup_detected_at=self.clock.now).model_dump(mode="json")
         self.publish(d.EventEnvelope(event_type=d.EventType.OPPORTUNITY_CREATED, symbol=symbol, payload=payload))
 
+    def send_gap_inputs(self, symbol: str, *, setup_present: bool) -> None:
+        """Feed the installed scheduler through normal context/feature/market-state contracts.
+
+        Gap's own evaluate() decides whether a proposal exists. This method never constructs or
+        publishes an OpportunityCreated event.
+        """
+        d = self.d
+        self.client.portal.call(d.get_context_engine().evaluate_for_symbol, symbol)
+        features = {"pdc": 92.0, "gap_dollars": 3.0, "gap_pct": 100.0 * 3.0 / 92.0,
+                    "regular_open": STOP_LEVEL} if setup_present else {}
+        feature_set = d.FeatureSet(timeframe="1m", candle_ts=self.clock.now, close=ENTRY_PRICE,
+                                   features=features)
+        self.publish(d.EventEnvelope(event_type=d.EventType.FEATURES_UPDATED, symbol=symbol,
+                                     payload=feature_set.model_dump(mode="json")))
+        self.settle()  # scheduler's feature cache and other FeaturesUpdated subscribers have processed it
+        market_state = d.MarketState(timeframe="1m", candle_ts=self.clock.now,
+                                     trend_score=70.0, volatility_regime_score=50.0,
+                                     volume_regime_score=60.0, vwap_relationship_score=50.0)
+        self.publish(d.EventEnvelope(event_type=d.EventType.MARKET_STATE_CHANGED, symbol=symbol,
+                                     payload=market_state.model_dump(mode="json")))
+
     def venue_tick(self, symbol: str, price: float) -> None:
         venue = self.d.broker_registry.get_execution_venue()
         if venue is None:
@@ -619,10 +656,10 @@ class Acceptance:
         self.client.portal.call(bounded)
 
     # --- ledger reads (rows written by the application's own workers) ------------------------------
-    def trade(self, symbol: str):
+    def trade(self, symbol: str, strategy_name: str = STRATEGY_NAME):
         d = self.d
         with d.SessionLocal() as s:
-            return s.query(d.Trade).filter(d.Trade.strategy_name == STRATEGY_NAME, d.Trade.symbol == symbol) \
+            return s.query(d.Trade).filter(d.Trade.strategy_name == strategy_name, d.Trade.symbol == symbol) \
                 .order_by(d.Trade.created_at).first()
 
     def orders(self, trade_id) -> list:
@@ -646,10 +683,12 @@ class Acceptance:
         with d.SessionLocal() as s:
             return s.get(d.ExitRequest, position_id)
 
-    def outcomes(self, trade_id=None) -> list:
+    def outcomes(self, trade_id=None, strategy_name: str | None = STRATEGY_NAME) -> list:
         d = self.d
         with d.SessionLocal() as s:
-            query = s.query(d.Outcome).filter(d.Outcome.strategy_name == STRATEGY_NAME)
+            query = s.query(d.Outcome)
+            if strategy_name is not None:
+                query = query.filter(d.Outcome.strategy_name == strategy_name)
             if trade_id is not None:
                 query = query.filter(d.Outcome.opportunity_id == trade_id)
             return query.all()
@@ -670,21 +709,23 @@ class Acceptance:
         self.c.check("Position Monitor running (GET /intelligence/exit-intents)",
                      monitor["monitor_status"] == "running", lambda: f"monitor: {monitor['monitor_status']}")
 
-    def enter_position(self, symbol: str, *, label: str) -> Evidence:
-        """Seed one opportunity and drive it to an OPEN position through the real pipeline."""
+    def enter_position(self, symbol: str, *, label: str, strategy_name: str = STRATEGY_NAME,
+                       opportunity_input: Callable[[str], None] | None = None,
+                       target_level: float = TARGET_LEVEL) -> Evidence:
+        """Drive a seeded or scheduler-generated opportunity to an open position."""
         c = self.c
         ev = self.evidence.setdefault(symbol, Evidence(symbol=symbol))
         self.send_price(symbol, ENTRY_PRICE)        # reference price for the authorizer
-        self.send_opportunity(symbol)
+        (opportunity_input or self.send_opportunity)(symbol)
 
         def entry_state():
-            trade = self.trade(symbol)
+            trade = self.trade(symbol, strategy_name)
             order = None if trade is None else next(iter(self.orders(trade.trade_id)), None)
             return (None if trade is None else trade.decision, None if order is None else order.status)
 
         c.wait(f"{label}: authorizer persists an approved decision and the entry order is submitted",
                lambda: entry_state() == ("approved", "submitted"), entry_state)
-        trade = self.trade(symbol)
+        trade = self.trade(symbol, strategy_name)
         order = self.orders(trade.trade_id)[0]
         expected_qty = math.floor(self.settings.execution_fixed_notional_usd / ENTRY_PRICE)
         c.check(f"{label}: persisted approval is simulated, auto, sized by the authorizer limits",
@@ -707,9 +748,9 @@ class Acceptance:
                lambda: open_state() == ("open", 1, True), open_state)
         pos = self.position(trade.trade_id)
         fill = self.fills(trade.trade_id)[0]
-        c.check(f"{label}: ledger holds one entry fill and an open position with the seeded stop/target",
+        c.check(f"{label}: ledger holds one entry fill and an open position with the structural stop/target",
                 (float(fill.price), fill.qty) == (ENTRY_PRICE, ev.qty) and pos.qty == ev.qty
-                and (float(pos.avg_price), float(pos.stop), float(pos.target)) == (ENTRY_PRICE, STOP_LEVEL, TARGET_LEVEL)
+                and (float(pos.avg_price), float(pos.stop), float(pos.target)) == (ENTRY_PRICE, STOP_LEVEL, target_level)
                 and self.orders(trade.trade_id)[0].status == "filled",
                 lambda: (f"fill={fill.price}x{fill.qty} position={pos.status}/{pos.qty}/{pos.avg_price}/"
                          f"{pos.stop}/{pos.target}"))
@@ -984,6 +1025,105 @@ class Acceptance:
         c.check("restarted Portfolio State is flat; nothing re-opened or re-closed",
                 flat is not None and flat["positions"] == [] and flat["open_position_count"] == 0, lambda: f"{flat}")
 
+    # --- scenario 6 -------------------------------------------------------------------------------
+    @contextlib.contextmanager
+    def gap_only_registry(self):
+        """Use the scheduler's existing registry seam to isolate one registered production strategy."""
+        d = self.d
+        original = d.scheduler_module.default_registry
+        d.scheduler_module.default_registry = lambda active_from: [
+            d.GapStrategy(d.gap_default_config(active_from))
+        ]
+        try:
+            yield
+        finally:
+            d.scheduler_module.default_registry = original
+
+    def gap_events(self, symbol: str) -> list[Any]:
+        return [e for e in list(self.events)
+                if e.event_type == self.d.EventType.OPPORTUNITY_CREATED and e.symbol == symbol]
+
+    def scenario_6(self) -> None:
+        c, d = self.c, self.d
+        c.begin("S6", "Scenario 6 — real Gap strategy through StrategyScheduler, simulated execution and outcome")
+        self.clock.now = SESSION_DAY_3  # fresh trading day: S4's stop must not consume S6's daily risk cap
+        c.check("controlled clock is the next regular-session day, with a fresh daily loss budget",
+                self.clock.now == SESSION_DAY_3, note=self.clock.now.isoformat())
+        self.expect_startup_ready()
+        scheduler = d.scheduler_module.get_strategy_scheduler()
+        strategies = scheduler._strategies
+        c.check("lifespan-installed scheduler has only the real registered Gap v1 and its default configuration",
+                len(strategies) == 1 and isinstance(strategies[0], d.GapStrategy)
+                and strategies[0].config == d.gap_default_config(strategies[0].config.active_from),
+                lambda: f"registered={[(s.name, s.config.version) for s in strategies]}")
+
+        # No gap keys: the selected strategy's own GATE returns None. The drain is the processing
+        # barrier; a sleep would not establish that scheduler/authorizer work had finished.
+        self.send_price(SYMBOL_GAP_ABSENT, ENTRY_PRICE)
+        self.send_gap_inputs(SYMBOL_GAP_ABSENT, setup_present=False)
+        self.settle()
+        absent_orders = self.api("/intelligence/execution-orders", symbol=SYMBOL_GAP_ABSENT)["orders"]
+        absent_positions = self.api("/intelligence/execution-positions", symbol=SYMBOL_GAP_ABSENT)["positions"]
+        c.check("absent Gap setup produces no scheduler opportunity, authorized trade or entry order",
+                not self.gap_events(SYMBOL_GAP_ABSENT)
+                and self.trade(SYMBOL_GAP_ABSENT, GAP_STRATEGY) is None
+                and not absent_orders and not absent_positions,
+                lambda: f"opportunities={len(self.gap_events(SYMBOL_GAP_ABSENT))} "
+                        f"trade={self.trade(SYMBOL_GAP_ABSENT, GAP_STRATEGY)} "
+                        f"orders={len(absent_orders)} positions={len(absent_positions)}")
+
+        def publish_gap_inputs(symbol: str) -> None:
+            self.send_gap_inputs(symbol, setup_present=True)
+            c.wait("Gap evaluate() causes StrategyScheduler to publish OpportunityCreated",
+                   lambda: len(self.gap_events(symbol)) == 1,
+                   lambda: f"events={len(self.gap_events(symbol))}")
+            opportunity = d.Opportunity.model_validate(self.gap_events(symbol)[0].payload)
+            conditions = opportunity.evidence.get("conditions", {})
+            c.check("scheduler opportunity carries Gap v1, default-config setup evidence and structural levels",
+                    opportunity.strategy == GAP_STRATEGY and opportunity.version == GAP_VERSION
+                    and opportunity.direction == "BUY" and opportunity.status == "actionable"
+                    and (opportunity.structural_invalidation, opportunity.structural_target)
+                    == (STOP_LEVEL, GAP_TARGET)
+                    and opportunity.setup_detected_at == self.clock.now
+                    and conditions.get("pdc") == 92.0 and conditions.get("gap_dollars") == 3.0
+                    and math.isclose(conditions.get("gap_pct", 0), 100.0 * 3.0 / 92.0)
+                    and conditions.get("regular_open") == STOP_LEVEL
+                    and conditions.get("close") == ENTRY_PRICE
+                    and conditions.get("trend_score") == 70.0
+                    and conditions.get("volume_regime_score") == 60.0,
+                    lambda: f"opportunity={opportunity.model_dump(mode='json')}")
+
+        ev = self.enter_position(SYMBOL_GAP, label="Gap", strategy_name=GAP_STRATEGY,
+                                 opportunity_input=publish_gap_inputs, target_level=GAP_TARGET)
+        self.expect_public_open_position(ev)
+        trade = self.trade(SYMBOL_GAP, GAP_STRATEGY)
+        c.check("approved trade retains Gap strategy/version and the same structural thesis",
+                trade.strategy_version == GAP_VERSION
+                and (trade.thesis.get("structural_invalidation"), trade.thesis.get("structural_target"))
+                == (STOP_LEVEL, GAP_TARGET),
+                lambda: f"version={trade.strategy_version} thesis={trade.thesis}")
+        self.protective_close(ev, reason="target", level=GAP_TARGET, trigger_tick=111.0,
+                              fill_price=111.0, label="Gap target")
+
+        def recorded() -> bool:
+            with d.SessionLocal() as s:
+                row = s.get(d.Trade, ev.trade_id)
+                return row.outcome_status == "recorded" and row.outcome_id is not None
+
+        c.wait("OutcomeRecorder records and links the scheduler-originated trade", recorded)
+        self.settle()
+        rows = self.outcomes(ev.trade_id, strategy_name=None)
+        trade = self.trade(SYMBOL_GAP, GAP_STRATEGY)
+        c.check("exactly one linked simulated Gap v1 outcome preserves strategy and structural attribution",
+                len(rows) == 1 and trade.outcome_id == rows[0].outcome_id
+                and rows[0].strategy_name == GAP_STRATEGY and rows[0].strategy_version == GAP_VERSION
+                and rows[0].execution_mode == "simulated" and rows[0].is_backtest is False
+                and rows[0].exit_reason == "target"
+                and (float(rows[0].structural_invalidation), float(rows[0].structural_target))
+                == (STOP_LEVEL, GAP_TARGET),
+                lambda: f"outcomes={len(rows)} trade_link={trade.outcome_id}"
+                        + (f" outcome={rows[0].outcome_id}" if rows else ""))
+
     # --- driver ------------------------------------------------------------------------------------
     def run(self) -> None:
         self._import()
@@ -1000,6 +1140,9 @@ class Acceptance:
             self.retain_venue = False                  # the book is flat now: a fresh venue reconciles cleanly
             with self.lifespan():                      # process 3: another restart
                 self.scenario_5_after_restart(before)
+            with self.gap_only_registry():
+                with self.lifespan():                  # process 4: isolated real Gap strategy
+                    self.scenario_6()
 
 
 # =================================================================================================

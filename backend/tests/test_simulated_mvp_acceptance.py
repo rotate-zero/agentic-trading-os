@@ -1,6 +1,6 @@
 """Unit tests for the simulated-MVP acceptance command's OWN logic (app/acceptance/simulated_mvp.py).
 
-These do not run the five scenarios (that is the command itself:
+These do not run the six scenarios (that is the command itself:
 `python scripts/simulated_mvp_acceptance.py --database <disposable_db>`, see TESTING.md). They prove that the
 guard rails and the PASS/FAIL reporting behave: a populated, unmigrated, wrongly named or unselected database
 is refused before anything starts; a failed milestone is named and yields a nonzero exit code; the database
@@ -189,5 +189,6 @@ def test_exit_1_on_an_unexpected_crash_and_names_the_milestone_in_progress(selec
 def test_exit_0_prints_pass_and_the_scope_limits(selected_db):
     code, text = run_main(["--database", "mvp_acceptance_unit"])
     assert code == 0 and "RESULT: PASS" in text
-    assert "does NOT prove strategy profitability, ranking, live-feed coverage or real broker execution" in text
+    assert "real StrategyScheduler/Gap opportunity (S6)" in text
+    assert "do NOT prove candle acquisition, FeatureEngine calculations, live-feed coverage" in text
     assert PASSWORD not in text and "unit_user" in text

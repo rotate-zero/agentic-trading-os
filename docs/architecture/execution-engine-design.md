@@ -3319,7 +3319,7 @@ POSTGRES_HOST=… POSTGRES_PORT=… POSTGRES_DB=<disposable_db> POSTGRES_USER=�
 
 Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a precondition failed (nothing started), `3` watchdog expired.
 
-**What it proves, and what it does not.** It proves the downstream simulated lifecycle from *seeded* `OpportunityCreated` events. It does **not** prove strategy profitability, opportunity ranking, live-feed coverage or real broker execution. The opportunities, prices and clock are controlled inputs.
+**What it proves, and what it does not.** S1–S5 prove the downstream simulated lifecycle from *seeded* `OpportunityCreated` events. S6 additionally proves that the real lifespan-installed `StrategyScheduler` can evaluate registered Gap, publish an actionable opportunity, and reach one recorded simulated outcome. Feature, market-state, context, price and clock inputs are controlled. This does **not** prove candle acquisition, FeatureEngine calculations, live-feed operation, profitability, ranking or real broker execution.
 
 **Component data flow.**
 
@@ -3331,7 +3331,8 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
         │                                     │  ── any failure: exit 2, NO worker started
         ▼                                     ▼
   disposable PostgreSQL            controlled inputs (the only substitutions)
-  (migrated, empty)                 • seeded OpportunityCreated + PriceUpdated  (published on the bus)
+  (migrated, empty)                 • S1–S5: seeded OpportunityCreated + PriceUpdated
+        │                           • S6: FeaturesUpdated + MarketStateChanged + context + PriceUpdated
         ▲                           • DeterministicClock → MarketClock, PositionMonitor.wall_clock,
         │                             PostgresExitLedger.clock  (auto-pulse off; EOD pulse is explicit)
         │                           • fixed entry-snapshot capture; venue book retained on restart
@@ -3339,6 +3340,7 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
         │                                     ▼
         │              REAL app.main lifespan (one per simulated "process")
         │   ┌───────────────────────────────────────────────────────────────────────┐
+        │   │ S6: StrategyScheduler + real Gap.evaluate() ─► OpportunityCreated   │
         │   │ EventBus ─► AuthorizerStub ─► ExecutionEngine ─► SimulatedVenue       │
         │   │                  │                 ▲  │               │ fills           │
         │   │                  ▼                 │  ▼               ▼                 │
@@ -3356,7 +3358,7 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
                                 execution-outcome-status, strategy-outcomes}
 ```
 
-**Scenario flow** (three lifespans = three "processes"; one deterministic clock; one position at a time because `execution_max_concurrent_positions = 1`):
+**Scenario flow** (four lifespans = four "processes"; one deterministic clock; one position at a time because `execution_max_concurrent_positions = 1`):
 
 ```
  lifespan #1 (2026-09-16, clock 14:00Z)
@@ -3374,6 +3376,16 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
          OutcomeRecorder: 4 closed trades ─► exactly 4 linked outcomes, ledger-consistent
  lifespan #3 (restart again; fresh, flat venue)
    S5b startup ready ─► recorder running ─► explicit sweep drained ─► still exactly 4, same outcome ids
+ lifespan #4 (fresh, flat venue; Gap-only registry through the existing scheduler test seam)
+   S6  clock 2026-09-18 14:00Z (fresh daily risk budget)
+       negative symbol: context + FeaturesUpdated(no gap keys) + MarketStateChanged
+         ─► bounded queue barrier ─► no OpportunityCreated/trade/order/position
+       positive symbol: context + FeaturesUpdated(gap 3/92, regular_open 95, close 100)
+         + MarketStateChanged(trend 70, volume 60)
+         ─► Gap.evaluate() ─► scheduler OpportunityCreated(BUY, gap_v1, stop 95, target 110)
+         ─► approval ─► entry order ─► venue fill 100 ─► Portfolio State OPEN
+         ─► price observation 111 ─► durable target exit ─► close order ─► fill 111
+         ─► Portfolio State CLOSED ─► OutcomeRecorder ─► one linked Gap outcome
 ```
 
 **Internal flow of `simulated_mvp.py`.**
@@ -3390,7 +3402,13 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
         ├─ controlled_inputs()          patch only clocks/inputs; always restored
         ├─ lifespan()                   reset singletons ─► `with TestClient(app)` (shutdown guaranteed)
         ├─ Checker.check / Checker.wait named milestones; wait = bounded poll for an OBSERVED state
-        └─ scenario_1 … scenario_5      AcceptanceFailure ─► "RESULT: FAIL — failed milestone S2.3 …", exit 1
+        ├─ scenario_1 … scenario_5      original seeded and restart scenarios
+        └─ gap_only_registry() ─► lifespan() ─► scenario_6()
+             ├─ send_gap_inputs()      real ContextEngine snapshot, normal FeaturesUpdated/MarketStateChanged
+             ├─ settle()               bounded queue drain before negative assertion
+             ├─ Gap.evaluate()         scheduler alone publishes OpportunityCreated
+             └─ existing entry/close helpers ─► ledger/API/outcome attribution checks
+           AcceptanceFailure ─► "RESULT: FAIL — failed milestone S6.6 …", exit 1
 ```
 
 **Contracts worth knowing.**
@@ -3400,6 +3418,7 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
 - *Deterministic clock.* `AuthorizerStub` asks the market clock about the real `datetime.now()`, so the run injects a `MarketClock` that answers for the controlled clock instead; the run therefore does not depend on the time of day it is executed.
 - *Restart and the venue.* `SimulatedVenue` keeps its book in memory only. A **fresh** venue after a restart with an open position reports quantity 0 and startup reconciliation fails closed (`reconciliation_blocked`), which is the designed behavior (§6.9; `test_real_lifespan_eod_and_fresh_venue_restart_block`). Scenario 4 therefore retains the previous venue's book across the restart to stand in for a durable venue; it proves ledger-side restoration and the protective close after it, **not** that a simulated venue survives a restart. Scenario 5's second restart uses a fresh venue only because the book is flat by then.
 - *Authorizer limits.* Each seeded entry risks `qty × (100 − 95)` against `execution_daily_loss_cap_usd`; the scenarios close the winner first so realized loss never blocks a later seeded entry. Precondition P.2 fails early if the configured limits cannot admit the seeded entries.
+- *Gap choice and isolation.* Gap's documented v1 default setup needs only `pdc`, `gap_dollars`, `gap_pct`, `regular_open`, a confirming close and settled trend/volume scores; existing unit fixtures exercise those keys. At 10:00 ET, `regular_open=95`, `close=100`, and default `target_r_multiple=2` give structural stop 95 and target 110. The acceptance-only registry seam selects one actual `GapStrategy` with `default_config`; production registration defaults are untouched. S6 uses the next regular day because S4's same-day stop plus S6's open risk would exceed the Governor's existing daily cap. The no-setup case is checked after the bus and worker queues drain, not after an arbitrary sleep.
 - *Output hygiene.* The target is printed as `host:port/database as user`; every output line is scrubbed of the configured password. Application logs are captured and shown only (last few warnings/errors) when a milestone fails.
 
 ---

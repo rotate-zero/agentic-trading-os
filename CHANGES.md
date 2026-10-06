@@ -1,3 +1,14 @@
+<!-- BEGIN DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
+# CHANGES — `strategy-to-simulated-execution-acceptance`
+
+Base: `main` `7a27e67` (rechecked before implementation). The existing five seeded scenarios remain; no production scheduler, strategy, event contract, Governor, execution, schema, or registration default changed. No new decision number was needed.
+
+- Extended `backend/app/acceptance/simulated_mvp.py` with S6 in a fourth real lifespan. Its acceptance-only registry seam selects the existing Gap v1 implementation with its default configuration. Controlled context, `FeaturesUpdated`, and `MarketStateChanged` inputs make its documented 10:00 ET gap continuation setup reproducible. The real scheduler calls `GapStrategy.evaluate()` and publishes the opportunity; the test checks strategy/version, setup evidence, stop 95 and target 110 before observing a persisted approval, entry order, fill, open Portfolio State position, protective target close, closing fill, and exactly one linked simulated Gap outcome. A separate missing-gap-keys symbol is checked after a deterministic processing barrier for no opportunity, trade, order or position. S6 uses the next trading day to respect the existing daily-loss cap after S4's stop.
+- Updated the acceptance module's scope text and its focused test. Updated `docs/architecture/execution-engine-design.md` §6.12, `docs/architecture/strategy-engine-design.md`, `docs/roadmap/phase-roadmap.md`, `backend/README.md`, and `TESTING.md` with the observed flow and its limits.
+
+The command still requires an explicitly selected disposable, migrated, empty PostgreSQL database and leaves evidence rows intact. Controlled inputs do not validate acquisition, FeatureEngine calculations, a live feed, profitability or real broker execution; D4 ranking remains open.
+<!-- END DELIVERY SECTION: strategy-to-simulated-execution-acceptance -->
+
 <!-- BEGIN DELIVERY SECTION: backtest-selection-performance-summary -->
 # CHANGES — `backtest-selection-performance-summary`
 

@@ -693,6 +693,34 @@ Everything above, connected — the learning loop this design is actually buildi
 
 ---
 
+### Observed strategy-to-simulated-execution acceptance (`strategy-to-simulated-execution-acceptance`)
+
+The simulated-MVP command now has a separate S6 after its seeded and restart scenarios (execution-engine-design.md §6.12). It runs the lifespan-installed `StrategyScheduler` with only the existing registered `GapStrategy(default_config(...))` selected through the scheduler's test registry seam. Gap was chosen because its v1 setup is reproducible from four named `FeatureSet` keys (`pdc`, `gap_dollars`, `gap_pct`, `regular_open`), a close and two Market State scores; `test_gap_strategy.py` already covers these conditions. S6 feeds the normal `FeaturesUpdated` and `MarketStateChanged` contracts and a real ContextEngine per-symbol snapshot. Only the scheduler publishes `OpportunityCreated`; the strategy's `evaluate()` return is not replaced.
+
+```
+ controlled context + FeatureSet + MarketState (10:00 ET, 2026-09-18)
+             │ normal event contracts
+             ▼
+ real StrategyScheduler ─► Gap.evaluate() ─► actionable Gap v1 opportunity
+                                            stop 95 / target 110
+                                               │
+                                               ▼
+ Governor approval ─► Execution / SimulatedVenue ─► open Portfolio State position
+                                                     │ observed target tick
+                                                     ▼
+                                           protective close order ─► close fill
+                                                                         │
+                                                                         ▼
+                                                                  OutcomeRecorder
+                                                                         │
+                                                                         ▼
+                                                     one linked simulated Gap v1 outcome
+```
+
+With the gap keys absent, S6 drains the event and worker queues before confirming no opportunity, trade, entry order or position. These checks establish this controlled scheduler-to-outcome path. They do not validate candle acquisition, FeatureEngine calculations, live feeds, profitability, or a broker venue; D4 ranking remains open.
+
+---
+
 ## 11. Guiding constraints carried into this design (standing project principles, not new rules)
 
 - **Honest state over fabricated state** — an outcome record with no data for a field stays `None`/absent; Performance Intelligence never estimates a plausible-looking number for something not yet measured. Extends to time, not just data (§8): a forming candle's shape is real but not yet settled, and `evidence.basis` exists so a strategy is never ambiguous about which kind of fact it acted on.
