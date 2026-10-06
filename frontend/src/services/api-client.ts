@@ -1373,6 +1373,56 @@ export async function triggerIbkrBacktest(
 }
 
 // ---------------------------------------------------------------------------
+// POST /backtest/run/stored (task `stored-candle-backtest`) — replays the
+// same BacktestRunner over candles already recorded in PostgreSQL, no IBKR
+// or other external provider. Same POST-with-query-params convention and
+// the same BacktestRunResult response as /run and /run/ibkr, so
+// BacktestRunResultWireShape is reused verbatim. Errors reuse the
+// {code, message} `detail` shape (and parseIbkrErrorDetail above, which is
+// not IBKR-specific) plus the plain-string 409 live-data guard.
+
+/**
+ * Stable codes this route adds: "stored_candles_no_data" (422, nothing
+ * recorded in the exact interval), "stored_candles_malformed" (422),
+ * "stored_history_unavailable" (503); it also returns the shared
+ * "invalid_backtest_request" (422). `code` is null for the plain-string 409
+ * or an unparseable body.
+ */
+export class StoredBacktestError extends ApiError {
+  constructor(
+    message: string,
+    status: number,
+    public readonly code: string | null,
+  ) {
+    super(message, status);
+    this.name = "StoredBacktestError";
+  }
+}
+
+/**
+ * POST /backtest/run/stored — `start`/`end` must already be timezone-aware
+ * UTC ISO-8601 strings (see BacktestPanel.tsx's Eastern-time conversion).
+ * The interval is exact [start, end) and capped at 24 elapsed hours by the
+ * backend, which stays the authority on validation.
+ */
+export async function triggerStoredBacktest(
+  strategyName: string,
+  symbol: string,
+  start: string,
+  end: string,
+): Promise<BacktestRunResultWireShape> {
+  const url =
+    `${API_BASE_URL}/backtest/run/stored?strategy_name=${encodeURIComponent(strategyName)}` +
+    `&symbol=${encodeURIComponent(symbol)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  const res = await fetch(url, { method: "POST" });
+  if (!res.ok) {
+    const { message, code } = await parseIbkrErrorDetail(res);
+    throw new StoredBacktestError(message, res.status, code);
+  }
+  return (await res.json()) as BacktestRunResultWireShape;
+}
+
+// ---------------------------------------------------------------------------
 // POST /backtest/sweep (decision #163) — the third,
 // additive trigger path: one strategy across an explicit symbols×scenarios
 // cross-product, run sequentially, sharing one real sweep_id. Confirmed

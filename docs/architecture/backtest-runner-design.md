@@ -1292,3 +1292,85 @@ Frontend-only; no backend, API contract, hook, `api-client.ts`, `WorkspaceContex
 ```
 
 **File contract.** Columns, in order: `outcome_id, backtest_run_id, symbol, strategy_name, strategy_version, direction, entry_filled_at, exit_filled_at, entry_price, exit_price, realized_r, exit_reason, realized_pnl, entry_qty, exit_qty, holding_seconds, commission_total, slippage_entry, final_stop, final_target, structural_invalidation, structural_target, confidence_at_signal, trading_day, opportunity_id, origin` (names equal the wire fields; JSON blobs excluded; run-level settings such as `config_hash` are not included). Filename `backtest-outcomes-<run|sweep>-<id>.csv`, or `backtest-outcomes-run-unfiltered.csv`; the id is reduced to `[A-Za-z0-9._-]` and capped at 64 characters. Formula protection applies to text cells only, so negative numbers stay numeric. Known limits: a protected text cell differs from the original by one leading apostrophe; no real-browser/spreadsheet verification was possible in the delivery environment.
+
+### Stored-candle backtest (task `stored-candle-backtest`)
+
+Backend and frontend; no migration, dependency, `BacktestRunner`, engine, execution-lifecycle or `BacktestRunResult` change, and no decision number (the delivery slug identifies it). New: `backend/app/backtest_runner/stored_history.py`, `frontend/src/hooks/useStoredBacktestRun.ts`. Changed: `backend/app/api/routes/backtest.py`, `frontend/src/services/api-client.ts`, `frontend/src/components/backtest/BacktestPanel.tsx`.
+
+**What it adds.** `POST /backtest/run/stored` (`strategy_name`, `symbol`, `start`, `end`) replays the unchanged `BacktestRunner` over candles `CandleRecorder` already wrote to PostgreSQL, so a run needs no IBKR connection or other external provider. It is the third sibling beside `/run` (fixtures) and `/run/ibkr`, and returns the normal `BacktestRunResult`.
+
+**Reused unchanged.** Strategy-name validation, symbol `strip().upper()`, the timezone-aware / `start < end` / 24-elapsed-hour validation (the existing `_validate_ibkr_range`, same `invalid_backtest_request` 422), exact `[start, end)` semantics, the decision #132 connected-provider guard, `BacktestRunner`, `_RUN_LOCK` replay serialization, and the run-scoped `PreloadedHistoricalCandleProvider` from the IBKR path.
+
+**What is read.** Only `symbols.is_backtest = FALSE` rows. A backtest-namespace `Symbol` with the same ticker (where the runner's own state lives) is never read, so a run cannot replay its own or another run's output.
+
+| Series | Window | Role |
+|---|---|---|
+| 1m primary | exactly `[start, end)`, ordered by `candle_ts` | the replayed candles |
+| 1m warm-up | `[start - 3 * feature_engine_premarket_lookback_days, end)` | pre-market baseline, as `FeatureEngine` asks for it |
+| 1d warm-up | `[start - daily_levels_lookback_days, end)`, recorded `1d` rows only | Daily Levels / ATR / RVOL |
+
+**Component data flow.**
+
+```
+ BacktestPanel ("Stored candles" tab)
+   useStoredBacktestRun ── POST /backtest/run/stored ──────────────────────────────┐
+          ▲ run_id → setLastBacktestRunId → Backtest Results panel + CSV export     ▼
+          │                                                      routes/backtest.py: run_stored_backtest
+          │                                                        validate strategy / symbol / interval
+          │                                                        _reject_if_live_data_connected()      (409)
+          │                                                                     │
+          │                                       asyncio.to_thread ───────────►│
+          │                                  stored_history.read_stored_replay_data
+          │                                     worker-owned Session, REPEATABLE READ, read-only
+          │                                     SELECT candles ⋈ symbols WHERE is_backtest = FALSE
+          │                                                                     │ StoredReplayDataset
+          │                                                                     ▼   (Session already closed)
+          │                                                        _reject_if_live_data_connected()      (409, re-check)
+          │                                                                     │
+          │                                                                     ▼
+          │                                  BacktestRunner.run()  (unchanged) with PreloadedHistoricalCandleProvider
+          │                                     install_replay_engines → install_replay_historical_provider
+          │                                     writes backtests row (data_version = stored:postgres:candles:1m-1d)
+          │                                     replays candle by candle, writes strategy_outcomes (is_backtest = TRUE)
+          └──────────────────────────── BacktestRunResult (run_id, sweep_id, outcomes_recorded, discarded_signals)
+```
+
+**Internal acquisition flow (`stored_history.py`).**
+
+```
+ read_stored_replay_data(symbol, start, end, daily_lookback_days, premarket_lookback_days)
+   Session = SessionLocal()   (created in the worker thread; closed in finally)
+   connection(isolation REPEATABLE READ, readonly)
+   1m rows  [start - 3*premarket_days, end)  ordered ──► primary = rows with ts >= start
+   1d rows  [start - daily_days, end)        ordered
+      non-finite OHLC / negative volume ─► StoredHistoryMalformedError  (422, nothing repaired)
+      SQLAlchemyError                  ─► StoredHistoryUnavailableError (503, no driver detail)
+   close Session
+   primary empty ─► StoredHistoryNoDataError (422)  ── before any backtests row is written
+   drop 1d rows whose trading day >= trading day of the last primary candle
+   provider = PreloadedHistoricalCandleProvider({(sym,"1m"): all 1m, (sym,"1d"): kept 1d})
+```
+
+**Replay-time look-ahead flow.** `FeatureEngine` asks the run-scoped provider for `[candle_ts - lookback, candle_ts)`; the provider slices `start <= ts < end` per call, so each replayed candle only sees strictly older rows.
+
+```
+ replayed candle C ─► FeatureEngine
+      provider.get_historical(sym, "1d", C - daily_days, C)  ─► rows older than C (engine also keeps trading_day < C's day)
+      provider.get_historical(sym, "1m", C - 3*pm_days,  C)  ─► rows older than C
+   Nothing at/after `end` was ever loaded; no still-forming daily bar is in the provider.
+```
+
+**Missing data, with no new thresholds.** The only required input is at least one recorded 1m candle in `[start, end)`; otherwise `422 stored_candles_no_data` and no run row. Missing or thin warm-up is not an error: an empty daily series flows into `FeatureEngine`'s existing "no history" path (daily-derived features and regime scores stay at their existing insufficient-data values) and `outcomes_recorded == 0` is a valid result. **Synthetic daily history (`fixture_daily_history.py`) is never used here**, so results can legitimately differ from the fixture route on the same 1m data for strategies that depend on daily-derived scores; the verified fixture comparison uses VWAP, which does not.
+
+**Errors.** `detail` is `{"code","message"}`: `stored_candles_no_data` (422), `stored_candles_malformed` (422), `stored_history_unavailable` (503), plus the shared `invalid_backtest_request` (422) and the plain-string live-provider 409.
+
+**Namespace and state.** Source candles are read-only (only `SELECT`s are issued) and verified unchanged by test, in both namespaces. Runner-generated state (`market_state_history`, level-interaction rows, `daily_levels_state`) and outcomes stay in the backtest namespace (D18/D20). `FeatureEngine`'s own pre-existing cold-start backfill from `candle_store` continues to read the non-backtest namespace strictly before the candle being processed; for a recorded ticker that is real prior history and is not look-ahead.
+
+**Frontend.** An explicit **Stored candles** tab in `BacktestPanel` reuses the strategy select, symbol input and the Eastern-time window controls with the same client-side validation as the IBKR tab (the backend remains the authority). It shows a running state, structured error headings (`No recorded candles in this window`, `Recorded candles are malformed`, `Recorded candles could not be read`, the live-data 409), explains that only recorded data is used and that fundamentals/news are unavailable, and states that 0 outcomes is a valid result. A successful `run_id` is published through the existing `setLastBacktestRunId`, so the Backtest Results panel and CSV export follow it. Fixture, IBKR and Sweep behavior are unchanged.
+
+**Limits.**
+- Historical point-in-time fundamentals and news are not stored anywhere this path reads, so they stay absent (same as the other two paths).
+- The window is capped at 24 elapsed hours (warm-up is not capped); the request is synchronous with no progress signal.
+- The live-provider guard is checked before the read and again before the runner is built; as on the IBKR path, `BacktestRunner.run()` awaits its producer start before installing the replay engines, so a provider connecting inside that short interval is not caught.
+- Whether `1d` rows are being recorded is up to the recorder configuration; an unrecorded daily series degrades regime scores rather than failing.
+- Synthetic or sparse stored data proves plumbing only, never real-market profitability.

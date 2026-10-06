@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestRun } from "../../hooks/useBacktestRun";
 import { useIbkrBacktestRun, type IbkrBacktestRunError } from "../../hooks/useIbkrBacktestRun";
+import { useStoredBacktestRun, type StoredBacktestRunError } from "../../hooks/useStoredBacktestRun";
 import { useBacktestSweepRun } from "../../hooks/useBacktestSweepRun";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
@@ -53,7 +54,7 @@ function formatHoursMinutes(totalMs: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-type BacktestMode = "fixture" | "ibkr" | "sweep";
+type BacktestMode = "fixture" | "stored" | "ibkr" | "sweep";
 
 // Decision #152. Maps every real failure
 // shape POST /backtest/run/ibkr can return (confirmed directly against
@@ -96,6 +97,30 @@ function classifyIbkrBacktestError(err: IbkrBacktestRunError): { heading: string
       // future code, and the no-code case (network failure before a body
       // existed, or an unparseable response) — safe fallback, still the
       // backend's real message when one was recovered.
+      return { heading: "Request failed", message: message || "The request failed for an unknown reason." };
+  }
+}
+
+// Task `stored-candle-backtest`. Maps every failure POST /backtest/run/stored
+// can return (backtest.py's run_stored_backtest + stored_history.py's
+// StoredHistoryError subclasses, plus the shared validation 422 and the
+// plain-string live-data 409) to a short heading; the backend's own message
+// is always shown underneath verbatim.
+function classifyStoredBacktestError(err: StoredBacktestRunError): { heading: string; message: string } {
+  const { status, code, message } = err;
+  if (status === 409) {
+    return { heading: "Live data connection prevents backtesting", message };
+  }
+  switch (code) {
+    case "invalid_backtest_request":
+      return { heading: "Invalid date, symbol, or range", message };
+    case "stored_candles_no_data":
+      return { heading: "No recorded candles in this window", message };
+    case "stored_candles_malformed":
+      return { heading: "Recorded candles are malformed", message };
+    case "stored_history_unavailable":
+      return { heading: "Recorded candles could not be read", message };
+    default:
       return { heading: "Request failed", message: message || "The request failed for an unknown reason." };
   }
 }
@@ -335,6 +360,7 @@ function validateIbkrRange(startLocal: string, endLocal: string): IbkrRangeValid
 function BacktestForm() {
   const fixtureRun = useBacktestRun();
   const ibkrRun = useIbkrBacktestRun();
+  const storedRun = useStoredBacktestRun();
   const sweepRun = useBacktestSweepRun();
   const { setLastBacktestRunId, setLastBacktestSweepId } = useWorkspace();
 
@@ -394,6 +420,22 @@ function BacktestForm() {
     }
   }, [ibkrRun.status, ibkrRun.result, setLastBacktestRunId]);
 
+  // Stored-candle runs publish their run_id through the same shared
+  // WorkspaceContext mechanism, so the Backtest Results panel (and its CSV
+  // export) follows a stored run exactly like a fixture or IBKR run.
+  //
+  // Keyed on the result only, with the setter read through a ref: the
+  // WorkspaceContext setter is re-created on every state change, so listing
+  // it as a dependency (as the two effects above do) re-fires the effect
+  // after each publish. Publishing once per new result is all that is needed.
+  const setLastBacktestRunIdRef = useRef(setLastBacktestRunId);
+  setLastBacktestRunIdRef.current = setLastBacktestRunId;
+  useEffect(() => {
+    if (storedRun.status === "done" && storedRun.result?.run_id) {
+      setLastBacktestRunIdRef.current(storedRun.result.run_id);
+    }
+  }, [storedRun.status, storedRun.result]);
+
   // Sweep's own completion effect publishes sweep_id, deliberately NOT
   // run_id — a sweep response carries many pairs' own run_ids (one each,
   // some possibly null on a per-pair failure), and no single one of them
@@ -418,7 +460,11 @@ function BacktestForm() {
   // BACKTEST_SWEEP_MAX_PAIRS sequential runs), during which neither of
   // the other two modes could actually run anyway even if this guard
   // didn't disable them.
-  const running = fixtureRun.status === "running" || ibkrRun.status === "running" || sweepRun.status === "running";
+  const running =
+    fixtureRun.status === "running" ||
+    ibkrRun.status === "running" ||
+    storedRun.status === "running" ||
+    sweepRun.status === "running";
 
   const selectedScenario = useMemo(() => BACKTEST_SCENARIOS.find((sc) => sc.name === scenario), [scenario]);
   const rangeValidation = useMemo(() => validateIbkrRange(startLocal, endLocal), [startLocal, endLocal]);
@@ -434,14 +480,22 @@ function BacktestForm() {
 
   const canRunFixture = !running && strategyName !== "" && scenario !== "" && symbol.trim() !== "";
   const canRunIbkr = !running && strategyName !== "" && symbol.trim() !== "" && rangeValidation.canSubmit;
+  // Stored mode reuses the IBKR mode's time-window validation unchanged: the
+  // backend applies the same rules (tz-aware, start < end, <= 24 elapsed
+  // hours) to both routes and stays the real authority.
+  const canRunStored = !running && strategyName !== "" && symbol.trim() !== "" && rangeValidation.canSubmit;
   const canRunSweep =
     !running && strategyName !== "" && sweepSymbols.length > 0 && sweepScenarios.length > 0 && !sweepExceedsCap;
-  const canRun = mode === "fixture" ? canRunFixture : mode === "ibkr" ? canRunIbkr : canRunSweep;
+  const canRun =
+    mode === "fixture" ? canRunFixture : mode === "stored" ? canRunStored : mode === "ibkr" ? canRunIbkr : canRunSweep;
 
   const handleRun = () => {
     if (mode === "fixture") {
       if (!canRunFixture) return;
       fixtureRun.run(strategyName, symbol.trim(), scenario);
+    } else if (mode === "stored") {
+      if (!canRunStored || !rangeValidation.startIso || !rangeValidation.endIso) return;
+      storedRun.run(strategyName, symbol.trim(), rangeValidation.startIso, rangeValidation.endIso);
     } else if (mode === "ibkr") {
       if (!canRunIbkr || !rangeValidation.startIso || !rangeValidation.endIso) return;
       ibkrRun.run(strategyName, symbol.trim(), rangeValidation.startIso, rangeValidation.endIso);
@@ -464,6 +518,8 @@ function BacktestForm() {
     setEndLocal(`${anchorDate}T${endTime}`);
   };
 
+  const storedError =
+    storedRun.status === "error" && storedRun.error ? classifyStoredBacktestError(storedRun.error) : null;
   const ibkrError = ibkrRun.status === "error" && ibkrRun.error ? classifyIbkrBacktestError(ibkrRun.error) : null;
 
   return (
@@ -481,6 +537,18 @@ function BacktestForm() {
             } disabled:opacity-50`}
           >
             Fixture scenario
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "stored"}
+            onClick={() => setMode("stored")}
+            disabled={running}
+            className={`flex-1 px-2 py-1 ${
+              mode === "stored" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+            } disabled:opacity-50`}
+          >
+            Stored candles
           </button>
           <button
             type="button"
@@ -573,7 +641,9 @@ function BacktestForm() {
             <span className="font-mono text-[9px] text-text-muted">
               {mode === "fixture"
                 ? "Label only — not a real ticker lookup."
-                : "Must resolve to a real US-listed symbol via IBKR SMART/USD."}
+                : mode === "stored"
+                  ? "Must be a ticker whose candles are already recorded in this database."
+                  : "Must resolve to a real US-listed symbol via IBKR SMART/USD."}
             </span>
           </label>
         )}
@@ -633,7 +703,19 @@ function BacktestForm() {
           </div>
         )}
 
-        {mode === "ibkr" && (
+        {mode === "stored" && (
+          <div className="rounded border border-base-border p-1.5">
+            <span className="font-mono text-[9px] leading-snug text-text-muted">
+              Replays only candles already recorded in this database — nothing is fetched from IBKR or any other
+              provider and no synthetic history is added. Recorded 1m/1d history before the window is used as warm-up
+              where it exists. Historical fundamentals and news are not available, so those inputs stay absent. Thin
+              or missing history can leave a strategy with nothing to act on: 0 outcomes is a valid result, not an
+              error.
+            </span>
+          </div>
+        )}
+
+        {(mode === "ibkr" || mode === "stored") && (
           <div className="flex flex-col gap-1.5 rounded border border-base-border p-1.5">
             <div className="flex gap-1">
               <button
@@ -659,8 +741,8 @@ function BacktestForm() {
             </div>
             <span className="font-mono text-[9px] leading-snug text-text-muted">
               Applies to the date already entered below (today's Eastern date if none yet). Not a guarantee this is a
-              real trading day — weekends and exchange holidays aren't checked here; the backend/IBKR will report
-              honestly if there's no data for the date picked.
+              real trading day — weekends and exchange holidays aren't checked here; the backend will report
+              honestly if there's no {mode === "stored" ? "recorded" : ""} data for the date picked.
             </span>
 
             <label className="flex flex-col gap-1">
@@ -696,8 +778,9 @@ function BacktestForm() {
               <span className="font-mono text-[10px] leading-snug text-bear">{rangeValidation.message}</span>
             )}
             <span className="font-mono text-[9px] leading-snug text-text-muted">
-              Acquisition time depends on IBKR and the requested range. Replay then settles through exact engine
-              queues without the live one-second debounce wait; the request remains synchronous.
+              {mode === "stored"
+                ? "The recorded candles are read from the database first, then replayed through exact engine queues; the request remains synchronous."
+                : "Acquisition time depends on IBKR and the requested range. Replay then settles through exact engine queues without the live one-second debounce wait; the request remains synchronous."}
             </span>
           </div>
         )}
@@ -747,6 +830,42 @@ function BacktestForm() {
           outcomesRecorded={fixtureRun.result.outcomes_recorded}
           discardedSignals={fixtureRun.result.discarded_signals}
         />
+      )}
+
+      {mode === "stored" && storedRun.status === "running" && (
+        <div className="flex flex-col gap-1 border-t border-base-border px-2 py-2">
+          <span className="font-mono text-xs font-semibold text-signal">
+            Running… {formatElapsed(storedRun.elapsedSeconds)} elapsed
+          </span>
+          <span className="font-mono text-[9px] text-text-muted">
+            Reading recorded candles, then replaying them — one synchronous request with no progress percentage or
+            completion estimate.
+          </span>
+        </div>
+      )}
+
+      {mode === "stored" && storedRun.status === "error" && storedError && (
+        <div className="border-t border-base-border px-2 py-2">
+          <p className="font-mono text-[11px] font-semibold text-bear">{storedError.heading}</p>
+          <p className="font-mono text-[10px] text-bear">{storedError.message}</p>
+        </div>
+      )}
+
+      {mode === "stored" && storedRun.status === "done" && storedRun.result && (
+        <>
+          <ResultsView
+            runId={storedRun.result.run_id}
+            sweepId={storedRun.result.sweep_id}
+            outcomesRecorded={storedRun.result.outcomes_recorded}
+            discardedSignals={storedRun.result.discarded_signals}
+          />
+          {storedRun.result.outcomes_recorded === 0 && (
+            <p className="px-2 pb-2 font-mono text-[10px] text-text-muted">
+              0 outcomes is a valid result: the recorded candles in this window did not produce a trade for this
+              strategy. It does not mean anything failed.
+            </p>
+          )}
+        </>
       )}
 
       {mode === "ibkr" && ibkrRun.status === "running" && (

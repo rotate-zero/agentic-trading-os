@@ -59,6 +59,16 @@ point-in-time fundamentals or news; both keep the existing replay-safe
 FixtureBacktestContextProvider calendar behavior and honest absence for
 those fields.
 
+**A stored-candle path, additive: `POST /backtest/run/stored`.** Replays
+the same runner over candles `CandleRecorder` already recorded in
+PostgreSQL (non-backtest `Symbol` namespace only), with no IBKR or other
+external provider. Recorded 1m/1d warm-up is read in the same worker-owned
+snapshot and served from a run-scoped in-memory provider; synthetic daily
+history is never substituted. Same two caveats as above — no historical
+fundamentals/news — plus: a window with no recorded candles is a
+structured 422, and `outcomes_recorded == 0` is a valid result. See
+`backtest_runner/stored_history.py`.
+
 **A third path, additive: `POST /backtest/sweep`.** One strategy across
 an explicit cross-product of symbols × fixture scenarios, run
 sequentially through this exact same `BacktestRunner`/`_RUN_LOCK` path,
@@ -91,6 +101,7 @@ from app.backtest_runner.ibkr_historical import (
 )
 from app.backtest_runner.runner import BacktestRunner, DiscardedSignal
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
+from app.backtest_runner.stored_history import StoredHistoryError, acquire_stored_replay_data
 from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
 from app.strategy_engine.scheduler import default_registry
@@ -390,6 +401,85 @@ async def run_ibkr_backtest(
 
     strategy = next(
         s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name
+    )
+    runner = BacktestRunner(
+        strategy=strategy,
+        symbol=symbol,
+        market_data_provider=dataset.provider,
+        start=start,
+        end=end,
+        context_provider=FixtureBacktestContextProvider(),
+        data_version=dataset.data_version,
+        feature_version=_FEATURE_VERSION,
+    )
+    result = await runner.run()
+    return dataclasses.asdict(result)
+
+
+@router.post("/run/stored")
+async def run_stored_backtest(
+    strategy_name: str = Query(..., description="One of the 7 real v1 strategy names."),
+    symbol: str = Query(..., description="Ticker whose candles were already recorded in this database."),
+    start: datetime = Query(..., description="Timezone-aware ISO-8601 inclusive start."),
+    end: datetime = Query(..., description="Timezone-aware ISO-8601 exclusive end."),
+) -> dict[str, Any]:
+    """Replay the existing runner over already-recorded PostgreSQL candles.
+
+    The user interval is exact ``[start, end)`` and uses the same
+    validation as ``/run/ibkr`` (timezone-aware, ``start < end``, at most
+    24 elapsed hours, symbol stripped and upper-cased). Candles come only
+    from the non-backtest ``Symbol`` namespace. Configured 1m pre-market and
+    1d Daily Levels lookbacks are read as *available* warm-up in addition
+    to the interval and are not subject to the 24-hour cap; nothing at or
+    after ``end`` is read and no synthetic history is added. The read runs
+    in a worker thread that owns its database session and finishes before
+    replay; replay then goes through the unchanged runner with a run-scoped
+    in-memory provider.
+
+    Provenance: the run's ``data_version`` is ``stored:postgres:candles:1m-1d``.
+    Errors are ``{"code", "message"}`` details: ``stored_candles_no_data``
+    (422, nothing recorded in the exact interval), ``stored_candles_malformed``
+    (422), ``stored_history_unavailable`` (503), plus the shared
+    ``invalid_backtest_request`` (422) and the live-provider 409 guard,
+    which is checked again after the read and before any replay engine or
+    database row of the run is touched.
+
+    Synthetic or sparse stored data proves plumbing only, never profitability;
+    ``outcomes_recorded == 0`` is a valid result.
+    """
+    _validate_strategy_name(strategy_name)
+    symbol, start, end = _validate_ibkr_range(symbol, start, end)
+    _reject_if_live_data_connected()
+
+    settings = get_settings()
+    try:
+        dataset = await acquire_stored_replay_data(
+            symbol=symbol,
+            start=start,
+            end=end,
+            daily_lookback_days=settings.daily_levels_lookback_days,
+            premarket_lookback_days=settings.feature_engine_premarket_lookback_days,
+        )
+    except StoredHistoryError as exc:
+        raise HTTPException(
+            status_code=exc.http_status,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+    # A live provider may have connected while the read was in flight.
+    # Re-check before any process-wide replay singleton or database row of
+    # the run is touched.
+    _reject_if_live_data_connected()
+
+    strategy = next(
+        s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name
+    )
+    logger.info(
+        "stored backtest: symbol=%s primary=%d warmup_1m=%d daily=%d",
+        symbol,
+        dataset.primary_candle_count,
+        dataset.warmup_minute_candle_count,
+        dataset.daily_candle_count,
     )
     runner = BacktestRunner(
         strategy=strategy,
