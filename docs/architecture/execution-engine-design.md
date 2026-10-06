@@ -3307,6 +3307,101 @@ All values live in `core/config.py`'s `Settings` (the repository's single source
 | I14 never discard a fill | fill commit is independent of snapshots, plans, and matching orders; anomalies flag and halt entries | an overfill and an unmatched fill are persisted and flagged; a missing snapshot still yields an outcome with `NULL` + reason |
 | I15 daily-loss gate | realized + open exposure + candidate vs cap; unknown ⇒ reject (§6.2) | tables of cases including unrealized loss, an in-flight entry, a missing mark, and a limit raised above 1 |
 
+### 6.12 Simulated-MVP acceptance command (`simulated-mvp-acceptance`)
+
+**What it is.** One maintained command that demonstrates the *already-built* simulated lifecycle against PostgreSQL and prints PASS/FAIL per milestone. It builds no pipeline of its own: it enters the real `app.main` lifespan (as `TestClient` does in `test_main_execution_pipeline.py`), feeds it controlled inputs, and reads what the application's own workers wrote.
+
+```
+cd backend
+POSTGRES_HOST=… POSTGRES_PORT=… POSTGRES_DB=<disposable_db> POSTGRES_USER=… POSTGRES_PASSWORD=… \
+  python scripts/simulated_mvp_acceptance.py --database <disposable_db>
+```
+
+Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a precondition failed (nothing started), `3` watchdog expired.
+
+**What it proves, and what it does not.** It proves the downstream simulated lifecycle from *seeded* `OpportunityCreated` events. It does **not** prove strategy profitability, opportunity ranking, live-feed coverage or real broker execution. The opportunities, prices and clock are controlled inputs.
+
+**Component data flow.**
+
+```
+ scripts/simulated_mvp_acceptance.py ──► app/acceptance/simulated_mvp.py
+                                              │
+        P.1-P.4 preconditions (read-only)     │  explicit --database == POSTGRES_DB, disposable name,
+        ┌─────────────────────────────────────┤  migrated to alembic head, empty (migration seed excepted)
+        │                                     │  ── any failure: exit 2, NO worker started
+        ▼                                     ▼
+  disposable PostgreSQL            controlled inputs (the only substitutions)
+  (migrated, empty)                 • seeded OpportunityCreated + PriceUpdated  (published on the bus)
+        ▲                           • DeterministicClock → MarketClock, PositionMonitor.wall_clock,
+        │                             PostgresExitLedger.clock  (auto-pulse off; EOD pulse is explicit)
+        │                           • fixed entry-snapshot capture; venue book retained on restart
+        │                                     │
+        │                                     ▼
+        │              REAL app.main lifespan (one per simulated "process")
+        │   ┌───────────────────────────────────────────────────────────────────────┐
+        │   │ EventBus ─► AuthorizerStub ─► ExecutionEngine ─► SimulatedVenue       │
+        │   │                  │                 ▲  │               │ fills           │
+        │   │                  ▼                 │  ▼               ▼                 │
+        │   │            trades/reservation   PositionMonitor ◄─ Portfolio State      │
+        │   │            (approval row)       (stop/target/EOD)   (positions)        │
+        │   │                                          │            │                 │
+        │   │                      exit_requests ◄─────┘            ▼ PositionClosed   │
+        │   │                                                OutcomeRecorder          │
+        │   └──────────────┬───────────────────────────────────────┬─────────────────┘
+        │  ledger writes   │ (by the app's own workers only)       │ strategy_outcomes
+        └──────────────────┴───────────────────────────────────────┘
+                           ▲
+   public reads  ──────────┴── GET /health/execution-startup · /intelligence/{execution-orders, execution-fills,
+   (TestClient)                 execution-positions, execution-exit-requests, exit-intents, portfolio-state,
+                                execution-outcome-status, strategy-outcomes}
+```
+
+**Scenario flow** (three lifespans = three "processes"; one deterministic clock; one position at a time because `execution_max_concurrent_positions = 1`):
+
+```
+ lifespan #1 (2026-09-16, clock 14:00Z)
+   S1  price 100 + OpportunityCreated(stop 95, target 120) ZZACCT
+         ─► approved trade ─► entry order submitted ─► venue tick ─► fill ─► position OPEN   [ledger + 4 API reads]
+   S2  tick 121 ─► target exit_request ─► close order ─► venue tick 121 ─► position CLOSED, flat   (+210)
+       ZZACCS entry ─► tick 94 ─► stop exit_request ─► close order ─► venue tick 94 ─► CLOSED, flat (−60)
+   S3  ZZACCE entry ─► clock 19:59:05Z ─► tick ─► explicit EOD pulse ─► eod_flatten exit_request
+         window [close−lead, close) ─► close order ─► venue tick ─► CLOSED, flat                (+10)
+   S4a clock 2026-09-17 14:00Z, ZZACCR entry ─► position OPEN  ── lifespan #1 ends ──
+ lifespan #2 (restart; venue book retained)
+   S4b startup ready ─► Portfolio State restores SAME position id/qty/stop ─► no duplicate entry
+         ─► tick 94 ─► stop exit_request ─► close order ─► venue tick ─► CLOSED, flat           (−60)
+   S5a negative control ZZACCX (no reference price) ─► REJECTED, no order/position/outcome
+         OutcomeRecorder: 4 closed trades ─► exactly 4 linked outcomes, ledger-consistent
+ lifespan #3 (restart again; fresh, flat venue)
+   S5b startup ready ─► recorder running ─► explicit sweep drained ─► still exactly 4, same outcome ids
+```
+
+**Internal flow of `simulated_mvp.py`.**
+
+```
+ main(argv)
+   ├─ apply_safe_environment()          FINNHUB/POLYGON keys = "", EXECUTION_MODE=simulated   (before get_settings)
+   ├─ validate_target_selection()       --database must equal POSTGRES_DB and look disposable
+   ├─ validate_settings_for_scenarios() limits must admit a 10-share, 50 USD-risk seeded entry
+   ├─ inspect_database()                server-enforced READ ONLY: alembic revision, per-table "has data"
+   │     └─ evaluate_database_state()   migration problems vs "not empty" problems (pure, unit-tested)
+   ├─ watchdog timer                    a hang becomes "FAIL … exit 3", never a stuck process
+   └─ Acceptance.run()
+        ├─ controlled_inputs()          patch only clocks/inputs; always restored
+        ├─ lifespan()                   reset singletons ─► `with TestClient(app)` (shutdown guaranteed)
+        ├─ Checker.check / Checker.wait named milestones; wait = bounded poll for an OBSERVED state
+        └─ scenario_1 … scenario_5      AcceptanceFailure ─► "RESULT: FAIL — failed milestone S2.3 …", exit 1
+```
+
+**Contracts worth knowing.**
+
+- *Disposable, migrated, empty.* The command refuses anything else *before* starting a worker and never truncates or cleans. Migration `0004` seeds six scanner symbols (`AAPL MSFT NVDA AMD TSLA SPY`) into `symbols` and `scanner_universe_symbols`; those two tables count as empty only while they hold exactly that seed. A finished run leaves its rows as evidence; recreate a fresh migrated database to run again.
+- *No manufactured success.* The module inserts no ledger or outcome row. It reads rows written by the authorizer, execution engine, Portfolio State and OutcomeRecorder, and checks them against each other (ledger fills and positions versus API views versus outcomes).
+- *Deterministic clock.* `AuthorizerStub` asks the market clock about the real `datetime.now()`, so the run injects a `MarketClock` that answers for the controlled clock instead; the run therefore does not depend on the time of day it is executed.
+- *Restart and the venue.* `SimulatedVenue` keeps its book in memory only. A **fresh** venue after a restart with an open position reports quantity 0 and startup reconciliation fails closed (`reconciliation_blocked`), which is the designed behavior (§6.9; `test_real_lifespan_eod_and_fresh_venue_restart_block`). Scenario 4 therefore retains the previous venue's book across the restart to stand in for a durable venue; it proves ledger-side restoration and the protective close after it, **not** that a simulated venue survives a restart. Scenario 5's second restart uses a fresh venue only because the book is flat by then.
+- *Authorizer limits.* Each seeded entry risks `qty × (100 − 95)` against `execution_daily_loss_cap_usd`; the scenarios close the winner first so realized loss never blocks a later seeded entry. Precondition P.2 fails early if the configured limits cannot admit the seeded entries.
+- *Output hygiene.* The target is printed as `host:port/database as user`; every output line is scrubbed of the configured password. Application logs are captured and shown only (last few warnings/errors) when a milestone fails.
+
 ---
 
 ## 7. Forks — six resolved by decision #170, the rest still open

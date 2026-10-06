@@ -351,6 +351,18 @@ Exits non-zero with a clear message if anything's wrong (most commonly: uvicorn 
 
 **If you get `[Errno 98] Address already in use`:** that's not a bug — it means a previous `uvicorn` is still running in another terminal. Either use that one (it's fine), or stop it first (`Ctrl+C` in its terminal, or `lsof -i :8000` to find and kill it) before starting a new one.
 
+## Simulated-MVP acceptance
+
+One command demonstrates the already-built simulated execution lifecycle (seeded opportunity -> authorizer -> execution -> `SimulatedVenue` -> Portfolio State -> stop/target/EOD exits -> restart -> `strategy_outcomes`) against PostgreSQL through the real FastAPI lifespan, with clear PASS/FAIL per milestone:
+
+```bash
+cd backend
+createdb mvp_acceptance && POSTGRES_DB=mvp_acceptance alembic upgrade head      # a fresh, disposable database
+POSTGRES_DB=mvp_acceptance python scripts/simulated_mvp_acceptance.py --database mvp_acceptance
+```
+
+The database must be explicitly selected (`--database` must equal `POSTGRES_DB` and the name must contain `acceptance`, `disposable`, `scratch` or `test`), migrated to head, and empty; anything else is refused before any worker starts, and nothing is ever truncated or cleaned. Finnhub/Polygon are disabled and no IBKR Gateway or credentials are needed. Exit code `0` = PASS, `1` = a milestone failed (named in the output), `2` = a precondition failed. A finished run leaves its rows as evidence: create a fresh database to run again. This proves the downstream simulated lifecycle from seeded opportunities only; it does not prove strategy profitability, ranking, live-feed coverage or real broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.12.
+
 ## Running tests
 
 ```bash

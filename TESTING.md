@@ -1,3 +1,28 @@
+<!-- BEGIN DELIVERY SECTION: simulated-mvp-acceptance (backend utility + tests + docs; integrate alongside other sections, do not merge them) -->
+# TESTING — `simulated-mvp-acceptance`
+
+Base `0338678580164004b736329a3a27661fd9df02a1`, Python 3.13.16 with `backend/requirements.txt`, PostgreSQL 16 (a throwaway local cluster; databases `atos_acceptance` for the command and `atos_pytest` for pytest, both migrated to `0017`). No IBKR Gateway, account credentials, Finnhub/Polygon key or network feed was used. The full backend suite was not run (not requested).
+
+**The acceptance command (how to run it).**
+
+```bash
+cd backend
+createdb mvp_acceptance && POSTGRES_DB=mvp_acceptance alembic upgrade head     # fresh, disposable, migrated, empty
+POSTGRES_DB=mvp_acceptance python scripts/simulated_mvp_acceptance.py --database mvp_acceptance
+```
+
+`POSTGRES_HOST/PORT/USER/PASSWORD` select the server as usual. A finished run leaves its rows as evidence and the next run is refused until a fresh database is created (nothing is ever cleaned). Exit `0` PASS, `1` milestone failed, `2` precondition failed, `3` watchdog.
+
+- **Observed result.** Final code, three consecutive runs each on a freshly recreated and migrated database: `RESULT: PASS — 68 milestones passed` every time (4.2 s, 3.8 s, 4.1 s; 56–58 public API reads across 9 routes). Earlier runs on near-identical logic also passed. Milestones: preconditions P.1–P.4, S1 ×8, S2 ×15, S3 ×11, S4 ×15, S5 ×15. Output was searched for the database password: 0 occurrences.
+- **Refusals and failure reporting (observed).** A populated database (the one a run had just used): exit 2 at P.4 naming the tables holding data, nothing started. No `--database`, a name that differs from `POSTGRES_DB`, and a non-disposable name (`trading_workspace`): exit 2 at P.1. A deliberately impossible wait bound (`--timeout 0.001`) on a fresh database: exit 1, `RESULT: FAIL — failed milestone S1.4 …` with what was last observed.
+- **Unit tests for the module's own logic.** `backend/tests/test_simulated_mvp_acceptance.py`: 19 passed (about 1.5 s). Covered: database-selection rules, migrated/empty evaluation (unmigrated, behind head, missing tables, populated tables named, migration seed tolerated), scenario-settings validation, secret scrubbing, milestone numbering and failure naming, bounded waits (timeout reports the last observation; returns as soon as the state is observed), every exit code (2 for unselected/non-disposable/populated/unmigrated/unreachable, 1 for a named failed milestone and for an unexpected crash, 0 with the scope statement), and a read-only `inspect_database` check against the real migrated test database. These need no scenario run.
+- **Relevant existing tests, run on `atos_pytest`.** `test_main_execution_pipeline.py`, `test_simulated_eod_integration.py`, `test_outcome_recorder_lifespan_recovery.py`, `test_outcome_recorder_restart_recovery.py`, `test_execution_startup_status_route.py`, `test_portfolio_state_route.py`, `test_execution_outcome_status_route.py`: 74 tests; 73 passed and 1 failed in the final run, and the six-file subset without the new test file and without `test_execution_outcome_status_route.py` passed 50 of 50 in each of 5 runs.
+- **Known intermittent failure, pre-existing, not touched.** `test_main_execution_pipeline.py::test_position_monitor_places_durable_exit_and_closes_on_later_tick` (stop or target parameter) sometimes fails with a `protection_diagnostics.incident_counts.snapshot_unavailable` difference (2 vs 1) between two successive reads of `GET /intelligence/exit-intents`: a timing race in that test's own equality check. It fails 2 of 15 runs alone on a **pristine checkout of the base with none of this delivery's files**, so it is not caused by this delivery. It is reported, not fixed (out of scope; AGENTS.md §9 "related follow-up").
+- **Observed, benign.** During entry fills the log can show `PositionMonitor: position snapshot unavailable; retained ticks await recovery` (ERROR): a tick arrives before Portfolio State has applied the fill and is replayed afterwards, as the existing tests already describe. The command waits for the position to be visible in Portfolio State before sending a trigger tick.
+- **Not covered / limitations.** The command proves the downstream simulated lifecycle from seeded opportunities only: no strategy profitability, ranking, live-feed coverage or real broker execution; opportunities, prices and the clock are controlled. Restart restoration is shown with the venue's in-memory book retained (a fresh `SimulatedVenue` fails closed by design). One position at a time, one symbol per scenario. Wall-clock use outside the injected clocks (for example the recorder's own timers) is real. The output's timings and read counts vary slightly between runs. Not exercised: a Postgres outage during a run, concurrent runs against one database, or database-level fault injection.
+- **Housekeeping.** `git diff --check` and the clean-checkout verification of the ZIP are reported in the final response (extract onto a fresh clone of the base: `git status --short` lists exactly the manifest).
+<!-- END DELIVERY SECTION: simulated-mvp-acceptance -->
+
 <!-- BEGIN DELIVERY SECTION: backtest-results-csv-export (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `backtest-results-csv-export`
 
