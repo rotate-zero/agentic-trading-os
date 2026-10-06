@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: stored-candle-coverage-preview -->
+# TESTING — `stored-candle-coverage-preview`
+
+Base: GitHub `main` `1f43c11ac42607f1f88947d1a5f53cc3c419788b`. Isolated PostgreSQL 18 cluster under `/tmp/stored-coverage-pg`, port 55432, database `stored_coverage_test`, migrated to `0017`; no live or external database was touched. The test fixtures insert and clean their own `ZSTORE1`/`ZSTORE1F` rows.
+
+- `pytest -q tests/test_stored_backtest_route.py -k stored_coverage`: 9 passed after avoiding unrelated app lifespan startup in the read-only route tests. Covers live/backtest namespace separation, inclusive/exclusive bounds, unknown and empty results, warm-up selection, same-day daily exclusion, malformed parameters, and a read-only repeatable-read transaction with unchanged source rows and no backtest rows.
+- `pytest -q tests/test_stored_backtest_route.py`: 35 passed, including existing replay tests after the shared selection-rule extraction. Both commands used the isolated PostgreSQL database. The initial attempt against the configured stopped service skipped; the first isolated run exposed a test-only repeated-lifespan event-loop collision, corrected before the passing runs.
+- `node /tmp/stored-coverage-hook-check.mjs`: passed controlled hook checks for input invalidation, reverse response ordering and unmount completion (temporary harness, not packaged).
+- `npm run build`: TypeScript and Vite passed. Vite reported its existing chunk-size advisory. `git diff --check` passed.
+
+The frontend check used controlled responses rather than a browser. The backend tests used synthetic candles and do not prove continuous market coverage, valid replay outcomes or profitability.
+<!-- END DELIVERY SECTION: stored-candle-coverage-preview -->
+
 <!-- BEGIN DELIVERY SECTION: backtest-run-history (frontend + docs; integrate alongside other sections, do not merge them) -->
 # TESTING — `backtest-run-history`
 

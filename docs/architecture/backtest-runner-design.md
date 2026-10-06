@@ -1376,6 +1376,42 @@ Backend and frontend; no migration, dependency, `BacktestRunner`, engine, execut
 - Synthetic or sparse stored data proves plumbing only, never real-market profitability.
 
 
+### Stored candle coverage preview (task `stored-candle-coverage-preview`)
+
+`GET /backtest/stored-coverage?symbol=&start=&end=` is an explicit, informational read before a stored run. It reuses `/run/stored`'s symbol normalization, timezone-aware `[start, end)` validation and 24 elapsed-hour cap. Unknown symbols and intervals without 1m rows return 200 with zero counts and null timestamp bounds. The panel keeps its Run action and the backend still performs every run validation.
+
+Data flow:
+
+```
+BacktestPanel Stored candles: Check stored data (user click)
+    │ symbol + ET fields → UTC interval
+    ▼
+useStoredCoverage → api-client GET /backtest/stored-coverage
+    │                              │
+    │                              ▼
+    │                   backtest.py: shared range validation
+    │                              │ asyncio.to_thread
+    │                              ▼
+    │                   stored_coverage.py → PostgreSQL candles ⋈ symbols
+    │                                              (is_backtest = FALSE)
+    ▼
+recorded range, exact-window count, available warm-up counts
+```
+
+Internal query flow:
+
+```
+worker thread: SessionLocal → REPEATABLE READ + read-only transaction
+    ├─ aggregate 1m across the symbol: count, min(ts), max(ts)
+    ├─ aggregate 1m in [start, end): count, min(ts), max(ts)
+    ├─ aggregate 1m in [minute_start, start): available pre-window warm-up
+    └─ if a primary 1m row exists: read 1d timestamps in [daily_start, end)
+         → keep only trading_day(ts) < trading_day(last primary 1m)
+    → close Session → response; no recorder, provider or runner call
+```
+
+`minute_start` and `daily_start` come from `stored_history.stored_history_starts`; the daily trading-day predicate is shared with replay. The 1m warm-up count excludes primary rows. When the requested interval has no primary row, both warm-up counts are zero because no replay dataset can be acquired and there is no last replay day against which to apply the daily exclusion. The overall recorded count can still be nonzero for data outside that interval. The snapshot only counts rows. It does not inspect OHLCV, detect gaps, prove sufficient indicator history, or predict replay success. A response is discarded after a symbol or interval edit, a newer check, or component unmount; there is no automatic checking. No database row is written and no replay engine or provider is touched. This extends the existing stored-candle path and needs no new decision number.
+
 ### Backtest run history (task `backtest-run-history`)
 
 Frontend-only; no backend, API contract, `api-client.ts`, `WorkspaceContext.tsx`, `BacktestPanel` or dependency change, and no decision number (the route it reads is decision #136's). New: `RecentBacktestRuns.tsx`, `useRecentBacktestRuns.ts`; changed: `BacktestResultsPanel.tsx`. `useBacktestRuns` (one `run_id` -> one run) is unchanged.

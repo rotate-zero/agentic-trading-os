@@ -20,6 +20,7 @@ from starlette.testclient import TestClient
 
 import app.api.routes.backtest as backtest_route
 import app.backtest_runner.stored_history as stored_history
+import app.backtest_runner.stored_coverage as stored_coverage
 from app.api.routes import broker, finnhub_data, market_data
 from app.backtest_runner.scenarios import load_scenario_candles
 from app.backtest_runner.stored_history import (
@@ -147,6 +148,101 @@ def _provider_1m(dataset, start, end):
 
 def _params(start="2026-02-02T14:30:00Z", end="2026-02-02T14:33:00Z", **overrides):
     return {"strategy_name": "VWAP", "symbol": SYMBOL, "start": start, "end": end, **overrides}
+
+
+def _coverage_params(start="2026-02-02T14:30:00Z", end="2026-02-02T14:33:00Z", **overrides):
+    return {"symbol": SYMBOL, "start": start, "end": end, **overrides}
+
+
+def _coverage(**params):
+    # This read-only route needs no lifespan; repeated startup/shutdown in
+    # one test would start unrelated singleton workers on different loops.
+    return TestClient(app).get("/backtest/stored-coverage", params=_coverage_params(**params))
+
+
+def test_stored_coverage_namespace_bounds_and_read_only_snapshot(monkeypatch):
+    live_id = _seed(SYMBOL, [_bar(T0 - timedelta(minutes=1)), *_minutes(T0, 3), _bar(T0 + timedelta(minutes=3))])
+    _seed(SYMBOL, _minutes(T0 - timedelta(minutes=2), 7, price=999), is_backtest=True)
+    before = _source_snapshot(live_id)
+    real_session_local = stored_coverage.SessionLocal
+    observed = []
+
+    def tracking_factory():
+        session = real_session_local()
+        original_execute = session.execute
+
+        def execute(*args, **kwargs):
+            observed.append((session.execute.__name__, session.connection().exec_driver_sql("SHOW transaction_read_only").scalar_one(),
+                             session.connection().exec_driver_sql("SHOW transaction_isolation").scalar_one()))
+            return original_execute(*args, **kwargs)
+
+        session.execute = execute
+        return session
+
+    monkeypatch.setattr(stored_coverage, "SessionLocal", tracking_factory)
+    response = _coverage(symbol=f"  {SYMBOL.lower()}  ")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["symbol"] == SYMBOL
+    assert body["recorded_count"] == 5
+    assert body["recorded_first"] == "2026-02-02T14:29:00Z"
+    assert body["recorded_last"] == "2026-02-02T14:33:00Z"
+    assert body["requested_count"] == 3
+    assert body["requested_first"] == "2026-02-02T14:30:00Z"
+    assert body["requested_last"] == "2026-02-02T14:32:00Z"
+    assert body["warmup_minute_count"] == 1
+    assert body["warmup_daily_count"] == 0
+    assert observed and all(readonly == "on" and isolation == "repeatable read" for _, readonly, isolation in observed)
+    assert _source_snapshot(live_id) == before
+    assert _run_rows() == []
+    _clean()
+    _seed(SYMBOL, _minutes(T0, 2), is_backtest=True)
+    decoy_only = _coverage()
+    assert decoy_only.status_code == 200
+    assert decoy_only.json()["recorded_count"] == 0
+    assert decoy_only.json()["requested_first"] is None
+
+
+def test_stored_coverage_empty_unknown_and_warmup_selection(monkeypatch):
+    monkeypatch.setenv("FEATURE_ENGINE_PREMARKET_LOOKBACK_DAYS", "2")
+    get_settings.cache_clear()
+    _seed(SYMBOL, [_bar(T0 - timedelta(days=6)), _bar(T0 - timedelta(days=6) - timedelta(minutes=1)),
+                   _bar(T0 - timedelta(minutes=1)), _bar(T0), _bar(T0 + timedelta(minutes=3))])
+    _seed(SYMBOL, [_bar(datetime(2026, 1, 30, 5, tzinfo=timezone.utc)),
+                   _bar(datetime(2026, 2, 2, 5, tzinfo=timezone.utc)),
+                   _bar(datetime(2026, 2, 3, 5, tzinfo=timezone.utc))], timeframe="1d")
+    response = _coverage()
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["requested_count"] == 1
+    assert body["warmup_minute_count"] == 2  # 6-day inclusive lookback, not the earlier row
+    assert body["warmup_daily_count"] == 1  # prior trading day only
+    unknown = _coverage(symbol="UNKNOWN")
+    assert unknown.status_code == 200
+    assert unknown.json()["recorded_count"] == unknown.json()["requested_count"] == 0
+    assert unknown.json()["recorded_first"] is None
+    assert unknown.json()["requested_last"] is None
+    empty = _coverage(start="2026-02-04T14:30:00Z", end="2026-02-04T14:31:00Z")
+    assert empty.status_code == 200
+    assert empty.json()["recorded_count"] == 5
+    assert empty.json()["requested_count"] == 0
+    assert empty.json()["requested_first"] is None
+    assert empty.json()["warmup_minute_count"] == 0
+    assert empty.json()["warmup_daily_count"] == 0
+
+
+@pytest.mark.parametrize("overrides", [
+    {"symbol": "  "}, {"start": "not-a-date"}, {"end": "not-a-date"},
+    {"start": "2026-02-02T14:30:00"}, {"end": "2026-02-02T14:33:00"},
+    {"end": "2026-02-02T14:30:00Z"}, {"end": "2026-02-03T14:31:00Z"},
+])
+def test_stored_coverage_rejects_malformed_parameters_before_read(monkeypatch, overrides):
+    def must_not_read(**kwargs):
+        raise AssertionError("invalid request reached the database")
+
+    monkeypatch.setattr(backtest_route, "acquire_stored_coverage", must_not_read)
+    response = _coverage(**overrides)
+    assert response.status_code == 422
 
 
 def _run_rows() -> list[tuple]:

@@ -102,6 +102,7 @@ from app.backtest_runner.ibkr_historical import (
 from app.backtest_runner.runner import BacktestRunner, DiscardedSignal
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
 from app.backtest_runner.stored_history import StoredHistoryError, acquire_stored_replay_data
+from app.backtest_runner.stored_coverage import acquire_stored_coverage
 from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
 from app.strategy_engine.scheduler import default_registry
@@ -414,6 +415,26 @@ async def run_ibkr_backtest(
     )
     result = await runner.run()
     return dataclasses.asdict(result)
+
+
+@router.get("/stored-coverage")
+async def get_stored_coverage(
+    symbol: str = Query(..., description="Recorded ticker to inspect."),
+    start: datetime = Query(..., description="Timezone-aware ISO-8601 inclusive start."),
+    end: datetime = Query(..., description="Timezone-aware ISO-8601 exclusive end."),
+) -> dict[str, Any]:
+    """Informational row counts in the exact replay interval and warm-up windows."""
+    symbol, start, end = _validate_ibkr_range(symbol, start, end)
+    settings = get_settings()
+    try:
+        coverage = await acquire_stored_coverage(
+            symbol=symbol, start=start, end=end,
+            daily_lookback_days=settings.daily_levels_lookback_days,
+            premarket_lookback_days=settings.feature_engine_premarket_lookback_days,
+        )
+    except StoredHistoryError as exc:
+        raise HTTPException(status_code=exc.http_status, detail={"code": exc.code, "message": exc.message}) from exc
+    return coverage.as_dict()
 
 
 @router.post("/run/stored")

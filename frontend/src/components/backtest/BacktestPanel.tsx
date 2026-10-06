@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestRun } from "../../hooks/useBacktestRun";
 import { useIbkrBacktestRun, type IbkrBacktestRunError } from "../../hooks/useIbkrBacktestRun";
 import { useStoredBacktestRun, type StoredBacktestRunError } from "../../hooks/useStoredBacktestRun";
+import { useStoredCoverage } from "../../hooks/useStoredCoverage";
 import { useBacktestSweepRun } from "../../hooks/useBacktestSweepRun";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
@@ -41,6 +42,10 @@ function formatElapsed(totalSeconds: number): string {
   const m = Math.floor(totalSeconds / 60);
   const s = totalSeconds % 60;
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function formatCoverageUtc(value: string | null): string {
+  return value ? new Date(value).toISOString().replace("T", " ").replace(".000Z", "Z").replace("Z", " UTC") : "—";
 }
 
 // Only used for the IBKR range's 24h-cap validation message, where a
@@ -370,6 +375,7 @@ function BacktestForm() {
   const [symbol, setSymbol] = useState("");
   const [startLocal, setStartLocal] = useState("");
   const [endLocal, setEndLocal] = useState("");
+  const storedCoverage = useStoredCoverage(symbol, startLocal, endLocal);
   const symbolInputRef = useRef<HTMLInputElement>(null);
 
   // Sweep mode's own inputs. Symbols: a single free-text field, split on
@@ -782,6 +788,36 @@ function BacktestForm() {
                 ? "The recorded candles are read from the database first, then replayed through exact engine queues; the request remains synchronous."
                 : "Acquisition time depends on IBKR and the requested range. Replay then settles through exact engine queues without the live one-second debounce wait; the request remains synchronous."}
             </span>
+          </div>
+        )}
+
+        {mode === "stored" && (
+          <div className="flex flex-col gap-1 rounded border border-base-border p-1.5 font-mono text-[10px]">
+            <button
+              type="button"
+              disabled={symbol.trim() === "" || !rangeValidation.canSubmit || storedCoverage.state?.status === "loading"}
+              onClick={() => {
+                if (rangeValidation.startIso && rangeValidation.endIso) {
+                  storedCoverage.check(symbol.trim(), rangeValidation.startIso, rangeValidation.endIso);
+                }
+              }}
+              className="rounded border border-base-border px-2 py-1 text-signal hover:bg-base-bg disabled:opacity-40"
+            >
+              Check stored data
+            </button>
+            {storedCoverage.state?.status === "loading" && <span role="status">Checking stored data…</span>}
+            {storedCoverage.state?.status === "error" && (
+              <span role="alert" className="text-bear">Stored data check failed: {storedCoverage.state.error}</span>
+            )}
+            {storedCoverage.state?.status === "done" && storedCoverage.state.result && (
+              <div className="flex flex-col gap-0.5" role="status">
+                <span>Recorded 1m: {storedCoverage.state.result.recorded_count} ({formatCoverageUtc(storedCoverage.state.result.recorded_first)} to {formatCoverageUtc(storedCoverage.state.result.recorded_last)})</span>
+                <span>Requested [start, end): {storedCoverage.state.result.requested_count} ({formatCoverageUtc(storedCoverage.state.result.requested_first)} to {formatCoverageUtc(storedCoverage.state.result.requested_last)})</span>
+                <span>Available warm-up: {storedCoverage.state.result.warmup_minute_count} minute, {storedCoverage.state.result.warmup_daily_count} daily candles</span>
+                {storedCoverage.state.result.requested_count === 0 && <span>No recorded 1m candles in this interval.</span>}
+              </div>
+            )}
+            <span className="text-text-muted">Counts and bounds do not prove continuous coverage, valid OHLCV, enough indicator warm-up, or replay success. Run validation still applies.</span>
           </div>
         )}
 

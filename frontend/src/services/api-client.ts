@@ -1422,6 +1422,34 @@ export async function triggerStoredBacktest(
   return (await res.json()) as BacktestRunResultWireShape;
 }
 
+export interface StoredCoverageWireShape {
+  symbol: string;
+  start: string;
+  end: string;
+  recorded_count: number;
+  recorded_first: string | null;
+  recorded_last: string | null;
+  requested_count: number;
+  requested_first: string | null;
+  requested_last: string | null;
+  warmup_minute_count: number;
+  warmup_daily_count: number;
+}
+
+/** Read-only preview; called only by the panel's explicit Check action. */
+export async function fetchStoredCoverage(
+  symbol: string, start: string, end: string, signal?: AbortSignal,
+): Promise<StoredCoverageWireShape> {
+  const url = `${API_BASE_URL}/backtest/stored-coverage?symbol=${encodeURIComponent(symbol)}` +
+    `&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) {
+    const { message } = await parseIbkrErrorDetail(res);
+    throw new ApiError(message, res.status);
+  }
+  return (await res.json()) as StoredCoverageWireShape;
+}
+
 // ---------------------------------------------------------------------------
 // POST /backtest/sweep (decision #163) — the third,
 // additive trigger path: one strategy across an explicit symbols×scenarios

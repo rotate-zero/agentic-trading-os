@@ -143,6 +143,18 @@ def _to_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def stored_history_starts(start: datetime, daily_lookback_days: int, premarket_lookback_days: int) -> tuple[datetime, datetime]:
+    """The replay reader's inclusive 1m and 1d acquisition starts."""
+    return (start - timedelta(days=premarket_lookback_days * 3),
+            start - timedelta(days=daily_lookback_days))
+
+
+def daily_usable_before(candle_ts: datetime, last_primary_ts: datetime) -> bool:
+    """Exclude daily bars on/after the last primary candle's trading day."""
+    clock = get_market_clock()
+    return clock.trading_day(candle_ts) < clock.trading_day(last_primary_ts)
+
+
 def _fetch_candles(session, symbol: str, timeframe: str, start: datetime, end: datetime) -> list[Candle]:
     rows = session.execute(
         select(
@@ -201,8 +213,7 @@ def read_stored_replay_data(
     (or ``asyncio.to_thread``). The session is created here, used only by
     the calling thread, and always closed.
     """
-    minute_start = start - timedelta(days=premarket_lookback_days * 3)
-    daily_start = start - timedelta(days=daily_lookback_days)
+    minute_start, daily_start = stored_history_starts(start, daily_lookback_days, premarket_lookback_days)
 
     session = SessionLocal()
     try:
@@ -232,9 +243,7 @@ def read_stored_replay_data(
 
     # Drop daily rows FeatureEngine could never legitimately use for any
     # replayed candle (see module docstring: no still-forming daily bar).
-    clock = get_market_clock()
-    last_primary_day = clock.trading_day(primary[-1].candle_ts)
-    daily_candles = [c for c in daily_candles if clock.trading_day(c.candle_ts) < last_primary_day]
+    daily_candles = [c for c in daily_candles if daily_usable_before(c.candle_ts, primary[-1].candle_ts)]
 
     provider = PreloadedHistoricalCandleProvider(
         {

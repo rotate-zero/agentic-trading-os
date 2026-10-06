@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: stored-candle-coverage-preview -->
+# CHANGES — `stored-candle-coverage-preview`
+
+Base: GitHub `main` `1f43c11ac42607f1f88947d1a5f53cc3c419788b`. The existing stored-candle replay remains the authority for starting runs. No migration, provider call, replay-engine installation, or new architectural decision is involved; the delivery slug identifies this additive read.
+
+- Added `GET /backtest/stored-coverage` with the stored route's symbol and interval validation. A worker-owned, read-only repeatable-read transaction reports the live-namespace symbol's overall 1m bounds/count, exact `[start, end)` bounds/count, and available minute/daily warm-up counts. It shares the replay reader's acquisition starts and daily trading-day exclusion. An unknown symbol or empty requested interval returns a successful informational response.
+- Added an explicit **Check stored data** action in BacktestPanel's Stored candles mode. It shows loading, failure, empty interval, recorded range and warm-up counts in UTC. Symbol and interval edits invalidate the preview; newer requests and unmounts retire older responses. The Run control and its backend validation remain independent.
+- Added PostgreSQL route tests for namespace separation, boundary and warm-up selection, daily look-ahead, malformed parameters and read-only snapshot behavior. Updated `docs/architecture/backtest-runner-design.md` with the data and query flows, plus this changelog and `TESTING.md`.
+
+Counts and timestamps do not establish continuous data, valid OHLCV, sufficient indicator warm-up or a successful replay. A subsequent run can still fail validation or produce zero outcomes.
+<!-- END DELIVERY SECTION: stored-candle-coverage-preview -->
+
 <!-- BEGIN DELIVERY SECTION: backtest-run-history (frontend + docs; integrate alongside other sections, do not merge them) -->
 # CHANGES — `backtest-run-history`
 
