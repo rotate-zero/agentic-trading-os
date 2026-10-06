@@ -2,10 +2,12 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { useBacktestOutcomes } from "../../hooks/useBacktestOutcomes";
 import { useBacktestRuns } from "../../hooks/useBacktestRuns";
 import { useBacktestSweepOutcomes } from "../../hooks/useBacktestSweepOutcomes";
+import { useBacktestSelectionSummary } from "../../hooks/useBacktestSelectionSummary";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../services/api-client";
 import { downloadCsvFile, outcomesCsvFilename, outcomesToCsv, type ExportMode } from "./outcomesCsv";
 import { RecentBacktestRuns } from "./RecentBacktestRuns";
+import { PerformanceSummaryCard } from "./PerformanceSummaryCard";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -302,7 +304,9 @@ function RunMetadataCard({ runId }: { runId: string }) {
 //
 // `outcomeCountByRunId` is computed by the caller (BacktestResultsBody)
 // from the same merged outcomes list already fetched for the list below —
-// this component does no fetching of its own. Existing purely to make an
+// this component does no fetching of its own. These are loaded-row counts,
+// capped with the list; the independent Performance summary below has
+// complete-population counts. Existing purely to make an
 // honest outcomes_recorded=0 pair visible even though it contributes zero
 // rows to the merged list underneath (see useBacktestSweepOutcomes.ts's
 // own comment for why this matters) — reusing "known 0" vs "still
@@ -333,7 +337,7 @@ function RunsInSweepStrip({
             <span className="min-w-0 flex-1 truncate text-text-primary" title={r.run_id}>
               {r.symbol_universe.join(", ") || "—"} <span className="text-text-muted">{r.run_id}</span>
             </span>
-            <span className="shrink-0 text-text-muted">{outcomeCountByRunId.get(r.run_id) ?? 0} outcome(s)</span>
+            <span className="shrink-0 text-text-muted">{outcomeCountByRunId.get(r.run_id) ?? 0} loaded outcome(s)</span>
           </div>
         ))}
       </div>
@@ -545,6 +549,11 @@ function BacktestResultsBody() {
     sweepId: filterType === "sweep_id" ? appliedSweepId : undefined,
   });
 
+  const selectionSummary = useBacktestSelectionSummary(
+    filterType,
+    filterType === "run_id" ? appliedRunId : appliedSweepId,
+  );
+
   const outcomeCountByRunId = useMemoOutcomeCounts(sweepOutcomes);
 
   const applyRunFilter = () => {
@@ -755,7 +764,7 @@ function BacktestResultsBody() {
           outcomes={runOutcomes}
           loading={runLoading}
           error={runError}
-          refetch={runRefetch}
+          refetch={() => { runRefetch(); selectionSummary.refetch(); }}
           emptyMessage={
             appliedRunId
               ? `No backtest outcomes found for run_id "${appliedRunId}".`
@@ -765,8 +774,9 @@ function BacktestResultsBody() {
           exportId={appliedRunId}
           extraContent={
             appliedRunId ? (
-              <div className="mb-2">
+              <div className="mb-2 flex flex-col gap-2">
                 <RunMetadataCard runId={appliedRunId} />
+                <PerformanceSummaryCard summary={selectionSummary.summary} loading={selectionSummary.loading} error={selectionSummary.error} />
               </div>
             ) : undefined
           }
@@ -776,7 +786,7 @@ function BacktestResultsBody() {
           outcomes={sweepOutcomes}
           loading={sweepLoading}
           error={sweepError}
-          refetch={sweepRefetch}
+          refetch={() => { sweepRefetch(); selectionSummary.refetch(); }}
           emptyMessage={
             appliedSweepId
               ? `No backtest outcomes found for sweep_id "${appliedSweepId}" (its own runs may have honestly recorded zero each — see the sweep summary above).`
@@ -786,7 +796,10 @@ function BacktestResultsBody() {
           exportId={appliedSweepId}
           extraContent={
             appliedSweepId ? (
-              <RunsInSweepStrip runs={sweepRuns} outcomeCountByRunId={outcomeCountByRunId} loading={sweepLoading} />
+              <div className="mb-2 flex flex-col gap-2">
+                <RunsInSweepStrip runs={sweepRuns} outcomeCountByRunId={outcomeCountByRunId} loading={sweepLoading} />
+                <PerformanceSummaryCard summary={selectionSummary.summary} loading={selectionSummary.loading} error={selectionSummary.error} />
+              </div>
             ) : undefined
           }
         />

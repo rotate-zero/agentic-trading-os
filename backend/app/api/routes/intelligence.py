@@ -761,6 +761,36 @@ async def get_expectancy_by_session_type_view(
     return {"session_expectancy": [asdict(row) for row in rows]}
 
 
+@router.get("/backtest-selection-summary")
+async def get_backtest_selection_summary(
+    run_id: str | None = Query(None),
+    sweep_id: str | None = Query(None),
+) -> dict[str, Any]:
+    """Complete recorded backtest population, grouped by run provenance.
+
+    Exactly one UUID selects either one run or every run in a sweep.
+    ``selection_found=False`` distinguishes an unknown ID from a known
+    zero-outcome run/sweep. This query does not apply the outcome-list cap.
+    """
+    import uuid as _uuid
+
+    from app.trading_intelligence.backtest_selection_summary import read_backtest_selection_summary
+
+    if (run_id is None) == (sweep_id is None):
+        raise HTTPException(status_code=400, detail="Provide exactly one of run_id or sweep_id")
+    name, value = ("run_id", run_id) if run_id is not None else ("sweep_id", sweep_id)
+    try:
+        selected_uuid = _uuid.UUID(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{name} {value!r} is not a valid UUID") from exc
+
+    return await asyncio.to_thread(
+        read_backtest_selection_summary,
+        run_id=selected_uuid if run_id is not None else None,
+        sweep_id=selected_uuid if sweep_id is not None else None,
+    )
+
+
 @router.get("/backtest-runs")
 async def get_backtest_runs(
     limit: int = Query(50, ge=1, le=500, description="Cap on returned rows, 1-500 inclusive."),

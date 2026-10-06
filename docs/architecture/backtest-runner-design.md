@@ -1452,3 +1452,41 @@ Frontend-only; no backend, API contract, `api-client.ts`, `WorkspaceContext.tsx`
 A history failure is local to the section: the selected run's metadata/outcomes, UUID entry and CSV export are unaffected. **Refresh runs** is never disabled while pending; each press supersedes earlier requests. The list reloads when the workspace reports a newly completed run or sweep (changed `refreshKey`), with no polling or WebSocket; while collapsed the list is unmounted and nothing is fetched, and expanding it loads fresh data.
 
 **Limits.** 50 most recent runs only, no paging/search; completions in another tab are not detected (use Refresh runs); validated with controlled stub responses in a jsdom harness, not a real browser or backend.
+
+### Selected backtest performance summary (task `backtest-selection-performance-summary`)
+
+`GET /intelligence/backtest-selection-summary` requires exactly one valid UUID, `run_id` or `sweep_id` (400 for absent, both or malformed IDs). It returns `selection_found: false, groups: []` for an unknown selection; a known run or sweep with no outcomes has a recorded group with its run count, zero outcomes and null win rate/mean R. Groups keep strategy name/version, configuration hash, data version and feature version separate. No schema, persisted rank or candidate-selection formula is added; D4 remains open.
+
+Cross-component data flow:
+
+```
+BacktestResultsPanel applied run_id / sweep_id
+       │
+       ├── capped GET /strategy-outcomes ──► outcome list ──► CSV of loaded rows
+       ├── GET /backtest-runs ──────────────► metadata / sweep run strip
+       └── useBacktestSelectionSummary ────► GET /backtest-selection-summary
+                                                │
+                                                ▼
+                                   worker-owned PostgreSQL aggregate
+                                                │
+                                                ▼
+                                   Performance summary card (all rows)
+       Refresh ──► reload outcome list and summary independently
+```
+
+Internal query flow:
+
+```
+validate exactly one UUID (route, before DB access)
+  → asyncio.to_thread(read_backtest_selection_summary)
+  → worker SessionLocal, REPEATABLE READ, read-only snapshot
+  → backtests filtered by run_id OR sweep_id
+  → LEFT JOIN strategy_outcomes ON backtest_run_id = run_id
+       AND is_backtest = TRUE AND execution_mode = 'backtest'
+  → GROUP BY strategy_name/version, config_hash, data_version, feature_version
+  → COUNT(DISTINCT run_id), COUNT(outcome_id), FILTER positive/negative/zero R,
+       AVG(realized_r); no LIMIT
+  → close session; return selection_found + groups
+```
+
+The left join retains zero-outcome runs. Positive-R wins divided by all outcomes gives win rate, so zero-R outcomes remain in its denominator; null metrics for an empty group are not fabricated zeros. The card shows each group's provenance and its independent loading/error/unknown/empty state. An error there leaves the list, history and metadata usable. The summary hook keys responses to the applied filter, discards obsolete or unmounted completions, and a newer Refresh supersedes an older request. The sweep strip labels its per-run counts **loaded outcomes** because those counts still come from the capped list; CSV still exports only those loaded rows.

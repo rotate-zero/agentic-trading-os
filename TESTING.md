@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: backtest-selection-performance-summary -->
+# TESTING — `backtest-selection-performance-summary`
+
+Base: GitHub `main` `a42984641e43d3f43b16e3e46d3d10a9e889b270`. Isolated PostgreSQL 18 cluster under `/tmp/stored-coverage-pg`, port 55432; separate database `backtest_selection_summary_test` migrated to `0017`. Fixtures use the dedicated `__TEST_BACKTEST_SELECTION_SUMMARY__` name and clean their own rows. No live or external database was touched.
+
+- `pytest -q tests/test_backtest_selection_summary_route.py tests/test_backtest_runs_route.py tests/test_performance_analytics_routes.py`: **36 passed**. The new route tests prove that a sweep aggregate uses more rows than a deliberately limited outcome-list response, excludes an unrelated run and a simulated-execution row, separates version/configuration/data/feature groups, includes a zero-outcome run, and computes independently expected positive/negative/zero-R counts, win rate and mean R. They also cover unknown versus known-empty selections, malformed/missing/double UUID filters, and a worker-owned read-only repeatable-read transaction.
+- `node /tmp/backtest-selection-summary-hook-check.mjs`: passed controlled hook checks for no request without a selection, run/sweep filter changes, reverse response order, request failure, Refresh supersession and unmount completion. The temporary harness is not packaged.
+- `npm run build`: TypeScript and Vite passed (existing Vite chunk-size advisory). `git diff --check` and ZIP content verification are final packaging checks.
+
+The frontend hook was checked with controlled responses, not a browser. Synthetic outcomes verify aggregation and isolation, not profitability or a ranking decision.
+<!-- END DELIVERY SECTION: backtest-selection-performance-summary -->
+
 <!-- BEGIN DELIVERY SECTION: stored-candle-coverage-preview -->
 # TESTING — `stored-candle-coverage-preview`
 

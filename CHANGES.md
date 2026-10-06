@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: backtest-selection-performance-summary -->
+# CHANGES — `backtest-selection-performance-summary`
+
+Base: GitHub `main` `a42984641e43d3f43b16e3e46d3d10a9e889b270`, which already contains the complete stored-candle-coverage-preview delivery. No schema change or new ranking decision; D4 remains open.
+
+- Added `GET /intelligence/backtest-selection-summary`, requiring exactly one valid `run_id` or `sweep_id`. A worker-owned, read-only PostgreSQL snapshot aggregates all eligible outcomes, without the outcome-list limit. The `backtests` left join preserves zero-outcome runs and separates strategy/version, configuration hash, data version and feature version. Unknown selections are explicitly distinguished from known empty ones.
+- Added a Performance summary card for an applied Backtest Results run or sweep. It shows provenance, run and outcome counts, positive-R wins, negative-R losses, zero-R breakevens, win rate and mean realized R. Its request state is independent of the capped outcome list, history and metadata. The existing Refresh action reloads both list and summary; filter changes and superseding requests discard obsolete summary responses.
+- Clarified that sweep-strip counts and CSV represent loaded rows, while the summary covers the complete selected population. Added focused PostgreSQL tests and updated `TESTING.md`, `docs/architecture/strategy-engine-design.md` and `docs/architecture/backtest-runner-design.md` with the selection and query flows.
+
+No ranking, candidate-selection formula, confidence claim or live-configuration promotion is inferred from these descriptive statistics.
+<!-- END DELIVERY SECTION: backtest-selection-performance-summary -->
+
 <!-- BEGIN DELIVERY SECTION: stored-candle-coverage-preview -->
 # CHANGES — `stored-candle-coverage-preview`
 

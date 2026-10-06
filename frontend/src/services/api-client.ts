@@ -815,6 +815,38 @@ export async function fetchBacktestRuns(
   return (await res.json()) as BacktestRunsWireShape;
 }
 
+export interface BacktestSelectionSummaryGroupWireShape {
+  strategy_name: string;
+  strategy_version: string;
+  config_hash: string;
+  data_version: string;
+  feature_version: string;
+  run_count: number;
+  total_outcomes: number;
+  wins: number;
+  losses: number;
+  breakevens: number;
+  win_rate: number | null;
+  mean_realized_r: number | null;
+}
+
+export interface BacktestSelectionSummaryWireShape {
+  selection_found: boolean;
+  groups: BacktestSelectionSummaryGroupWireShape[];
+}
+
+/** Full-population aggregate for one applied run or sweep; no list limit. */
+export async function fetchBacktestSelectionSummary(
+  selection: { runId: string; sweepId?: never } | { runId?: never; sweepId: string },
+): Promise<BacktestSelectionSummaryWireShape> {
+  const param = selection.runId !== undefined
+    ? `run_id=${encodeURIComponent(selection.runId)}`
+    : `sweep_id=${encodeURIComponent(selection.sweepId)}`;
+  const res = await fetch(`${API_BASE_URL}/intelligence/backtest-selection-summary?${param}`);
+  if (!res.ok) throw new ApiError(await parseErrorDetail(res), res.status);
+  return (await res.json()) as BacktestSelectionSummaryWireShape;
+}
+
 // Matches GET /intelligence/opportunity-conflicts's response shape
 // (decision #123) — a genuinely thin passthrough of
 // `opportunity_view.get_opportunity_conflicts()` (decision #121); see
