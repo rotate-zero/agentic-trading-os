@@ -141,6 +141,17 @@ flowchart TD
     RANK & SKIP --> RESPONSE[Scanner response]
 ```
 
+Separate read-only status view (`scanner-observation-status`); it never scans, so it is not part of the flow above:
+
+```mermaid
+flowchart TD
+    PANEL[Scheduled observation section: manual Refresh] --> ROUTE[GET /scanner/observation]
+    ROUTE --> SLOT{Reader installed on app.state?}
+    SLOT -- no, production today --> UNAVAILABLE[status: unavailable]
+    SLOT -- yes --> READ[One in-memory snapshot read]
+    READ --> VIEW[Worker running/cycle state + retained results + skipped + attempt/success times + last error]
+```
+
 ## 7. Strategy Scheduler and strategies
 
 ```mermaid

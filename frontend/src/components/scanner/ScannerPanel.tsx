@@ -1,8 +1,13 @@
 import { useRef, useState } from "react";
 import { useWorkspace } from "../../state/WorkspaceContext";
+import { useScannerObservation } from "../../hooks/useScannerObservation";
 import { useScannerState } from "../../hooks/useScannerState";
 import { useScannerUniverse } from "../../hooks/useScannerUniverse";
-import type { ScannerResultWireShape } from "../../services/api-client";
+import type {
+  ScannerObservationDetailWireShape,
+  ScannerObservationRowWireShape,
+  ScannerResultWireShape,
+} from "../../services/api-client";
 
 const MIN_WIDTH = 64;
 const MAX_WIDTH = 480;
@@ -114,6 +119,192 @@ function ResultsTab() {
         {lastUpdated && <span className="font-mono text-[9px] text-text-muted">Updated {lastUpdated.toLocaleTimeString()}</span>}
       </div>
     </>
+  );
+}
+
+function formatUtc(iso: string | null): string {
+  if (!iso) return "—";
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? iso : `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
+function ObservationRow({ row }: { row: ScannerObservationRowWireShape }) {
+  const lowConfidence = row.inputs_available < 2;
+  const features = FEATURE_DISPLAY_ORDER.filter((k) => typeof row.features[k] === "number");
+
+  return (
+    <div className="flex flex-col gap-1 border-b border-base-border px-2 py-1.5">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-xs font-medium text-text-primary">{row.symbol}</span>
+        <div className="flex items-center gap-1.5">
+          {lowConfidence && (
+            <span
+              title={`Only ${row.inputs_available}/3 inputs available — thin reading, not a confident score`}
+              className="rounded bg-base-bg px-1 font-mono text-[9px] text-text-muted"
+            >
+              {row.inputs_available}/3
+            </span>
+          )}
+          <span className="font-mono text-xs font-semibold text-text-primary">
+            {row.score === null ? "—" : row.score.toFixed(2)}
+          </span>
+        </div>
+      </div>
+      {features.length > 0 && (
+        <div className="flex flex-wrap gap-x-2 font-mono text-[10px]">
+          {features.map((key) => {
+            const chip = formatFeatureChip(key, row.features[key] as number);
+            return (
+              <span key={key} className={chip.primary ? "font-semibold text-text-primary" : "text-text-muted"}>
+                {chip.label}
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ObservationStatus({ observation, running }: { observation: ScannerObservationDetailWireShape; running: boolean }) {
+  const { retained, latest_attempt: attempt } = observation;
+  const retainedNote =
+    retained === "none"
+      ? "No successful scan has been retained."
+      : `Showing results retained from the last success at ${formatUtc(observation.last_success_at)}.`;
+
+  return (
+    <>
+      {attempt === "failed" && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-bear">
+          Latest attempt{observation.last_attempt_at ? ` at ${formatUtc(observation.last_attempt_at)}` : ""} failed
+          {observation.last_error ? `: ${observation.last_error}` : ""}. {retainedNote}
+        </div>
+      )}
+      {attempt === "interrupted" && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">
+          The latest attempt at {formatUtc(observation.last_attempt_at)} was interrupted before it completed. {retainedNote}
+        </div>
+      )}
+      {!running && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">
+          Worker stopped.{" "}
+          {retained === "none" ? "No successful scan was retained." : `Showing results retained from the last success at ${formatUtc(observation.last_success_at)}.`}
+        </div>
+      )}
+      {retained === "none" && attempt === "in_progress" && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">First scan in progress — no successful scan yet.</div>
+      )}
+      {retained === "none" && attempt === "none" && running && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">No successful scan yet — none has been attempted.</div>
+      )}
+      {retained === "none" && attempt === "none" && !running && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">No scan was ever attempted.</div>
+      )}
+      {retained === "none" && (attempt === "failed" || attempt === "interrupted") && running && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">No successful scan yet.</div>
+      )}
+      {retained === "empty" && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">
+          Last successful scan at {formatUtc(observation.last_success_at)} scored no symbols (successful, empty
+          result).
+        </div>
+      )}
+      {retained === "populated" && attempt !== "failed" && running && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">
+          Last successful scan at {formatUtc(observation.last_success_at)}.
+        </div>
+      )}
+    </>
+  );
+}
+
+function ObservationBody() {
+  const { data, error, loadedAt, loading, refresh } = useScannerObservation();
+  const observation = data?.observation ?? null;
+  const worker = data?.worker ?? null;
+
+  return (
+    <div className="flex max-h-80 flex-col overflow-y-auto">
+      <div className="flex shrink-0 items-center justify-between px-2 py-1">
+        {/* Manual only, never disabled: pressing it while a request is pending
+            starts a newer one that supersedes it. */}
+        <button
+          onClick={refresh}
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+        >
+          Refresh
+        </button>
+        <span className="font-mono text-[9px] text-text-muted">
+          {loading ? "loading…" : loadedAt ? `Read ${loadedAt.toLocaleTimeString()}` : ""}
+        </span>
+      </div>
+
+      {error && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-bear">
+          {data ? `Refresh failed: ${error} — showing the last loaded read.` : `Failed to load: ${error}`}
+        </div>
+      )}
+      {!data && !error && loading && <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">Loading…</div>}
+
+      {data?.status === "unavailable" && (
+        <div className="px-2 py-1.5 font-mono text-[10px] text-text-muted">
+          Unavailable — {data.reason ?? "no scheduled observation is reported by this backend"}. Nothing is being
+          scanned on a schedule here; use the Results tab for an on-demand scan.
+        </div>
+      )}
+
+      {data?.status === "available" && observation && worker && (
+        <>
+          <div className="px-2 py-1 font-mono text-[10px] text-text-muted">
+            Worker {worker.running ? "running" : "stopped"} · {worker.cycle_running ? "scan in progress" : "no scan in progress"}
+          </div>
+          <ObservationStatus observation={observation} running={worker.running} />
+          {(observation.retained !== "none" || observation.universe.length > 0) && (
+            <div
+              className="px-2 py-1 font-mono text-[10px] text-text-muted"
+              title={observation.skipped.length > 0 ? `Skipped: ${observation.skipped.join(", ")}` : undefined}
+            >
+              Universe {observation.universe.length} · Scored {observation.results.length} · Skipped{" "}
+              {observation.skipped.length}
+            </div>
+          )}
+          {observation.results.length > 0 && (
+            <>
+              <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
+                Activity observations — not execution recommendations.
+              </div>
+              {observation.results.map((r) => (
+                <ObservationRow key={r.symbol} row={r} />
+              ))}
+            </>
+          )}
+          <div className="px-2 py-1.5 font-mono text-[9px] text-text-muted">
+            Worker availability does not establish healthy feed delivery or complete coverage.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ScheduledObservationSection() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="shrink-0 border-t border-base-border">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1 px-2 py-1 text-left font-mono text-[10px] font-semibold text-text-muted hover:text-text-primary"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>Scheduled observation</span>
+      </button>
+      {/* Mounted only while expanded: collapsing unmounts the body, which
+          invalidates any in-flight request. Re-expanding loads afresh. */}
+      {open && <ObservationBody />}
+    </div>
   );
 }
 
@@ -299,7 +490,8 @@ export function ScannerPanel() {
               {tab === "results" && <span className="font-mono text-[9px] text-text-muted">{SCORE_BASIS_LABEL}</span>}
             </div>
 
-            {tab === "results" ? <ResultsTab /> : <UniverseTab />}
+            <div className="flex min-h-0 flex-1 flex-col">{tab === "results" ? <ResultsTab /> : <UniverseTab />}</div>
+            <ScheduledObservationSection />
           </>
         )}
       </div>

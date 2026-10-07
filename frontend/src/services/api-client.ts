@@ -1313,6 +1313,46 @@ export async function fetchScannerState(symbols?: string[], topN?: number): Prom
   return (await res.json()) as ScannerStateWireShape;
 }
 
+/** GET /scanner/observation — read-only view of the scheduled observation
+ * worker's retained snapshot (task `scanner-observation-status`). Separate
+ * from GET /scanner/state, which scans on demand. `status: "unavailable"`
+ * means no observation reader is installed in the backend process. */
+export type ScannerObservationRetained = "none" | "empty" | "populated";
+export type ScannerObservationAttempt = "none" | "in_progress" | "succeeded" | "failed" | "interrupted";
+
+export interface ScannerObservationRowWireShape {
+  symbol: string;
+  score: number | null;
+  inputs_available: number;
+  features: Record<string, number | null>;
+}
+
+export interface ScannerObservationDetailWireShape {
+  retained: ScannerObservationRetained;
+  latest_attempt: ScannerObservationAttempt;
+  universe: string[];
+  results: ScannerObservationRowWireShape[]; // complete retained results, no top-N cut
+  skipped: string[];
+  last_attempt_at: string | null; // ISO-8601 UTC
+  last_success_at: string | null; // ISO-8601 UTC
+  last_error: string | null;
+}
+
+export interface ScannerObservationWireShape {
+  status: "unavailable" | "available";
+  reason: string | null;
+  worker: { running: boolean; cycle_running: boolean } | null;
+  observation: ScannerObservationDetailWireShape | null;
+}
+
+export async function fetchScannerObservation(): Promise<ScannerObservationWireShape> {
+  const res = await fetch(`${API_BASE_URL}/scanner/observation`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ScannerObservationWireShape;
+}
+
 export interface ScannerUniverseEntryWireShape {
   symbol: string;
   added_at: string;
