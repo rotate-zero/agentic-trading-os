@@ -894,6 +894,25 @@ export async function fetchStrategyOutcomes(
   return (await res.json()) as StrategyOutcomesWireShape;
 }
 
+/**
+ * GET /intelligence/strategy-outcomes/{outcome_id} (task
+ * `recorded-outcome-evidence-detail`). One persisted outcome by UUID. The
+ * body is the SAME `StrategyOutcomeWireShape` the list route serves for each
+ * row — no envelope and no extra field — exactly as recorded: NULL snapshots
+ * stay `null` with their reason in `snapshot_missing_reasons`, a NULL
+ * `commission_total` stays `null`, and `is_backtest`/`execution_mode` are the
+ * row's own population labels (the lookup is by ID alone and never relabels).
+ * An unknown ID throws `ApiError` with `status === 404`; a malformed ID is a
+ * 422 (`ApiError`), like any other failed request.
+ */
+export async function fetchStrategyOutcome(outcomeId: string): Promise<StrategyOutcomeWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/strategy-outcomes/${encodeURIComponent(outcomeId)}`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as StrategyOutcomeWireShape;
+}
+
 // Matches GET /intelligence/backtest-runs's response shape (decision
 // #136). Field names/types copied directly from `schemas/performance.py`'s
 // `BacktestRun` (re-verified against that file's current contents) — the

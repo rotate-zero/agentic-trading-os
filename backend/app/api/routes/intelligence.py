@@ -623,6 +623,81 @@ def _fetch_strategy_outcomes(limit, is_backtest, backtest_run_uuid, sweep_uuid):
         session.close()
 
 
+@router.get("/strategy-outcomes/{outcome_id}")
+async def get_strategy_outcome_detail(outcome_id: UUID) -> dict[str, Any]:
+    """
+    One persisted `strategy_outcomes` row by its `outcome_id`, for the Info
+    tab's "View evidence" detail (task `recorded-outcome-evidence-detail`;
+    no new decision number — a read-only reader of the contracts decisions
+    #89/#120 (schema), #122 (list route) and #186 (simulated writer) already
+    fixed).
+
+    The response body IS the existing `schemas.performance.StrategyOutcome`
+    contract, serialized exactly as one element of `GET /strategy-outcomes`
+    (`model_validate(row, from_attributes=True).model_dump(mode="json")`) —
+    no envelope, no second response model and no added field. That means:
+    recorded evidence and entry/exit snapshots exactly as stored; strategy
+    name/version attribution; `execution_mode`/`execution_venue`;
+    timestamps, prices, quantities, realized P&L/R, stop/target and
+    structural levels; `commission_total` as stored.
+
+    **Nothing is reconstructed, estimated or recomputed.** A NULL snapshot
+    stays JSON `null` with its machine-readable code in
+    `snapshot_missing_reasons`; a NULL `commission_total` stays `null`
+    (never `0`); P&L and R are the stored values, not re-derived. No
+    configuration hash is returned because the contract has none —
+    `strategy_version` is the immutable StrategyConfig version and, for a
+    backtest row, `backtest_run_id` names the run that holds its
+    configuration.
+
+    **Population identity is whatever the row recorded.** The lookup is by
+    primary key alone and deliberately has no `is_backtest` selector: a
+    backtest ID returns a row labelled `is_backtest=true` /
+    `execution_mode="backtest"`, a simulated ID one labelled `false` /
+    `"simulated"`. Nothing here relabels either (the contract's
+    default-from-`is_backtest` validator only runs for dict input, never for
+    an ORM row), and the outcome UUID is never linked to a `trades` row —
+    no persisted relationship is read here.
+
+    422 for a malformed UUID (FastAPI validation, before the helper runs);
+    404 for a well-formed unknown ID. Off the event loop via
+    `asyncio.to_thread`; the helper owns its session and reads in one
+    REPEATABLE READ, server-enforced READ ONLY transaction, so it can never
+    write, lock or change the schema.
+    """
+    outcome = await asyncio.to_thread(_fetch_strategy_outcome, outcome_id)
+    if outcome is None:
+        raise HTTPException(status_code=404, detail=f"Unknown strategy outcome {outcome_id}")
+    return outcome
+
+
+def _fetch_strategy_outcome(outcome_id) -> dict[str, Any] | None:
+    """Read and serialize ONE outcome inside a worker-owned read-only snapshot
+    transaction (same isolation options `execution_engine/trade_detail.py`
+    uses). Returns `None` for an unknown ID."""
+    from sqlalchemy import select
+
+    from app.db.session import SessionLocal
+    from app.models.trading_intelligence import StrategyOutcomeRecord
+    from app.schemas.performance import StrategyOutcome
+
+    session = SessionLocal()
+    try:
+        session.connection(execution_options={"isolation_level": "REPEATABLE READ", "postgresql_readonly": True})
+        row = session.execute(
+            select(StrategyOutcomeRecord).where(StrategyOutcomeRecord.outcome_id == outcome_id)
+        ).scalar_one_or_none()
+        payload = (
+            None
+            if row is None
+            else StrategyOutcome.model_validate(row, from_attributes=True).model_dump(mode="json")
+        )
+        session.rollback()  # read-only: end the snapshot transaction explicitly
+        return payload
+    finally:
+        session.close()
+
+
 @router.get("/opportunity-conflicts")
 async def get_opportunity_conflicts_view(symbol: str | None = Query(None)) -> dict[str, Any]:
     """

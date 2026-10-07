@@ -3179,6 +3179,96 @@ Lost in-memory snapshots keep the C3 contract: the recovered outcomes carry NULL
 ```
 
 
+#### P. Recorded-outcome evidence detail (`recorded-outcome-evidence-detail`; decisions #89/#120, #122 and #186 are the contracts, no new decision number)
+
+**As built.** A closed trade in the Info tab's "Recent Closed Trades" (§I) can now be opened to the evidence
+its `strategy_outcomes` row recorded. Backend: `GET /intelligence/strategy-outcomes/{outcome_id}` returns **one**
+persisted row serialized through the existing `schemas.performance.StrategyOutcome` contract
+(`model_validate(row, from_attributes=True).model_dump(mode="json")`, the same expression the list route uses), with
+no envelope, no second response model and no added field. Malformed UUIDs are rejected by FastAPI (422) before the
+helper runs; an unknown ID is a 404. The query runs off the event loop (`asyncio.to_thread`) in a worker-owned session
+in one `REPEATABLE READ`, server-enforced `READ ONLY` transaction (the same options as `trade_detail.py`): it cannot
+write, lock or alter schema, and there is no migration. Frontend: `fetchStrategyOutcome`,
+`useStrategyOutcomeDetail` and `StrategyOutcomeEvidence`, opened from a **View evidence** button on each row.
+
+- **Recorded, not reconstructed.** A NULL snapshot stays `null` with its code in `snapshot_missing_reasons`; a NULL
+  `commission_total` stays `null` (the view says "not available (not recorded)" and never shows `0`); P&L, R, levels and
+  prices are the stored values (floats exactly as the list route serves them, shown verbatim, no rounding). Nothing is
+  re-derived or recomputed here, and no snapshot is rebuilt.
+- **Population identity is the row's own.** The lookup is by primary key only, with no `is_backtest` selector. A backtest
+  ID returns `is_backtest: true` / `execution_mode: "backtest"` / its `backtest_run_id`; a simulated ID returns `false` /
+  `"simulated"`. The contract's default-from-`is_backtest` validator only runs for dict input, never for an ORM row, so
+  nothing is relabelled. The view words its note from `execution_mode` alone (simulated, backtest, or the mode verbatim).
+- **Configuration attribution** is what the contract carries: `strategy_name`, the immutable `strategy_version` and, for a
+  backtest row, `backtest_run_id` (the run that holds its configuration). The contract has no `config_hash`, so none is shown.
+- **No outcome → trade link.** The outcome UUID is not matched to a `trades` row: `trades.outcome_id → strategy_outcomes`
+  exists, but the reverse lookup is not read here and no trade ID is shown. No trading action is offered.
+- **Evidence is text.** Nested `evidence` and snapshot values render through a recursive text-only renderer (strings are
+  JSON-quoted so `"10"` and `10` differ; null, empty list/object/string are named; past depth 8 the subtree is JSON text).
+  No value reaches `dangerouslySetInnerHTML`, `href` or `style`.
+
+**Data flow between components**
+
+```
+ OutcomeRecorder (#186) ─INSERT─► strategy_outcomes ◄─INSERT─ BacktestRunner (#128)
+                                          │ (append-only rows; PK outcome_id)
+        ┌─────────────────────────────────┴───────────────────────────────┐
+        │ GET /intelligence/strategy-outcomes?limit=10&is_backtest=false  │ GET /intelligence/strategy-outcomes/{outcome_id}   (NEW)
+        │ (existing list; §I)                                              │ 422 malformed UUID · 404 unknown · 200 StrategyOutcome
+        ▼                                                                  ▼
+ fetchStrategyOutcomes()                                            fetchStrategyOutcome(id)      api-client.ts
+        │ StrategyOutcomesWireShape                                        │ StrategyOutcomeWireShape (same type as one list row)
+        ▼                                                                  ▼
+ useStrategyOutcomes(10)                                            useStrategyOutcomeDetail(outcomeId | null)
+   outcomes · loading · error · refetch                               outcome · loading · error · notFound · refresh
+        ▼                                                                  ▼
+ InfoTab.tsx RecentClosedTrades ── selectedOutcomeId (local state) ─► StrategyOutcomeEvidence  (rendered below the list)
+   rows + "View evidence" / "Hide evidence"                              attribution · mode/venue · timing · trade values
+   list Refresh and states unchanged                                     levels · evidence · four snapshots · reason codes
+```
+
+**Internal flow of the route and helper**
+
+```
+ GET /intelligence/strategy-outcomes/{outcome_id}
+   │  FastAPI: outcome_id: UUID ── malformed ──► 422 (helper not called)
+   ▼
+ asyncio.to_thread(_fetch_strategy_outcome, outcome_id)         (event loop stays free)
+   │   worker thread: SessionLocal()
+   │   connection(isolation=REPEATABLE READ, postgresql_readonly=True)
+   │   SELECT strategy_outcomes WHERE outcome_id = :id          (no is_backtest filter, no join, no write)
+   │     ├─ no row ──► rollback ─► None ─► route raises 404
+   │     └─ row ─► StrategyOutcome.model_validate(row, from_attributes=True).model_dump(mode="json")
+   │              rollback (ends the snapshot) ─► close
+   ▼
+ 200 body = the StrategyOutcome (nulls and snapshot_missing_reasons exactly as stored)
+```
+
+**Internal flow of the request state (`useStrategyOutcomeDetail`)**
+
+```
+ outcomeId changes │ refresh()                           unmount / Hide
+        ▼                                                      │
+   id = ++requestId ; state.outcome = (same id ? kept : null) ; loading = true        requestId++ (in-flight response dropped)
+        ▼
+   fetchStrategyOutcome(outcomeId)
+     ├─ ok,    id == latest ─► outcome = row ; error = null ; notFound = false
+     ├─ 404,   id == latest ─► outcome = null ; notFound = true            (distinct from failure)
+     ├─ other, id == latest ─► error = message ; outcome kept ONLY for the same id
+     └─ id != latest ─► dropped, no state write
+   render: the hook never returns another id's outcome for the current selection (even for the render before the effect)
+```
+
+**Verification.** `tests/test_strategy_outcome_detail_route.py` (isolated PostgreSQL rows under one marker, including a
+backtest run row for the FK): exact stored values for a recorder-style simulated row with NULL snapshots and commission;
+equality with the same row as returned by the list route (simulated with commission, simulated unavailable, backtest);
+verbatim nested evidence; partially present snapshots with only their recorded codes; backtest vs simulated identity;
+only the requested row returned despite a shared `opportunity_id`; 404 and 422 (helper not called); worker thread,
+`transaction_read_only = on`, `repeatable read` observed on every statement, the server refusing an `UPDATE` inside the
+helper's transaction, and an unchanged table fingerprint; a blocked read not blocking `/health`. The frontend behavior was
+verified with a temporary jsdom harness (not shipped); see `TESTING.md`.
+
+
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)
 
 Names follow `system-design.md` §4.13; columns are illustrative. Every write goes through `asyncio.to_thread` (the repository's sync-engine pattern) and precedes the corresponding event (I8). **The ledger tables are authoritative (I12).**

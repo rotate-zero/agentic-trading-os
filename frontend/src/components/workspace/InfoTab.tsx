@@ -10,6 +10,7 @@ import { useContextSnapshot } from "../../hooks/useContextSnapshot";
 import { useMarketState } from "../../hooks/useMarketState";
 import { useWorldView } from "../../hooks/useWorldView";
 import { PortfolioStateSummary } from "./PortfolioStateSummary";
+import { StrategyOutcomeEvidence } from "./StrategyOutcomeEvidence";
 import { AIAnalysisPanel } from "../ai-panel/AIAnalysisPanel";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
@@ -71,8 +72,15 @@ function formatLoadedAt(ms: number): string {
 // A failed Refresh keeps the previously loaded rows on screen (the hook
 // never clears them) and says how old they are. Refresh is a manual
 // action only — no polling, no WebSocket (see useStrategyOutcomes.ts).
+//
+// "View evidence" (task recorded-outcome-evidence-detail) opens the recorded
+// evidence of one row below the list (StrategyOutcomeEvidence, GET
+// /intelligence/strategy-outcomes/{outcome_id}). The selection is just an
+// outcome ID kept here: the list, its Refresh and its states are untouched,
+// and the open evidence is independent of the list's own refresh result.
 function RecentClosedTrades() {
   const { outcomes, loading, error, hasLoaded, lastLoadedAt, refetch } = useStrategyOutcomes(10);
+  const [selectedOutcomeId, setSelectedOutcomeId] = useState<string | null>(null);
 
   return (
     <section className="flex flex-col gap-1" aria-label="Recent closed trades (simulated)">
@@ -126,7 +134,9 @@ function RecentClosedTrades() {
             return (
               <div
                 key={o.outcomeId}
-                className="flex items-center justify-between rounded border border-base-border px-2 py-1.5"
+                className={`flex items-center justify-between rounded border px-2 py-1.5 ${
+                  selectedOutcomeId === o.outcomeId ? "border-signal" : "border-base-border"
+                }`}
               >
                 <div>
                   <div className="font-mono text-xs font-medium text-text-primary">
@@ -155,11 +165,22 @@ function RecentClosedTrades() {
                     {o.realizedR >= 0 ? "+" : ""}
                     {o.realizedR.toFixed(2)}R
                   </div>
+                  <button
+                    onClick={() => setSelectedOutcomeId(selectedOutcomeId === o.outcomeId ? null : o.outcomeId)}
+                    aria-pressed={selectedOutcomeId === o.outcomeId}
+                    className="mt-0.5 rounded px-1 py-0.5 font-mono text-[10px] text-signal hover:bg-base-bg"
+                  >
+                    {selectedOutcomeId === o.outcomeId ? "Hide evidence" : "View evidence"}
+                  </button>
                 </div>
               </div>
             );
           })}
         </div>
+      )}
+
+      {selectedOutcomeId !== null && (
+        <StrategyOutcomeEvidence outcomeId={selectedOutcomeId} onClose={() => setSelectedOutcomeId(null)} />
       )}
     </section>
   );
