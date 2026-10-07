@@ -644,7 +644,7 @@ Frontend-only; no backend, `api-client.ts`, `useScannerState`, ranking, scoring,
 
 ---
 
-## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`)
+## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`; context hot-add built as `context-universe-hot-add`)
 
 This section records the verified full-system design and, in §18.8, the tested observation worker core. The worker is **not started by the application**, so continuous scanning and promotion are not deployed. Decision #189 confirms only the directions identified in §18.7; the remaining filter and switch details are recommendations. It supersedes the *as-built* implications of §§0, 4–5: the old cadence table is a draft, `ScannerRankingUpdated` does not exist, `GET /scanner/state` already exists but recomputes per request, `StrategyScheduler` already exists but has no scanner eligibility input, and relay activation does not control strategy evaluation. Scanner scores are activity observations, not authorizations to execute.
 
@@ -654,13 +654,13 @@ This section records the verified full-system design and, in §18.8, the tested 
 |---|---|---|
 | Universe | `backend/app/scanner/universe.py`: `DbUniverseProvider` reads `scanner_universe_symbols`; add/remove/list are persistent, format-only operations. `backend/app/api/routes/scanner.py:get_scanner_state` falls back to `TEST_UNIVERSE` on an empty DB universe and accepts a validated `?symbols=` override. | The observation worker now rereads this table each admitted cycle and treats empty as a successful empty result (§18.8). Startup ownership and feed coverage remain open. |
 | Score | `backend/app/scanner/scorer.py:score_symbol` consumes existing 1m `FeatureSet` values; `backend/app/scanner/runner.py:run_scan` reads `FeatureEngine.get_snapshot()` and ranks on demand. It skips symbols with no 1m snapshot, but **includes** a snapshot with zero usable inputs and score zero. `GET /scanner/state?top_n=` cuts only the response. | The observation worker now retains full results, skipped symbols and status (§18.8). A promotion filter remains unapproved. |
-| Strategy | `backend/app/strategy_engine/scheduler.py:StrategyScheduler._on_market_state_changed` triggers on every per-symbol `MarketStateChanged` with matching cached features and context, then applies strategy gate conditions. It reads no scanner set. `backend/app/context_engine/engine.py` snapshots the DB universe once at startup; a later universe edit does not automatically add per-symbol context there. | A narrow **entry-evaluation** eligibility read at the scheduler, plus a way to refresh ContextEngine's tracked symbols or an equivalent already supported context update. Neither scanner membership nor score may be read by Governor or Execution as authorization. |
+| Strategy | `backend/app/strategy_engine/scheduler.py:StrategyScheduler._on_market_state_changed` triggers on every per-symbol `MarketStateChanged` with matching cached features and context, then applies strategy gate conditions. It reads no scanner set. `backend/app/context_engine/engine.py` loads the DB universe at startup and, since `context-universe-hot-add` (§18.9), rereads it after each successful `POST /scanner/universe` to start per-symbol context loops for newly added symbols. Removal never stops a loop. | A narrow **entry-evaluation** eligibility read at the scheduler. The ContextEngine refresh for additions is built (§18.9); a ContextEngine retirement/ownership rule for removed symbols is not. Neither scanner membership nor score may be read by Governor or Execution as authorization. |
 | Feed | `backend/app/api/routes/market.py:subscribe` calls the current streaming provider. `FinnhubAdapter`, `PolygonAdapter` and `IBKRAdapter` each own their own transient subscription sets (`backend/app/broker_adapters/`); there is no central manual-subscription owner or general capacity registry. `backend/app/main.py:lifespan` connects providers but does not subscribe the scanner universe or restored holdings. Finnhub has no automatic reconnect after a WebSocket close. | Explicit, additive feed subscription for symbols needed to score and to monitor existing exposure; track manual needs to compute the full union; re-establish after provider connection/reconnection. Provider capacity and data quality require real validation. |
 | Relay | `backend/app/services/live_tick_relay.py:LiveTickRelay.set_active_symbols` replaces a maximum-eight set; its `PriceUpdated` subscriber emits throttled `PriceSnapshot` only for that set. `POST /market/active-symbols` can set it manually. | Optional scanner-owned chart activation, with a defined interaction with manual relay settings. It is **not** a provider subscription or a strategy eligibility gate. |
 | UI | `ScannerPanel` / `useScannerState` poll on-demand `GET /scanner/state`; `useScannerUniverse` edits the DB universe. Chart/watchlist subscriptions use `frontend/src/hooks/useLatestPrices.ts` and the market subscribe route; broker-panel subscriptions have their own local UI record. | A recorded/current scheduled result read surface, with status and staleness, only if needed for observe/promote visibility. UI selection must not become the scanner's authority. |
 | Protection | `backend/app/position_monitor/engine.py:PositionMonitor` reads `PortfolioStatePositionReader` and bus-wide `PriceUpdated`/`CandleClosed`, journals ticks before held-position visibility can settle, and has an EOD timer. `SimulatedVenue`, `ReferencePriceTracker` and Portfolio State consume their own tick/order paths. | A durable feed-need reconciliation from restored open positions and working orders. Scanner exclusion must never stop those observations. Existing monitor journal capacity/loss behavior remains a separate limit. |
 
-The four symbol sets—provider subscriptions, relay chart activation, StrategyScheduler entry eligibility and UI selection—**do not share one runtime registry today**. The persisted scanner universe is shared by the scanner route and ContextEngine's startup load; it is not a subscription or eligibility registry. Manual provider subscription and UI selection can indirectly cause data to appear, but neither calls `set_active_symbols` or writes a scheduler gate. `backend/app/core/debounce_scheduler.py:DebounceScheduler` is a bounded event-recompute utility, not a session cadence schedule. `backend/app/core/market_clock.py:MarketClock.current_session` supplies session labels; its OPEN/LUNCH/POWER_HOUR boundaries do not match every clock time in §4's proposed 5/20/90/20/5-second table. Its verified holiday/early-close coverage is 2026–2028; scheduling that must fail closed outside covered years must check `has_calendar_for_year()`.
+The four symbol sets—provider subscriptions, relay chart activation, StrategyScheduler entry eligibility and UI selection—**do not share one runtime registry today**. The persisted scanner universe is shared by the scanner route, ContextEngine's startup load and its add-only refresh (§18.9); it is not a subscription or eligibility registry. Manual provider subscription and UI selection can indirectly cause data to appear, but neither calls `set_active_symbols` or writes a scheduler gate. `backend/app/core/debounce_scheduler.py:DebounceScheduler` is a bounded event-recompute utility, not a session cadence schedule. `backend/app/core/market_clock.py:MarketClock.current_session` supplies session labels; its OPEN/LUNCH/POWER_HOUR boundaries do not match every clock time in §4's proposed 5/20/90/20/5-second table. Its verified holiday/early-close coverage is 2026–2028; scheduling that must fail closed outside covered years must check `has_calendar_for_year()`.
 
 ### 18.2 Minimum simulated-only slice and responsibility boundaries
 
@@ -740,7 +740,7 @@ For this minimum slice, keep scanner subscriptions additive and never use `provi
 | `backend/app/scanner/scanner.py` | Observation lifecycle, immutable result/status, no overlap and universe reread are built (§18.8). Subscription request and mode-specific eligibility update remain future work. Reuse `run_scan` and `DbUniverseProvider`. |
 | `backend/app/scanner/runner.py`, `scorer.py` | Reuse unchanged unless a focused test finds a genuine contract gap; keep zero-input rows in on-demand output, filter only at promotion. |
 | `backend/app/strategy_engine/scheduler.py` | Inject optional eligibility reader; check before each new strategy evaluation, with pass-through default for off/observe and existing backtest/tests. Do not change `gate_conditions` or opportunity payloads. |
-| `backend/app/context_engine/engine.py` | Minimal way to refresh tracked universe after edits, without restarting global calendar work or changing per-symbol context contracts. |
+| `backend/app/context_engine/engine.py` | **Built for additions (§18.9, `context-universe-hot-add`):** `refresh_symbol_loops()` rereads the universe and starts loops for new symbols without restarting global calendar work or changing per-symbol context contracts. Retiring loops for removed symbols is not built. |
 | `backend/app/services/live_tick_relay.py`, `backend/app/api/routes/market.py`, provider-specific subscription routes | No relay semantic change; coordinate optional scanner chart writes and manual set ownership per C4. Record manual provider needs in a shared, inspectable owner so the full-union capacity check is possible, and coordinate direct provider unsubscribe safety. Preserve route contracts. |
 | `backend/app/portfolio_state/*`, `backend/app/execution_engine/*` | Read existing restored position/working-order state through a narrow adapter; no exit or accounting policy changes. Add transition notifications only if needed to reassert feed need promptly. |
 | `backend/app/main.py`, `backend/app/core/config.py` | Validate simulated-only mode and approved schedule/filter settings; start owner after required dependencies, stop it before provider disconnect and normal bus drain. |
@@ -775,7 +775,7 @@ Local doubles and an in-process event bus can prove S1–S4, EL1–EL3, UI1 and 
 | C3 | **Switch mechanics:** recommend `off` / `observe` / `promote`, default off, operator configuration plus restart, and no promotion until a successful current scan. Manual default and explicit operator enablement are decided; the interface/restart behavior is not. | A runtime toggle needs an authorization and transition contract; observe offers quality data while leaving strategy evaluation unchanged. Provider recovery alone must not enable automation. |
 | C4 | **Relay/manual coexistence:** recommend scanner relay writes only when its computed set changes, with visible override of a manual relay set. Manual provider subscriptions and protected symbols must be retained by decision #189. | A later scanner write may still replace a manual chart set. A shared owner ledger can preserve manual relay priority and permit safe provider unsubscribe if verified capacity requires it, at greater scope. |
 
-No threshold/top-N, hysteresis, session-coverage, switch-interface, relay-priority or new execution policy is approved by decision #189. `ContextEngine`'s one-time universe snapshot and missing held/order feed re-subscription remain implementation prerequisites. Neither permits scanner membership to control protective exits.
+No threshold/top-N, hysteresis, session-coverage, switch-interface, relay-priority or new execution policy is approved by decision #189. `ContextEngine`'s add-side universe refresh is now built (§18.9); its removal/ownership behavior and the missing held/order feed re-subscription remain implementation prerequisites. Neither permits scanner membership to control protective exits.
 
 ### 18.8 Tested observation worker core (`scanner-observation-worker`)
 
@@ -829,3 +829,72 @@ restart ──► new generation + one timer; old completion cannot publish
 `ObservationSnapshot` is a frozen value: captured universe, ranked rows, skipped symbols, `last_attempt_at`, `last_success_at`, `last_error`, `running` (worker lifecycle) and `cycle_running` (an active admitted cycle). Row feature maps are copied and read-only; callers cannot mutate the retained result. `last_success_at is None` means no cycle has succeeded; a non-null timestamp with empty tuples means a genuine successful empty observation; a non-null `last_error` means the latest attempt failed and the prior success remains visible. A successful cycle clears the error. Snapshots are in memory only; a process restart begins with no successful result. There is no scheduled-result HTTP endpoint.
 
 `stop()` blocks new cycles immediately, invalidates the generation before awaiting the owner task, and drains an active offloaded read. Cancelling a stop caller cannot abandon the read: shutdown still waits for the thread to finish, then propagates cancellation. A hung database call can therefore delay shutdown; `asyncio.to_thread` cancellation does not stop its underlying thread. No provider subscriptions, relay writes, strategy eligibility, switch modes or application-startup wiring are included. C1–C4, feed-capacity validation and protected-subscription reconciliation in §§18.2–18.7 remain open before unattended scanning or promotion.
+
+### 18.9 Context hot-add for universe additions (`context-universe-hot-add`)
+
+**Problem.** `ContextEngine` loaded `scanner_universe_symbols` once at `start()`. A symbol added through `POST /scanner/universe` was persisted and scored by the on-demand scanner, but got no per-symbol `ContextChanged` or snapshot entry until the next application restart. This delivery closes that gap for **additions only**. It reuses the existing universe selection (`ContextEngine._load_scanner_universe_symbols`, non-backtest symbols), the same providers, the same immediate first evaluation and the same 15-minute per-symbol cadence; the global calendar loop, `evaluate_for_symbol()` output and `get_snapshot()` shape are unchanged. No decision number was needed: §18.5 already named this refresh as a prerequisite under decision #189, and nothing here changes a decided policy (the canonical index, log and archive were checked at base `2a483e4`; the log ends at #189, the archive at #184).
+
+**Component data flow:**
+
+```
+POST /scanner/universe {symbol}
+   │ asyncio.to_thread
+   ▼
+add_symbol_to_universe ──commit──► symbols + scanner_universe_symbols      (unchanged)
+   │ committed; everything below is a SEPARATE, best-effort step
+   ▼
+request.app.state.context_engine
+   │  None (no lifespan / shutting down) ──► skip; route never calls get_context_engine()
+   ▼ running engine
+ContextEngine.refresh_symbol_loops() ─ owned task ─► to_thread ─► _load_scanner_universe_symbols
+   │                                                                   ▲ same read bootstrap uses
+   ▼ ticker list
+_track_symbols()  ── already tracked? skip ── stopped / stale generation? create nothing
+   │ new symbol
+   ▼
+_symbol_loop(symbol) ─► evaluate_for_symbol ─► FundamentalsProvider + NewsFlagProvider
+   │                         │                          │
+   │ every 15 min            ├─► _latest_by_symbol ─► get_snapshot() ─► StrategyScheduler, World View,
+   │                         │                                        GET /intelligence/context (readers)
+   └─────────────────────────┴─► ContextChanged(symbol) ─► Event Bus ─► WebSocket "intelligence.context"
+                                                       (response {"symbol","added":true} returned either way)
+Untouched: global _loop (CalendarProvider, session boundaries), every existing symbol loop,
+           DELETE /scanner/universe/{symbol}, GET /scanner/state scoring.
+```
+
+**Internal refresh and lifecycle flow:**
+
+```
+start():  _running=True, generation++ ─► global _loop + bootstrap task (read universe ─► _track_symbols)
+
+refresh_symbol_loops():
+   not _running ───────────────────────────────► return []      (never started / stopped / stopping)
+   create owned refresh task (captures generation), caller waits with asyncio.wait
+        │  caller cancelled ─► owned task keeps going (a committed addition is not lost)
+        ▼
+   to_thread(universe read)
+        ├─ raises ─► logger.exception("ContextEngine universe refresh failed ...") ─► re-raise
+        │            tracking untouched; the next refresh retries from scratch
+        └─ symbols ─► _track_symbols(symbols, generation)      (synchronous: no await between
+                         │                                      "tracked?" and create_task, so
+                         │                                      bootstrap + N refreshes serialize)
+                         ├─ _running False or generation changed ─► [] (stale completion ignored)
+                         └─ create loops only for untracked symbols ─► return the new ones
+
+stop():  _running=False, generation++   (before any await: late reads become no-ops)
+         cancel global loop ─► cancel+await bootstrap ─► cancel+await refresh tasks
+         ─► cancel+await every symbol loop (including removed symbols') ─► clear
+```
+
+**Route contract.** `POST /scanner/universe` returns exactly `{"symbol": <normalized>, "added": true}` as before; invalid tickers still return 400 and trigger nothing. The refresh runs after the commit and any exception from it is logged (`ContextEngine universe refresh failed ...` with traceback from the engine, plus one warning line naming the committed symbol from the route) and swallowed, so a refresh failure never reports a committed addition as failed. The refresh is triggered on every successful POST, including an idempotent re-add of a symbol already present, which doubles as a manual retry. `main.py` publishes the **running** engine as `app.state.context_engine` just before the lifespan yields and clears it first thing at shutdown; without it (tests without a lifespan, shutdown) the route skips the refresh and never instantiates or starts an engine. `GET /scanner/universe`, `DELETE /scanner/universe/{symbol}` and `GET /scanner/state` are untouched.
+
+**Honest limitations.**
+
+- **Add-only.** A symbol removed from the universe keeps its context loop (15-minute evaluations, snapshot entry, `ContextChanged` events) until the engine stops. This is deliberate: other activity may still read that symbol's context and safe ownership/retirement is a separate task. After a restart, removed symbols are no longer bootstrapped. Re-adding a still-tracked symbol creates no second loop.
+- **No automatic retry.** A failed refresh is visible only in the log. The next successful `POST /scanner/universe` (even a re-add of the same symbol) or an explicit internal `refresh_symbol_loops()` call retries; there is no periodic reconciliation, no refresh endpoint and no status field. A universe change made any other way (direct SQL, another process) triggers nothing until the next refresh or restart.
+- **A failed bootstrap read is still not retried by the engine itself** (unchanged behavior); a later refresh will, as a side effect, track every persisted symbol.
+- **A crashed loop is not restarted.** If a symbol's loop task ends with an exception (a provider raising from `evaluate_for_symbol`), its entry stays in the tracked set, so refresh will not replace it, and `stop()` re-raises that exception when it awaits the task. Both behaviors predate this delivery and were left unchanged.
+- **The HTTP request waits for one extra universe read** (not for the initial evaluations, which run in the new loop tasks).
+- **A read orphaned by `stop()`** (`asyncio.to_thread` cannot interrupt its thread) finishes harmlessly and its result is discarded.
+- **Per-process.** Only the process handling the POST refreshes its own engine.
+- **Out of scope and unchanged:** provider subscriptions and feed capacity, relay activation, strategy eligibility, observation-worker wiring and scanner scoring. Hot-added context does not mean the symbol is receiving market data.

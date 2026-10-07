@@ -427,9 +427,14 @@ async def lifespan(app: FastAPI):
         logger.error("Execution pipeline rollback complete — entry acceptance stays OFF")
 
     logger.info("%s started (debug=%s)", settings.app_name, settings.debug)
+    # context-universe-hot-add: expose the RUNNING engine to the scanner
+    # universe route; cleared first thing at shutdown (below) so a late
+    # addition cannot reach an engine that is stopping.
+    app.state.context_engine = context_engine
     try:
         yield
     finally:
+        app.state.context_engine = None
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
         # Same "no active lifespan" reset as the two lines above — a route

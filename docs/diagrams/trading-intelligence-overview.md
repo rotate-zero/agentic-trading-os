@@ -114,7 +114,9 @@ flowchart TD
     CLOCK[Market Clock] --> BOUNDARY[Start + session-boundary loop]
     BOUNDARY --> CALENDAR[CalendarProvider]
     CALENDAR --> GLOBAL[Global context]
-    UNIVERSE[(Scanner universe read at startup)] --> SYMBOLS[Tracked symbol loops]
+    UNIVERSE[(Scanner universe: read at startup + after each universe addition)] --> SYMBOLS[Tracked symbol loops: add-only]
+    ADD[POST /scanner/universe commit] --> REFRESH[refresh_symbol_loops: new symbols only]
+    REFRESH --> UNIVERSE
     SYMBOLS --> TIMER[Every 15 minutes]
     TIMER --> FUND[FundamentalsProvider: stored facts]
     TIMER --> NEWS[NewsFlagProvider: recent headlines]

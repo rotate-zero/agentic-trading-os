@@ -30,12 +30,18 @@ News, so both ride the same per-symbol timer rather than each getting its
 own -- one merged ContextChanged per symbol per tick of this loop, same
 "merge everything registered" shape evaluate_all() already uses.
 
-Tracked symbols come from `scanner_universe_symbols`, snapshotted ONCE at
-start() -- a real v1 limitation, not a silent one: a symbol added to the
-Scanner Universe after this engine starts won't get its own per-symbol
-loop until a restart. Flagged here rather than building live
-universe-change reactivity, which is real scope beyond what decision #96
-asked for.
+Tracked symbols come from `scanner_universe_symbols`. start() loads them
+once (bootstrap); `refresh_symbol_loops()` (`context-universe-hot-add`)
+rereads the same table later and starts a loop for each symbol that has
+none yet, so a symbol added to the persisted universe after startup gets
+its per-symbol context without a restart. Refresh is add-only: a symbol
+removed from the universe keeps its loop until stop() (safe removal and
+ownership are a separate task -- other activity may still read that
+symbol's context). A loop that crashed is not restarted either. Refresh
+and bootstrap share one synchronous check-and-create step (no `await`
+between "is this symbol tracked?" and "track it"), so overlapping reads can
+never create two loops for one symbol, and a lifecycle generation makes a
+read that completes after stop() (or a stop()/start() cycle) a no-op.
 
 Cancellation note, global path: unlike LevelInteractionEngine (decision
 #84), this loop's only per-iteration work is an in-memory provider call
@@ -106,6 +112,14 @@ class ContextEngine:
         self._task: asyncio.Task | None = None
         self._symbol_tasks: dict[str, asyncio.Task] = {}
         self._bootstrap_task: asyncio.Task | None = None
+        # Hot-add refresh (`context-universe-hot-add`): `_running` is True
+        # only between start() and stop(); `_lifecycle_generation` changes on
+        # every start() and stop() so a universe read that finishes after the
+        # lifecycle moved on cannot create loops. Refresh work runs as owned
+        # tasks in `_refresh_tasks` so stop() can cancel and settle them.
+        self._running = False
+        self._lifecycle_generation = 0
+        self._refresh_tasks: set[asyncio.Task] = set()
 
         # Read-side snapshot cache (decision #98, M4) — same motivation as
         # MarketStateEngine's own cache added alongside this one: neither
@@ -235,20 +249,90 @@ class ContextEngine:
     # --- lifecycle -----------------------------------------------------------------
 
     def start(self) -> None:
+        self._running = True
+        self._lifecycle_generation += 1
         self._task = asyncio.create_task(self._loop(), name="context-engine")
-        self._bootstrap_task = asyncio.create_task(self._bootstrap_symbol_loops(), name="context-engine-symbol-bootstrap")
+        self._bootstrap_task = asyncio.create_task(
+            self._bootstrap_symbol_loops(self._lifecycle_generation), name="context-engine-symbol-bootstrap"
+        )
 
         logger.info(
             "ContextEngine started — global providers=%s, symbol providers=%s, session-boundary + 15min triggers",
             [p.name for p in self._providers], [p.name for p in self._symbol_providers],
         )
 
-    async def _bootstrap_symbol_loops(self) -> None:
-        symbols = await asyncio.to_thread(self._load_scanner_universe_symbols)
+    def _track_symbols(self, symbols: list[str], generation: int) -> list[str]:
+        """Start one per-symbol loop for every symbol in `symbols` that has
+        none, returning the symbols newly started (input order).
+
+        Deliberately synchronous: with no `await` between the membership
+        check and the create_task, bootstrap and any number of overlapping
+        refreshes serialize on the event loop, so one symbol can never get
+        two loops. A stale `generation` (stop() or a restart happened while
+        the caller was reading the universe) or a stopped engine creates
+        nothing. Existing entries are never replaced or cancelled here."""
+        if not self._running or generation != self._lifecycle_generation:
+            return []
+        started: list[str] = []
         for symbol in symbols:
+            if symbol in self._symbol_tasks:
+                continue
             self._symbol_tasks[symbol] = asyncio.create_task(self._symbol_loop(symbol), name=f"context-engine-{symbol}")
+            started.append(symbol)
+        return started
+
+    async def _bootstrap_symbol_loops(self, generation: int) -> None:
+        symbols = await asyncio.to_thread(self._load_scanner_universe_symbols)
+        self._track_symbols(symbols, generation)
+
+    async def refresh_symbol_loops(self) -> list[str]:
+        """Reread the persisted scanner universe and start a per-symbol
+        loop (immediate ContextChanged, then the 15-minute cadence) for each
+        symbol not yet tracked. Returns the newly started symbols.
+
+        - Idempotent and safe to overlap with itself, bootstrap and stop().
+        - Add-only: loops for symbols already tracked, including ones since
+          removed from the universe, are left running until stop().
+        - A no-op returning [] unless the engine is running (never started,
+          or stopped/stopping) -- it cannot revive a stopped engine.
+        - Raises if the universe read fails (after logging), leaving every
+          existing loop untouched; calling it again retries.
+        - If the caller is cancelled the owned refresh still finishes (or is
+          cancelled by stop()), so a committed addition is not lost."""
+        if not self._running:
+            return []
+        task = asyncio.create_task(
+            self._refresh_symbol_loops(self._lifecycle_generation), name="context-engine-symbol-refresh"
+        )
+        self._refresh_tasks.add(task)
+        task.add_done_callback(self._on_refresh_done)
+        await asyncio.wait({task})  # a cancelled caller does not cancel the owned task
+        if task.cancelled():  # only stop() cancels it
+            return []
+        return task.result()
+
+    async def _refresh_symbol_loops(self, generation: int) -> list[str]:
+        try:
+            symbols = await asyncio.to_thread(self._load_scanner_universe_symbols)
+        except Exception:
+            logger.exception("ContextEngine universe refresh failed — existing symbol loops unchanged")
+            raise
+        started = self._track_symbols(symbols, generation)
+        if started:
+            logger.info("ContextEngine refresh started %d symbol loop(s): %s", len(started), started)
+        return started
+
+    def _on_refresh_done(self, task: asyncio.Task) -> None:
+        self._refresh_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # mark retrieved; the failure was already logged in _refresh_symbol_loops
 
     async def stop(self) -> None:
+        # Close the engine to new loop creation BEFORE awaiting anything:
+        # from here on a refresh/bootstrap read that completes is a no-op.
+        self._running = False
+        self._lifecycle_generation += 1
+
         if self._task is not None:
             self._task.cancel()
             try:
@@ -266,7 +350,8 @@ class ContextEngine:
         # mid-flight: bootstrap only reads the Scanner Universe and
         # creates tasks, no write, so a cancelled bootstrap simply
         # creates fewer (possibly zero) per-symbol tasks — nothing
-        # orphaned either way.
+        # orphaned either way. In-flight refreshes get the same
+        # treatment (they too only read, then create tasks).
         if self._bootstrap_task is not None:
             self._bootstrap_task.cancel()
             try:
@@ -274,6 +359,13 @@ class ContextEngine:
             except asyncio.CancelledError:
                 pass
             self._bootstrap_task = None
+
+        refresh_tasks = tuple(self._refresh_tasks)
+        for task in refresh_tasks:
+            task.cancel()
+        if refresh_tasks:
+            await asyncio.gather(*refresh_tasks, return_exceptions=True)
+        self._refresh_tasks.clear()
 
         for task in self._symbol_tasks.values():
             task.cancel()

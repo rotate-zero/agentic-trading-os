@@ -33,9 +33,10 @@ nothing blocking to move.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.core.config import get_settings
@@ -49,6 +50,8 @@ from app.scanner.universe import (
     list_universe_symbols,
     remove_symbol_from_universe,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scanner", tags=["scanner"])
 
@@ -145,12 +148,37 @@ async def get_scanner_universe() -> dict[str, Any]:
     return {"symbols": symbols}
 
 
+async def _refresh_context_after_universe_add(request: Request, symbol: str) -> None:
+    """`context-universe-hot-add`: ask the running ContextEngine to start a
+    per-symbol loop for what was just committed. A separate step from the
+    universe commit by design -- any failure here is logged and swallowed,
+    never turned into a failed addition (the symbol IS in the universe; a
+    later addition or an explicit engine.refresh_symbol_loops() retries).
+
+    The engine comes only from `app.state.context_engine`, which the
+    lifespan sets while the engine is running and clears before stopping
+    it. Absent (no lifespan, or shutting down) means skip -- this route
+    never calls get_context_engine(), so it cannot create or start one."""
+    engine = getattr(request.app.state, "context_engine", None)
+    if engine is None:
+        return
+    try:
+        await engine.refresh_symbol_loops()
+    except Exception as exc:  # the engine already logged the traceback
+        logger.warning(
+            "Scanner universe addition of %s is committed but the ContextEngine refresh failed (%s) — "
+            "its per-symbol context starts on the next refresh or restart",
+            symbol, type(exc).__name__,
+        )
+
+
 @router.post("/universe")
-async def add_scanner_universe_symbol(payload: AddSymbolRequest) -> dict[str, Any]:
+async def add_scanner_universe_symbol(payload: AddSymbolRequest, request: Request) -> dict[str, Any]:
     try:
         added = await asyncio.to_thread(add_symbol_to_universe, SessionLocal, payload.symbol)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await _refresh_context_after_universe_add(request, added)
     return {"symbol": added, "added": True}
 
 
