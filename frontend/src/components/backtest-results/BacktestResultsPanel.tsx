@@ -8,6 +8,7 @@ import type { BacktestRunWireShape, StrategyOutcomeWireShape } from "../../servi
 import { downloadCsvFile, outcomesCsvFilename, outcomesToCsv, type ExportMode } from "./outcomesCsv";
 import { RecentBacktestRuns } from "./RecentBacktestRuns";
 import { PerformanceSummaryCard } from "./PerformanceSummaryCard";
+import { BacktestSelectionComparison } from "./BacktestSelectionComparison";
 
 // Same collapsible-width convention ScannerPanel.tsx established and
 // BacktestPanel.tsx already reused verbatim — same constants, same
@@ -641,6 +642,11 @@ function BacktestResultsBody() {
         selectedRunId={filterType === "run_id" ? appliedRunId : undefined}
         onViewResults={viewRecentRun}
       />
+
+      {/* Self-contained A/B comparison (task `backtest-selection-comparison`):
+          no props, no workspace reads or writes, so the applied selection,
+          Follow latest, summary card and CSV export are unaffected. */}
+      <BacktestSelectionComparison />
 
       {filterType === "run_id" && (
         <div className="flex shrink-0 flex-col gap-1 border-b border-base-border p-2">

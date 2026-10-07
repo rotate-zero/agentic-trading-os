@@ -1567,3 +1567,73 @@ Backend and frontend; no migration, dependency, `BacktestRunner`, engine, strate
 - **Historical context.** As on `/run/stored`, point-in-time fundamentals and news are not stored and stay absent; daily-derived scores use only the recorded 1d history counted per symbol (zero recorded 1d rows leaves them at their no-history values); no synthetic daily history is used.
 - **Size and time.** A synchronous request bounded by 20 distinct symbols and a 24-hour window; measured here at about one second per symbol of roughly 119 candles on a local PostgreSQL, which is an observation, not a guarantee.
 - Synthetic or sparse stored data proves plumbing only, never real-market profitability.
+
+### Backtest selection comparison (task `backtest-selection-comparison`)
+
+Frontend-only. A collapsible **Compare selections** section in Backtest Results lets a person place two saved selections — each a `run_id` or a `sweep_id` — side by side. It adds no route, schema or API-client function: both sides use the existing `fetchBacktestSelectionSummary` (`GET /intelligence/backtest-selection-summary`), whose complete-population aggregate is independent of the 500-row outcome list. Nothing in the comparison is computed from that list, and no decision number was needed.
+
+Cross-component data flow:
+
+```
+BacktestResultsPanel (unchanged selection, Follow latest, history, summary card, CSV)
+   │   renders, with no props and no shared state
+   ▼
+BacktestSelectionComparison            (wrapper: drafts + applied A/B, kept across collapse)
+   │  expanded only ──► ComparisonBody
+   │                       │ Apply: parseSelectionId() ── invalid ──► inline error, no request
+   │                       ▼
+   │              useBacktestSelectionComparison(appliedA, appliedB)
+   │                 ├─ side A: useBacktestSelectionSummary ─┐   two independent
+   │                 └─ side B: useBacktestSelectionSummary ─┤   request counters
+   │                                                          ▼
+   │                                   fetchBacktestSelectionSummary({runId | sweepId})
+   │                                                          ▼
+   │                                   GET /intelligence/backtest-selection-summary
+   │                                   (worker-owned, read-only, full population)
+   ▼
+selectionComparison.ts (pure): alignGroups(A.groups, B.groups), selectionTotals(), formatters
+   ▼
+Overview table · Matching provenance groups (A | B | B − A) · Only in A · Only in B
+
+WorkspaceContext: never read or written by the comparison
+```
+
+Internal selection / request flow, per side (A and B never share state):
+
+```
+Apply ─► trim, lower-case, canonical UUID? ──no──► inline error (applied selection unchanged)
+              │ yes
+              ▼
+      same as applied?  ──yes──► refetch()         ──no──► setApplied({kind,id})
+                                     │                         │ key changes
+                                     └────────────┬────────────┘
+                                                  ▼
+                          requestId = ++counter; snapshot = {key, previous data only if same key, loading}
+                                                  ▼
+                                   fetchBacktestSelectionSummary
+                          ┌───────────────┬───────────────┬───────────────┐
+                    requestId stale?   HTTP/network error   selection_found
+                    key changed?             │              ┌──────┴───────┐
+                    unmounted?               ▼             false          true
+                          │            status "error"   "unknown"   "known" (outcomes may be 0)
+                          ▼
+                    response discarded
+Refresh ─► same path, never disabled while pending; each press supersedes earlier ones.
+Collapse / unmount ─► counter advanced; nothing in flight can write; re-expand re-requests.
+```
+
+Alignment rule (`alignGroups`): a group is paired only with a group on the other side whose strategy name, strategy version, configuration hash, data version **and** feature version are all identical, and only if each side has exactly one such group (the backend groups by those five columns, so duplicates should not occur; if one ever did, pairing would be a guess and those groups are left unmatched). A group differing in any field is listed under **Only in A** or **Only in B** and is never compared. Aligned groups are shown in A's server order; unmatched groups keep their own side's order.
+
+Displayed values and differences:
+
+| Value | Source | Difference (B − A) |
+|---|---|---|
+| Runs, outcomes, wins, losses, breakevens | summary groups; selection-level values are exact integer sums | not shown |
+| Win rate | group `win_rate` (`wins / total_outcomes`) | percentage points, `(B.win_rate − A.win_rate) × 100`, 2 decimals |
+| Mean realized R | group `mean_realized_r` (average over non-null `realized_r`) | `B − A`, 4 decimals |
+
+A null win rate or mean on either side (a zero-outcome group) has no difference and is shown as "—". Win rate and mean R are deliberately shown per provenance group and not pooled to selection level: pooling would blend different strategies, configurations and data, and the mean cannot be pooled exactly from group means because it averages non-null `realized_r` values only. A rounded zero difference is shown without a sign.
+
+State model per side: **no selection**, **loading**, **request failure** (HTTP or network; carries the error text), **unknown** (`selection_found: false`) and **known** (a known selection whose groups all have zero outcomes reads "Recorded, zero outcomes" and is never conflated with unknown). A failure or delay on one side does not alter the other; groups of a loaded side are shown without comparison until both sides are known.
+
+Scope boundaries and limits: the section reads nothing from and writes nothing to `WorkspaceContext` (the latest run/sweep, Follow latest, the applied results selection, the history browser, the Performance summary card and CSV export are unchanged). The ID check is a narrow canonical-UUID test (the repository had no earlier client-side check); the backend remains the authority. Differences are descriptive: they do not establish statistical significance, profitability or a recommended strategy, and the section adds no score, ranking or automatic selection (D4 remains open). Two selections per comparison; no saved comparisons or URL state. Validated with controlled responses in a jsdom harness, not a real browser or backend.
