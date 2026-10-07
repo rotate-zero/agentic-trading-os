@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: continuous-scanner-design -->
+# TESTING — `continuous-scanner-design`
+
+Base: GitHub `main` `5459edfc482b915b576090e637773139b129c62f`. Documentation-only delivery. Inspected the current branch, clean initial worktree, recent commits, canonical scanner/system/strategy/roadmap docs and decision-log state before editing. `git ls-remote origin refs/heads/main` matched the local base before work and was rechecked before numbering #189 and at packaging.
+
+- Verified scanner source contracts by reading `backend/app/scanner/{universe,scorer,runner}.py`, `backend/app/api/routes/scanner.py`, `backend/app/core/config.py` and the existing scanner design history: on-demand recomputation, empty-DB fallback, override validation, output slicing and zero-input scored rows.
+- Verified separate provider, relay, scheduler and UI paths in `backend/app/{main.py,broker_adapters/{finnhub_provider,polygon_provider,ibkr_adapter}.py,services/live_tick_relay.py,strategy_engine/scheduler.py,api/routes/market.py,context_engine/engine.py}`, `frontend/src/hooks/useLatestPrices.ts` and the existing scanner UI hooks. Read `MarketClock` and `DebounceScheduler`; compared actual session boundaries with the draft schedule.
+- Verified protection path in `backend/app/position_monitor/{engine,portfolio_state_reader}.py`, `backend/app/broker_adapters/simulated_venue.py`, `backend/app/governor/reference_price.py` and lifespan's restored execution startup/shutdown. The documented feed-retention gap is a code-inspection finding, not a live-provider experiment.
+- Checked decision #3's variable-schedule text, then matched the tails of `INDEX.md`, `confirmed-decisions.md` and the archive filenames before appending #189. Checked the design's cited repository paths/symbols, `git diff --check`, package manifest and extraction onto a clean checkout of the stated base. No backend suite, database migration, provider connection or live order was run; no production code changed. Local doubles versus real-provider checks are separated in scanner-design.md §18.6.
+
+Limits: this verifies architecture claims and delivery integrity, not real Finnhub/IBKR symbol capacity, reconnect behavior, Polygon polling budget, pre-market coverage or live-session correctness. Decision #189 confirms only the directions it names; §18.7's remaining choices are unapproved. No implementation behavior is claimed.
+<!-- END DELIVERY SECTION: continuous-scanner-design -->
+
 <!-- BEGIN DELIVERY SECTION: recorded-outcome-evidence-detail -->
 # TESTING — `recorded-outcome-evidence-detail`
 

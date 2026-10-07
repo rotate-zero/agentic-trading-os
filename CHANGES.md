@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: continuous-scanner-design -->
+# CHANGES — `continuous-scanner-design`
+
+Base: GitHub `main` `5459edfc482b915b576090e637773139b129c62f`. Documentation-only design delivery; no production code, migration, provider connection or execution-policy change. Saqib's follow-up selected a 60-second cadence, manual-first activation subject to verified feed capacity, and protected-symbol retention; decision #189 records these directions as a correction to #3 for this slice.
+
+- Extended the existing `docs/architecture/scanner-design.md` with §18: verified as-built inventory, distinct provider/relay/strategy/UI ownership, simulated-only scheduled-scan path, startup/failure/session/shutdown lifecycle, protected-symbol retention, full-union provider-capacity gate, file-level future implementation plan, deterministic acceptance criteria and remaining unapproved choices. A header pointer marks the new section without rewriting §§1–17.
+- Updated `docs/roadmap/phase-roadmap.md` only to point to this design and state explicitly that continuous scanning and promotion remain unbuilt.
+- Appended decision #189 to `docs/decisions/confirmed-decisions.md` and indexed it in `docs/decisions/INDEX.md`; existing decision bodies remain unchanged. Recorded verification and delivery limits in `TESTING.md`. Existing on-demand scan and manual universe contracts remain as built. No decision number was assigned to the remaining recommendations.
+
+Included files: `CHANGES.md`, `TESTING.md`, `docs/architecture/scanner-design.md`, `docs/roadmap/phase-roadmap.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`. No deletions or renames.
+<!-- END DELIVERY SECTION: continuous-scanner-design -->
+
 <!-- BEGIN DELIVERY SECTION: recorded-outcome-evidence-detail -->
 # CHANGES — `recorded-outcome-evidence-detail`
 
