@@ -1496,6 +1496,78 @@ export async function triggerStoredBacktest(
   return (await res.json()) as BacktestRunResultWireShape;
 }
 
+// ---------------------------------------------------------------------------
+// POST /backtest/sweep/stored (task `stored-candle-symbol-sweep`) — one
+// strategy over an explicit list of symbols, replayed from candles already
+// recorded in PostgreSQL over ONE shared [start, end) interval, sequentially,
+// under one real sweep_id. Same POST-with-query-params convention as every
+// other backtest trigger; `symbols` is sent as a repeated query key.
+//
+// Mirrors backend/app/api/routes/backtest.py's StoredSweep* dataclasses
+// field-for-field. A symbol that could not be replayed has `run_id: null`
+// (never an invented ID) and an `error` with a stable `code` and a `stage`:
+// "before_replay" = no run/outcome row exists for it; "during_replay" = the
+// runner raised, so a run row and partial outcomes MAY exist under the shared
+// sweep_id but their run_id is not available here. `outcomes_recorded === 0`
+// on a symbol without an error is a successful run.
+export interface StoredSweepSymbolErrorWireShape {
+  code: string;
+  message: string;
+  stage: "before_replay" | "during_replay" | string;
+}
+
+export interface StoredSweepSymbolResultWireShape {
+  symbol: string;
+  run_id: string | null;
+  outcomes_recorded: number | null;
+  discarded_signals: DiscardedSignalWireShape[];
+  primary_candle_count: number | null;
+  warmup_minute_candle_count: number | null;
+  daily_candle_count: number | null;
+  error: StoredSweepSymbolErrorWireShape | null;
+}
+
+export interface StoredSweepResultWireShape {
+  sweep_id: string;
+  strategy_name: string;
+  start: string;
+  end: string;
+  data_version: string;
+  symbols_requested: number;
+  symbols_succeeded: number;
+  symbols_failed: number;
+  runs: StoredSweepSymbolResultWireShape[];
+}
+
+/**
+ * POST /backtest/sweep/stored — `start`/`end` must already be timezone-aware
+ * UTC ISO-8601 strings (see BacktestPanel.tsx's Eastern-time conversion).
+ * The backend stays the authority on validation (symbol normalization and
+ * de-duplication, the 24-hour bound, the BACKTEST_SWEEP_MAX_PAIRS cap) and
+ * rejects the whole request before any run starts. Errors reuse
+ * StoredBacktestError and the shared `{code, message}` / plain-string `detail`
+ * parser; a 200 with every symbol failed is NOT an error here — it is a
+ * StoredSweepResultWireShape the caller must inspect.
+ */
+export async function triggerStoredBacktestSweep(
+  strategyName: string,
+  symbols: string[],
+  start: string,
+  end: string,
+): Promise<StoredSweepResultWireShape> {
+  const params = new URLSearchParams();
+  params.append("strategy_name", strategyName);
+  for (const symbol of symbols) params.append("symbols", symbol);
+  params.append("start", start);
+  params.append("end", end);
+  const res = await fetch(`${API_BASE_URL}/backtest/sweep/stored?${params.toString()}`, { method: "POST" });
+  if (!res.ok) {
+    const { message, code } = await parseIbkrErrorDetail(res);
+    throw new StoredBacktestError(message, res.status, code);
+  }
+  return (await res.json()) as StoredSweepResultWireShape;
+}
+
 export interface StoredCoverageWireShape {
   symbol: string;
   start: string;

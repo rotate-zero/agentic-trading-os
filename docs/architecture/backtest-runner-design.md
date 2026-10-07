@@ -1490,3 +1490,80 @@ validate exactly one UUID (route, before DB access)
 ```
 
 The left join retains zero-outcome runs. Positive-R wins divided by all outcomes gives win rate, so zero-R outcomes remain in its denominator; null metrics for an empty group are not fabricated zeros. The card shows each group's provenance and its independent loading/error/unknown/empty state. An error there leaves the list, history and metadata usable. The summary hook keys responses to the applied filter, discards obsolete or unmounted completions, and a newer Refresh supersedes an older request. The sweep strip labels its per-run counts **loaded outcomes** because those counts still come from the capped list; CSV still exports only those loaded rows.
+
+### Stored-candle symbol sweep (task `stored-candle-symbol-sweep`)
+
+Backend and frontend; no migration, dependency, `BacktestRunner`, engine, strategy, `stored_history.py`, execution-lifecycle or `BacktestRunResult` change, and no decision number (the canonical log, `INDEX.md` and `archive/` still end at #188; the delivery slug identifies the change, as for `stored-candle-backtest`). New: `backend/tests/test_stored_sweep_route.py`, `frontend/src/hooks/useStoredBacktestSweepRun.ts`. Changed: `backend/app/api/routes/backtest.py`, `frontend/src/services/api-client.ts`, `frontend/src/components/backtest/BacktestPanel.tsx`.
+
+**What it adds.** `POST /backtest/sweep/stored` (`strategy_name`, repeated `symbols`, `start`, `end`) runs one strategy over an explicit list of tickers whose 1m (and, where recorded, 1d) candles `CandleRecorder` already wrote to PostgreSQL, over one shared exact `[start, end)` interval, sequentially, under one real `sweep_id`. It is the stored-data sibling of `POST /backtest/sweep` (decision #159, fixture scenarios) and a multi-symbol sibling of `POST /backtest/run/stored`. Each symbol uses the same acquisition (`stored_history.acquire_stored_replay_data`), run-scoped provider and unchanged `BacktestRunner` as the single-symbol route, so `data_version` is `stored:postgres:candles:1m-1d` and results are comparable with a single stored run of the same symbol and window (verified by test).
+
+**Request validation (whole request, before any read or write).** Strategy via the shared `_validate_strategy_name`; each symbol via `/run/stored`'s normalization (`strip().upper()`, non-empty) and interval via its timezone-aware, `start < end`, ≤ 24 elapsed hours rule; the symbol list must be non-empty. Symbols are then de-duplicated in first-occurrence order. This **differs deliberately** from fixture `/backtest/sweep`, which does not de-duplicate: a repeated ticker there is a repeated fixture run, whereas here a repeat would replay the same recorded data twice under one `sweep_id` and double-count it in `/intelligence/backtest-selection-summary`. The sweep-size cap (`_MAX_SWEEP_PAIRS`, 20) counts distinct symbols. Any invalid element rejects the whole request: `422 invalid_backtest_request`, `400 backtest_sweep_too_large`, `400` unknown strategy, `409` when a live provider is connected. The live-data guard is checked once before the loop and again per symbol (see below).
+
+**Component data flow.**
+
+```
+ BacktestPanel ("Stored candles" tab ▸ Multi-symbol sweep)
+   useStoredBacktestSweepRun ── POST /backtest/sweep/stored ?symbols=A&symbols=B… ────┐
+        ▲  keeps `submitted` (strategy, symbols, window) copied at click time          ▼
+        │                                                routes/backtest.py: run_stored_backtest_sweep
+        │                                                  validate strategy / every symbol / interval / cap
+        │                                                  dedupe symbols; sweep_id = uuid4()
+        │                                                  _reject_if_live_data_connected()          (409)
+        │                                                                     │ for symbol in symbols  (sequential)
+        │                                                                     ▼
+        │                                                  _run_stored_sweep_symbol(...)   (next diagram)
+        │                                                    │                     │
+        │                         asyncio.to_thread ◄────────┘                     │
+        │                  stored_history.acquire_stored_replay_data               │
+        │                    worker Session, REPEATABLE READ, read-only            │
+        │                    candles ⋈ symbols WHERE is_backtest = FALSE           │
+        │                                       │ StoredReplayDataset              ▼
+        │                                       └──────────► BacktestRunner(sweep_id=<shared>).run()
+        │                                                       writes backtests row (data_version = stored:postgres:candles:1m-1d)
+        │                                                       replays; writes strategy_outcomes (is_backtest = TRUE)
+        │                                                                     │ one StoredSweepSymbolResult per symbol
+        └──────────── {sweep_id, data_version, symbols_*, runs[]} ◄───────────┘
+   sweep_id (only if symbols_succeeded > 0) → setLastBacktestSweepId → Backtest Results panel
+        → GET /intelligence/backtest-runs?sweep_id=…, strategy-outcomes per run, backtest-selection-summary
+```
+
+**Internal flow of one symbol (`_run_stored_sweep_symbol`).**
+
+```
+ stage = "before_replay"
+   guard (live provider connected?) ──yes──► failure live_data_connected
+   acquire_stored_replay_data(symbol, start, end, lookbacks)
+        StoredHistoryNoDataError / MalformedError / UnavailableError ─► failure (that error's own code)
+   guard again — immediately before any replay engine is installed ──yes──► failure live_data_connected
+   strategy = fresh instance from default_registry(...)   (never shared across symbols)
+   runner   = BacktestRunner(..., data_version=STORED_DATA_VERSION, sweep_id=<shared sweep_id>)
+ stage = "during_replay"
+   await runner.run()        (process-wide _RUN_LOCK held per run, not per sweep)
+        any Exception ─► failure backtest_run_failed  "<Type>: <message>"   (logged with traceback)
+   success ─► {symbol, run_id, outcomes_recorded, discarded_signals, primary/warm-up/daily counts, error: null}
+ A failure never stops the loop: the next symbol starts from its own guard.
+```
+
+**Response.** HTTP 200 with `sweep_id`, `strategy_name`, `start`/`end` (normalized UTC), `data_version`, `symbols_requested`/`symbols_succeeded`/`symbols_failed` and `runs[]` in normalized request order. A successful row carries `run_id`, `outcomes_recorded` (0 is a valid success), `discarded_signals` and the recorded 1m/warm-up/1d counts, with `error: null`. A failed row has `run_id: null`, null counts and `error {code, message, stage}`. The status is 200 even if every symbol failed; a request with zero outcomes everywhere is a success.
+
+| `error.code` | meaning |
+|---|---|
+| `stored_candles_no_data` | no recorded 1m candle in `[start, end)` for that symbol |
+| `stored_candles_malformed` | a recorded row has non-finite OHLC or negative volume (nothing repaired) |
+| `stored_history_unavailable` | the read failed in the database layer (no driver detail returned) |
+| `live_data_connected` | a live provider connected after the sweep began |
+| `backtest_run_failed` | the runner raised during that symbol's replay |
+
+**What a failure can and cannot say.** `error.stage` states what may remain: `before_replay` means `BacktestRunner.run()` (which writes the `backtests` row) was never started for that symbol, so no run row or outcome exists (proved by test); `during_replay` means the run row, and partial outcomes already written, may exist under the shared `sweep_id` while its `run_id` is not returned (the runner only exposes it on success), so the response neither fabricates an ID nor claims the run left nothing. Such partial outcomes are included in sweep-level reads that aggregate by `sweep_id` (e.g. the Backtest Results panel and `/intelligence/backtest-selection-summary`); a test creates exactly this case and verifies it.
+
+**Isolation and state.** Source candles are only `SELECT`ed, in the live namespace; the backtest namespace (`is_backtest = TRUE`) is never read as source, live derived state is untouched, and source rows are verified unchanged by test in both namespaces. A fresh strategy instance is built per symbol (all strategies keep per-symbol mutable state). The look-ahead rules, warm-up lookbacks and same-trading-day daily-bar exclusion are exactly those of `/run/stored`; tests plant "bait" at and after `end` and on the last replay day's daily bar and verify neither is loaded.
+
+**Frontend.** Inside **Stored candles** a **Single symbol | Multi-symbol sweep** switch (default single) reveals a comma/space-separated symbols input; the strategy select and Eastern-time window are the same shared controls with the same client validation. The panel shows the de-duplicated symbol count, disables Run over the 20-symbol cap, and offers no coverage preview in sweep scope (that read is single-symbol). One request, guarded synchronously against double submission, shows a running state with elapsed time only (no per-symbol progress exists). The result block shows the **submitted** strategy, symbols and window (kept by the hook, so later form edits cannot change what a result claims), `sweep_id`, counts, and per-symbol rows with run IDs, 0-outcome explanation and failure headings plus the `stage` statement. `setLastBacktestSweepId` is called only when at least one symbol succeeded, so an all-failed sweep, and any request-level rejection (422/400/409/network), leaves the Backtest Results selection unchanged. The existing single-symbol stored run, coverage preview, fixture, IBKR and fixture-Sweep modes are unchanged.
+
+**Limits.**
+- **Per-symbol snapshots.** Each symbol is read in its own repeatable-read snapshot immediately before its replay, not one snapshot across symbols; a candle recorded between two symbols' reads can appear in only the later one.
+- **Interleaving.** `_RUN_LOCK` serializes individual runs, not the sweep; other backtest requests can run between two symbols of one sweep.
+- **Failed replays.** As stated above, a `during_replay` failure may leave an unreported run row and partial outcomes under the `sweep_id`; this delivery does not change the runner's return contract.
+- **Historical context.** As on `/run/stored`, point-in-time fundamentals and news are not stored and stay absent; daily-derived scores use only the recorded 1d history counted per symbol (zero recorded 1d rows leaves them at their no-history values); no synthetic daily history is used.
+- **Size and time.** A synchronous request bounded by 20 distinct symbols and a 24-hour window; measured here at about one second per symbol of roughly 119 candles on a local PostgreSQL, which is an observation, not a guarantee.
+- Synthetic or sparse stored data proves plumbing only, never real-market profitability.

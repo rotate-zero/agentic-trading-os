@@ -78,6 +78,15 @@ deliberately excludes `/run/ibkr`'s real-data path, since a single IBKR
 acquisition already costs real minutes and looping that synchronously
 inside one request would be impractical. See the route's own docstring
 for scope, batch-size bound, and partial-failure handling.
+
+**A fourth path, additive: `POST /backtest/sweep/stored`.** One strategy
+across an explicit list of symbols over one shared UTC interval, each symbol
+replayed from the candles `CandleRecorder` already recorded in PostgreSQL
+(the `/run/stored` acquisition, reused unchanged), sequentially, sharing one
+real `sweep_id`. It is the stored-candle counterpart of `/sweep` (which is
+fixture-only). See the route's own docstring for the validation, per-symbol
+failure and provenance rules, including what a failed symbol does and does not
+tell you about records it may have left behind.
 """
 from __future__ import annotations
 
@@ -101,7 +110,11 @@ from app.backtest_runner.ibkr_historical import (
 )
 from app.backtest_runner.runner import BacktestRunner, DiscardedSignal
 from app.backtest_runner.scenarios import available_scenarios, load_scenario_candles
-from app.backtest_runner.stored_history import StoredHistoryError, acquire_stored_replay_data
+from app.backtest_runner.stored_history import (
+    STORED_DATA_VERSION,
+    StoredHistoryError,
+    acquire_stored_replay_data,
+)
 from app.backtest_runner.stored_coverage import acquire_stored_coverage
 from app.core.config import get_settings
 from app.core.market_clock import get_market_clock
@@ -735,6 +748,315 @@ async def run_backtest_sweep(
         pairs_requested=len(pairs),
         pairs_succeeded=len(pairs) - pairs_failed,
         pairs_failed=pairs_failed,
+        runs=runs,
+    )
+    return dataclasses.asdict(sweep_result)
+
+
+# --- POST /backtest/sweep/stored -------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredSweepSymbolError:
+    """Why one symbol of a stored sweep produced no result.
+
+    ``stage`` is the honest statement of what may have been left behind:
+
+    * ``"before_replay"`` — the failure happened before a ``BacktestRunner``
+      was run for this symbol (the live-provider guard, the recorded-candle
+      read, or construction). ``BacktestRunner.run()`` is what writes the
+      ``backtests`` row, and it was never started, so no run row and no
+      outcome row exists for this symbol (asserted by the route tests).
+    * ``"during_replay"`` — ``BacktestRunner.run()`` raised. The runner only
+      returns its internally-minted ``run_id`` on success, so no ID is
+      available here, and it may already have written a ``backtests`` row
+      (written before the replay starts) and partial ``strategy_outcomes``
+      rows under the shared ``sweep_id``. This response neither reports nor
+      denies them; nothing here has verified either way."""
+
+    code: str
+    message: str
+    stage: str
+
+
+@dataclass(frozen=True)
+class StoredSweepSymbolResult:
+    """One symbol's outcome within a stored sweep. On success ``run_id``,
+    ``outcomes_recorded`` and ``discarded_signals`` are exactly the fields
+    ``POST /backtest/run/stored`` returns (``BacktestRunResult``) and
+    ``error`` is ``None``; the three counts describe what the recorded-candle
+    read actually found. On failure all of those are ``None``/empty and
+    ``error`` explains why. ``outcomes_recorded == 0`` is a success."""
+
+    symbol: str
+    run_id: UUID | None
+    outcomes_recorded: int | None
+    discarded_signals: list[DiscardedSignal]
+    primary_candle_count: int | None
+    warmup_minute_candle_count: int | None
+    daily_candle_count: int | None
+    error: StoredSweepSymbolError | None
+
+
+@dataclass(frozen=True)
+class StoredSweepResult:
+    sweep_id: UUID
+    strategy_name: str
+    start: str
+    end: str
+    data_version: str
+    symbols_requested: int
+    symbols_succeeded: int
+    symbols_failed: int
+    runs: list[StoredSweepSymbolResult] = field(default_factory=list)
+
+
+def _iso_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _validate_stored_sweep_request(
+    symbols: list[str],
+    start: datetime,
+    end: datetime,
+) -> tuple[list[str], datetime, datetime]:
+    """Validate the WHOLE stored-sweep request before any run starts.
+
+    Reuses ``_validate_ibkr_range`` unchanged for every symbol (strip and
+    upper-case, non-empty, tz-aware ``start < end``, at most 24 elapsed hours,
+    UTC normalization), so the sweep accepts exactly what ``/run/stored``
+    accepts per symbol. Symbols are then de-duplicated keeping first-occurrence
+    order: replaying one recorded dataset twice under one sweep would only
+    double-count it in the sweep's population. (The fixture ``/sweep``
+    deliberately does not de-duplicate — its caller names (symbol, scenario)
+    pairs; the web form de-duplicates before sending. Stored replays have no
+    second axis, so a repeat is always the same run twice.) The existing
+    ``_MAX_SWEEP_PAIRS`` cap is applied to the number of runs that would
+    actually execute, i.e. after de-duplication."""
+    if not symbols:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "invalid_backtest_request", "message": "symbols must contain at least one value"},
+        )
+    unique: list[str] = []
+    seen: set[str] = set()
+    start_utc, end_utc = start, end
+    for raw in symbols:
+        symbol, start_utc, end_utc = _validate_ibkr_range(raw, start, end)
+        if symbol not in seen:
+            seen.add(symbol)
+            unique.append(symbol)
+    if len(unique) > _MAX_SWEEP_PAIRS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "backtest_sweep_too_large",
+                "message": (
+                    f"Requested {len(unique)} distinct symbols, exceeding the maximum of "
+                    f"{_MAX_SWEEP_PAIRS} per sweep. Split this into multiple requests, or request "
+                    "fewer symbols."
+                ),
+            },
+        )
+    return unique, start_utc, end_utc
+
+
+def _live_data_connected_message() -> str | None:
+    """``_reject_if_live_data_connected`` as a value: the 409 detail if a
+    live provider is connected, else ``None``. Lets the per-symbol loop record
+    the very same guard text without catching ``HTTPException`` broadly."""
+    try:
+        _reject_if_live_data_connected()
+    except HTTPException as exc:
+        return str(exc.detail)
+    return None
+
+
+def _stored_sweep_failure(symbol: str, code: str, message: str, stage: str) -> StoredSweepSymbolResult:
+    return StoredSweepSymbolResult(
+        symbol=symbol,
+        run_id=None,
+        outcomes_recorded=None,
+        discarded_signals=[],
+        primary_candle_count=None,
+        warmup_minute_candle_count=None,
+        daily_candle_count=None,
+        error=StoredSweepSymbolError(code=code, message=message, stage=stage),
+    )
+
+
+async def _run_stored_sweep_symbol(
+    *,
+    symbol: str,
+    strategy_name: str,
+    start: datetime,
+    end: datetime,
+    sweep_id: UUID,
+) -> StoredSweepSymbolResult:
+    """One symbol of a stored sweep: exactly ``POST /run/stored``'s steps
+    (guard, recorded-candle read, guard again immediately before any replay
+    engine is installed, run) with the failure turned into a value."""
+    settings = get_settings()
+    stage = "before_replay"
+    try:
+        guard = _live_data_connected_message()
+        if guard is not None:
+            return _stored_sweep_failure(symbol, "live_data_connected", guard, stage)
+
+        dataset = await acquire_stored_replay_data(
+            symbol=symbol,
+            start=start,
+            end=end,
+            daily_lookback_days=settings.daily_levels_lookback_days,
+            premarket_lookback_days=settings.feature_engine_premarket_lookback_days,
+        )
+
+        # A live provider may have connected while the read was in flight.
+        # Re-check before any process-wide replay singleton or database row
+        # of THIS symbol's run is touched — the same point /run/stored checks.
+        guard = _live_data_connected_message()
+        if guard is not None:
+            return _stored_sweep_failure(symbol, "live_data_connected", guard, stage)
+
+        # Fresh instance per symbol — never shared across the loop (all real
+        # strategies keep per-symbol mutable state in `self._state`).
+        strategy = next(
+            s for s in default_registry(datetime.now(timezone.utc)) if s.name == strategy_name
+        )
+        logger.info(
+            "stored backtest sweep: sweep_id=%s symbol=%s primary=%d warmup_1m=%d daily=%d",
+            sweep_id,
+            symbol,
+            dataset.primary_candle_count,
+            dataset.warmup_minute_candle_count,
+            dataset.daily_candle_count,
+        )
+        runner = BacktestRunner(
+            strategy=strategy,
+            symbol=symbol,
+            market_data_provider=dataset.provider,
+            start=start,
+            end=end,
+            context_provider=FixtureBacktestContextProvider(),
+            data_version=dataset.data_version,
+            feature_version=_FEATURE_VERSION,
+            sweep_id=sweep_id,
+        )
+        stage = "during_replay"
+        result = await runner.run()
+    except StoredHistoryError as exc:
+        return _stored_sweep_failure(symbol, exc.code, exc.message, stage)
+    except Exception as exc:  # noqa: BLE001 — one bad symbol must not sink the rest of the sweep
+        logger.exception(
+            "stored backtest sweep: symbol=%r failed (%s) under sweep_id=%s", symbol, stage, sweep_id
+        )
+        return _stored_sweep_failure(symbol, "backtest_run_failed", f"{type(exc).__name__}: {exc}", stage)
+
+    return StoredSweepSymbolResult(
+        symbol=symbol,
+        run_id=result.run_id,
+        outcomes_recorded=result.outcomes_recorded,
+        discarded_signals=result.discarded_signals,
+        primary_candle_count=dataset.primary_candle_count,
+        warmup_minute_candle_count=dataset.warmup_minute_candle_count,
+        daily_candle_count=dataset.daily_candle_count,
+        error=None,
+    )
+
+
+@router.post("/sweep/stored")
+async def run_stored_backtest_sweep(
+    strategy_name: str = Query(..., description="One of the 7 real v1 strategy names."),
+    symbols: list[str] = Query(
+        ...,
+        description=(
+            "Explicit list of tickers whose candles were already recorded in this database, e.g. "
+            "?symbols=AAPL&symbols=MSFT. No implicit 'all recorded symbols' expansion."
+        ),
+    ),
+    start: datetime = Query(..., description="Timezone-aware ISO-8601 inclusive start, shared by every symbol."),
+    end: datetime = Query(..., description="Timezone-aware ISO-8601 exclusive end, shared by every symbol."),
+) -> dict[str, Any]:
+    """Run one strategy over each of ``symbols`` using candles already
+    recorded in PostgreSQL, over one shared exact ``[start, end)`` interval,
+    sequentially, under one real ``sweep_id``.
+
+    **Validation is all-or-nothing and happens first.** Unknown
+    ``strategy_name`` (400), then every symbol and the interval through the
+    unchanged ``/run/stored`` rules (422 ``invalid_backtest_request``: blank
+    symbol, naive datetime, ``start >= end``, more than 24 elapsed hours),
+    then symbols are normalized (strip, upper-case) and de-duplicated in
+    first-occurrence order, then the existing ``_MAX_SWEEP_PAIRS`` (20) cap on
+    the distinct symbols (400 ``backtest_sweep_too_large``), then the
+    connected-provider guard (409). Nothing is read or written until all of
+    that passes.
+
+    **Execution.** Each symbol is executed in request order, one at a time,
+    through the same steps as ``/run/stored``: guard, one worker-owned
+    read-only snapshot of that symbol's recorded candles
+    (``acquire_stored_replay_data`` — live namespace only, exact interval,
+    configured warm-up lookbacks, nothing at or after ``end``, no daily bar the
+    replay could not legitimately see, no synthetic history), the guard again
+    immediately before the replay engines are installed, then a fresh
+    ``Strategy`` instance and a ``BacktestRunner`` carrying the shared
+    ``sweep_id``. Each run takes and releases ``engine_singleton_guard``'s
+    process-wide lock on its own, exactly like ``/sweep``; another request's
+    replay can therefore run between two symbols of one sweep. Nothing is
+    written to the source candles and no external provider is contacted.
+
+    **Per-symbol results, never a lost sweep.** A symbol that cannot be
+    replayed (no recorded candles in the interval, malformed stored values,
+    database unavailable, a live provider connecting mid-sweep, or an
+    exception inside the runner) is recorded in ``runs`` as
+    ``{"error": {"code", "message", "stage"}}`` with ``run_id: null`` — no ID
+    is ever invented — and the remaining symbols still run. Completed runs are
+    never undone. ``outcomes_recorded == 0`` is a success, not a failure. The
+    response is ``200`` whenever the request passed validation, even if every
+    symbol failed; ``symbols_succeeded`` says how many produced a run.
+
+    **Provenance limits, stated plainly.** (1) Each symbol is read in its own
+    snapshot, taken just before its own replay: the sweep is not one
+    consistent snapshot across symbols. (2) A failure with ``stage ==
+    "before_replay"`` left no run or outcome row. A failure with ``stage ==
+    "during_replay"`` may have left a ``backtests`` row and partial outcomes
+    under the shared ``sweep_id`` whose ``run_id`` this response cannot give
+    (the runner returns it only on success); those rows would count in
+    sweep-level reads. (3) Historical fundamentals and news are not stored, so
+    they stay absent; daily-derived scores use only recorded ``1d`` history
+    and are at their no-history value where none is recorded
+    (``daily_candle_count`` shows how much each symbol had). (4) Synthetic or
+    sparse data proves plumbing, never profitability.
+    """
+    _validate_strategy_name(strategy_name)
+    symbols, start, end = _validate_stored_sweep_request(symbols, start, end)
+
+    guard = _live_data_connected_message()
+    if guard is not None:
+        raise HTTPException(status_code=409, detail=guard)
+
+    sweep_id = uuid4()
+    runs: list[StoredSweepSymbolResult] = []
+    for symbol in symbols:
+        runs.append(
+            await _run_stored_sweep_symbol(
+                symbol=symbol,
+                strategy_name=strategy_name,
+                start=start,
+                end=end,
+                sweep_id=sweep_id,
+            )
+        )
+
+    symbols_failed = sum(1 for r in runs if r.error is not None)
+    sweep_result = StoredSweepResult(
+        sweep_id=sweep_id,
+        strategy_name=strategy_name,
+        start=_iso_utc(start),
+        end=_iso_utc(end),
+        data_version=STORED_DATA_VERSION,
+        symbols_requested=len(symbols),
+        symbols_succeeded=len(symbols) - symbols_failed,
+        symbols_failed=symbols_failed,
         runs=runs,
     )
     return dataclasses.asdict(sweep_result)

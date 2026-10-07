@@ -3,6 +3,7 @@ import { useBacktestRun } from "../../hooks/useBacktestRun";
 import { useIbkrBacktestRun, type IbkrBacktestRunError } from "../../hooks/useIbkrBacktestRun";
 import { useStoredBacktestRun, type StoredBacktestRunError } from "../../hooks/useStoredBacktestRun";
 import { useStoredCoverage } from "../../hooks/useStoredCoverage";
+import { useStoredBacktestSweepRun, type StoredSweepSubmission } from "../../hooks/useStoredBacktestSweepRun";
 import { useBacktestSweepRun } from "../../hooks/useBacktestSweepRun";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import {
@@ -12,6 +13,8 @@ import {
   type BacktestSweepPairResultWireShape,
   type BacktestSweepResultWireShape,
   type DiscardedSignalWireShape,
+  type StoredSweepResultWireShape,
+  type StoredSweepSymbolResultWireShape,
 } from "../../services/api-client";
 import { currentEtCalendarDate, etWallClockToUtc } from "./easternTime";
 
@@ -119,6 +122,8 @@ function classifyStoredBacktestError(err: StoredBacktestRunError): { heading: st
   switch (code) {
     case "invalid_backtest_request":
       return { heading: "Invalid date, symbol, or range", message };
+    case "backtest_sweep_too_large":
+      return { heading: "Too many symbols for one sweep", message };
     case "stored_candles_no_data":
       return { heading: "No recorded candles in this window", message };
     case "stored_candles_malformed":
@@ -128,6 +133,39 @@ function classifyStoredBacktestError(err: StoredBacktestRunError): { heading: st
     default:
       return { heading: "Request failed", message: message || "The request failed for an unknown reason." };
   }
+}
+
+// Task `stored-candle-symbol-sweep`. Per-symbol failure inside a 200 sweep
+// response: a short heading for the stable backend code, and an honest line on
+// what the failure may have left behind, taken from the backend's own `stage`.
+function classifyStoredSweepSymbolError(
+  error: NonNullable<StoredSweepSymbolResultWireShape["error"]>,
+): { heading: string; residue: string } {
+  let heading: string;
+  switch (error.code) {
+    case "stored_candles_no_data":
+      heading = "No recorded candles in this window";
+      break;
+    case "stored_candles_malformed":
+      heading = "Recorded candles are malformed";
+      break;
+    case "stored_history_unavailable":
+      heading = "Recorded candles could not be read";
+      break;
+    case "live_data_connected":
+      heading = "Live data connection prevented this replay";
+      break;
+    case "backtest_run_failed":
+      heading = "Replay failed";
+      break;
+    default:
+      heading = "Failed";
+  }
+  const residue =
+    error.stage === "before_replay"
+      ? "Failed before its replay started: no run or outcome was recorded for this symbol."
+      : "Failed during its replay: a run record and partial outcomes may exist under this sweep_id. Its run_id was not returned, so this result cannot say.";
+  return { heading, residue };
 }
 
 function DiscardedSignalRow({ signal }: { signal: DiscardedSignalWireShape }) {
@@ -310,6 +348,128 @@ function SweepResultsView({ result }: { result: BacktestSweepResultWireShape }) 
   );
 }
 
+function StoredSweepSymbolRow({ run }: { run: StoredSweepSymbolResultWireShape }) {
+  const failure = run.error ? classifyStoredSweepSymbolError(run.error) : null;
+  return (
+    <div className="flex flex-col gap-1 border-b border-base-border p-2 last:border-b-0">
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-xs font-medium text-text-primary">{run.symbol}</span>
+        {failure === null ? (
+          <span className="font-mono text-[10px] text-text-muted">
+            outcomes_recorded <span className="font-semibold text-text-primary">{run.outcomes_recorded}</span>
+          </span>
+        ) : (
+          <span className="font-mono text-[10px] font-semibold text-bear">failed</span>
+        )}
+      </div>
+      <div className="grid grid-cols-[auto_1fr] gap-x-2 font-mono text-[9px]">
+        <span className="text-text-muted">run_id</span>
+        <span className="truncate text-text-primary" title={run.run_id ?? undefined}>
+          {run.run_id ?? "—"}
+        </span>
+        {failure === null && (
+          <>
+            <span className="text-text-muted">recorded</span>
+            <span className="text-text-primary">
+              {run.primary_candle_count} 1m in window · warm-up {run.warmup_minute_candle_count} 1m,{" "}
+              {run.daily_candle_count} 1d
+            </span>
+          </>
+        )}
+      </div>
+      {failure !== null && run.error && (
+        <div className="flex flex-col gap-0.5">
+          <p className="font-mono text-[10px] font-semibold text-bear">{failure.heading}</p>
+          <p className="font-mono text-[10px] text-bear">{run.error.message}</p>
+          <p className="font-mono text-[9px] text-text-muted">{failure.residue}</p>
+        </div>
+      )}
+      {failure === null && run.outcomes_recorded === 0 && (
+        <p className="font-mono text-[9px] text-text-muted">
+          0 outcomes is a valid result, not a failure: the recorded candles did not produce a trade.
+        </p>
+      )}
+      {run.discarded_signals.length > 0 && (
+        <div className="rounded border border-base-border">
+          {run.discarded_signals.map((signal, i) => (
+            <DiscardedSignalRow key={`${signal.signal_candle_ts}-${i}`} signal={signal} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Result of one stored multi-symbol sweep. The submitted parameters shown here
+// are the ones the request was SENT with (kept by the hook), never the live
+// form fields, so editing the form afterwards cannot change what a result
+// claims to be. Runs appear in the backend's order (the normalized, de-duplicated
+// request order), never re-sorted.
+function StoredSweepResultsView({
+  submission,
+  result,
+}: {
+  submission: StoredSweepSubmission;
+  result: StoredSweepResultWireShape;
+}) {
+  return (
+    <div className="flex flex-col gap-2 border-t border-base-border p-2">
+      <div className="grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 font-mono text-[10px]">
+        <span className="text-text-muted">strategy</span>
+        <span className="text-text-primary">{submission.strategyName}</span>
+        <span className="text-text-muted">window</span>
+        <span className="text-text-primary">
+          {submission.startLocal} → {submission.endLocal} ET (end exclusive)
+          <br />
+          {submission.startIso} → {submission.endIso}
+        </span>
+        <span className="text-text-muted">submitted</span>
+        <span className="text-text-primary">{submission.symbols.join(", ")}</span>
+        <span className="text-text-muted">sweep_id</span>
+        <span className="truncate text-text-primary" title={result.sweep_id}>
+          {result.sweep_id}
+        </span>
+        <span className="text-text-muted">data</span>
+        <span className="text-text-primary">{result.data_version}</span>
+        <span className="text-text-muted">symbols</span>
+        <span className="text-text-primary">
+          <span className="font-semibold">{result.symbols_requested}</span> run,{" "}
+          <span className="font-semibold text-bull">{result.symbols_succeeded}</span> succeeded
+          {result.symbols_failed > 0 && (
+            <>
+              , <span className="font-semibold text-bear">{result.symbols_failed}</span> failed
+            </>
+          )}
+        </span>
+      </div>
+      {result.symbols_succeeded > 0 ? (
+        <span className="font-mono text-[9px] text-text-muted">
+          → sweep_id prefilled in the Backtest Results panel's sweep_id filter (unless it's currently pinned to a
+          different sweep you picked manually there).
+        </span>
+      ) : (
+        <span className="font-mono text-[10px] font-semibold text-bear">
+          Every symbol failed — nothing was published to the Backtest Results panel, and its current selection is
+          unchanged.
+        </span>
+      )}
+      <span className="font-mono text-[9px] text-text-muted">
+        Each symbol was read in its own snapshot just before its own replay (not one snapshot across symbols).
+        Historical fundamentals and news are not stored and stay absent; daily-derived scores use only the recorded
+        1d history counted per symbol. Synthetic or sparse data proves plumbing, not profitability.
+      </span>
+      <div className="flex flex-col gap-1">
+        <span className="text-[10px] uppercase tracking-wide text-text-muted">runs ({result.runs.length})</span>
+        <div className="rounded border border-base-border">
+          {result.runs.map((run) => (
+            <StoredSweepSymbolRow key={run.symbol} run={run} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Result of validating the two Eastern-time datetime-local inputs against
 // POST /backtest/run/ibkr's own real constraints (backtest.py's
 // _validate_ibkr_range: both tz-aware, start < end, window <= 24 elapsed
@@ -376,6 +536,24 @@ function BacktestForm() {
   const [startLocal, setStartLocal] = useState("");
   const [endLocal, setEndLocal] = useState("");
   const storedCoverage = useStoredCoverage(symbol, startLocal, endLocal);
+  // Stored mode has two explicit scopes: the existing single-symbol replay and
+  // the multi-symbol sweep. The sweep reuses the shared strategy and window
+  // controls; only the symbol field and the result block differ.
+  const storedSweepRun = useStoredBacktestSweepRun();
+  const [storedScope, setStoredScope] = useState<"single" | "sweep">("single");
+  const [storedSweepInput, setStoredSweepInput] = useState("");
+  const storedSweepSymbols = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          storedSweepInput
+            .split(/[,\s]+/)
+            .map((s) => s.trim().toUpperCase())
+            .filter((s) => s !== ""),
+        ),
+      ),
+    [storedSweepInput],
+  );
   const symbolInputRef = useRef<HTMLInputElement>(null);
 
   // Sweep mode's own inputs. Symbols: a single free-text field, split on
@@ -442,6 +620,21 @@ function BacktestForm() {
     }
   }, [storedRun.status, storedRun.result]);
 
+  // Stored multi-symbol sweep: publishes its sweep_id (never a run_id, same as
+  // the fixture sweep) through the existing workspace mechanism, but ONLY when
+  // at least one symbol produced a run. An entirely failed sweep (or an HTTP
+  // error, which never reaches "done") publishes nothing, so it cannot replace
+  // a usable selection with one that has no runs. Keyed on the result with the
+  // setter read through a ref, like the stored single-run effect above, so it
+  // publishes once per result.
+  const setLastBacktestSweepIdRef = useRef(setLastBacktestSweepId);
+  setLastBacktestSweepIdRef.current = setLastBacktestSweepId;
+  useEffect(() => {
+    if (storedSweepRun.status === "done" && storedSweepRun.result && storedSweepRun.result.symbols_succeeded > 0) {
+      setLastBacktestSweepIdRef.current(storedSweepRun.result.sweep_id);
+    }
+  }, [storedSweepRun.status, storedSweepRun.result]);
+
   // Sweep's own completion effect publishes sweep_id, deliberately NOT
   // run_id — a sweep response carries many pairs' own run_ids (one each,
   // some possibly null on a per-pair failure), and no single one of them
@@ -470,6 +663,7 @@ function BacktestForm() {
     fixtureRun.status === "running" ||
     ibkrRun.status === "running" ||
     storedRun.status === "running" ||
+    storedSweepRun.status === "running" ||
     sweepRun.status === "running";
 
   const selectedScenario = useMemo(() => BACKTEST_SCENARIOS.find((sc) => sc.name === scenario), [scenario]);
@@ -490,15 +684,40 @@ function BacktestForm() {
   // backend applies the same rules (tz-aware, start < end, <= 24 elapsed
   // hours) to both routes and stays the real authority.
   const canRunStored = !running && strategyName !== "" && symbol.trim() !== "" && rangeValidation.canSubmit;
+  const storedSweepExceedsCap = storedSweepSymbols.length > BACKTEST_SWEEP_MAX_PAIRS;
+  const canRunStoredSweep =
+    !running &&
+    strategyName !== "" &&
+    storedSweepSymbols.length > 0 &&
+    !storedSweepExceedsCap &&
+    rangeValidation.canSubmit;
   const canRunSweep =
     !running && strategyName !== "" && sweepSymbols.length > 0 && sweepScenarios.length > 0 && !sweepExceedsCap;
   const canRun =
-    mode === "fixture" ? canRunFixture : mode === "stored" ? canRunStored : mode === "ibkr" ? canRunIbkr : canRunSweep;
+    mode === "fixture"
+      ? canRunFixture
+      : mode === "stored"
+        ? storedScope === "sweep"
+          ? canRunStoredSweep
+          : canRunStored
+        : mode === "ibkr"
+          ? canRunIbkr
+          : canRunSweep;
 
   const handleRun = () => {
     if (mode === "fixture") {
       if (!canRunFixture) return;
       fixtureRun.run(strategyName, symbol.trim(), scenario);
+    } else if (mode === "stored" && storedScope === "sweep") {
+      if (!canRunStoredSweep || !rangeValidation.startIso || !rangeValidation.endIso) return;
+      storedSweepRun.run({
+        strategyName,
+        symbols: storedSweepSymbols,
+        startIso: rangeValidation.startIso,
+        endIso: rangeValidation.endIso,
+        startLocal,
+        endLocal,
+      });
     } else if (mode === "stored") {
       if (!canRunStored || !rangeValidation.startIso || !rangeValidation.endIso) return;
       storedRun.run(strategyName, symbol.trim(), rangeValidation.startIso, rangeValidation.endIso);
@@ -526,6 +745,8 @@ function BacktestForm() {
 
   const storedError =
     storedRun.status === "error" && storedRun.error ? classifyStoredBacktestError(storedRun.error) : null;
+  const storedSweepError =
+    storedSweepRun.status === "error" && storedSweepRun.error ? classifyStoredBacktestError(storedSweepRun.error) : null;
   const ibkrError = ibkrRun.status === "error" && ibkrRun.error ? classifyIbkrBacktestError(ibkrRun.error) : null;
 
   return (
@@ -621,7 +842,65 @@ function BacktestForm() {
           </label>
         )}
 
-        {mode !== "sweep" && (
+        {mode === "stored" && (
+          <div className="flex rounded border border-base-border font-mono text-[10px]" role="radiogroup" aria-label="Stored candles scope">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={storedScope === "single"}
+              onClick={() => setStoredScope("single")}
+              disabled={running}
+              className={`flex-1 rounded-l px-2 py-1 ${
+                storedScope === "single" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+              } disabled:opacity-50`}
+            >
+              Single symbol
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={storedScope === "sweep"}
+              onClick={() => setStoredScope("sweep")}
+              disabled={running}
+              className={`flex-1 rounded-r px-2 py-1 ${
+                storedScope === "sweep" ? "bg-signal/20 text-signal" : "text-text-muted hover:bg-base-bg"
+              } disabled:opacity-50`}
+            >
+              Multi-symbol sweep
+            </button>
+          </div>
+        )}
+
+        {mode === "stored" && storedScope === "sweep" && (
+          <label className="flex flex-col gap-1 rounded border border-base-border p-1.5">
+            <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">
+              Symbols (recorded tickers — comma or space separated)
+            </span>
+            <input
+              value={storedSweepInput}
+              onChange={(e) => setStoredSweepInput(e.target.value.toUpperCase())}
+              disabled={running}
+              placeholder="e.g. AAPL, MSFT, NVDA"
+              className="rounded border border-base-border bg-base-bg px-1.5 py-1 font-mono text-xs text-text-primary placeholder:text-text-muted outline-none focus:border-signal disabled:opacity-50"
+            />
+            <span className="font-mono text-[9px] text-text-muted">
+              {storedSweepSymbols.length} distinct symbol{storedSweepSymbols.length === 1 ? "" : "s"}
+              {storedSweepSymbols.length > 0 && `: ${storedSweepSymbols.join(", ")}`}
+              {" — "}max {BACKTEST_SWEEP_MAX_PAIRS} per sweep
+            </span>
+            {storedSweepExceedsCap && (
+              <span className="font-mono text-[9px] leading-snug text-bear">
+                Exceeds the sweep limit — remove symbols, or split this into more than one sweep.
+              </span>
+            )}
+            <span className="font-mono text-[9px] leading-snug text-text-muted">
+              Every symbol is replayed over the same window, one after another; a symbol with no recorded candles
+              fails on its own without stopping the rest.
+            </span>
+          </label>
+        )}
+
+        {mode !== "sweep" && !(mode === "stored" && storedScope === "sweep") && (
           <label className="flex flex-col gap-1">
             <span className="font-mono text-[10px] uppercase tracking-wide text-text-muted">Symbol</span>
             <input
@@ -791,7 +1070,7 @@ function BacktestForm() {
           </div>
         )}
 
-        {mode === "stored" && (
+        {mode === "stored" && storedScope === "single" && (
           <div className="flex flex-col gap-1 rounded border border-base-border p-1.5 font-mono text-[10px]">
             <button
               type="button"
@@ -868,7 +1147,7 @@ function BacktestForm() {
         />
       )}
 
-      {mode === "stored" && storedRun.status === "running" && (
+      {mode === "stored" && storedScope === "single" && storedRun.status === "running" && (
         <div className="flex flex-col gap-1 border-t border-base-border px-2 py-2">
           <span className="font-mono text-xs font-semibold text-signal">
             Running… {formatElapsed(storedRun.elapsedSeconds)} elapsed
@@ -880,14 +1159,14 @@ function BacktestForm() {
         </div>
       )}
 
-      {mode === "stored" && storedRun.status === "error" && storedError && (
+      {mode === "stored" && storedScope === "single" && storedRun.status === "error" && storedError && (
         <div className="border-t border-base-border px-2 py-2">
           <p className="font-mono text-[11px] font-semibold text-bear">{storedError.heading}</p>
           <p className="font-mono text-[10px] text-bear">{storedError.message}</p>
         </div>
       )}
 
-      {mode === "stored" && storedRun.status === "done" && storedRun.result && (
+      {mode === "stored" && storedScope === "single" && storedRun.status === "done" && storedRun.result && (
         <>
           <ResultsView
             runId={storedRun.result.run_id}
@@ -902,6 +1181,35 @@ function BacktestForm() {
             </p>
           )}
         </>
+      )}
+
+      {mode === "stored" && storedScope === "sweep" && storedSweepRun.status === "running" && (
+        <div className="flex flex-col gap-1 border-t border-base-border px-2 py-2">
+          <span className="font-mono text-xs font-semibold text-signal">
+            Running… {formatElapsed(storedSweepRun.elapsedSeconds)} elapsed
+          </span>
+          <span className="font-mono text-[9px] text-text-muted">
+            Sweeping {storedSweepRun.submitted?.symbols.length ?? 0} symbols ({storedSweepRun.submitted?.symbols.join(", ")}
+            ) one after another — one synchronous request with no per-symbol progress, percentage or completion
+            estimate. Nothing else in this tab can run a backtest until it finishes.
+          </span>
+        </div>
+      )}
+
+      {mode === "stored" && storedScope === "sweep" && storedSweepRun.status === "error" && storedSweepError && (
+        <div className="border-t border-base-border px-2 py-2">
+          <p className="font-mono text-[11px] font-semibold text-bear">{storedSweepError.heading}</p>
+          <p className="font-mono text-[10px] text-bear">{storedSweepError.message}</p>
+          <p className="font-mono text-[9px] text-text-muted">
+            {[400, 409, 422].includes(storedSweepRun.error?.status ?? 0)
+              ? "Rejected before any symbol ran. Nothing was published to the Backtest Results panel."
+              : "No sweep result was received, so this panel cannot say whether any symbol ran or left records. Nothing was published to the Backtest Results panel."}
+          </p>
+        </div>
+      )}
+
+      {mode === "stored" && storedScope === "sweep" && storedSweepRun.status === "done" && storedSweepRun.result && storedSweepRun.submitted && (
+        <StoredSweepResultsView submission={storedSweepRun.submitted} result={storedSweepRun.result} />
       )}
 
       {mode === "ibkr" && ibkrRun.status === "running" && (

@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: stored-candle-symbol-sweep -->
+# CHANGES — `stored-candle-symbol-sweep`
+
+Base: GitHub `main` `cf28e8a4c7a14bfb5788342ca3f79fd1c11a3789` (re-checked immediately before packaging). No migration, dependency, `BacktestRunner`, engine, strategy, stored-history reader, execution-lifecycle or `BacktestRunResult` change. No decision number was needed (the canonical log, `INDEX.md` and `archive/` end at #188); the delivery slug identifies the change. No deletions or renames.
+
+- Added `POST /backtest/sweep/stored` (`strategy_name`, repeated `symbols`, `start`, `end`): one strategy over an explicit symbol list using recorded PostgreSQL candles, one shared exact `[start, end)` interval, sequential execution, a fresh strategy per symbol and one shared `sweep_id`. It reuses the existing strategy validation, symbol normalization, interval/24-hour validation, sweep-size cap (20, counted over distinct symbols), stored-history acquisition and run-scoped providers, live/backtest namespace separation, historical lookbacks, same-day daily-bar exclusion, recorded-data provenance and live-provider guards (including the check immediately before engine installation). The whole request is validated before any read or run; symbols are normalized and de-duplicated in first-occurrence order (unlike fixture `/backtest/sweep`; see the design doc for why).
+- A genuine per-symbol failure no longer stops the sweep: each symbol returns either its run result or `error {code, message, stage}` with no invented `run_id`. `stage` is `before_replay` (no run or outcome row, tested) or `during_replay` (a run row and partial outcomes may exist under the `sweep_id` but their ID is not returned). Zero outcomes is a valid success; a sweep where every symbol failed still answers 200.
+- Added a **Single symbol | Multi-symbol sweep** switch inside BacktestPanel's Stored candles mode, reusing the shared strategy and Eastern-time window controls. It shows per-symbol results, run IDs and errors, retains the submitted parameters in the result, blocks double submission synchronously, disables Run over the cap, and publishes the completed `sweep_id` through the existing `setLastBacktestSweepId` only when at least one symbol succeeded, so a wholly failed or rejected sweep never replaces a usable Backtest Results selection. Single-symbol stored replay, the coverage preview and the fixture, IBKR and fixture-Sweep modes are unchanged.
+- Added `backend/tests/test_stored_sweep_route.py` (27 PostgreSQL tests). Updated `TESTING.md` and `docs/architecture/backtest-runner-design.md` with the acquisition/sweep data flow, the per-symbol internal flow, the error contract and limits.
+
+Limits: each symbol is read in its own snapshot (not one snapshot across symbols); other backtest requests can interleave between symbols; a failed replay can leave an unreported run row and partial outcomes that sweep-level reads include; fundamentals and news are not historical and daily-derived scores use only recorded 1d history; the request is synchronous with no progress signal. Synthetic data proves plumbing, not profitability.
+<!-- END DELIVERY SECTION: stored-candle-symbol-sweep -->
+
 <!-- BEGIN DELIVERY SECTION: execution-authorization-history -->
 # CHANGES — `execution-authorization-history`
 
