@@ -60,12 +60,14 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.context_engine.engine import get_context_engine
 from app.core.config import get_settings
 from app.execution_engine.authorization_history import read_execution_authorizations
+from app.execution_engine.trade_detail import read_execution_trade_detail
 from app.feature_engine.engine import get_feature_engine
 from app.feature_engine.historical import compute_series
 from app.market_state_engine.engine import get_market_state_engine
@@ -1141,6 +1143,26 @@ async def get_execution_authorizations(
         read_execution_authorizations, symbol=symbol, decision=decision, limit=limit,
     )
     return {"authorizations": rows}
+
+
+@router.get("/execution-trades/{trade_id}")
+async def get_execution_trade_detail(trade_id: UUID) -> dict[str, Any]:
+    """One recorded authorization with its COMPLETE linked lifecycle.
+
+    Returns `trade` (the authorization, same projection as
+    `/execution-authorizations`), `orders`, `fills`, `positions`,
+    `exit_requests` and `outcome`. Linked populations are read via the real
+    foreign keys with no row cap, in one worker-owned read-only snapshot.
+    A rejected trade is a valid 200 with empty collections and an all-null
+    outcome; an approved trade may legitimately have no order yet. 404 for an
+    unknown trade; FastAPI returns 422 for a malformed UUID before the helper
+    runs. The outcome status is returned as stored: no failure reason is
+    inferred, and nothing is reconciled, retried or recorded here.
+    """
+    detail = await asyncio.to_thread(read_execution_trade_detail, trade_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"Unknown trade {trade_id}")
+    return detail
 
 
 @router.get("/execution-orders")

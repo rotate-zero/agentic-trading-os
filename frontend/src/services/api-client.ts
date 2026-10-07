@@ -428,6 +428,117 @@ export async function fetchExecutionAuthorizations(options: {
   return (await res.json()) as ExecutionAuthorizationsWireShape;
 }
 
+// GET /intelligence/execution-trades/{trade_id}: one recorded authorization with
+// its COMPLETE linked lifecycle (no recent-list caps). Money/price values are
+// exact decimal strings; null means "not recorded", never zero. A rejected trade
+// has empty collections. An approved trade with empty `orders` has no recorded
+// order (yet): approval alone establishes neither an order nor a fill.
+export interface ExecutionTradeOrderWireShape {
+  id: number;
+  client_order_id: string;
+  position_id: string | null;
+  symbol: string;
+  side: string;
+  position_effect: string;
+  order_type: string;
+  qty: number;
+  limit_price: string | null;
+  status: string;
+  execution_mode: string;
+  execution_venue: string;
+  exit_reason: string | null;
+  reject_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExecutionTradeFillWireShape {
+  ledger_seq: number;
+  client_order_id: string;
+  symbol: string;
+  execution_venue: string;
+  venue_fill_id: string;
+  qty: number;
+  price: string;
+  venue_ts: string;
+  commission: string | null;
+  anomaly: string | null;
+  created_at: string;
+}
+
+export interface ExecutionTradePositionWireShape {
+  position_id: string;
+  symbol: string;
+  side: string;
+  qty: number;
+  status: string;
+  avg_price: string;
+  stop: string | null;
+  target: string | null;
+  opened_at: string;
+  closed_at: string | null;
+  realized_pnl: string | null;
+  exit_attempt: number;
+}
+
+export interface ExecutionTradeExitRequestWireShape {
+  position_id: string;
+  symbol: string;
+  exit_reason: string;
+  trigger_price: string;
+  trigger_ts: string;
+  retry_after: string | null;
+  created_at: string;
+  position_status: string;
+  remaining_qty: number;
+  eod_flatten_at: string | null;
+  eod_close_at: string | null;
+  eod_expired_at: string | null;
+  fallback_reason: string | null;
+  fallback_trigger_price: string | null;
+  fallback_trigger_ts: string | null;
+}
+
+export interface ExecutionTradeOutcomeSummaryWireShape {
+  exit_reason: string;
+  entry_price: string;
+  entry_qty: string;
+  exit_price: string;
+  exit_qty: string;
+  commission_total: string | null;
+  realized_pnl: string;
+  realized_r: string;
+  entry_filled_at: string;
+  exit_filled_at: string;
+  holding_seconds: number;
+}
+
+export interface ExecutionTradeDetailWireShape {
+  trade: ExecutionAuthorizationWireShape & {
+    direction: string;
+    origin: string;
+    status: string | null;
+    updated_at: string;
+  };
+  orders: ExecutionTradeOrderWireShape[];
+  fills: ExecutionTradeFillWireShape[];
+  positions: ExecutionTradePositionWireShape[];
+  exit_requests: ExecutionTradeExitRequestWireShape[];
+  outcome: {
+    outcome_status: string | null;
+    outcome_id: string | null;
+    summary: ExecutionTradeOutcomeSummaryWireShape | null;
+  };
+}
+
+export async function fetchExecutionTradeDetail(tradeId: string): Promise<ExecutionTradeDetailWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/execution-trades/${encodeURIComponent(tradeId)}`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ExecutionTradeDetailWireShape;
+}
+
 // GET /intelligence/execution-orders (decision #181). The route returns
 // only persisted simulated orders, newest ledger ID first, default limit 50.
 // `symbol` (this delivery) is an exact, case-sensitive match on

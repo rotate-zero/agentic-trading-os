@@ -4,6 +4,7 @@ import {
   type AuthorizationDecisionFilter,
 } from "../../hooks/useExecutionAuthorizations";
 import type { ExecutionAuthorizationWireShape } from "../../services/api-client";
+import { TradeLifecycleDetail } from "./TradeLifecycleDetail";
 
 function utcTime(value: string): string {
   const date = new Date(value);
@@ -12,7 +13,11 @@ function utcTime(value: string): string {
     : date.toISOString().replace("T", " ").replace(/(?:\.000)?Z$/, " UTC");
 }
 
-function AuthorizationRow({ row }: { row: ExecutionAuthorizationWireShape }) {
+function AuthorizationRow({ row, selected, onToggle }: {
+  row: ExecutionAuthorizationWireShape;
+  selected: boolean;
+  onToggle: () => void;
+}) {
   const limits = row.limits_snapshot;
   const hasLimits = limits.max_concurrent_positions !== null ||
     limits.fixed_notional_usd !== null || limits.daily_loss_cap_usd !== null;
@@ -40,12 +45,21 @@ function AuthorizationRow({ row }: { row: ExecutionAuthorizationWireShape }) {
         </div>
       )}
       <div className="break-all text-text-muted">Trade ID: {row.trade_id}</div>
+      <button
+        onClick={onToggle}
+        aria-expanded={selected}
+        className="mt-0.5 rounded px-1 py-0.5 text-signal hover:bg-base-bg"
+      >
+        {selected ? "Hide lifecycle" : "View lifecycle"}
+      </button>
+      {selected && <TradeLifecycleDetail tradeId={row.trade_id} onClose={onToggle} />}
     </div>
   );
 }
 
 function AuthorizationHistory() {
   const [filter, setFilter] = useState<AuthorizationDecisionFilter>("all");
+  const [selectedTradeId, setSelectedTradeId] = useState<string | null>(null);
   const { rows, loading, error, invalidate, refresh } = useExecutionAuthorizations(filter);
 
   return (
@@ -56,6 +70,7 @@ function AuthorizationHistory() {
           value={filter}
           onChange={(event) => {
             invalidate();
+            setSelectedTradeId(null);
             setFilter(event.target.value as AuthorizationDecisionFilter);
           }}
           className="min-w-0 rounded border border-base-border bg-base-bg px-1 py-0.5 font-mono text-[10px] text-text-primary"
@@ -83,8 +98,15 @@ function AuthorizationHistory() {
         </p>
       )}
       {rows !== null && rows.length > 0 && (
-        <div className="max-h-48 overflow-y-auto border-t border-base-border">
-          {rows.map((row) => <AuthorizationRow key={row.trade_id} row={row} />)}
+        <div className="max-h-96 overflow-y-auto border-t border-base-border">
+          {rows.map((row) => (
+            <AuthorizationRow
+              key={row.trade_id}
+              row={row}
+              selected={selectedTradeId === row.trade_id}
+              onToggle={() => setSelectedTradeId((current) => (current === row.trade_id ? null : row.trade_id))}
+            />
+          ))}
         </div>
       )}
     </div>

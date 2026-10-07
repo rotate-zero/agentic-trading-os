@@ -404,6 +404,46 @@ The route accepts an optional exact `symbol`, optional `decision` (`approved` or
 
 The panel labels the rows as a bounded recent subset, shows raw rejection codes and UTC timestamps, and separates loading, error and empty states. It keeps existing event, order, fill, position, startup, exit and outcome sections independent. This projection neither changes authorization policy nor retries, edits or reconsiderations of decisions.
 
+**Recorded trade lifecycle detail (`execution-trade-detail`).** `GET /intelligence/execution-trades/{trade_id}` answers "what happened to this authorization" without searching the capped recent lists. It is a read-only projection over existing foreign keys and adds no schema: `orders.trade_id` and `positions.trade_id` link directly to `trades`; fills reach a trade through `fills.client_order_id → orders`; exit requests through `exit_requests.position_id → positions`; the outcome through `trades.outcome_id → strategy_outcomes`. Entry and close orders both carry `trade_id` (a close is `<trade_id>:exit:<attempt>`), so multiple exit attempts appear as separate orders against one position whose `exit_attempt` counter is returned.
+
+The response is `{trade, orders, fills, positions, exit_requests, outcome}`. `trade` is the same projection as the recent authorization route (shared `serialize_authorization`) plus direction, origin, trade status and `updated_at`. No `LIMIT` is applied to any linked collection. Order: orders by `orders.id`, fills by `fills.ledger_seq`, positions by `opened_at` then `position_id`, exit requests by `trigger_ts` then `position_id` (oldest first, strict total orders). Money fields are exact decimal strings, absent values are `null`, timestamps are UTC. A rejected trade returns 200 with empty collections and an all-null `outcome`; approval alone never implies an order or fill. `outcome` carries the stored `outcome_status` and `outcome_id`, plus a curated summary only when the linked row exists; failure reasons exist only in logs and are never inferred. 404 for an unknown trade; 422 for a malformed UUID.
+
+**Component data flow.**
+
+```
+ trades ◄── orders (trade_id) ◄── fills (client_order_id)
+   ▲  ▲
+   │  └── positions (trade_id) ◄── exit_requests (position_id)
+   └───── strategy_outcomes (trades.outcome_id)
+                     │ read only, complete populations
+                     ▼
+        read_execution_trade_detail(trade_id)   [worker thread, one snapshot]
+                     │
+                     ▼
+        GET /intelligence/execution-trades/{trade_id}
+                     │
+ Recorded authorizations row ─ "View lifecycle" ─► useExecutionTradeDetail ─► TradeLifecycleDetail
+ (recent list, unchanged)
+```
+
+**Internal snapshot-query flow.**
+
+```
+ route: UUID validated by FastAPI (422 before any DB work)
+   └─ asyncio.to_thread(read_execution_trade_detail)
+        └─ worker opens Session ─► REPEATABLE READ + PostgreSQL READ ONLY
+             ├─ SELECT trade (authorization columns, status, outcome link) ─ none ─► rollback ─► 404
+             ├─ SELECT orders        WHERE trade_id = :id                  ORDER BY id
+             ├─ SELECT fills ⨝ orders WHERE orders.trade_id = :id          ORDER BY ledger_seq
+             ├─ SELECT positions     WHERE trade_id = :id                  ORDER BY opened_at, position_id
+             ├─ SELECT exit_requests ⨝ positions WHERE positions.trade_id = :id ORDER BY trigger_ts, position_id
+             └─ GET strategy_outcomes[outcome_id] when linked
+                  └─ curated exact-string / UTC serialization ─► rollback + close
+ (a writer committing after the first statement is invisible to every later statement)
+```
+
+The panel's "View lifecycle" selects one row at a time, requests only while selected, and separates loading, "no records yet", not-found and failure states; a failed Refresh keeps the same trade's last detail, and responses for a superseded selection or after collapse/unmount are ignored. It has no trading, retry or re-arm controls and neither reconciles nor records anything.
+
 ### 6.3 Execution Engine (`execution_engine/`)
 
 **What it is.** The only module that talks to a venue (I1). It turns an authorization (or a reduce-only exit intent) into a durable, idempotent order, sends it, and turns every venue update into ledger state and an `OrderFilled` — deduplicated, persisted first, published second.
