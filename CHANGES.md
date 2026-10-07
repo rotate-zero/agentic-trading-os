@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: scanner-observation-worker -->
+# CHANGES — `scanner-observation-worker`
+
+Base: GitHub `main` `b64be4f` (`continuous-scanner-design`). Decision #189 already approves the fixed 60-second first-slice cadence; this delivery needs no new decision number. The worker is a tested, opt-in core and is not started by the application.
+
+- Added `backend/app/scanner/scanner.py`: explicit idempotent start/stop, caller-supplied eligibility, injectable monotonic clock/wait/wall clock/universe provider/runner/settings, one active cycle and coalesced missed deadlines. Each admitted cycle rereads the persisted universe off the event loop through `DbUniverseProvider`, captures it before calling the existing `run_scan` on the FeatureEngine's owning event loop, and retains all ranked rows and skipped symbols. Empty DB universe is a successful empty observation; no route fallback, top-N or promotion filter is applied.
+- Added an immutable-by-contract in-memory observation/status snapshot with separate last-attempt and last-success timestamps, lifecycle/cycle flags, and latest error. Failed attempts retain the prior successful result. Stop invalidates publication, drains an offloaded read, and prevents a cancelled stop caller from abandoning its database thread; restart uses a new generation and one timer.
+- Added `backend/tests/test_scanner_observation_worker.py` with controlled clocks, waits and deferred reads, the real `run_scan` over controlled FeatureEngine snapshots, and a small isolated PostgreSQL `DbUniverseProvider` edit-across-cycles test. Existing scanner routes, CRUD, scorer, runner and startup wiring were not changed.
+- Updated `docs/architecture/scanner-design.md` with as-built component/data-flow and worker-lifecycle diagrams, `docs/roadmap/phase-roadmap.md` to distinguish the worker core from deployed scanning, and `TESTING.md` with validation evidence. C1–C4, full-union feed-capacity validation, protected subscriptions, promotion and operator switch remain open.
+
+Included files: `backend/app/scanner/scanner.py`, `backend/tests/test_scanner_observation_worker.py`, `docs/architecture/scanner-design.md`, `docs/roadmap/phase-roadmap.md`, `CHANGES.md`, `TESTING.md`. No migration, commit, push or ZIP.
+<!-- END DELIVERY SECTION: scanner-observation-worker -->
+
 <!-- BEGIN DELIVERY SECTION: continuous-scanner-design -->
 # CHANGES — `continuous-scanner-design`
 

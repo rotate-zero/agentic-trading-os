@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: scanner-observation-worker -->
+# TESTING — `scanner-observation-worker`
+
+Base: GitHub `main` `b64be4f`. Python 3.14; isolated PostgreSQL 18 cluster on `127.0.0.1:55432`, database `scanner_observation_test`, migrated through Alembic `0017`. The database test added and removed only ticker `ZZWKR`; it left the seeded universe intact. No broker, external provider, production database, full backend suite or real-minute wait was used.
+
+- **Focused serial suite:** `pytest -q --disable-warnings tests/test_scanner_observation_worker.py tests/test_scanner.py tests/test_scanner_runner.py tests/test_scanner_universe.py tests/test_scanner_state_route.py tests/test_scanner_route_concurrency.py` with the isolated PostgreSQL environment — **38 passed** (8 new worker tests). Existing on-demand route, override, fallback, universe CRUD and runner tests passed unchanged.
+- Controlled monotonic clock/wait tests cover an immediate first admitted cycle, fixed 60-second deadlines, ineligible due points, blocked reads, no overlap, coalescing missed boundaries, empty success, universe edits after capture, failed DB and scorer attempts with retained success, stop during an offloaded read, cancelled stop draining that read, restart generation isolation and a single timer. The real `run_scan` test checks configured weights, zero-input/zero-score rows, missing 1m snapshots, skipped symbols, full ranking, FeatureEngine access on the owning loop and caller mutation isolation.
+- The PostgreSQL test uses the real `DbUniverseProvider` and worker-owned session factory. It commits an add and a remove between controlled cycles, sees `ZZWKR` appear and disappear in the captured universe, and verifies worker read sessions are opened off the event-loop thread.
+- `git diff --check` passed. The final `git ls-remote origin refs/heads/main` still reported `b64be4f`; the decision index and canonical log end at #189 and the archive ends at #184. The isolated test cluster was stopped after validation. The worker has no application startup wiring or read route, so this suite verifies the reusable core rather than unattended operation. A stuck synchronous DB read may delay `stop()` because cancelling `asyncio.to_thread` cannot stop its thread.
+
+<!-- END DELIVERY SECTION: scanner-observation-worker -->
+
 <!-- BEGIN DELIVERY SECTION: continuous-scanner-design -->
 # TESTING — `continuous-scanner-design`
 

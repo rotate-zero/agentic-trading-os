@@ -1,7 +1,7 @@
 # Market Activity Scanner (Core Tier) — Design & Implementation Plan
 
-**Status:** DRAFT — not yet confirmed; partial implementation exists. Built: `ActivityScorer`, the on-demand `run_scan` path, persisted/editable Core universe and scanner routes, plus `ScannerPanel`, `useScannerState`, and `useScannerUniverse`. Not built: continuous `MarketActivityScanner`, `ScanCadenceSchedule`, top-N promotion into `StrategyScheduler`, top-N activation through `LiveTickRelay.set_active_symbols`, the Discovered tier, or spread-tightness scoring/filtering. The DRAFT/proposed label is unchanged pending Saqib's product/design decision.
-**Continuous-scanner-design update:** §18 verifies the current implementation and specifies a minimum simulated-only continuous slice. Decision #189 confirms its 60-second cadence, manual-first activation, capacity prerequisite and protective feed retention; §18.7 separates those choices from recommendations still open. None is built behavior. Where earlier proposed text differs from current code, use §18's as-built inventory.
+**Status:** DRAFT — not yet confirmed; partial implementation exists. Built: `ActivityScorer`, the on-demand `run_scan` path, persisted/editable Core universe and scanner routes, `ScannerPanel`, `useScannerState`, `useScannerUniverse`, and the opt-in `ScannerObservationWorker` core (§18.8). Not built: application-started continuous scanning, `ScanCadenceSchedule`, top-N promotion into `StrategyScheduler`, top-N activation through `LiveTickRelay.set_active_symbols`, the Discovered tier, or spread-tightness scoring/filtering. The DRAFT/proposed label is unchanged pending Saqib's remaining product/design choices.
+**Continuous-scanner-design update:** §18 verifies the current implementation and specifies a minimum simulated-only continuous slice. Decision #189 confirms its 60-second cadence, manual-first activation, capacity prerequisite and protective feed retention; §18.7 separates those choices from recommendations still open. Only the observation worker core is built, with no startup wiring (§18.8). Where earlier proposed text differs from current code, use §18's as-built inventory.
 **Revision note:** updated after a follow-up conversation that resolved IBKR's role in this plan (see new §9) — spread tightness (§2) and the Discovered-tier data source (§7) both now have a real answer instead of an open gap, on a timeline, not immediately. The rest of the plan (§1–§6, §8) is unchanged. **Second update:** §2's `ActivityScorer` is now actually built and unit-tested (`app/scanner/scorer.py`, `tests/test_scanner.py`, 6 passing tests) — this resolves §10's old "build now vs. wait for IBKR" question in favor of building now. A placeholder `UniverseProvider` (`app/scanner/universe.py`) and a live pipeline test script (`scripts/test_scanner_pipeline.py`) exist to look at real rankings against a small 6-symbol test set — NOT the real Core-100, still open. `ScanCadenceSchedule`, `MarketActivityScanner` (promotion/orchestration), and `LiveTickRelay` wiring (§1, §4, §5) are not built yet — deliberately out of scope for this pass. **Third update:** a real frontend surface now exists — `GET /scanner/state` (`app/scanner/runner.py`, `app/api/routes/scanner.py`, 3 more passing tests) runs the same `ActivityScorer` on demand and returns ranked JSON; `ScannerPanel.tsx` + `useScannerState.ts` poll it every 15s and render it as a docked panel next to `FeatureEnginePanel`. This is explicitly a smaller thing than §5's `MarketActivityScanner` — on-demand recomputation on every request, not a continuously-running scheduled process, and not wired into `LiveTickRelay` or any WebSocket event. See new §11 for what's built vs. still open on the frontend side specifically.
 **Owner:** Saqib
 **Companion documents:** [`system-design.md`](./system-design.md) §4.5 (Feature Engine — the sole source of every input this scanner uses), §4.7 (Market Activity Scanner — the original concept this plan implements in full), §4.11 (Trading Workspace UI — the `Market Scanner` frontend widget this plan's output eventually feeds); [`../decisions/confirmed-decisions.md`](../decisions/confirmed-decisions.md) (decisions #45–#71 — every Feature Engine indicator this plan reads from; #72 — `LiveTickRelay`, the existing consumer this plan's output slots into directly); [`../../backend/app/services/live_tick_relay.py`](../../backend/app/services/live_tick_relay.py); [`../decisions/future-ideas.md`](../decisions/future-ideas.md).
@@ -24,6 +24,8 @@ Four concerns, kept separate on purpose (same discipline `daily-levels-design.md
 ---
 
 ## 1. Module breakdown
+
+The diagram below is the historical proposed full module layout. The as-built worker core is described in §18.8; `schedule.py` and `MarketActivityScanner` are not present.
 
 ```
 backend/app/scanner/
@@ -642,16 +644,16 @@ Frontend-only; no backend, `api-client.ts`, `useScannerState`, ranking, scoring,
 
 ---
 
-## 18. Continuous scanner design (`continuous-scanner-design`, proposed)
+## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`)
 
-This section is a verified implementation plan, **not an implementation or an execution-policy change**. Decision #189 confirms only the directions identified in §18.7; the remaining filter and switch details are recommendations. It supersedes the *as-built* implications of §§0, 4–5: the old cadence table is a draft, `ScannerRankingUpdated` does not exist, `GET /scanner/state` already exists but recomputes per request, `StrategyScheduler` already exists but has no scanner eligibility input, and relay activation does not control strategy evaluation. The only proposed functional scope here is simulated-mode scanning and entry evaluation eligibility. Scanner scores are activity observations, not authorizations to execute.
+This section records the verified full-system design and, in §18.8, the tested observation worker core. The worker is **not started by the application**, so continuous scanning and promotion are not deployed. Decision #189 confirms only the directions identified in §18.7; the remaining filter and switch details are recommendations. It supersedes the *as-built* implications of §§0, 4–5: the old cadence table is a draft, `ScannerRankingUpdated` does not exist, `GET /scanner/state` already exists but recomputes per request, `StrategyScheduler` already exists but has no scanner eligibility input, and relay activation does not control strategy evaluation. Scanner scores are activity observations, not authorizations to execute.
 
 ### 18.1 Verified inventory and missing connections
 
 | Concern | Current source / behavior | Missing for continuous operation |
 |---|---|---|
-| Universe | `backend/app/scanner/universe.py`: `DbUniverseProvider` reads `scanner_universe_symbols`; add/remove/list are persistent, format-only operations. `backend/app/api/routes/scanner.py:get_scanner_state` falls back to `TEST_UNIVERSE` on an empty DB universe and accepts a validated `?symbols=` override. | A scheduled owner must read the current persisted universe each cycle and define its own empty-universe behavior. Route fallback and ad hoc override must not silently become scheduler policy. |
-| Score | `backend/app/scanner/scorer.py:score_symbol` consumes existing 1m `FeatureSet` values; `backend/app/scanner/runner.py:run_scan` reads `FeatureEngine.get_snapshot()` and ranks on demand. It skips symbols with no 1m snapshot, but **includes** a snapshot with zero usable inputs and score zero. `GET /scanner/state?top_n=` cuts only the response. | Retain full result, skipped list and time/status from each completed cycle; apply a separately approved promotion filter. No new indicator or duplicate scorer. |
+| Universe | `backend/app/scanner/universe.py`: `DbUniverseProvider` reads `scanner_universe_symbols`; add/remove/list are persistent, format-only operations. `backend/app/api/routes/scanner.py:get_scanner_state` falls back to `TEST_UNIVERSE` on an empty DB universe and accepts a validated `?symbols=` override. | The observation worker now rereads this table each admitted cycle and treats empty as a successful empty result (§18.8). Startup ownership and feed coverage remain open. |
+| Score | `backend/app/scanner/scorer.py:score_symbol` consumes existing 1m `FeatureSet` values; `backend/app/scanner/runner.py:run_scan` reads `FeatureEngine.get_snapshot()` and ranks on demand. It skips symbols with no 1m snapshot, but **includes** a snapshot with zero usable inputs and score zero. `GET /scanner/state?top_n=` cuts only the response. | The observation worker now retains full results, skipped symbols and status (§18.8). A promotion filter remains unapproved. |
 | Strategy | `backend/app/strategy_engine/scheduler.py:StrategyScheduler._on_market_state_changed` triggers on every per-symbol `MarketStateChanged` with matching cached features and context, then applies strategy gate conditions. It reads no scanner set. `backend/app/context_engine/engine.py` snapshots the DB universe once at startup; a later universe edit does not automatically add per-symbol context there. | A narrow **entry-evaluation** eligibility read at the scheduler, plus a way to refresh ContextEngine's tracked symbols or an equivalent already supported context update. Neither scanner membership nor score may be read by Governor or Execution as authorization. |
 | Feed | `backend/app/api/routes/market.py:subscribe` calls the current streaming provider. `FinnhubAdapter`, `PolygonAdapter` and `IBKRAdapter` each own their own transient subscription sets (`backend/app/broker_adapters/`); there is no central manual-subscription owner or general capacity registry. `backend/app/main.py:lifespan` connects providers but does not subscribe the scanner universe or restored holdings. Finnhub has no automatic reconnect after a WebSocket close. | Explicit, additive feed subscription for symbols needed to score and to monitor existing exposure; track manual needs to compute the full union; re-establish after provider connection/reconnection. Provider capacity and data quality require real validation. |
 | Relay | `backend/app/services/live_tick_relay.py:LiveTickRelay.set_active_symbols` replaces a maximum-eight set; its `PriceUpdated` subscriber emits throttled `PriceSnapshot` only for that set. `POST /market/active-symbols` can set it manually. | Optional scanner-owned chart activation, with a defined interaction with manual relay settings. It is **not** a provider subscription or a strategy eligibility gate. |
@@ -735,7 +737,7 @@ For this minimum slice, keep scanner subscriptions additive and never use `provi
 | File/module | Narrow change |
 |---|---|
 | `backend/app/scanner/schedule.py` (new) | MarketClock-aware due-time calculation for the approved cadence/windows; inject clock and sleep for deterministic tests. No use of `DebounceScheduler` as an implicit wall-clock calendar. |
-| `backend/app/scanner/scanner.py` (new) | One owner of scan lifecycle, immutable result/status, no overlap, universe reread, subscription request, result publication and mode-specific eligibility update. Reuse `run_scan` and `DbUniverseProvider`. |
+| `backend/app/scanner/scanner.py` | Observation lifecycle, immutable result/status, no overlap and universe reread are built (§18.8). Subscription request and mode-specific eligibility update remain future work. Reuse `run_scan` and `DbUniverseProvider`. |
 | `backend/app/scanner/runner.py`, `scorer.py` | Reuse unchanged unless a focused test finds a genuine contract gap; keep zero-input rows in on-demand output, filter only at promotion. |
 | `backend/app/strategy_engine/scheduler.py` | Inject optional eligibility reader; check before each new strategy evaluation, with pass-through default for off/observe and existing backtest/tests. Do not change `gate_conditions` or opportunity payloads. |
 | `backend/app/context_engine/engine.py` | Minimal way to refresh tracked universe after edits, without restarting global calendar work or changing per-symbol context contracts. |
@@ -774,3 +776,56 @@ Local doubles and an in-process event bus can prove S1–S4, EL1–EL3, UI1 and 
 | C4 | **Relay/manual coexistence:** recommend scanner relay writes only when its computed set changes, with visible override of a manual relay set. Manual provider subscriptions and protected symbols must be retained by decision #189. | A later scanner write may still replace a manual chart set. A shared owner ledger can preserve manual relay priority and permit safe provider unsubscribe if verified capacity requires it, at greater scope. |
 
 No threshold/top-N, hysteresis, session-coverage, switch-interface, relay-priority or new execution policy is approved by decision #189. `ContextEngine`'s one-time universe snapshot and missing held/order feed re-subscription remain implementation prerequisites. Neither permits scanner membership to control protective exits.
+
+### 18.8 Tested observation worker core (`scanner-observation-worker`)
+
+`backend/app/scanner/scanner.py:ScannerObservationWorker` is an opt-in, in-process owner with `start()`, `stop()` and `get_snapshot()`. A caller must supply an `eligible()` predicate; this delivery supplies no production session default and does not attach the worker to `main.py` or any route. The fixed 60-second monotonic cadence is decision #189's first-slice interval. The first eligible due point is immediate at start. Each subsequent due point is anchored to that start; missed boundaries are coalesced into at most one immediate next cycle. An ineligible due point reads no universe and starts no scan. Session coverage C1 is still open; the caller decides eligibility.
+
+**Component data flow:**
+
+```
+caller: eligible() + start()/stop()      configured scanner weights
+                 │                                  │
+                 ▼                                  ▼
+        ScannerObservationWorker ── due/admitted ──► run_scan (owning event loop)
+                 │                                      ▲
+                 │ asyncio.to_thread                     │ get_snapshot(symbol)
+                 ▼                                      │
+        DbUniverseProvider ── worker-owned Session       FeatureEngine 1m cache
+                 │
+                 ▼
+        scanner_universe_symbols
+
+        run_scan ── full ranked rows + skipped ──► immutable ObservationSnapshot
+                                                   │
+                                                   └─► get_snapshot() (local reader only)
+```
+
+The DB read is synchronous SQLAlchemy work offloaded with `asyncio.to_thread`; `DbUniverseProvider` opens and closes its own session inside that thread. The returned symbol list is copied into a tuple before scoring, so an edit after capture affects the next cycle, not the active `run_scan` input. `run_scan` and `FeatureEngine.get_snapshot()` remain on the worker's owning event loop, following the on-demand scanner route's convention. The worker uses configured scorer weights and retains every ranked row (including zero-score/zero-input rows) and every skipped symbol. It applies no `TEST_UNIVERSE` fallback, top-N cut or promotion threshold. An empty persisted universe is a successful empty observation.
+
+**Internal lifecycle:**
+
+```
+stopped ── start() ──► running: next_due = monotonic now
+                         │
+                         ├─ due + ineligible ──► advance to next 60s boundary
+                         │
+                         └─ due + eligible ──► mark attempt/cycle_running
+                                                  │
+                                      to_thread DB read → capture tuple
+                                                  │
+                                      run_scan on owning loop
+                                                  │
+                           success ──► replace full result + last_success_at
+                           failure ──► retain last success + set last_error
+                                                  │
+                                      advance/coalesce due boundaries
+
+stop() ──► invalidate generation + stop timer ──► drain active DB read/task
+                                                   └─► stopped; no late publish
+restart ──► new generation + one timer; old completion cannot publish
+```
+
+`ObservationSnapshot` is a frozen value: captured universe, ranked rows, skipped symbols, `last_attempt_at`, `last_success_at`, `last_error`, `running` (worker lifecycle) and `cycle_running` (an active admitted cycle). Row feature maps are copied and read-only; callers cannot mutate the retained result. `last_success_at is None` means no cycle has succeeded; a non-null timestamp with empty tuples means a genuine successful empty observation; a non-null `last_error` means the latest attempt failed and the prior success remains visible. A successful cycle clears the error. Snapshots are in memory only; a process restart begins with no successful result. There is no scheduled-result HTTP endpoint.
+
+`stop()` blocks new cycles immediately, invalidates the generation before awaiting the owner task, and drains an active offloaded read. Cancelling a stop caller cannot abandon the read: shutdown still waits for the thread to finish, then propagates cancellation. A hung database call can therefore delay shutdown; `asyncio.to_thread` cancellation does not stop its underlying thread. No provider subscriptions, relay writes, strategy eligibility, switch modes or application-startup wiring are included. C1–C4, feed-capacity validation and protected-subscription reconciliation in §§18.2–18.7 remain open before unattended scanning or promotion.
