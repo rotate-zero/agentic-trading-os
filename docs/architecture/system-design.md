@@ -329,7 +329,39 @@ app/main.py lifespan (startup, soft-fail)     curl / DataFeedStatus.tsx's own
               PoppedOutWindowShell
 ```
 
-Deliberately read-only for Polygon; Finnhub alone gets a manual "Reconnect" button, wrapping the same `POST /finnhub/connect` `app/main.py`'s own startup call already uses — a real, confirmed gap, not a preemptive control surface: `broker_adapters/finnhub_provider.py`'s own `_listen()` sets its connected flag to `False` on an unexpected WebSocket close with **no auto-reconnect**, by that file's own comment deferred to a future Phase 4 `ConnectionManager` (the same `ConnectionManager` this section's §4.2 responsibilities list above already names as not yet built). Until that Phase 4 work lands, calling this route again is genuinely the only way to restore a dropped Finnhub session — confirmed directly with Saqib before adding the button rather than assumed. Polygon has no equivalent gap (REST-polling based, no persistent socket to drop — `PolygonAdapter`'s own docstring), so it gets no matching button.
+Deliberately read-only for Polygon; Finnhub's existing manual "Reconnect" button calls the shared `POST /finnhub/connect` path. As built in `finnhub-stream-reconnect`, one Finnhub adapter now supervises its WebSocket after a successful initial connection. A remote exception or clean iterator termination clears current-socket requests, closes that socket and retries with positive, capped exponential delays (`FINNHUB_RETRY_INITIAL_SECONDS`, default 1; `FINNHUB_RETRY_MAX_SECONDS`, default 30). Initial connect failure still returns a route error without background retry. During an outage the route returns `reconnecting` and keeps the existing owner and bridge. The 120-second status poll shows `connected: false` until a replacement socket is established and desired requests are restored. Polygon has no persistent socket to recover.
+
+**Finnhub reconnect component flow:**
+
+```
+Finnhub WebSocket ── trade ──► FinnhubAdapter ── Tick ──► one TickIngestBridge
+       ▲                              │                         │
+       │                     desired symbol set                 ▼
+       │                     current-socket set             Event Bus
+       │                              │                         │
+       └── reconnect + restore ◄── one supervisor          live engines
+
+remote close ──► connected=false, current set cleared ──► bounded-backoff retry
+manual disconnect / streaming takeover ──► cancel and settle supervisor + socket
+backtest route ──► reject while Finnhub owner is connecting, connected or retrying
+```
+
+**Internal socket and subscription flow:**
+
+```
+connect() ── first socket succeeds ──► supervisor listens
+          └─ failure ──► caller error; no retry task
+listen ends (exception or clean close) ──► close old socket, clear current set
+       └─ wait 1, 2, 4 ... max seconds ──► open replacement socket
+             ├─ failure ──► wait again
+             └─ success ──► send each desired symbol on this socket
+                   ├─ partial send failure ──► discard partial current set,
+                   │                          close socket, retry
+                   └─ complete ──► listen on replacement generation
+unsubscribe during outage ──► remove desired intent; no future restore
+```
+
+`get_subscription_snapshot()` exposes only requests sent on the **current** socket, never desired intent. A send is not provider acknowledgement, verified capacity or proof of delivery. Tick callbacks and the bridge survive an adapter retry; obsolete socket messages are ignored. Registry takeover settles the retired Finnhub owner, so it cannot resume behind the new streaming provider. The broader Phase 4 `ConnectionManager`/state-cache design above remains future work; this is adapter-local recovery.
 
 Internal flow inside the new hook/component pair:
 

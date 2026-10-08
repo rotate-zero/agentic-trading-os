@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: finnhub-stream-reconnect -->
+# TESTING — `finnhub-stream-reconnect`
+
+Base: GitHub `main` `dcbb730`. All WebSocket transports were controlled local fakes; no real Finnhub key, external feed or broker connection was used. No database changes or full-suite run.
+
+- Baseline sensitivity: the first five new reconnect regressions against untouched `dcbb730` failed (5/5) with `TypeError: FinnhubAdapter.__init__() got an unexpected keyword argument 'connect_ws'`. This demonstrates the new lifecycle coverage did not pass against baseline.
+- Final affected tests, serial: from `backend/`, `.venv/bin/pytest -q --disable-warnings tests/test_finnhub_reconnect.py tests/test_finnhub_provider.py tests/test_provider_subscription_status.py::test_finnhub_snapshot_tracks_changes_sorted_and_sends_nothing_itself tests/test_provider_subscription_status.py::test_finnhub_failed_send_is_not_recorded tests/test_provider_subscription_status.py::test_same_instance_reconnect_can_request_finnhub_and_ibkr_again` — **30 passed**.
+- Controlled cases include exceptional and clean remote close, failed retries and capped delays, eventual restoration, unsubscribe during outage, partial restore, current-only inventory with unknown capacity/delivery, obsolete-socket messages, callback/bridge uniqueness, repeated connect, disconnect during initial connect/backoff/restore, registry takeover, replay rejection during retry and before singleton installation, and replay permitted after settled disconnect.
+- Existing TestClient-based `test_provider_subscription_status.py` cases were attempted serially but the local Python 3.14/Starlette `TestClient(app).get(...)` portal hung even for `test_no_streaming_provider_is_an_explicit_unavailable_state`, which uses no Finnhub adapter. The pure route was verified directly in the new controlled test. These TestClient cases are not claimed as passing.
+
+These checks establish local lifecycle and replay-guard behavior only. They cannot establish Finnhub acknowledgement, real-feed delivery or subscription capacity.
+<!-- END DELIVERY SECTION: finnhub-stream-reconnect -->
+
 <!-- BEGIN DELIVERY SECTION: protected-feed-reconciliation-status -->
 # TESTING — `protected-feed-reconciliation-status`
 

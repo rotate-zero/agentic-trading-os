@@ -50,6 +50,17 @@ _RUN_LOCK = asyncio.Lock()
 
 
 @asynccontextmanager
+async def finnhub_connection_slot() -> AsyncIterator[None]:
+    """Serialize Finnhub connection establishment with replay installation."""
+    async with _RUN_LOCK:
+        yield
+
+
+def replay_slot_busy() -> bool:
+    return _RUN_LOCK.locked()
+
+
+@asynccontextmanager
 async def install_replay_engines(
     *,
     feature_engine,
@@ -77,6 +88,16 @@ async def install_replay_engines(
     import app.trading_intelligence.level_interaction_engine as level_interaction_engine_module
 
     async with _RUN_LOCK:
+        # A connection can win the lock after an API route's initial live
+        # check. Recheck before touching any process-wide replay singleton.
+        from fastapi import HTTPException
+        from app.api.routes import finnhub_data
+
+        if finnhub_data.is_streaming_active():
+            raise HTTPException(
+                status_code=409,
+                detail="Refusing to run a backtest: Finnhub can connect or resume streaming. Disconnect Finnhub first.",
+            )
         prev_feature_engine = feature_engine_module._feature_engine
         prev_level_interaction_engine = level_interaction_engine_module._level_interaction_engine
         prev_market_state_engine = market_state_engine_module._market_state_engine

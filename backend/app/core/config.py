@@ -5,7 +5,7 @@ nothing else in the app should read os.environ directly.
 from functools import lru_cache
 import math
 
-from pydantic import field_validator
+from pydantic import PositiveFloat, field_validator
 from pydantic import ValidationInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     # not assumed). See docs/decisions/confirmed-decisions.md #32.
     finnhub_api_key: str | None = None
     finnhub_max_calls_per_minute: int = 60
+    finnhub_retry_initial_seconds: PositiveFloat = 1.0
+    finnhub_retry_max_seconds: PositiveFloat = 30.0
 
     # --- CORS (frontend dev server) ---
     cors_allow_origins: list[str] = ["http://localhost:5173"]

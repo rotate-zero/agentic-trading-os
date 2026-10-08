@@ -169,11 +169,13 @@ def _reject_if_live_data_connected() -> None:
     now. Since this deployment is a single always-on process (no
     per-request worker isolation — see this route's own docstring), the
     provider modules' existing connection state is the safety signal.
+    Finnhub also exposes whether its owner can resume after an outage;
+    `install_replay_engines()` repeats that check under the replay lock.
     Finnhub and Polygon expose their status directly; `broker.py` checks
     registry-owned IBKR adapters in either role. The isolated historical
     acquisition adapter is never registered and is therefore not mistaken
     for a live provider."""
-    if finnhub_data.is_connected():
+    if finnhub_data.is_connected() or finnhub_data.is_streaming_active():
         raise HTTPException(
             status_code=409,
             detail=(

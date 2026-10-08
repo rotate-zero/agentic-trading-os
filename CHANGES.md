@@ -1,3 +1,18 @@
+<!-- BEGIN DELIVERY SECTION: finnhub-stream-reconnect -->
+# CHANGES — `finnhub-stream-reconnect`
+
+Base: GitHub `main` `dcbb730` (assignment reference; fetched before implementation and again before finalization). No commit or push. Decision #190 records the adapter-local recovery and replay boundary, superseding #143's historical no-reconnect observation without editing it. The canonical index/log and archive boundary were checked at #189 before assigning the number.
+
+- `backend/app/broker_adapters/finnhub_provider.py`: one supervised WebSocket lifecycle per adapter. A successful initial connection starts the supervisor; an unexpected exception or clean iterator close disconnects, clears current-socket requests and retries with capped exponential backoff. Initial connect failure returns to the caller and creates no retry task. A desired-symbol set survives an outage and is restored on the replacement socket; the separate current-socket set backs `SubscriptionInventory`. Partial restore closes that socket and retries without reporting complete restoration. Unsubscribe removes future intent even during backoff. One listener and one socket generation route ticks; callback registrations survive retry. Manual disconnect cancels and settles the supervisor, closes the socket and clears both sets.
+- `backend/app/api/routes/finnhub_data.py`: concurrent/repeated route connects reuse the active owner; an explicit connect during retry reports `reconnecting` without constructing another bridge. A retired owner is not reused after registry takeover. Manual disconnect cancels an in-flight initial connection and settles the owner before clearing it. New route errors/logs omit transport exception text so token-bearing URLs are not exposed.
+- `backend/app/backtest_runner/engine_singleton_guard.py` and `backend/app/api/routes/backtest.py`: replay refuses a Finnhub owner that is connecting or retrying, even when `is_connected()` is false. Finnhub establishment shares the existing replay lock; replay rechecks Finnhub under that lock before replacing process-wide singletons. Existing replay serialization and Polygon/IBKR guards remain.
+- `backend/app/core/config.py`, `backend/.env.example`: positive retry delays, defaults 1 and 30 seconds, with initial <= cap validation.
+- `backend/tests/test_finnhub_reconnect.py`: controlled socket, retry, owner, inventory and replay regressions. Before implementation, all five initial regressions failed against `dcbb730` because the adapter had no injected transport/retry lifecycle.
+- Documentation: `docs/architecture/system-design.md` has component and internal reconnect/subscription diagrams; `docs/architecture/scanner-design.md` describes protected-feed behavior through an outage; `docs/architecture/backtest-runner-design.md` describes the replay exclusion and lock; `docs/decisions/confirmed-decisions.md` and `docs/decisions/INDEX.md` record #190; this section and `TESTING.md` record delivery and validation.
+
+Limits: sends remain local request evidence, not Finnhub acknowledgement, confirmed capacity or actual tick delivery. Real-feed behavior and provider limits remain unverified. No Polygon/IBKR reconnect, scanner policy, strategy, broker execution or schema change was made.
+<!-- END DELIVERY SECTION: finnhub-stream-reconnect -->
+
 <!-- BEGIN DELIVERY SECTION: protected-feed-reconciliation-status -->
 # CHANGES — `protected-feed-reconciliation-status`
 
