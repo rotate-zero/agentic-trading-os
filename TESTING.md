@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: late-tick-candle-ordering -->
+# TESTING — `late-tick-candle-ordering`
+
+Base: pushed `main` `db8cb18`. Controlled provider and bus only for the new bridge tests; no real provider or full suite. Before the bridge fix, the two deterministic older-minute cases failed: a 10:30 tick arriving after the 10:31 bucket opened prematurely closed 10:31 and later repeated 10:30, while a 10:30 tick after the wall-clock close reopened and repeated that candle. The timestamp assertion was normalized to UTC before the final baseline rerun, so these failures reflect extra or split candles rather than string formatting.
+
+- From `backend/`, serial targeted checks: `.venv/bin/pytest -q --disable-warnings tests/test_tick_ingest.py` — **8 passed** (including the two baseline failures and two paused-publication cases); `tests/test_tick_bridge_retirement.py` — **24 passed**; `tests/test_finnhub_reconnect.py` — **19 passed**; `tests/test_candle_recorder.py` — **4 passed**; `tests/test_feature_engine.py` — **81 passed**; `tests/test_main_execution_pipeline.py` — **8 passed**. **144 passed across six files**, each file run serially; the bridge file was rerun after the paused-publication cases were added.
+- The bridge cases verify that all raw `PriceUpdated` events still publish, a source-time regression inside the same minute remains in that candle, older-minute ticks neither close a newer bucket nor reopen an already closed minute, and paused close publication does not duplicate a candle, corrupt the next bucket's OHLC or let a later minute's close overtake an earlier one.
+- `test_candle_recorder.py` used the configured local PostgreSQL development/test connection (its four tests passed, with no skip) and its isolated `__TEST_ZZZZ__` rows were removed by the test fixture. No migration or task-specific persistent data was added. `git diff --check` passed at final verification.
+
+These tests establish the corrected bridge behavior for controlled sequences. The prior real Finnhub report retained only bounded anomaly samples and did not record regression source timestamps, so this delivery does not claim that any of its 22 regressions crossed a minute boundary or that the provider's trade order has been diagnosed.
+<!-- END DELIVERY SECTION: late-tick-candle-ordering -->
+
 <!-- BEGIN DELIVERY SECTION: real-finnhub-streaming-coverage-trial -->
 # TESTING — `real-finnhub-streaming-coverage-trial`
 

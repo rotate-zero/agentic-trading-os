@@ -42,8 +42,10 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   see `../docs/decisions/confirmed-decisions.md` #31) — Phase-3-minimal bridge:
   publishes every tick as `PriceUpdated`, buckets ticks into 1-minute `CandleClosed`
   events. Works for any `MarketDataProvider`, not just IBKR — shared by all three
-  adapters. Explicitly not the real Market Data Engine (Phase 4) — gets replaced
-  wholesale, not extended.
+  adapters. Older-minute ticks still publish `PriceUpdated` but cannot roll an active
+  minute backward or reopen a closed candle; same-minute source-time regressions
+  remain in the open bucket. Explicitly not the real Market Data Engine (Phase 4) —
+  gets replaced wholesale, not extended.
 - `POST /broker/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`, `GET /broker/status`
   for manual connection control (no auto-connect on app startup — see below)
 - `GET /market/candles?symbol=&count=&timeframe=` — candle backfill via whichever

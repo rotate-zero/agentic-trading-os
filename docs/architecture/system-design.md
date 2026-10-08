@@ -411,6 +411,8 @@ Finnhub badge, when disconnected:
 
 **Bridge retirement (`retired-tick-bridge-isolation`, decision #194).** Before this, `TickIngestBridge.stop()` cancelled only the flush timer. The bridge's `_on_tick` stayed registered on its provider and kept creating handlers, so after `take_over_streaming()` kept the old provider connected for the historical role (decision #33) that provider could still publish live `PriceUpdated`/`CandleClosed` events. A bridge is now `ACTIVE` → `RETIRING` (`stop()`, synchronous) → `RETIRED` (`aclose()`, owned tasks awaited).
 
+**Late-minute candle guard (`late-tick-candle-ordering`).** Every admitted tick still publishes `PriceUpdated`. For 1m bucketing, a tick from an older minute than the active bucket, or from a minute already closed by rollover or the wall-clock flush, is excluded from candle aggregation. A tick with an earlier source time **inside the active minute** remains in that bucket; OHLC follows bucket-processing order as before. The bridge keeps the last closed minute per symbol until retirement. One per-symbol lock serializes bucket updates, rollover publication and wall-clock closes, so a later minute cannot publish its close while an earlier one is still pending. This prevents an older tick from rolling the bucket backward or reopening a closed minute within one bridge lifetime. It does not reorder provider ticks, revise an already closed candle, or establish that the 22 tick timestamp regressions in the 2026-10-08 real Finnhub trial crossed minute boundaries (`TESTING.md`).
+
 **Component data flow (live path and retirement):**
 
 ```
@@ -446,9 +448,11 @@ provider callback ──► _on_tick(tick)
                                           ├─ state != ACTIVE ──► return (queued work guard)
                                           ├─ publish PriceUpdated
                                           ├─ state != ACTIVE ──► return
-                                          ├─ minute rollover? publish CandleClosed (recheck first)
-                                          └─ update bucket
-flush loop (per minute) ──► state != ACTIVE ──► stop; else publish stale buckets (recheck per bucket)
+                                          └─ per-symbol bucket lock
+                                               ├─ minute <= last closed or < active? skip candle path
+                                               ├─ newer minute? publish old CandleClosed; open new bucket
+                                               └─ same active minute? update bucket
+flush loop (per minute) ──► per-symbol lock ──► stale bucket? publish; mark closed
 
 stop()   [sync, idempotent]                    aclose()  [async, idempotent]
   ACTIVE ─► RETIRING                             stop()

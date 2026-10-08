@@ -1,3 +1,13 @@
+<!-- BEGIN DELIVERY SECTION: late-tick-candle-ordering -->
+# CHANGES — `late-tick-candle-ordering`
+
+Base: pushed `main` `db8cb18` (`Review retired bridge deliveries`). A deterministic older-minute tick sequence reproduced premature and duplicate `CandleClosed` events in `TickIngestBridge`; this is a bridge candle-path correction, not evidence that the 22 tick timestamp regressions in the 2026-10-08 real Finnhub trial crossed minute boundaries.
+
+`backend/app/services/tick_ingest.py` now retains each symbol's last closed minute until bridge retirement. Every admitted tick still publishes `PriceUpdated`, but a tick from an older minute than the active bucket, or from a minute already closed by rollover or the wall-clock flush, cannot change a candle. Same-minute source-time regressions remain in the open bucket. A per-symbol lock serializes rollover and wall-clock closes across the async bus publication, so consecutive closed candles cannot overtake or duplicate one another within a bridge. No provider, Event Bus, candle schema, database migration or execution policy changed.
+
+Four regression cases in `backend/tests/test_tick_ingest.py` cover an older tick after rollover, one after wall-clock flush, one during a paused candle publish, and a future-minute tick waiting for the prior close. `TESTING.md` records baseline reproduction and serial targeted checks. The as-built behavior is recorded in `docs/architecture/system-design.md` §4.2 and `backend/README.md`. No new architectural decision was required; the bridge still implements the existing one-minute `CandleClosed` contract. No commit, push or ZIP was made.
+<!-- END DELIVERY SECTION: late-tick-candle-ordering -->
+
 <!-- BEGIN DELIVERY SECTION: real-finnhub-streaming-coverage-trial -->
 # CHANGES — `real-finnhub-streaming-coverage-trial`
 

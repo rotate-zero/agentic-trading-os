@@ -104,6 +104,10 @@ class TickIngestBridge:
         self._provider = provider
         self._bus = bus
         self._buckets: dict[str, _MinuteBucket] = {}
+        # Needed even when the wall-clock flush leaves no active bucket.
+        self._last_closed_minute: dict[str, datetime] = {}
+        # Keep same-symbol closes ordered across the bus publish await.
+        self._bucket_locks: dict[str, asyncio.Lock] = {}
         self._state = BridgeState.ACTIVE
         # Every task this bridge creates (per-tick handlers + the flush
         # loop) is owned here until it finishes, so retirement can cancel
@@ -174,6 +178,8 @@ class TickIngestBridge:
                 except RuntimeError:  # owning event loop already closed
                     pass
         self._buckets.clear()
+        self._last_closed_minute.clear()
+        self._bucket_locks.clear()
         remover = getattr(self._provider, "remove_tick_callback", None)
         if callable(remover):
             try:
@@ -238,23 +244,29 @@ class TickIngestBridge:
         if self._state is not BridgeState.ACTIVE:
             return  # retired while the publish above was suspended
 
-        minute_ts = tick.exchange_ts.replace(second=0, microsecond=0)
-        bucket = self._buckets.get(tick.symbol)
-
-        if bucket is not None and bucket.minute_ts != minute_ts:
-            # The clock rolled over to a new minute — the previous bucket
-            # is now final, so publish it as a closed candle.
-            await self._bus.publish(
-                make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=tick.symbol)
-            )
-            bucket = None
+        lock = self._bucket_locks.setdefault(tick.symbol, asyncio.Lock())
+        async with lock:
             if self._state is not BridgeState.ACTIVE:
-                return
-
-        if bucket is None:
-            self._buckets[tick.symbol] = _MinuteBucket(minute_ts, tick.price, tick.size)
-        else:
-            bucket.add(tick.price, tick.size)
+                return  # retired while waiting for another same-symbol close
+            minute_ts = tick.exchange_ts.replace(second=0, microsecond=0)
+            closed_minute = self._last_closed_minute.get(tick.symbol)
+            if closed_minute is not None and minute_ts <= closed_minute:
+                return  # raw tick published, but never reopen a closed candle
+            bucket = self._buckets.get(tick.symbol)
+            if bucket is not None and minute_ts < bucket.minute_ts:
+                return  # an older tick must not close a newer minute
+            if bucket is not None and minute_ts > bucket.minute_ts:
+                await self._bus.publish(
+                    make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=tick.symbol)
+                )
+                if self._state is not BridgeState.ACTIVE:
+                    return
+                self._last_closed_minute[tick.symbol] = bucket.minute_ts
+                self._buckets[tick.symbol] = _MinuteBucket(minute_ts, tick.price, tick.size)
+            elif bucket is None:
+                self._buckets[tick.symbol] = _MinuteBucket(minute_ts, tick.price, tick.size)
+            else:
+                bucket.add(tick.price, tick.size)
 
     async def _flush_loop(self) -> None:
         """
@@ -299,24 +311,19 @@ class TickIngestBridge:
             return
         current_minute = now.replace(second=0, microsecond=0)
         for symbol in list(self._buckets.keys()):
-            bucket = self._buckets.get(symbol)
-            if self._state is not BridgeState.ACTIVE:
-                return  # retired mid-pass: remaining buckets are discarded
-            if bucket is not None and bucket.minute_ts < current_minute:
-                # Popped BEFORE the publish await, not after — a tick for
-                # this symbol arriving while we're awaiting the publish
-                # call below then starts a fresh bucket instead of racing
-                # this same bucket to a second CandleClosed. (_handle_tick's
-                # own rollover check doesn't pop before its await either —
-                # same known, accepted race as always existed there for two
-                # rapid same-symbol ticks; not newly introduced by this fix,
-                # and still fine to leave given this whole module is
-                # explicitly throwaway-quality, replaced wholesale by the
-                # real Market Data Engine in Phase 4, not patched forever.)
-                del self._buckets[symbol]
-                await self._bus.publish(
-                    make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=symbol)
-                )
+            lock = self._bucket_locks[symbol]
+            async with lock:
+                if self._state is not BridgeState.ACTIVE:
+                    return  # retired mid-pass: remaining buckets are discarded
+                bucket = self._buckets.get(symbol)
+                if bucket is not None and bucket.minute_ts < current_minute:
+                    await self._bus.publish(
+                        make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=symbol)
+                    )
+                    if self._state is not BridgeState.ACTIVE:
+                        return
+                    del self._buckets[symbol]
+                    self._last_closed_minute[symbol] = bucket.minute_ts
 
 
 def _has_running_loop() -> bool:
