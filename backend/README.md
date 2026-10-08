@@ -88,7 +88,9 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   see `../docs/decisions/confirmed-decisions.md` #33) — Finnhub and Polygon need to be
   connected at once now, each doing the job it's actually good at.
   `take_over_streaming()` safely hands off the streaming role without disconnecting a
-  provider still needed for historical. `IBKRAdapter`, once connected, takes over
+  provider still needed for historical, and always retires the previous `TickIngestBridge`
+  (admission off immediately, owned tasks settled) so a retained historical provider can
+  no longer publish live events (decision #194). `IBKRAdapter`, once connected, takes over
   both roles (it's capable of both) — that's always a deliberate manual action, so
   it's allowed to override whatever auto-connected at startup.
 - `POST /market-data/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`,
@@ -394,6 +396,7 @@ PostgreSQL for a complete suite rather than treating a skip-only run as final va
 | `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
 | `test_ibkr_historical.py` | DB-free mocked IBKR acquisition: canonical candles, serial chunks, exact filtering, UTC normalization/order, overlap dedup/conflict detection, auxiliary lookbacks, error/event mapping, zero bars, and cleanup without streaming or order calls |
 | `test_ibkr_backtest_route.py` | Real-PostgreSQL sibling-route validation, configuration/client-ID rules, 24-hour cap, stable failure responses, no run row on acquisition failure, successful preloaded-provider persistence, and the IBKR live-provider `409` guard |
+| `test_tick_bridge_retirement.py` | Retired `TickIngestBridge` isolation (decision #194): late callbacks create no work, queued/paused handlers and flush are cancelled, retained historical provider cannot publish after takeover, immediate clear, idempotent lifecycle, same-provider replacement, new-provider candles, Finnhub same-instance reconnect, settled shutdown. Controlled providers/bus only. |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
 | `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Also covers `count`'s `[1, 1000]` bound directly: `0`/negative → 422, `1`/`1000` still reach the route's own logic unchanged. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |

@@ -38,10 +38,14 @@ from collections.abc import Callable
 from app.broker_adapters.base import MarketDataProvider
 from app.broker_adapters.order_venue import OrderVenue
 from app.core.config import get_settings
-from app.services.tick_ingest import TickIngestBridge
+from app.services.tick_ingest import BridgeState, TickIngestBridge
 
 _streaming_provider: MarketDataProvider | None = None
 _streaming_bridge: TickIngestBridge | None = None
+# Bridges whose admission is already shut off (stop() ran synchronously) but
+# whose owned tasks have not yet been awaited. Filled by the synchronous
+# clear path and by takeover; drained by settle_retired_bridges().
+_retired_bridges: list[TickIngestBridge] = []
 _historical_provider: MarketDataProvider | None = None
 _protected_feed_wake: Callable[[], None] | None = None
 
@@ -81,6 +85,31 @@ class UnsupportedExecutionModeError(RuntimeError):
     configured mode."""
 
 
+def _retire_bridge(bridge: TickIngestBridge) -> None:
+    """Synchronous half of retirement: admission off NOW, settle later."""
+    bridge.stop()
+    if bridge.state is not BridgeState.RETIRED and not any(b is bridge for b in _retired_bridges):
+        _retired_bridges.append(bridge)
+
+
+async def settle_retired_bridges() -> None:
+    """Awaits every bridge retired so far (idempotent; no-op when none).
+    The lifecycle boundaries that call it: take_over_streaming, the
+    provider disconnect routes, and lifespan shutdown."""
+    for bridge in list(_retired_bridges):
+        await bridge.aclose()
+    _retired_bridges[:] = [b for b in _retired_bridges if b.state is not BridgeState.RETIRED]
+
+
+async def retire_streaming_bridge() -> None:
+    """Retires and settles the currently registered bridge WITHOUT changing
+    any provider role (lifespan shutdown: providers are disconnected by the
+    caller; the registry itself is left as-is)."""
+    if _streaming_bridge is not None:
+        _retire_bridge(_streaming_bridge)
+    await settle_retired_bridges()
+
+
 async def take_over_streaming(
     new_provider: MarketDataProvider, bridge: TickIngestBridge | None = None
 ) -> None:
@@ -93,29 +122,35 @@ async def take_over_streaming(
     would know two sources were feeding it at once. If it's still needed
     for the historical role, it's left connected; only its streaming
     "ownership" changes.
+
+    The previous TickIngestBridge is retired in every case (decision slug
+    retired-tick-bridge-isolation): admission is shut off synchronously,
+    then its owned tasks are settled, and only THEN does the registry
+    expose the new provider/bridge or wake the protected-feed owner. A
+    historical-only provider that stays connected therefore can no longer
+    publish live events through its old bridge. If old.disconnect() raises,
+    nothing has been retired and the registry is unchanged (as before).
     """
     global _streaming_provider, _streaming_bridge
     old = _streaming_provider
     if old is not None and old is not new_provider and _historical_provider is not old:
         await old.disconnect()
-    # Stop the OLD bridge's background flush loop (tick_ingest.py) regardless
-    # of whether the old provider itself got disconnected above — a provider
-    # kept alive for the historical role still shouldn't have two
-    # TickIngestBridge instances both registered as its on_tick callback
-    # (the second registration just silently overwrites the first's, but the
-    # first's own flush loop would otherwise run forever, doing nothing
-    # useful, until process exit).
+    # Read AFTER the await: a clear/takeover may have run while disconnecting.
     if _streaming_bridge is not None and _streaming_bridge is not bridge:
-        _streaming_bridge.stop()
+        _retire_bridge(_streaming_bridge)
+    await settle_retired_bridges()
     _streaming_provider = new_provider
     _streaming_bridge = bridge
     request_protected_feed_reconcile()
 
 
 def clear_streaming_provider() -> None:
+    """Synchronous (callers include sync fixtures). Admission of the cleared
+    bridge is shut off immediately; its task cleanup is awaited at the next
+    lifecycle boundary (settle_retired_bridges())."""
     global _streaming_provider, _streaming_bridge
     if _streaming_bridge is not None:
-        _streaming_bridge.stop()
+        _retire_bridge(_streaming_bridge)
     _streaming_provider = None
     _streaming_bridge = None
     request_protected_feed_reconcile()

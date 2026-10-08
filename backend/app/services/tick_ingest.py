@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from app.broker_adapters.base import MarketDataProvider, Tick
 from app.event_bus.bus import EventBus
@@ -40,6 +41,21 @@ logger = logging.getLogger(__name__)
 # bucket. 250ms is generous relative to real tick jitter and negligible
 # next to the multi-second-to-tens-of-seconds delay this loop exists to fix.
 _FLUSH_MARGIN = timedelta(milliseconds=250)
+
+
+class BridgeState(str, Enum):
+    """Lifecycle of one TickIngestBridge (task retired-tick-bridge-isolation).
+
+    ACTIVE   — callback registered, admitting ticks, flush loop running.
+    RETIRING — stop() has been called: admission is OFF (synchronously, in
+               the same call), owned tasks are cancelled but may not yet
+               have finished unwinding. Terminal direction only.
+    RETIRED  — aclose() has awaited every owned task; nothing owned remains.
+    """
+
+    ACTIVE = "active"
+    RETIRING = "retiring"
+    RETIRED = "retired"
 
 
 class _MinuteBucket:
@@ -76,42 +92,142 @@ class TickIngestBridge:
     PolygonAdapter's docstring). In the latter case each "bucket" just
     ends up holding a single tick, which is correct, not a bug: bucketing
     on real trade granularity when the underlying data doesn't have that
-    granularity would be fabricating precision that isn't there."""
+    granularity would be fabricating precision that isn't there.
+
+    Lifecycle (task retired-tick-bridge-isolation): ACTIVE -> RETIRING
+    (stop(), synchronous: admission off) -> RETIRED (aclose(): owned tasks
+    settled). A retired bridge may stay registered on a provider that is
+    retained for another role (e.g. historical); its callback is then inert.
+    See docs/architecture/system-design.md §4.2 "Bridge retirement"."""
 
     def __init__(self, provider: MarketDataProvider, bus: EventBus) -> None:
+        self._provider = provider
         self._bus = bus
         self._buckets: dict[str, _MinuteBucket] = {}
-        provider.on_tick(self._on_tick)
+        self._state = BridgeState.ACTIVE
+        # Every task this bridge creates (per-tick handlers + the flush
+        # loop) is owned here until it finishes, so retirement can cancel
+        # and settle exactly the work it created — and nothing else.
+        self._tick_tasks: set[asyncio.Task] = set()
+        self._flush_task: asyncio.Task | None = None
+        self._draining: set[asyncio.Task] = set()
         # Wall-clock-driven close — see _flush_loop's docstring for the bug
         # this fixes. Self-starting here (constructor, not an explicit
-        # start()) mirrors provider.on_tick(self._on_tick) immediately
-        # above: this bridge has no other lifecycle hook today (it's
-        # constructed inline by connect routes, not centrally managed by
-        # main.py's lifespan), so "alive for as long as this instance
-        # exists" already has to be true of the tick callback registration
-        # too. stop() (below) is the matching teardown, called by
-        # broker_registry when a bridge is retired.
-        self._flush_task: asyncio.Task | None = asyncio.create_task(
-            self._flush_loop(), name="tick-ingest-flush"
-        )
+        # start()) because this bridge is constructed inline by the connect
+        # routes, not centrally managed by main.py's lifespan. The flush
+        # task is created BEFORE the callback is registered so a missing
+        # event loop fails the constructor without leaving a callback
+        # registered on the provider.
+        self._flush_task = asyncio.create_task(self._flush_loop(), name="tick-ingest-flush")
+        try:
+            provider.on_tick(self._on_tick)
+        except BaseException:
+            self._flush_task.cancel()
+            self._flush_task = None
+            self._state = BridgeState.RETIRED
+            raise
+
+    # --- lifecycle ----------------------------------------------------------
+
+    @property
+    def state(self) -> BridgeState:
+        return self._state
+
+    @property
+    def is_admitting(self) -> bool:
+        """True only while ACTIVE. Checked synchronously before any task is
+        created and again before every publish."""
+        return self._state is BridgeState.ACTIVE
 
     def stop(self) -> None:
-        """Cancels the wall-clock flush loop. Called by broker_registry
-        (take_over_streaming/clear_streaming_provider) when this bridge is
-        retired, so it doesn't keep running forever against a provider
-        that's no longer the active stream — every connect route already
-        creates a fresh TickIngestBridge per connection, so without this
-        each reconnect would leak one more background task."""
-        if self._flush_task is not None and not self._flush_task.done():
-            self._flush_task.cancel()
+        """Synchronous, idempotent retirement. When this returns:
+
+          * admission is OFF — _on_tick creates no further work, and no
+            queued/in-flight handler or flush pass can call bus.publish
+            again (every publish site re-checks is_admitting first);
+          * the flush loop and every not-yet-finished tick handler are
+            cancelled (a handler that never started never runs);
+          * partially filled minute buckets are DISCARDED, not published —
+            a retired source must not emit a candle the replacement may
+            also produce for the same minute;
+          * the provider callback is removed if (and only if) the provider
+            offers a public ``remove_tick_callback`` capability; otherwise
+            it stays registered but inert.
+
+        Not undoable, and NOT awaited: cancelled tasks may still be
+        unwinding. Use ``await aclose()`` (or the registry's
+        settle_retired_bridges()) to wait for them. Events already put on
+        the EventBus queues before this call cannot be retracted."""
+        if self._state is not BridgeState.ACTIVE:
+            return
+        self._state = BridgeState.RETIRING
+        current = asyncio.current_task() if _has_running_loop() else None
+        owned = set(self._tick_tasks)
+        if self._flush_task is not None:
+            owned.add(self._flush_task)
+        self._draining |= owned
         self._flush_task = None
+        for task in owned:
+            if task is not current and not task.done():
+                try:
+                    task.cancel()
+                except RuntimeError:  # owning event loop already closed
+                    pass
+        self._buckets.clear()
+        remover = getattr(self._provider, "remove_tick_callback", None)
+        if callable(remover):
+            try:
+                remover(self._on_tick)
+            except Exception:  # noqa: BLE001 — retirement must never raise
+                logger.warning("Provider remove_tick_callback failed; callback left inert")
+
+    async def aclose(self) -> None:
+        """stop() + wait until every owned task has finished. Idempotent and
+        safe to call concurrently (each caller awaits the same tasks).
+        Never waits on a stuck bus: owned tasks are already cancelled."""
+        self.stop()
+        loop = asyncio.get_running_loop()
+        current = asyncio.current_task()
+        pending = [
+            t for t in self._draining
+            if t is not current and not t.done() and t.get_loop() is loop
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._draining = {t for t in self._draining if not t.done()}
+        if not self._draining:
+            self._state = BridgeState.RETIRED
+        elif all(t.get_loop() is not loop for t in self._draining):
+            # Leftovers belong to a different (closed) loop and cannot be
+            # awaited here; nothing further can be settled.
+            self._draining.clear()
+            self._state = BridgeState.RETIRED
+
+    # --- tick path ------------------------------------------------------------
 
     def _on_tick(self, tick: Tick) -> None:
         # on_tick's callback is sync per the MarketDataProvider interface,
         # but EventBus.publish() is async — hand off to the running loop.
-        asyncio.create_task(self._handle_tick(tick))
+        # A retired bridge's callback may still be registered on a provider
+        # that was kept for another role; it must create NO new work.
+        if self._state is not BridgeState.ACTIVE:
+            return
+        task = asyncio.create_task(self._handle_tick(tick), name="tick-ingest-tick")
+        self._tick_tasks.add(task)
+        task.add_done_callback(self._tick_task_done)
+
+    def _tick_task_done(self, task: asyncio.Task) -> None:
+        self._tick_tasks.discard(task)
+        self._draining.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Tick handling failed", exc_info=task.exception())
 
     async def _handle_tick(self, tick: Tick) -> None:
+        # Queued work guard: a handler scheduled while ACTIVE may first run
+        # after retirement (cancellation normally prevents that; this guard
+        # also covers a handler already running when it was retired).
+        if self._state is not BridgeState.ACTIVE:
+            return
         await self._bus.publish(
             make_envelope(
                 EventType.PRICE_UPDATED,
@@ -119,6 +235,8 @@ class TickIngestBridge:
                 symbol=tick.symbol,
             )
         )
+        if self._state is not BridgeState.ACTIVE:
+            return  # retired while the publish above was suspended
 
         minute_ts = tick.exchange_ts.replace(second=0, microsecond=0)
         bucket = self._buckets.get(tick.symbol)
@@ -130,6 +248,8 @@ class TickIngestBridge:
                 make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=tick.symbol)
             )
             bucket = None
+            if self._state is not BridgeState.ACTIVE:
+                return
 
         if bucket is None:
             self._buckets[tick.symbol] = _MinuteBucket(minute_ts, tick.price, tick.size)
@@ -163,7 +283,7 @@ class TickIngestBridge:
         the past", not "is this bucket exactly one minute old").
         """
         try:
-            while True:
+            while self._state is BridgeState.ACTIVE:
                 await asyncio.sleep(self._seconds_until_next_flush())
                 await self._flush_stale_buckets(datetime.now(timezone.utc))
         except asyncio.CancelledError:
@@ -175,9 +295,13 @@ class TickIngestBridge:
         return max(0.0, (next_boundary - now).total_seconds())
 
     async def _flush_stale_buckets(self, now: datetime) -> None:
+        if self._state is not BridgeState.ACTIVE:
+            return
         current_minute = now.replace(second=0, microsecond=0)
         for symbol in list(self._buckets.keys()):
             bucket = self._buckets.get(symbol)
+            if self._state is not BridgeState.ACTIVE:
+                return  # retired mid-pass: remaining buckets are discarded
             if bucket is not None and bucket.minute_ts < current_minute:
                 # Popped BEFORE the publish await, not after — a tick for
                 # this symbol arriving while we're awaiting the publish
@@ -193,3 +317,11 @@ class TickIngestBridge:
                 await self._bus.publish(
                     make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=symbol)
                 )
+
+
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True

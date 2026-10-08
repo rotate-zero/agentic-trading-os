@@ -409,6 +409,55 @@ Finnhub badge, when disconnected:
                                an assumed one
 ```
 
+**Bridge retirement (`retired-tick-bridge-isolation`, decision #194).** Before this, `TickIngestBridge.stop()` cancelled only the flush timer. The bridge's `_on_tick` stayed registered on its provider and kept creating handlers, so after `take_over_streaming()` kept the old provider connected for the historical role (decision #33) that provider could still publish live `PriceUpdated`/`CandleClosed` events. A bridge is now `ACTIVE` → `RETIRING` (`stop()`, synchronous) → `RETIRED` (`aclose()`, owned tasks awaited).
+
+**Component data flow (live path and retirement):**
+
+```
+                 ticks                                   ticks
+ historical+streaming provider              new streaming provider
+   (e.g. Polygon, retained)                 (e.g. Finnhub)
+          │ on_tick callback                        │ on_tick callback
+          ▼                                         ▼
+ old TickIngestBridge  ── retired ──╳        new TickIngestBridge (ACTIVE)
+ (inert: _on_tick returns,                         │ PriceUpdated / CandleClosed
+  no task, no publish)                             ▼
+                                                Event Bus ──► CandleRecorder, engines, WebSocket gateway
+ broker_registry
+   take_over_streaming(new_provider, new_bridge)
+     1. disconnect previous provider unless it is still the historical provider
+     2. retire previous bridge: stop() now, then await settle
+     3. only then: _streaming_provider/_streaming_bridge = new,
+        request_protected_feed_reconcile()
+   clear_streaming_provider()   (sync)  ──► stop() now; cleanup deferred
+   settle_retired_bridges()  ◄── next takeover, /disconnect routes, lifespan shutdown
+   retire_streaming_bridge() ◄── lifespan shutdown (provider roles untouched)
+```
+
+**Internal bridge flow:**
+
+```
+provider callback ──► _on_tick(tick)
+                        ├─ state != ACTIVE ──► return (no task created)
+                        └─ ACTIVE ──► create tracked task ──► _handle_tick
+                                          ├─ state != ACTIVE ──► return (queued work guard)
+                                          ├─ publish PriceUpdated
+                                          ├─ state != ACTIVE ──► return
+                                          ├─ minute rollover? publish CandleClosed (recheck first)
+                                          └─ update bucket
+flush loop (per minute) ──► state != ACTIVE ──► stop; else publish stale buckets (recheck per bucket)
+
+stop()   [sync, idempotent]                    aclose()  [async, idempotent]
+  ACTIVE ─► RETIRING                             stop()
+  cancel flush task + unfinished tick tasks      await gather(cancelled owned tasks)
+  clear partial buckets (never published)        RETIRING ─► RETIRED
+  provider.remove_tick_callback(cb) if offered   (never waits on a stuck bus: tasks already cancelled)
+```
+
+**What retirement prevents, precisely.** After `stop()` returns: (1) no new handler task is created by a late provider callback; (2) handlers created but not yet started never run, and a handler suspended inside a publish is cancelled; (3) no publish call is started from this bridge, whether by a queued handler, a handler resuming, or the flush loop; (4) partially filled buckets are dropped rather than published, so a retired source cannot emit a candle the replacement also produces for that minute. **What it cannot prevent:** an envelope already put on the Event Bus queue before `stop()` cannot be retracted and subscribers may still process it. `EventBus.publish()` is an unbounded `Queue.put`, so a publish never suspends on the production bus and cannot be interrupted halfway. A replacement bridge built by a connect route admits from its own construction, so a short overlap with the old bridge before `take_over_streaming()` is called is unchanged.
+
+**Callback limitation.** `MarketDataProvider` has no public removal method. The bridge calls `remove_tick_callback(callback)` only if a provider offers it (none shipped does) and otherwise leaves its callback registered but inert. A provider that outlives many bridges therefore keeps one dead bound method per retired bridge; each costs one state check per tick and nothing else. The registry never edits a provider's private callback list. A same-instance Finnhub reconnect re-uses its one adapter, callback and active bridge, so it neither duplicates callbacks nor retires anything. `take_over_streaming()` calls are still not serialized against each other.
+
 ### 4.3 Market Clock
 The single source of truth for anything time/session-related. Every other module asks the Market Clock rather than computing this itself.
 

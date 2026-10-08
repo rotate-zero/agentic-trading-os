@@ -524,6 +524,9 @@ async def lifespan(app: FastAPI):
             await protected_feed_reconciler.stop()
         for provider in broker_registry.get_all_active_providers():
             await provider.disconnect()
+        # Retire the registered bridge and settle every retired bridge's
+        # tasks (no provider-role change) so none outlive the lifespan.
+        await broker_registry.retire_streaming_bridge()
 
         # ContextEngine stops here, BEFORE the bus — it's a pure
         # publisher, not a subscriber like the engines below, so decision

@@ -1,3 +1,22 @@
+<!-- BEGIN DELIVERY SECTION: retired-tick-bridge-isolation -->
+# CHANGES — `retired-tick-bridge-isolation`
+
+Base: GitHub `main` `95490d0` (fetched before implementation and again before packaging; unchanged). No commit, push or ZIP applied here. Decision #194 records the bridge lifecycle and takeover ordering; no earlier decision is changed (it extends #33's two-role registry and preserves #190's Finnhub reconnect behavior).
+
+**Defect reproduced first.** `TickIngestBridge.stop()` cancelled only the flush timer; the bridge's `_on_tick` stayed registered and kept creating handlers. `take_over_streaming()` can leave the previous provider connected for the historical role, so its old bridge could still publish live `PriceUpdated`/`CandleClosed` events after takeover. Against the base, 17 of the 21 new tests fail (see `TESTING.md`); the behavioural ones show retained-provider ticks reaching the bus after takeover and after clear.
+
+- `backend/app/services/tick_ingest.py`: new `BridgeState` (`ACTIVE`/`RETIRING`/`RETIRED`), `state`/`is_admitting`, synchronous idempotent `stop()` and awaited `aclose()`. `stop()` turns admission off in the same call, cancels the flush loop and every unfinished tick handler, discards partial minute buckets without publishing, and calls the provider's `remove_tick_callback` only if that public capability exists (failures are logged, never raised). `_on_tick` creates no task unless `ACTIVE`; tick tasks are now tracked and their failures logged; `_handle_tick` and the flush loop recheck admission before every publish, so queued or resumed work cannot publish. `aclose()` awaits only this bridge's cancelled tasks, never a stuck bus, and tolerates tasks from a closed loop. The constructor creates the flush task before registering the callback so a failed construction leaves nothing registered.
+- `backend/app/services/broker_registry.py`: `take_over_streaming()` retires the previous bridge in every case (including a provider kept for the historical role) and settles it before exposing the new provider/bridge or waking the protected-feed owner; a failing `old.disconnect()` still leaves the registry unchanged. `clear_streaming_provider()` stays synchronous with immediate admission shutdown. New `settle_retired_bridges()` (awaited cleanup) and `retire_streaming_bridge()` (lifespan shutdown, no role change). The old comment claiming a second `on_tick` registration "overwrites" the first was wrong (adapters append) and is replaced.
+- `backend/app/api/routes/{broker,market_data,finnhub_data}.py`: disconnect routes await `settle_retired_bridges()` after clearing; the Finnhub connect-failure path awaits `bridge.aclose()` instead of the old fire-and-forget `stop()`.
+- `backend/app/main.py`: lifespan shutdown awaits `retire_streaming_bridge()` after provider disconnects so no bridge task outlives the lifespan.
+- `backend/tests/test_tick_bridge_retirement.py` (new): 21 controlled-provider tests.
+- Documentation: `docs/architecture/system-design.md` §4.2 gains "Bridge retirement" with component data-flow and internal retirement/drain diagrams, the precise prevention boundary and the callback limitation; `docs/decisions/confirmed-decisions.md` and `INDEX.md` gain #194; `backend/README.md` registry paragraph and test table updated; `CHANGES.md` and `TESTING.md` complete, history preserved.
+
+**Unchanged by design:** historical-provider access (a retained provider stays connected and registered), active tick/candle semantics, Finnhub's same-instance reconnect (one adapter, one callback, one active bridge), provider selection, scanner policy and the Event Bus.
+
+**Limitations.** Envelopes already queued on the Event Bus cannot be retracted. No shipped provider offers `remove_tick_callback`, so a retired bridge's callback stays registered but inert (one dead bound method per retired bridge on a long-lived provider). A replacement bridge built by a connect route admits from its own construction, so the short overlap before the takeover call is unchanged. Concurrent `take_over_streaming()` calls are still not serialized. Related follow-ups, not implemented: adding `remove_tick_callback` to the adapters, and deferring a new bridge's admission until takeover.
+<!-- END DELIVERY SECTION: retired-tick-bridge-isolation -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-universe-feed-request -->
 # CHANGES — `scanner-universe-feed-request`
 

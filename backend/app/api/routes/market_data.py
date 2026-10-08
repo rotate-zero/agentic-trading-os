@@ -118,6 +118,7 @@ async def disconnect() -> dict:
         if broker_registry.get_streaming_provider() is _provider:
             broker_registry.clear_streaming_provider()
     _provider = None
+    await broker_registry.settle_retired_bridges()
     return {"status": "disconnected"}
 
 
