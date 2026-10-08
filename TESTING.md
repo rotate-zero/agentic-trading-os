@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: scanner-universe-feed-request -->
+# TESTING — `scanner-universe-feed-request`
+
+Base: GitHub `main` `e84934a`; the fetched tip remained unchanged before assigning decision #193. Focused checks ran serially; no full suite, real provider key or broker connection. The new database tests create only `symbols` and `scanner_universe_symbols` in a scratch PostgreSQL schema, drop it after each case, and never edit the public saved universe, candle or ledger tables.
+
+- Backend: `.venv/bin/pytest -q --disable-warnings tests/test_scanner_universe_feed_request.py tests/test_scanner_universe.py tests/test_scanner_state_route.py tests/test_scanner_route_concurrency.py tests/test_finnhub_reconnect.py tests/test_protected_feed_reconciliation.py` — **53 passed**. The new tests cover empty persisted set, offloaded session ownership, actual POST route, locally present requests, failed inventory read, sequential returned/failed requests with safe error class, missing/disconnected provider, failed provider check, read failure, provider takeover (including inside the last subscribe) and disconnect mid-batch, duplicate-batch rejection, saved-universe edit after capture, and replay contention both before and during the database read. A scoped SQL statement recorder confirms the request's database work is SELECT only; controlled providers record and assert no unsubscribe calls.
+- Frontend: a temporary jsdom 26.1.0 / React `act` harness outside the repository bundled the actual `UniverseTab` and API client and replaced only `fetch` — **passed**. It exercised the POST, repeated same-tick clicks, pending state, a partial result, a universe removal during the request, preservation of the submitted symbol set, another request after settlement and late completion after unmount. The harness is not a repository dependency. `npm run build` (`tsc -b && vite build`) — **passed** with Vite's existing large-chunk advisory; generated `tsconfig.tsbuildinfo` was restored to its tracked contents.
+- `git diff --check` — checked at final review. No automatic full suite was run.
+
+These checks establish local request ordering and response projection. They do not establish provider acknowledgement, capacity, real-feed delivery or continuous coverage. A provider takeover during an already awaited `subscribe()` can let that one call finish; the next symbol uses the rechecked owner and is left unattempted when it changes.
+<!-- END DELIVERY SECTION: scanner-universe-feed-request -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-observation-lifespan -->
 # TESTING — `scanner-observation-lifespan`
 

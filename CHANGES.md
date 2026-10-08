@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: scanner-universe-feed-request -->
+# CHANGES — `scanner-universe-feed-request`
+
+Base: GitHub `main` `e84934a` (fetched before implementation and again before numbering). No commit, push or ZIP. Decision #193 records the explicit operator route and batch/replay coordination, implementing #189's manual-first direction without changing its capacity or promotion policy.
+
+- `backend/app/api/routes/scanner.py`: `POST /scanner/request-universe-feeds` captures the persisted universe through `DbUniverseProvider` in an offloaded, session-owning read. It rejects failed reads and missing/disconnected providers, uses the current streaming registry owner, checks optional local inventory, sends sequential single-symbol requests and reports captured symbols, provider identity and per-symbol outcomes. One in-process batch lock rejects duplicates; the existing replay/connection slot excludes sends during replay. A takeover or disconnect leaves remaining symbols `not_attempted`. Errors returned to clients are fixed details or coarse classes, with no raw provider exception text.
+- `frontend/src/services/api-client.ts` and `components/scanner/ScannerPanel.tsx`: an explicit Universe-tab action, synchronous duplicate-click guard, pending/error/partial-result display and captured result snapshot. A tab switch or unmount ignores a late response; it does not cancel requests already sent. Existing universe editing, Results tab and scheduled observation remain separate.
+- `backend/tests/test_scanner_universe_feed_request.py`: isolated PostgreSQL schema and controlled-provider checks. `docs/architecture/scanner-design.md` §18.16 and `system-design.md` describe component and internal flows; `docs/roadmap/phase-roadmap.md` distinguishes built manual requests from unbuilt automated acquisition. The canonical decision log/index record #193, and `TESTING.md` records targeted validation.
+
+The route makes local subscription requests only. Provider acknowledgement, account capacity, live delivery, automatic universe reconciliation, C2 promotion and C4 relay priority remain unresolved.
+<!-- END DELIVERY SECTION: scanner-universe-feed-request -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-observation-lifespan -->
 # CHANGES — `scanner-observation-lifespan`
 

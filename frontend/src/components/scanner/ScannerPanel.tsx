@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useWorkspace } from "../../state/WorkspaceContext";
 import { useScannerObservation } from "../../hooks/useScannerObservation";
 import { useScannerState } from "../../hooks/useScannerState";
@@ -7,7 +7,9 @@ import type {
   ScannerObservationDetailWireShape,
   ScannerObservationRowWireShape,
   ScannerResultWireShape,
+  ScannerUniverseFeedRequestWireShape,
 } from "../../services/api-client";
+import { ApiError, requestScannerUniverseFeeds } from "../../services/api-client";
 
 const MIN_WIDTH = 64;
 const MAX_WIDTH = 480;
@@ -393,7 +395,7 @@ function ScheduledObservationSection() {
   );
 }
 
-function UniverseTab() {
+export function UniverseTab() {
   const {
     symbols,
     hasLoaded,
@@ -410,6 +412,34 @@ function UniverseTab() {
   } = useScannerUniverse();
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const feedPendingRef = useRef(false);
+  const feedMountedRef = useRef(false);
+  const [feedPending, setFeedPending] = useState(false);
+  const [feedError, setFeedError] = useState<string | null>(null);
+  const [feedResult, setFeedResult] = useState<ScannerUniverseFeedRequestWireShape | null>(null);
+
+  useEffect(() => {
+    feedMountedRef.current = true;
+    return () => { feedMountedRef.current = false; };
+  }, []);
+
+  const handleRequestFeeds = async () => {
+    // Set before the first await; two clicks in one render send one batch.
+    if (feedPendingRef.current) return;
+    feedPendingRef.current = true;
+    setFeedPending(true);
+    setFeedError(null);
+    setFeedResult(null);
+    try {
+      const result = await requestScannerUniverseFeeds();
+      if (feedMountedRef.current) setFeedResult(result); // response owns its captured universe
+    } catch (err: unknown) {
+      if (feedMountedRef.current) setFeedError(err instanceof ApiError ? err.message : "Feed request failed.");
+    } finally {
+      feedPendingRef.current = false;
+      if (feedMountedRef.current) setFeedPending(false);
+    }
+  };
 
   const handleAdd = async () => {
     // `mutating` is render-late; the hook's own synchronous guard is what
@@ -459,6 +489,28 @@ function UniverseTab() {
       </div>
 
       <div className="shrink-0 border-t border-base-border p-2">
+        <div className="mb-2 border-b border-base-border pb-2">
+          <p className="mb-1 font-mono text-[10px] text-text-muted">
+            Request saved-universe feeds from the current streaming provider. This does not verify feed capacity or delivery.
+          </p>
+          <button
+            onClick={handleRequestFeeds}
+            disabled={feedPending}
+            className="rounded border border-base-border px-2 py-1 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary disabled:opacity-50"
+          >
+            {feedPending ? "Requesting universe feeds…" : "Request universe feeds"}
+          </button>
+          {feedError && <div role="alert" className="mt-1 font-mono text-[10px] text-bear">{feedError}</div>}
+          {feedResult && (
+            <div data-testid="universe-feed-result" className="mt-1 max-h-36 overflow-y-auto font-mono text-[10px] text-text-muted">
+              <div>Saved universe captured: {feedResult.universe.length === 0 ? "empty" : feedResult.universe.join(", ")}. Provider: {feedResult.provider.provider_id} ({feedResult.provider.class_name}).</div>
+              <div>{feedResult.status === "completed" ? "Requests completed locally" : feedResult.status === "partial_failure" ? "Partial request failure" : `Batch stopped: ${feedResult.reason?.replace(/_/g, " ") ?? "interrupted"}`}. No provider acknowledgement or delivery is established.</div>
+              {feedResult.results.map((row) => (
+                <div key={row.symbol}>{row.symbol}: {row.outcome.replace(/_/g, " ")}{row.error_class ? ` (${row.error_class})` : ""}</div>
+              ))}
+            </div>
+          )}
+        </div>
         {mutationError && <div className="mb-1 font-mono text-[10px] text-bear">{mutationError}</div>}
         {loadError && hasLoaded && (
           <div className="mb-1 font-mono text-[10px] text-bear">

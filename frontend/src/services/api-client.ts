@@ -1378,6 +1378,26 @@ export async function fetchScannerUniverse(): Promise<ScannerUniverseEntryWireSh
   return wire.symbols;
 }
 
+export interface ScannerUniverseFeedRequestWireShape {
+  status: "completed" | "partial_failure" | "interrupted";
+  reason: "provider_changed" | "provider_disconnected" | "provider_check_failed" | null;
+  universe: string[];
+  provider: { provider_id: string; class_name: string };
+  results: Array<{
+    symbol: string;
+    outcome: "locally_present" | "request_returned" | "request_failed" | "not_attempted";
+    error_class: "timeout" | "connection" | "other" | null;
+  }>;
+}
+
+/** Explicit request for the saved universe. Outcomes are local request
+ * evidence, never provider acknowledgement, capacity or delivery. */
+export async function requestScannerUniverseFeeds(): Promise<ScannerUniverseFeedRequestWireShape> {
+  const res = await fetch(`${API_BASE_URL}/scanner/request-universe-feeds`, { method: "POST" });
+  if (!res.ok) throw new ApiError(await parseErrorDetail(res), res.status);
+  return (await res.json()) as ScannerUniverseFeedRequestWireShape;
+}
+
 /**
  * POST /scanner/universe — idempotent (re-adding an existing symbol is
  * a no-op, not an error). Throws ApiError with status 400 if the symbol

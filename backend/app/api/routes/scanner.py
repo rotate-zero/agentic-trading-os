@@ -44,6 +44,11 @@ row's score inputs came from, UTC, `null` when unknown) and a top-level
 `read_at` (the server clock at the moment of the one snapshot read), so a
 client can state a source age relative to that read without using its own
 clock. Neither is a freshness classification or feed-health evidence.
+
+`POST /scanner/request-universe-feeds` is an explicit operator action over
+the saved universe. It reads through an offloaded owned session, sends only
+to the current connected streaming registry owner, and returns local request
+outcomes. It does not run a scan, edit the universe or verify delivery.
 """
 from __future__ import annotations
 
@@ -56,6 +61,8 @@ from typing import Any, Protocol
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from app.backtest_runner.engine_singleton_guard import finnhub_connection_slot, replay_slot_busy
+from app.broker_adapters.base import SubscriptionInventory
 from app.core.config import get_settings
 from app.db.session import SessionLocal
 from app.scanner.runner import run_scan
@@ -68,10 +75,16 @@ from app.scanner.universe import (
     list_universe_symbols,
     remove_symbol_from_universe,
 )
+from app.services import broker_registry
+from app.services.protected_feed_reconciliation import _classify_error, _provider_identity
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/scanner", tags=["scanner"])
+
+# One in-process batch. The locked check and acquisition have no await between
+# them, so a duplicate request is rejected instead of queued behind a batch.
+_universe_feed_batch_lock = asyncio.Lock()
 
 
 class AddSymbolRequest(BaseModel):
@@ -294,6 +307,100 @@ async def get_scanner_observation(
 async def get_scanner_universe() -> dict[str, Any]:
     symbols = await asyncio.to_thread(list_universe_symbols, SessionLocal)
     return {"symbols": symbols}
+
+
+@router.post("/request-universe-feeds")
+async def request_universe_feeds() -> dict[str, Any]:
+    """Request the captured persisted universe from the current live owner.
+
+    Results describe local requests only. There is no provider acknowledgement,
+    delivery or capacity check, and this route never changes the universe.
+    """
+    if _universe_feed_batch_lock.locked():
+        raise HTTPException(status_code=409, detail="A universe feed request is already running.")
+    if replay_slot_busy():
+        raise HTTPException(status_code=409, detail="A replay or connection transition is in progress.")
+
+    async with _universe_feed_batch_lock:
+        try:
+            # DbUniverseProvider opens and closes its own Session in the worker.
+            # Unlike GET /scanner/state, an empty persisted set stays empty.
+            universe = await asyncio.to_thread(DbUniverseProvider(SessionLocal).get_core_universe)
+        except Exception as exc:
+            logger.warning("Scanner universe feed read failed (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="The saved scanner universe could not be read.") from None
+
+        if replay_slot_busy():
+            raise HTTPException(status_code=409, detail="A replay or connection transition is in progress.")
+        # The same process-wide slot used by replay installation and Finnhub
+        # connection establishment prevents live requests during replay.
+        async with finnhub_connection_slot():
+            provider = broker_registry.get_streaming_provider()
+            if provider is None:
+                raise HTTPException(status_code=409, detail="No streaming provider is installed.")
+            try:
+                connected = provider.is_connected()
+            except Exception as exc:
+                logger.warning("Scanner universe feed provider check failed (%s)", type(exc).__name__)
+                raise HTTPException(status_code=409, detail="Streaming provider availability could not be checked.") from None
+            if not connected:
+                raise HTTPException(status_code=409, detail="The streaming provider is disconnected.")
+
+            identity = _provider_identity(provider)
+            results: list[dict[str, str | None]] = []
+            interruption: str | None = None
+            for symbol in universe:
+                if broker_registry.get_streaming_provider() is not provider:
+                    interruption = "provider_changed"
+                else:
+                    try:
+                        if not provider.is_connected():
+                            interruption = "provider_disconnected"
+                    except Exception:
+                        interruption = "provider_check_failed"
+                if interruption is not None:
+                    results.append({"symbol": symbol, "outcome": "not_attempted", "error_class": None})
+                    continue
+
+                # Inventory is a record of locally returned requests, not a
+                # server acknowledgement. If unavailable, ask the adapter.
+                present = False
+                if isinstance(provider, SubscriptionInventory):
+                    try:
+                        present = symbol in provider.get_subscription_snapshot()
+                    except Exception as exc:
+                        logger.warning("Scanner universe feed inventory read failed (%s)", type(exc).__name__)
+                if present:
+                    results.append({"symbol": symbol, "outcome": "locally_present", "error_class": None})
+                    continue
+                try:
+                    await provider.subscribe([symbol])
+                except Exception as exc:
+                    logger.warning("Scanner universe feed request failed for %s (%s)", symbol, type(exc).__name__)
+                    results.append({"symbol": symbol, "outcome": "request_failed", "error_class": _classify_error(exc)})
+                else:
+                    results.append({"symbol": symbol, "outcome": "request_returned", "error_class": None})
+
+            # A takeover can occur inside the last awaited subscribe(). Keep
+            # the returned request evidence, but do not label its old owner
+            # as a completed current-provider batch.
+            if interruption is None and broker_registry.get_streaming_provider() is not provider:
+                interruption = "provider_changed"
+            if interruption is None:
+                try:
+                    if not provider.is_connected():
+                        interruption = "provider_disconnected"
+                except Exception:
+                    interruption = "provider_check_failed"
+            return {
+                "status": "interrupted" if interruption else (
+                    "partial_failure" if any(item["outcome"] == "request_failed" for item in results) else "completed"
+                ),
+                "reason": interruption,
+                "universe": list(universe),
+                "provider": {"provider_id": identity.provider_id, "class_name": identity.class_name},
+                "results": results,
+            }
 
 
 async def _refresh_context_after_universe_add(request: Request, symbol: str) -> None:
