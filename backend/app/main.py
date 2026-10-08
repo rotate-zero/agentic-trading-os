@@ -221,6 +221,7 @@ async def lifespan(app: FastAPI):
     from app.position_monitor.engine import ExitIntent, PositionMonitor
     from app.position_monitor.handoff import ObservationState
     from app.position_monitor.portfolio_state_reader import PortfolioStatePositionReader
+    from app.services.protected_feed_reconciliation import ProtectedFeedReconciler
     from app.models.execution_ledger import ExitRequest, Position
     from sqlalchemy import select
 
@@ -229,6 +230,7 @@ async def lifespan(app: FastAPI):
     portfolio_state = None
     position_monitor = None
     outcome_recorder = None
+    protected_feed_reconciler = None
     execution_venue = None
     app.state.world_view_portfolio_reader = None
     app.state.position_monitor = None
@@ -365,6 +367,12 @@ async def lifespan(app: FastAPI):
             # workers) already completed without raising.
             app.state.execution_startup_status = _execution_startup_status("ready")
 
+            # Protective feed needs are independent of scanner membership.
+            # The owner makes an immediate request and repeats at decision
+            # #189's 60-second interval against the current registry role.
+            protected_feed_reconciler = ProtectedFeedReconciler(SessionLocal)
+            protected_feed_reconciler.start()
+
             # Recorder failure cannot change an otherwise ready execution pipeline.
             try:
                 outcome_recorder = OutcomeRecorder(
@@ -407,6 +415,8 @@ async def lifespan(app: FastAPI):
         broker_registry.clear_execution_venue()
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
+        if protected_feed_reconciler is not None:
+            await protected_feed_reconciler.stop()
         if authorizer_stub is not None:
             authorizer_stub.deactivate()
         if execution_engine is not None:
@@ -458,6 +468,9 @@ async def lifespan(app: FastAPI):
         # the database just because nobody's watching anymore. That's
         # what was racing test cleanup: not a timing window in the
         # stop() sequence itself, but shutdown never running at all.
+        # Settle the only subscription owner before disconnecting providers.
+        if protected_feed_reconciler is not None:
+            await protected_feed_reconciler.stop()
         for provider in broker_registry.get_all_active_providers():
             await provider.disconnect()
 

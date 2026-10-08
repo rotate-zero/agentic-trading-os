@@ -1,3 +1,15 @@
+<!-- BEGIN DELIVERY SECTION: protected-feed-reconciliation -->
+# TESTING — `protected-feed-reconciliation`
+
+Base: GitHub `main` `a63dd0f`; targeted tests run serially with the repository's `backend/.venv`. Local PostgreSQL `trading_workspace` at `localhost:5432` was used for the isolated projection fixture and existing execution startup checks; test-owned trade/order/position rows were removed by fixture cleanup. No real provider connection or full suite.
+
+- `backend/.venv/bin/pytest -q backend/tests/test_protected_feed_reconciliation.py` — 6 passed. The projection test covers restored open/closing positions, each approved/submitted/partially-filled/unknown working status, terminal orders, closed positions, mode isolation and deduplication. Controlled providers cover manual-symbol retention after needs shrink, partial request failure, failed reads, unavailable inventory repeat requests, disconnect/retry, provider takeover, exposure changes on later cycles, overlap, shutdown cancellation, and the timer-driven next cycle. An in-process Event Bus, TickIngestBridge, PositionMonitor and SimulatedVenue check tick delivery for a protected symbol absent from a controlled scanner universe.
+- `backend/.venv/bin/pytest -q --disable-warnings backend/tests/test_execution_startup_status_route.py backend/tests/test_main_execution_pipeline.py::test_world_view_stays_unavailable_when_startup_reconciliation_blocks_entries backend/tests/test_main_execution_pipeline.py::test_position_monitor_places_durable_exit_and_closes_on_later_tick` — 8 passed. Clean startup still reaches ready; reconciliation discrepancy remains blocked; the existing monitor/execution path still closes on a later tick.
+- Provider regression run initially found two tests that asserted the older retained-record behavior after Finnhub/IBKR disconnect. Those assertions were updated for the required old-session reset, and a same-instance reconnect request check was added. The final serial command combining the six new tests, provider diagnostics/adapter tests, execution startup status, blocked reconciliation and existing monitor integration passed **62/62** (`--disable-warnings`; 3,031 dependency deprecation warnings). A first combined run exposed the new integration test patching the shared `MarketClock` instance; it was corrected to inject its own clock, and the same combined command then passed.
+
+The first sandboxed PostgreSQL run could not open the local database connection; the identical targeted check passed outside that network sandbox. The fixture never touches live trading or external provider accounts.
+<!-- END DELIVERY SECTION: protected-feed-reconciliation -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-observation-source-timestamps -->
 # TESTING — `scanner-observation-source-timestamps`
 

@@ -46,12 +46,23 @@ async def test_route_reports_unavailable_without_an_active_lifespan():
     assert response.json() == {"status": "unavailable", "reason_code": None, "discrepancy_count": None}
 
 
-def test_successful_startup_reports_ready():
+def test_successful_startup_reports_ready(monkeypatch):
+    from app.services.protected_feed_reconciliation import ProtectedFeedReconciler
+
+    started = []
+    original_start = ProtectedFeedReconciler.start
+
+    def track_start(self):
+        started.append(self)
+        original_start(self)
+
+    monkeypatch.setattr(ProtectedFeedReconciler, "start", track_start)
     with TestClient(fastapi_app) as client:
         response = client.get("/health/execution-startup")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready", "reason_code": None, "discrepancy_count": None}
+    assert len(started) == 1
 
     # Shutdown state, covered here too: once the lifespan context exits,
     # the app-owned status is cleared the same way world_view_portfolio_
@@ -77,11 +88,13 @@ def test_recorder_startup_failure_does_not_change_ready_execution_status(monkeyp
 def test_reconciliation_discrepancy_reports_blocked_with_a_safe_count(monkeypatch):
     from app.portfolio_state.reconciliation import ReconciliationReport
     from app.trading_intelligence.outcome_recorder import OutcomeRecorder
+    from app.services.protected_feed_reconciliation import ProtectedFeedReconciler
 
     starts = []
     async def recorder_start(self):
         starts.append(True)
     monkeypatch.setattr(OutcomeRecorder, "start", recorder_start)
+    monkeypatch.setattr(ProtectedFeedReconciler, "start", lambda self: starts.append("protected"))
 
     async def discrepant_reconciliation(*args):
         return ReconciliationReport(discrepancies=["mismatch A", "mismatch B", "mismatch C"])

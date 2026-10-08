@@ -304,8 +304,8 @@ async def get_subscription_status() -> dict:
     `status` says whether a streaming provider is registered at all
     ("unavailable" + reason `no_streaming_provider` otherwise). `inventory`
     is a separate verdict: "unavailable" (never an empty confirmed list) when
-    the provider is disconnected — an adapter keeps its local record across
-    a disconnect, and that retained record is not an active inventory — when
+    the provider is disconnected — any retained local record is not an active
+    inventory — when
     the adapter has no snapshot capability (existing doubles, future
     providers), or when the snapshot read fails or returns something other
     than a sequence of strings. Distinct from GET /market/feed-status, which

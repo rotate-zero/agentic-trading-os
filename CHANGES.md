@@ -1,3 +1,17 @@
+<!-- BEGIN DELIVERY SECTION: protected-feed-reconciliation -->
+# CHANGES — `protected-feed-reconciliation`
+
+Base: latest GitHub `main` `a63dd0f` (fetched before implementation and rechecked before handoff). Decision #189 already approves keeping protected observations independent of scanner membership; no new decision was required. No commit, push or ZIP.
+
+- Added `backend/app/services/protected_feed_reconciliation.py`: a simulated-only, distinct symbol projection from positive open/closing positions and the ledger's existing non-terminal order statuses, read in a worker-owned PostgreSQL session; one lifecycle-owned, non-overlapping request loop runs immediately after successful execution startup and then every 60 seconds after each cycle. It rereads the current streaming role, skips missing/disconnected providers, uses local inventory only to skip repeat requests, logs failed reads/requests, and requests one symbol at a time so partial failure remains retryable. It never unsubscribes.
+- `backend/app/main.py` starts the owner only after the execution path reaches `ready`; rollback and normal shutdown settle it before streaming providers disconnect. Reconciliation discrepancies still leave execution blocked.
+- Finnhub and IBKR discard old-session subscription bookkeeping on disconnect, including unexpected connection loss, so a later same-instance connection can accept new requests. Polygon's polling set is unchanged. `GET /market/subscription-status` still hides inventory while disconnected; its docstring and focused tests now reflect the different adapter behaviors.
+- Added PostgreSQL and controlled-provider tests in `backend/tests/test_protected_feed_reconciliation.py`, plus the updated subscription diagnostics tests. The in-process path checks a protected symbol outside the scanner universe reaches the existing Position Monitor and SimulatedVenue through TickIngestBridge and the Event Bus.
+- Updated `docs/architecture/scanner-design.md` §18.11/§18.13 and `docs/architecture/execution-engine-design.md` §6.9 with as-built responsibilities, component and internal-flow diagrams, bounded periodic delay, and limits.
+
+The loop requests subscriptions; it does not establish provider acknowledgement, continuous delivery, actual reconnection or verified full-union capacity. A new exposure may wait up to the next 60-second cycle plus its work duration. Direct unsubscribe remains possible and can create a gap until retry. Scanner-universe subscription, promotion, session policy, capacity clipping, Governor and broker execution are unchanged.
+<!-- END DELIVERY SECTION: protected-feed-reconciliation -->
+
 <!-- BEGIN DELIVERY SECTION: scanner-observation-source-timestamps -->
 # CHANGES — `scanner-observation-source-timestamps`
 

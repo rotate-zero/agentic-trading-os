@@ -110,6 +110,7 @@ class IBKRAdapter(BrokerAdapter):
     async def disconnect(self) -> None:
         if self._ib.isConnected():
             self._ib.disconnect()
+        self._contracts.clear()  # requests on the old IB session are no longer active
         logger.info("IBKRAdapter disconnected")
 
     async def _qualify(self, contract: Stock) -> Stock:
@@ -282,16 +283,17 @@ class IBKRAdapter(BrokerAdapter):
 
     def _on_disconnected(self) -> None:
         """
-        Observability only, deliberately not reconnect logic. Auto-reconnect
+        Clears old-session subscription bookkeeping and logs the loss;
+        deliberately not reconnect logic. Auto-reconnect
         with backoff is explicitly Market Data Engine's job in Phase 4
         (system-design.md §4.2's ConnectionManager) — building it here would
         pull Phase 4 scope forward into an adapter that's supposed to stay a
         thin, replaceable wrapper around the broker SDK. For now: log loudly,
         so a dropped connection doesn't silently go quiet. is_connected()
-        already reflects reality afterward without any extra state to
-        maintain here, since it always asks self._ib directly rather than
-        caching a status flag.
+        already reflects reality afterward, since it asks self._ib directly
+        rather than caching a status flag.
         """
+        self._contracts.clear()
         logger.warning(
             "IBKRAdapter lost its connection to %s:%s. No auto-reconnect yet — "
             "that's Phase 4's Market Data Engine (ConnectionManager), not this "

@@ -100,6 +100,7 @@ class FinnhubAdapter(MarketDataProvider):
 
     async def disconnect(self) -> None:
         self._connected = False
+        self._symbols.clear()  # a later WebSocket is a new subscription session
         if self._listen_task is not None:
             self._listen_task.cancel()
             try:
@@ -171,6 +172,7 @@ class FinnhubAdapter(MarketDataProvider):
                 self._handle_message(message)
         except websockets.ConnectionClosed:
             self._connected = False
+            self._symbols.clear()
             logger.warning(
                 "FinnhubAdapter's WebSocket closed unexpectedly. No auto-reconnect yet — "
                 "that's Phase 4's Market Data Engine (ConnectionManager), same reasoning "

@@ -268,16 +268,15 @@ async def test_snapshots_are_independent_immutable_copies(monkeypatch):
 # --- adapters + route: disconnect semantics ---------------------------------
 
 
-async def test_finnhub_disconnect_retains_local_record_but_route_reports_unavailable(monkeypatch):
+async def test_finnhub_disconnect_clears_old_session_record_and_route_reports_unavailable(monkeypatch):
     adapter, _sock = await _connected_finnhub(monkeypatch)
     await adapter.subscribe(["AAPL", "MSFT"])
     await broker_registry.take_over_streaming(adapter)
     assert _status()["inventory"]["symbols"] == ["AAPL", "MSFT"]
 
     await adapter.disconnect()
-    # Adapter level: the pre-existing disconnect() does not clear its record.
-    assert adapter.get_subscription_snapshot() == ("AAPL", "MSFT")
-    # Route level: that retained record is NOT presented as an inventory.
+    # The old socket's requests cannot suppress requests on a later socket.
+    assert adapter.get_subscription_snapshot() == ()
     body = _status()
     assert body["status"] == "available"
     assert body["connected"] is False
@@ -295,6 +294,7 @@ async def test_finnhub_unexpected_socket_close_reports_unavailable(monkeypatch):
     sock.drop()
     await asyncio.sleep(0.05)  # let _listen observe the close
     assert adapter.is_connected() is False
+    assert adapter.get_subscription_snapshot() == ()
     body = _status()
     assert body["connected"] is False
     assert body["inventory"]["availability"] == "unavailable"
@@ -320,10 +320,37 @@ async def test_polygon_and_ibkr_disconnect_report_unavailable_not_empty():
     assert body["provider"] == {"id": "ibkr", "class_name": "IBKRAdapter"}
     assert body["inventory"]["symbols"] == ["MSFT"]
     await ibkr.disconnect()
-    assert ibkr.get_subscription_snapshot() == ("MSFT",)  # retained, as for the others
+    assert ibkr.get_subscription_snapshot() == ()  # old IB session is gone
     body = _status()
     assert body["connected"] is False
     assert body["inventory"]["availability"] == "unavailable"
+
+
+async def test_same_instance_reconnect_can_request_finnhub_and_ibkr_again(monkeypatch):
+    finnhub, old_socket = await _connected_finnhub(monkeypatch)
+    await finnhub.subscribe(["AAPL"])
+    await finnhub.disconnect()
+    assert finnhub.get_subscription_snapshot() == ()
+    new_socket = FakeFinnhubSocket()
+
+    async def reconnect_socket(*args, **kwargs):
+        return new_socket
+
+    monkeypatch.setattr("app.broker_adapters.finnhub_provider.websockets.connect", reconnect_socket)
+    await finnhub.connect()
+    await finnhub.subscribe(["AAPL"])
+    assert old_socket.sent == [{"type": "subscribe", "symbol": "AAPL"}]
+    assert new_socket.sent == [{"type": "subscribe", "symbol": "AAPL"}]
+    await finnhub.disconnect()
+
+    ibkr, harness = await _connected_ibkr()
+    await ibkr.subscribe(["MSFT"])
+    await ibkr.disconnect()
+    assert ibkr.get_subscription_snapshot() == ()
+    await ibkr.connect()
+    await ibkr.subscribe(["MSFT"])
+    assert harness.requested == ["MSFT", "MSFT"]
+    await ibkr.disconnect()
 
 
 async def test_connected_provider_with_no_subscriptions_is_a_genuine_empty_inventory(monkeypatch):

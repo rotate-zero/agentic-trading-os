@@ -3439,6 +3439,35 @@ is an observer, not a guarantee) — the route's own docstring and the panel's
 own copy both say so. No new event, no polling, no change to §6.9's actual
 control flow or to any entry rule, exit placement, or EX-5/EX-12 decision.
 
+**Protected market observations after restoration (`protected-feed-reconciliation`, decision #189).** The running application starts one `ProtectedFeedReconciler` only after the successful simulated execution path above sets startup status to `ready`; it does not change the `reconciliation_blocked` or `startup_failed` paths. A focused worker-owned session projects distinct symbols from committed open/closing simulated positions and the existing non-terminal simulated order states. It does not create another Portfolio State or execution pipeline.
+
+```
+successful ledger/venue reconciliation + restored Portfolio State
+              │
+              └─► execution ready ─► protected feed owner ─► current streaming provider
+                                          ▲                         │
+                                          │                         ▼
+                                positions + orders         TickIngestBridge
+                                (read-only ledger)                │
+                                                         PriceUpdated ─► Monitor / Venue
+
+blocked reconciliation ─► execution remains blocked; no protected feed owner
+shutdown ─► stop and settle owner ─► disconnect providers
+```
+
+```
+one immediate cycle, then 60 seconds after each completion:
+  open worker DB session ─► select positive open/closing positions + non-terminal orders
+    ├─ error: log, keep prior requests, retry later
+    └─ distinct symbols ─► read current registry provider and connection state
+        ├─ absent/disconnected: retry later
+        └─ local inventory if available ─► per-symbol additive subscribe requests
+             ├─ failed request: log and continue; retry later
+             └─ returned request: no delivery assertion
+```
+
+The owner never unsubscribes or changes position/order accounting. Local inventory suppresses duplicate requests only; subscription success is not a feed health verdict. A new exposure can wait up to the next 60-second cycle plus its work duration for a request. Provider reconnect and observed tick delivery remain separate concerns; capacity for the full required union is unverified. See `scanner-design.md` §18.13 for ownership and adapter details.
+
 ### 6.10 Configuration (EX-4) — three limits, configurable, not hardcoded
 
 All values live in `core/config.py`'s `Settings` (the repository's single source of configuration — nothing else reads the environment), overridable by environment/`.env`, validated at startup (each must be positive), and **recorded on every authorization** as `limits_snapshot` so a decision's basis is auditable after the limits change. Changes take effect at restart in v1.
