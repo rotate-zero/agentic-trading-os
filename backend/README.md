@@ -142,12 +142,14 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   someone hitting the actual 403, not from a tutorial that might predate the change
 - ✅ Full connect → subscribe → receive-trade → ignore-ping → unsubscribe → disconnect
   flow — verified against a **real local WebSocket server** mimicking Finnhub's exact
-  protocol (this sandbox can't reach `wss://ws.finnhub.io` — not in its network
-  allowlist — so this is the strongest verification available short of a real key)
+  protocol (the earlier synthetic check, before the real-feed trial below)
 - ✅ Message parsing edge cases — multiple trades in one message, malformed entries,
   ping/unknown message types — all unit tested
-- ❌ Behavior against the real Finnhub servers with a real key — has to happen on your
-  machine
+- ✅ One real Finnhub connection and three-symbol regular-session observation with a
+  configured key on 2026-10-08: AAPL/MSFT/NVDA all produced ticks, closed 1m candles
+  and 1m feature updates at `/ws` during a 180-second window (`TESTING.md`).
+- ❌ Provider acknowledgement, account capacity, lossless delivery, real outage/reconnect,
+  and full-union/100-symbol coverage remain unverified.
 
 ## IBKR connection setup
 
@@ -389,6 +391,8 @@ python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000
 ```
 
 Exit `0` = completed window (zero events is a valid measurement), `2` = invalid input, `3` = failed setup (including an empty captured set or malformed beginning subscription diagnostics), `4` = interrupted/incomplete, `5` = JSON report not written. A malformed end diagnostic is recorded without failing a completed window. `last_source_ts` is the source time on the last event received in that category, including when source times regress. It reports events observed at the backend WebSocket boundary only: no provider capacity, lossless delivery or protective-coverage claim, and no threshold. Details and diagrams: `docs/architecture/scanner-design.md` section 18.17.
+
+One three-symbol real Finnhub session has been measured during regular hours (2026-10-08); see `TESTING.md` for counts, diagnostics and limits. It does not establish full-union or 100-symbol coverage.
 
 ## Running tests
 

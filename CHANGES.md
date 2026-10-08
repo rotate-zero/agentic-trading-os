@@ -1,3 +1,13 @@
+<!-- BEGIN DELIVERY SECTION: real-finnhub-streaming-coverage-trial -->
+# CHANGES — `real-finnhub-streaming-coverage-trial`
+
+Base: pushed `main` `059d9b4` (`streaming-isolation-coverage-corrections`). This is a one-session validation of the existing market-data path, not a code or policy change. No decision number, commit, push, ZIP, or source-code modification.
+
+On 2026-10-08 during the NYSE core session, a temporary local backend was started in simulated execution mode with its configured Finnhub key, Polygon auto-connect disabled, and scheduled scanner observation disabled. Finnhub connected to its real WebSocket. The existing `/finnhub/subscribe` route requested AAPL, MSFT and NVDA, and `measure_streaming_coverage.py` observed `/ws` for 180 seconds. The report completed with 213 ticks, nine closed 1m candles and nine 1m feature updates; all three symbols appeared in all categories. There were no malformed messages, connection interruptions or zero-event symbols. The report recorded 22 tick source-timestamp regressions; this trial does not establish their cause. The backend shut down cleanly after the window.
+
+The ignored local JSON evidence is `backend/.finnhub-validation/coverage-2026-10-08.json`. `TESTING.md` records the command, per-symbol counts, diagnostics, local database effect and limits. `docs/architecture/scanner-design.md` §18.17 and `docs/roadmap/phase-roadmap.md` now distinguish this small real-feed observation from the still-open full-union capacity and 100-symbol scale criteria. No real broker account or live execution venue was connected.
+<!-- END DELIVERY SECTION: real-finnhub-streaming-coverage-trial -->
+
 <!-- BEGIN DELIVERY SECTION: streaming-isolation-coverage-corrections -->
 # CHANGES — `streaming-isolation-coverage-corrections`
 
