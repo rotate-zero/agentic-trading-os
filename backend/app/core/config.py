@@ -5,9 +5,11 @@ nothing else in the app should read os.environ directly.
 from functools import lru_cache
 import math
 
-from pydantic import PositiveFloat, field_validator
+from pydantic import Field, PositiveFloat, field_validator, model_validator
 from pydantic import ValidationInfo
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.market_clock import Session
 
 
 class Settings(BaseSettings):
@@ -241,6 +243,24 @@ class Settings(BaseSettings):
     # ranking — this default keeps those two decisions apart. Flip above
     # 0 once real values have actually been looked at, not before.
     scanner_weight_premarket_volume_ratio: float = 0.0
+
+    # Observation-only scheduled scanner. Session coverage must be selected
+    # explicitly; no provider subscription or promotion follows this switch.
+    scanner_observation_enabled: bool = False
+    scanner_observation_sessions: list[Session] = Field(default_factory=list)
+
+    @field_validator("scanner_observation_sessions")
+    @classmethod
+    def _scanner_observation_sessions_supported(cls, value: list[Session]) -> list[Session]:
+        if Session.CLOSED in value or len(value) != len(set(value)):
+            raise ValueError("scanner observation sessions must be distinct trading-session labels, excluding closed")
+        return value
+
+    @model_validator(mode="after")
+    def _scanner_observation_requires_sessions(self) -> "Settings":
+        if self.scanner_observation_enabled and not self.scanner_observation_sessions:
+            raise ValueError("enabled scanner observation requires an explicit nonempty session selection")
+        return self
 
     # --- Execution: authorizer limits (decision #171) ---
     execution_max_concurrent_positions: int = 1

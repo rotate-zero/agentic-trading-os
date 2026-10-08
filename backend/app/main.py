@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import timezone
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,14 +13,17 @@ from app.api.routes.finnhub_data import connect_finnhub
 from app.api.routes.market_data import connect_polygon
 from app.api.websocket import channels
 from app.api.websocket.channels import get_gateway
+from app.backtest_runner.engine_singleton_guard import replay_slot_busy
 from app.context_engine.engine import get_context_engine
 from app.context_engine.fundamentals_refresh import get_fundamentals_refresh_jobs
 from app.core.config import get_settings
+from app.core.market_clock import Session, get_market_clock
 from app.core.error_handling import UnhandledExceptionMiddleware
 from app.core.logging import configure_logging
 from app.event_bus.bus import get_event_bus
 from app.feature_engine.engine import get_feature_engine
 from app.market_state_engine.engine import get_market_state_engine
+from app.scanner.scanner import ScannerObservationWorker
 from app.services import broker_registry
 from app.services.candle_recorder import CandleRecorder
 from app.services.live_tick_relay import get_live_tick_relay
@@ -28,6 +31,20 @@ from app.strategy_engine.scheduler import get_strategy_scheduler
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
 
 logger = logging.getLogger(__name__)
+
+
+def _scanner_observation_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _scanner_observation_eligible(selected_sessions: frozenset[Session]) -> bool:
+    """Admission only; scoring remains the existing worker's responsibility."""
+    if replay_slot_busy():
+        return False
+    clock = get_market_clock()
+    now = _scanner_observation_now()
+    return (clock.has_calendar_for_year(clock.trading_day(now).year)
+            and clock.current_session(now) in selected_sessions)
 
 
 # Read-only startup status for GET /health/execution-startup
@@ -231,11 +248,13 @@ async def lifespan(app: FastAPI):
     position_monitor = None
     outcome_recorder = None
     protected_feed_reconciler = None
+    scanner_observation_worker = None
     execution_venue = None
     app.state.world_view_portfolio_reader = None
     app.state.position_monitor = None
     app.state.execution_startup_status = None
     app.state.protected_feed_status_reader = None
+    app.state.scanner_observation_reader = None
     try:
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
@@ -377,6 +396,25 @@ async def lifespan(app: FastAPI):
             # exposes only get_snapshot() and is cleared before the owner stops.
             app.state.protected_feed_status_reader = protected_feed_reconciler
 
+            # Observation only: the worker scores this lifespan's existing
+            # FeatureEngine singleton. No universe subscription or promotion.
+            if settings.scanner_observation_enabled:
+                selected_sessions = frozenset(settings.scanner_observation_sessions)
+                try:
+                    scanner_observation_worker = ScannerObservationWorker(
+                        eligible=lambda: _scanner_observation_eligible(selected_sessions),
+                        settings=settings,
+                    )
+                    await scanner_observation_worker.start()
+                except Exception:
+                    app.state.scanner_observation_reader = None
+                    if scanner_observation_worker is not None:
+                        await scanner_observation_worker.stop()
+                    scanner_observation_worker = None
+                    logger.exception("Scanner observation failed to start; scheduled results unavailable")
+                else:
+                    app.state.scanner_observation_reader = scanner_observation_worker
+
             # Recorder failure cannot change an otherwise ready execution pipeline.
             try:
                 outcome_recorder = OutcomeRecorder(
@@ -420,6 +458,9 @@ async def lifespan(app: FastAPI):
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
         app.state.protected_feed_status_reader = None
+        app.state.scanner_observation_reader = None
+        if scanner_observation_worker is not None:
+            await scanner_observation_worker.stop()
         if protected_feed_reconciler is not None:
             await protected_feed_reconciler.stop()
         if authorizer_stub is not None:
@@ -453,6 +494,7 @@ async def lifespan(app: FastAPI):
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
         app.state.protected_feed_status_reader = None
+        app.state.scanner_observation_reader = None
         # Same "no active lifespan" reset as the two lines above — a route
         # hit after shutdown must report "unavailable", not a stale "ready"/
         # "reconciliation_blocked"/"startup_failed" from before this process
@@ -474,6 +516,9 @@ async def lifespan(app: FastAPI):
         # the database just because nobody's watching anymore. That's
         # what was racing test cleanup: not a timing window in the
         # stop() sequence itself, but shutdown never running at all.
+        # Settle observation reads before FeatureEngine/provider shutdown.
+        if scanner_observation_worker is not None:
+            await scanner_observation_worker.stop()
         # Settle the only subscription owner before disconnecting providers.
         if protected_feed_reconciler is not None:
             await protected_feed_reconciler.stop()

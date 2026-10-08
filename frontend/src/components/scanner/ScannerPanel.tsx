@@ -364,7 +364,8 @@ function ObservationBody() {
             </>
           )}
           <div className="px-2 py-1.5 font-mono text-[9px] text-text-muted">
-            Worker availability does not establish healthy feed delivery or complete coverage.
+            This worker scores existing Feature Engine data. Enabling it does not subscribe the universe or verify feed
+            capacity or delivery.
           </div>
         </>
       )}

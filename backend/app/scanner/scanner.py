@@ -1,4 +1,4 @@
-"""Reusable, opt-in scanner observation worker. No application startup wiring."""
+"""Reusable, opt-in scanner observation worker."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Awaitable, Callable, Mapping
 
+from app.backtest_runner.engine_singleton_guard import replay_slot_busy
 from app.core.config import Settings, get_settings
 from app.db.session import SessionLocal
 from app.scanner.runner import ScanResult, run_scan
@@ -170,7 +171,11 @@ class ScannerObservationWorker:
             # DbUniverseProvider creates and closes its Session in this
             # thread. Never pass a Session across the event-loop boundary.
             universe = tuple(await asyncio.to_thread(self._universe_provider.get_core_universe))
-            if stop_event.is_set() or generation != self._generation:
+            # Replay can acquire the singleton slot during the await above.
+            # The next call is synchronous and has no await: once admitted,
+            # replay cannot install a different FeatureEngine mid-score.
+            if (stop_event.is_set() or generation != self._generation
+                    or replay_slot_busy() or not self._eligible()):
                 return
             results, skipped = self._scan(
                 list(universe),

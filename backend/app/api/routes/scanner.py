@@ -33,10 +33,10 @@ nothing blocking to move.
 GET /scanner/observation (task `scanner-observation-status`) is a separate,
 read-only view of the optional scheduled observation worker's retained
 snapshot. It reads only `app.state.scanner_observation_reader` through the
-narrow `get_scanner_observation_reader` dependency below; nothing installs
-that reader yet (lifespan wiring is a separately approved task), so the
-production response is "unavailable". GET /scanner/state and universe CRUD
-are unchanged and independent of it.
+narrow `get_scanner_observation_reader` dependency below. The lifespan
+installs that reader only when observation is explicitly enabled, selected
+sessions admit work, and simulated execution startup is ready. The route
+itself never starts a scan. GET /scanner/state and universe CRUD are unchanged.
 
 Task `scanner-observation-source-timestamps` adds two additive fields to that
 response only: a per-row `source_candle_ts` (the 1m FeatureSet candle the

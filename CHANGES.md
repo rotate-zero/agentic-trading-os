@@ -1,3 +1,17 @@
+<!-- BEGIN DELIVERY SECTION: scanner-observation-lifespan -->
+# CHANGES — `scanner-observation-lifespan`
+
+Base: GitHub `main` `5087874` (assignment reference; fetched before implementation and decision numbering). No commit or push. Decision #192 records explicit session selection and replay-safe observation ownership.
+
+- `backend/app/core/config.py` and `backend/.env.example`: disabled-by-default `SCANNER_OBSERVATION_ENABLED`; an enabled service requires an explicit nonempty JSON list of supported MarketClock labels. Unknown, duplicate and `closed` labels fail validation. The existing simulated-only execution-mode validation applies. Exact regular-session example: `EXECUTION_MODE=simulated`, `SCANNER_OBSERVATION_ENABLED=true`, `SCANNER_OBSERVATION_SESSIONS='["open","lunch","power_hour"]'`.
+- `backend/app/main.py`: owns the existing `ScannerObservationWorker` only after simulated execution startup is ready. Its predicate admits selected sessions in covered MarketClock years while the replay/connection slot is free. The lifespan installs the existing read-only scanner reader only after a successful worker start, clears it on rollback/shutdown, and drains the worker before FeatureEngine/providers stop. A worker start failure leaves scheduled observation unavailable without changing a ready execution pipeline.
+- `backend/app/scanner/scanner.py`: after its asynchronous universe read, the worker rechecks the existing replay/connection slot, selected session and covered year immediately before synchronous `run_scan()`. A replay or session boundary during the read cannot put ineligible data into its retained live observation. The fixed 60-second cadence, authoritative universe read, complete result retention and on-demand scanner remain unchanged.
+- `backend/app/api/routes/scanner.py` and `frontend/src/components/scanner/ScannerPanel.tsx`: update explanatory wording for an optionally running worker. The panel states that observation scores existing FeatureEngine data and neither subscribes the universe nor verifies feed capacity/delivery. No response-contract or control changes.
+- `backend/tests/test_scanner_observation_lifespan.py`: real lifespan/route ownership, settings, MarketClock, blocked startup, rollback, shutdown, restart and replay-race coverage. `docs/architecture/scanner-design.md` §18.15 and `backtest-runner-design.md` show the data and admission flows; `docs/roadmap/phase-roadmap.md` updates scheduled-observation status narrowly; the canonical decision files, this section and `TESTING.md` record the delivery.
+
+Limits: this is observation only. It does not acquire scanner-universe feeds, activate chart relay symbols, promote into strategy eligibility, or verify real feed capacity, acknowledgement, delivery or freshness. C2 promotion thresholds and C4 relay/manual priority remain open.
+<!-- END DELIVERY SECTION: scanner-observation-lifespan -->
+
 <!-- BEGIN DELIVERY SECTION: protected-feed-event-wake -->
 # CHANGES — `protected-feed-event-wake`
 

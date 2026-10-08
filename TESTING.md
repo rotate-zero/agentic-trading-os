@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: scanner-observation-lifespan -->
+# TESTING — `scanner-observation-lifespan`
+
+Base: GitHub `main` `5087874`. Directly affected checks ran serially; no automatic full suite or external provider was used. Real FastAPI lifespan tests used controlled MarketClock times, worker timers/universe reads and local `trading_workspace` PostgreSQL startup dependencies. They did not place a real broker order or create a scanner subscription.
+
+- `.venv/bin/pytest -q --disable-warnings tests/test_scanner_observation_lifespan.py tests/test_scanner_observation_worker.py tests/test_scanner_observation_status.py tests/test_scanner_observation_source_timestamps.py tests/test_scanner_state_route.py tests/test_scanner_route_concurrency.py tests/test_finnhub_reconnect.py tests/test_execution_startup_status_route.py` (from `backend/`) — **117 passed**.
+- New lifecycle cases cover disabled startup; enabled selected and excluded sessions; settings rejection for empty/invalid/duplicate/closed labels and unsupported execution mode; the documented JSON environment setting; holiday, half-day and uncovered-year admission; blocked/failed execution startup; partial observer-start rollback; reader installation/removal and the real `/scanner/observation` response; shutdown draining a blocked universe read; repeated lifespan entry; a busy replay/connection slot skipping a due point; and a selected session ending during a blocked universe read.
+- The replay race holds an actual offloaded universe read while `install_replay_engines()` temporarily replaces process-wide singletons. The worker publishes no result while replay holds the slot; after restoration, its next admitted cycle reports the live FeatureEngine 1m candle timestamp through the real observation endpoint. Existing replay and scanner route/worker checks pass unchanged.
+- Frontend: `npm run build` — passed (`tsc -b` and Vite). Its generated `tsconfig.tsbuildinfo` was restored to the original tracked contents; build output is excluded. Vite emitted its existing large-chunk advisory.
+
+These tests establish lifecycle ownership and local replay isolation under controlled timing. They do not measure real-feed delivery, capacity, freshness or scanner-universe coverage. No full suite was run.
+<!-- END DELIVERY SECTION: scanner-observation-lifespan -->
+
 <!-- BEGIN DELIVERY SECTION: protected-feed-event-wake -->
 # TESTING — `protected-feed-event-wake`
 
