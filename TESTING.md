@@ -1,3 +1,23 @@
+<!-- BEGIN DELIVERY SECTION: candle-to-simulated-trade-acceptance -->
+# TESTING — `candle-to-simulated-trade-acceptance`
+
+Base: GitHub `main` `9527854f8e3b9af8f2485e0c98d465a1b8c46fc9`. Local PostgreSQL 16 at `localhost:5432`; every acceptance run used a fresh, disposable, migrated (`alembic upgrade head`, revision `0017`), empty database. No real provider connection was made (Finnhub/Polygon keys blanked by the command); no full-suite run was performed.
+
+Command (from `backend/`):
+
+```
+POSTGRES_DB=<disposable_db> python scripts/candle_to_simulated_trade_acceptance.py --database <disposable_db>
+```
+
+- **Acceptance command, PostgreSQL:** `RESULT: PASS — 43 milestones` on every fresh-database run (P.1–P.4 preconditions, C1.1–C1.30 positive path, C2.1–C2.9 contrast); about 4 s each, exit code 0. Recorded in the handoff: the final run on a clean checkout of the base with the ZIP applied.
+- **Directly affected tests:** `pytest -q tests/test_candle_to_simulated_trade_acceptance.py tests/test_simulated_mvp_acceptance.py` — 35 passed (16 new, 19 existing; the existing simulated-MVP file is unchanged). Run against a migrated database.
+- **Sensitivity (temporary mutation, not delivered):** `FeatureEngine._update_gap` was temporarily changed to `return {}`. The positive acceptance then failed with exit code 1 at milestone `C1.10` ("calculated gap features equal the values recomputed from the supplied candles"; detail showed `regular_open`, `gap_dollars`, `gap_pct` absent while `pdc` was present). The first attempt failed as an unexpected `TypeError` from an eagerly formatted milestone note; the note formatting was made absence-safe so the failure names the milestone. `backend/app/feature_engine/engine.py` was restored with `git checkout` and `git status` confirmed it unchanged; it is not in the ZIP.
+- **Existing simulated-MVP command:** `python scripts/simulated_mvp_acceptance.py --database <disposable_db>` still passes 88 milestones on a fresh database (baseline before and after).
+- **Not run:** the full test suite; any real-provider, IBKR or live-feed check. Frontend untouched.
+
+What a PASS establishes and does not: see `docs/architecture/execution-engine-design.md` §6.13. It is a synthetic candle-to-trade path with calculated features recomputed from supplied candles; it is not tick acquisition, real-feed coverage, profitability or broker execution. The database is left as evidence; recreate a fresh migrated database before rerunning.
+<!-- END DELIVERY SECTION: candle-to-simulated-trade-acceptance -->
+
 <!-- BEGIN DELIVERY SECTION: protected-feed-reconciliation -->
 # TESTING — `protected-feed-reconciliation`
 

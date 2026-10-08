@@ -363,6 +363,18 @@ POSTGRES_DB=mvp_acceptance python scripts/simulated_mvp_acceptance.py --database
 
 The database must be explicitly selected (`--database` must equal `POSTGRES_DB` and the name must contain `acceptance`, `disposable`, `scratch` or `test`), migrated to head, and empty; anything else is refused before any worker starts, and nothing is ever truncated or cleaned. Finnhub/Polygon are disabled and no IBKR Gateway or credentials are needed. Exit code `0` = PASS, `1` = a milestone failed (named in the output), `2` = a precondition failed. A finished run leaves its rows as evidence: create a fresh database to run again. S6 uses controlled feature, market-state, context, price and clock inputs; it does not prove candle acquisition, FeatureEngine calculations, live-feed operation, profitability, ranking or real broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.12.
 
+## Candle-to-simulated-trade acceptance
+
+A second command exercises the real producers that the simulated-MVP command's S6 injects. It supplies synthetic closed 1m candles (a prior-session warm-up and one trading-day candle per symbol) and synthetic daily history, and lets the real `FeatureEngine`, `MarketStateEngine`, `StrategyScheduler` and registered Gap v1 generate `FeaturesUpdated`, `MarketStateChanged` and `OpportunityCreated`, then follows simulated approval, entry, open position, target closure and one recorded outcome. A contrasting sequence with no opening gap must produce no entry:
+
+```bash
+cd backend
+createdb candle_acceptance && POSTGRES_DB=candle_acceptance alembic upgrade head   # a fresh, disposable database
+POSTGRES_DB=candle_acceptance python scripts/candle_to_simulated_trade_acceptance.py --database candle_acceptance
+```
+
+The same database rules apply as for the simulated-MVP command (explicit `--database` equal to `POSTGRES_DB`, a disposable-looking name, migrated to head, empty; never truncated; no provider credentials or IBKR Gateway needed). Exit code `0` = PASS, `1` = a milestone failed, `2` = a precondition failed, `3` = watchdog. It proves a synthetic candle-to-trade path; it does not prove tick acquisition, real-feed coverage, profitability or broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.13.
+
 ## Running tests
 
 ```bash

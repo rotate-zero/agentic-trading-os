@@ -3617,6 +3617,85 @@ Exit codes: `0` PASS, `1` a scenario milestone failed (named), `2` a preconditio
 
 ---
 
+### 6.13 Candle-to-simulated-trade acceptance command (`candle-to-simulated-trade-acceptance`)
+
+**What it is.** A second, separate maintained command that closes the gap §6.12 states explicitly: S6 of the simulated-MVP command runs the real `StrategyScheduler` and Gap v1 but *injects* `FeaturesUpdated` and `MarketStateChanged`. This command injects neither. It supplies closed 1m candles and lets the real `FeatureEngine`, `MarketStateEngine`, `StrategyScheduler` and `GapStrategy.evaluate()` produce every upstream event, then follows the already-built simulated lifecycle to one recorded outcome. The existing `simulated_mvp_acceptance.py` command and its six scenarios are untouched; the new module imports and reuses its safeguards (database selection, migrated-and-empty checks, redaction, milestone checker, watchdog, deterministic clock, ledger/API readers, entry and protective-close helpers) rather than copying them.
+
+```
+cd backend
+POSTGRES_HOST=… POSTGRES_PORT=… POSTGRES_DB=<disposable_db> POSTGRES_USER=… POSTGRES_PASSWORD=… \
+  python scripts/candle_to_simulated_trade_acceptance.py --database <disposable_db>
+```
+
+Exit codes: `0` PASS, `1` a milestone failed (named), `2` a precondition failed (nothing started), `3` watchdog expired. The database must be explicitly selected, disposable-named, migrated to head and empty; it is never truncated or cleaned.
+
+**Strategy choice.** Gap v1 (registered, default configuration, isolated only through the scheduler's existing `default_registry` seam). Its setup is fully determined by candles plus one prior-session reference: `regular_open` and `gap_pct` are calculated by `FeatureEngine._update_gap` from the first regular-session candle and the previous-day close, `trend_score` and `volume_regime_score` by `MarketStateEngine`, and Gap's MATCH needs a gap of at least 2%, trend at least 60, volume regime at least 45 inside the first 60 minutes. It fires on one candle, so the run is short and every number can be checked by hand. The open (95), close (100) and prior close (92) deliberately equal S6's, so the only difference from S6 is that nothing upstream is injected. Production defaults, gates, risk limits and event contracts are not changed: the acceptance asserts the installed configuration equals `default_config()` and the thresholds above.
+
+**Supplied inputs versus calculated outputs.**
+
+| Supplied (inputs, never evidence of calculation) | Calculated by production code (what is verified) |
+|---|---|
+| 45 prior-session 1m `CandleClosed` (a rising warm-up ending at 92.00) and one trading-day candle per symbol, published on the Event Bus; `CandleRecorder` persists them | `pdc` (from the persisted prior-session candles), `regular_open`, `gap_dollars`, `gap_pct`, `sma_20`, `sma_20_slope_angle`, `session_volume`, `rvol` — `FeatureEngine` |
+| Synthetic 1d history from `FixtureCandleProvider`, installed through the existing `broker_registry` historical role (average daily volume baseline) | `trend_score`, `volume_regime_score` — `MarketStateEngine` |
+| `ContextEngine` evaluation with every external provider disabled | The `Opportunity`, its direction, confidence and structural invalidation/target — `GapStrategy` via `StrategyScheduler` |
+| `PriceUpdated` reference/trigger observations and `SimulatedVenue` ticks (entry fill, target) and the wall clock | Approval, orders, fills, position, exit request, close, outcome — the application's own workers |
+
+`pdc` and `rvol` are calculated *from* supplied inputs; the milestones recompute `pdc`, `regular_open`, `gap_dollars`, `gap_pct`, `sma_20`, `session_volume` and `rvol` independently from the supplied candles and history and compare. The harness records every event type it puts on the bus and a milestone requires that set to be exactly `CandleClosed` and `PriceUpdated`; a unit test additionally asserts the module has no code path that publishes `FeaturesUpdated`, `MarketStateChanged` or `OpportunityCreated`. The production outcome-snapshot capture is left unpatched (the simulated-MVP command stubs it).
+
+**Component data flow.**
+
+```
+ harness (supplied)                       production components under test                   evidence
+ ──────────────────                       ────────────────────────────────                   ────────
+ CandleClosed 1m ──► Event Bus ──┬──► CandleRecorder ──► candles table ──┐ (pdc source)
+ (prior session + day candle)    │                                        ▼
+ FixtureCandleProvider (1d) ─────┼──► FeatureEngine ── pdc, regular_open, gap_pct, sma_20 slope,
+ via broker_registry             │        │            session_volume, rvol ──► FeaturesUpdated
+ ContextEngine (providers off)   │        ▼
+                                 │   MarketStateEngine ── trend_score, volume_regime_score
+                                 │        │                                   ──► MarketStateChanged
+                                 │        ▼
+                                 └──► StrategyScheduler ──► GapStrategy.evaluate() ──► OpportunityCreated
+ PriceUpdated (reference) ──────────►  AuthorizerStub ─► ExecutionEngine ─► SimulatedVenue (ingest_tick)
+ venue ticks (entry, target) ───────►  Portfolio State ─► Position Monitor ─► exit request ─► close fill
+                                       OutcomeRecorder ──► strategy_outcomes (exactly one, linked)
+                                                       │
+ database (disposable, migrated, empty) ◄──────────────┘  read back through ledger tables and public API routes
+```
+
+**Internal scenario flow of `candle_to_simulated_trade.py`.**
+
+```
+ P.1-P.4 preconditions (read-only, no worker started; any failure ─► exit 2)
+        │
+        ▼
+ controlled_inputs (clock/venue/monitor only) + recording_gap_strategy (Gap only; evaluate() results RECORDED, never altered)
+        │
+        ▼  real app.main lifespan  (always shut down, also on a failed milestone)
+ historical_input: 1d fixture history ─► broker_registry
+        │
+ C1 positive symbol ZZCTGP                                     C2 contrast symbol ZZCTNG
+   scheduler isolation + flat portfolio                          (same warm-up, same close/volume/regime,
+   warm-up: 45 candles x 2 symbols                                opens at 92.10 instead of 95.00)
+     wait: 45 FeaturesUpdated per symbol                            │
+     wait: 45 candles persisted (pdc source)                        ▼
+   session candle ─► wait FeaturesUpdated + MarketStateChanged   session candle ─► same two waits
+     recompute pdc/open/gap/sma/rvol independently ─ compare       gap_pct < 2% while trend/volume gates pass
+     trend >= 60, volume >= 45                                      settle(): bounded drain of every queue
+   wait OpportunityCreated (strategy-produced)                      evaluate() ran and returned None
+     stop 95.0 / target 110.0, conditions == calculated values      no opportunity, trade, order, position,
+   authorizer approval ─► entry order ─► venue fill ─► open           fill; trade count unchanged
+   target observation ─► exit request ─► close ─► flat
+   OutcomeRecorder ─► exactly one linked outcome (+ real entry snapshot)
+   harness published only CandleClosed + PriceUpdated
+```
+
+**Waiting model.** Every milestone is an observed event or row with a bounded wait (`--timeout`, default 20 s) that reports what was last seen; the only negative assertions (C2) are made after `settle()`, a bounded drain of the event-bus, Position Monitor, execution and Portfolio State queues, so they are evaluated after the work that could have violated them has finished. The overall watchdog (`--watchdog`, default 300 s) turns a hang into exit code 3.
+
+**What it proves, and what it does not.** It proves one deterministic, *synthetic* closed-candle-to-simulated-trade path with real producers between the candles and the strategy, and that a contrasting sequence without the selected setup produces no entry. It does not prove tick acquisition (no ticks, `TickIngestBridge` or `CandleAggregator`), real-feed coverage, provider behavior, strategy profitability, opportunity ranking, a second strategy, multi-symbol contention or broker execution; the prices, volumes and history are fabricated to be reviewable, not market-realistic.
+
+**Sensitivity check performed.** With `FeatureEngine._update_gap` temporarily made to return `{}`, the positive scenario fails at milestone C1.10 (calculated gap features absent) with exit code 1; the production change was reverted and is not part of the delivery.
+
 ## 7. Forks — six resolved by decision #170, the rest still open
 
 Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29 (decision #185), and the simulated EOD path is now built end to end (`simulated-eod-flatten-foundation` through `simulated-eod-flatten-integration`), with session-aware protective retries added by `simulated-protective-session-retry`. EX-12 option (a) is built for simulated auto trades in §6.7.1.
