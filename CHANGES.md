@@ -1,3 +1,13 @@
+<!-- BEGIN DELIVERY SECTION: streaming-tick-regression-minute-breakdown -->
+# CHANGES — `streaming-tick-regression-minute-breakdown`
+
+Base: pushed `main` `8c89833` (`Guard late tick candles`). The earlier three-symbol real Finnhub trial counted 22 tick source-timestamp regressions without retaining the timestamps needed to tell whether any crossed a minute boundary. This delivery extends the existing read-only coverage measurement; it does not alter provider, bridge, Event Bus, candle or trading behavior.
+
+`backend/app/measurement/streaming_coverage.py` now classifies each monitored tick regression against that symbol's preceding UTC source-time high-water mark as `same_minute` or `earlier_minute`. The JSON report adds bounded per-symbol counts and totals under `anomalies.tick_regressions_by_minute`, plus the first timestamp-pair example for each symbol and class. Generic regression samples also include the current and high-water source timestamps plus the class; the first examples remain available even if the existing 20-sample cap fills early. The console prints the two totals. Existing regression totals, event counts and exit semantics remain. Two focused unit tests cover timezone normalization, per-symbol separation, high-water comparison, and sample-cap behavior.
+
+`docs/architecture/scanner-design.md` §18.17, `docs/roadmap/phase-roadmap.md` and `backend/README.md` describe the added evidence and its limits. `TESTING.md` records targeted checks and two repeat real-feed windows: the first observed 240 same-minute and 10 earlier-minute regressions; the second retained real timestamp-pair examples for 81 same-minute regressions and observed no earlier-minute event. The second window also produced a simulated MSFT trade through the existing strategy path and exposed an unrelated outcome-snapshot serialization failure; those database records were left intact. No new architectural decision or schema migration was required.
+<!-- END DELIVERY SECTION: streaming-tick-regression-minute-breakdown -->
+
 <!-- BEGIN DELIVERY SECTION: late-tick-candle-ordering -->
 # CHANGES — `late-tick-candle-ordering`
 

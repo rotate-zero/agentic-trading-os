@@ -86,6 +86,7 @@ INTERPRETATION: tuple[str, ...] = (
     "A symbol with no events may be quiet, outside market hours, not subscribed, or faulty; the cause is not classified.",
     "Beginning/end subscription snapshots cannot prove that no provider change occurred between them.",
     "Local inventory is the adapter's own record of requests, not provider acknowledgement or verified capacity.",
+    "Tick regression classes compare source minutes against each symbol's prior high-water mark; they do not diagnose the cause.",
     "No automation-enablement threshold is defined, and counts alone do not support a no-dropped-ticks claim.",
 )
 
@@ -395,6 +396,12 @@ class CoverageCollector:
         self.unexpected_channels = _BoundedCounter()
         self.meta_errors = 0
         self.source_ts_regressions: dict[str, int] = {c: 0 for c in CATEGORIES}
+        self.tick_regressions_by_minute: dict[str, dict[str, int]] = {
+            symbol: {"same_minute": 0, "earlier_minute": 0} for symbol in self.monitored
+        }
+        self.tick_regression_first_examples: dict[str, dict[str, dict[str, Any] | None]] = {
+            symbol: {"same_minute": None, "earlier_minute": None} for symbol in self.monitored
+        }
         self.duplicate_source_ts: dict[str, int] = {c: 0 for c in CATEGORIES if c != "ticks"}
         self.naive_source_timestamps = 0
         self.samples: list[dict[str, Any]] = []
@@ -416,19 +423,25 @@ class CoverageCollector:
 
     # -- bookkeeping ---------------------------------------------------------
     def _sample(self, kind: str, mono: float, *, channel: str | None = None, symbol: str | None = None,
-                excerpt: str | None = None) -> None:
+                excerpt: str | None = None, source_ts: datetime | None = None,
+                high_water_source_ts: datetime | None = None, minute_relation: str | None = None) -> None:
         if len(self.samples) >= MAX_ANOMALY_SAMPLES:
             self.samples_dropped += 1
             return
         offset = None if self.window_start_mono is None else _r(mono - self.window_start_mono)
-        self.samples.append({
+        sample = {
             "kind": kind,
             "phase": self.phase,
             "channel": channel[:32] if isinstance(channel, str) else None,
             "symbol": symbol[:16] if isinstance(symbol, str) else None,
             "received_offset_s": offset,
             "excerpt": None if excerpt is None else excerpt[:MAX_EXCERPT_CHARS],
-        })
+        }
+        if source_ts is not None:
+            sample["source_ts"] = _iso(source_ts)
+            sample["high_water_source_ts"] = _iso(high_water_source_ts)
+            sample["minute_relation"] = minute_relation
+        self.samples.append(sample)
 
     def _malformed(self, kind: str, mono: float, raw: object, *, channel: str | None = None,
                    symbol: str | None = None) -> str:
@@ -441,6 +454,9 @@ class CoverageCollector:
     def retained_item_count(self) -> int:
         """Number of items held in every growing container (used to prove boundedness)."""
         n = len(self.stats) * len(CATEGORIES)
+        n += len(self.tick_regressions_by_minute) + len(self.tick_regression_first_examples)
+        n += sum(example is not None for classes in self.tick_regression_first_examples.values()
+                 for example in classes.values())
         n += len(self.samples) + len(self.unmonitored_sample) + len(self.ack_latency_s)
         n += len(self.malformed_by_kind.counts) + len(self.unexpected_channels.counts)
         n += sum(len(c.counts) for c in self.other_timeframe.values())
@@ -547,7 +563,22 @@ class CoverageCollector:
             if stats._max_source is not None:
                 if source < stats._max_source:
                     self.source_ts_regressions[category] += 1
-                    self._sample("source_ts_regression", mono, channel=channel, symbol=symbol)
+                    if category == "ticks":
+                        relation = ("same_minute" if source.replace(second=0, microsecond=0)
+                                    == stats._max_source.replace(second=0, microsecond=0)
+                                    else "earlier_minute")
+                        self.tick_regressions_by_minute[symbol][relation] += 1
+                        if self.tick_regression_first_examples[symbol][relation] is None:
+                            self.tick_regression_first_examples[symbol][relation] = {
+                                "source_ts": _iso(source),
+                                "high_water_source_ts": _iso(stats._max_source),
+                                "received_offset_s": _r(offset),
+                            }
+                        self._sample("source_ts_regression", mono, channel=channel, symbol=symbol,
+                                     source_ts=source, high_water_source_ts=stats._max_source,
+                                     minute_relation=relation)
+                    else:
+                        self._sample("source_ts_regression", mono, channel=channel, symbol=symbol)
                 elif source == stats._max_source and category in self.duplicate_source_ts:
                     self.duplicate_source_ts[category] += 1
                     self._sample("duplicate_source_ts", mono, channel=channel, symbol=symbol)
@@ -767,6 +798,16 @@ def build_report(
         "pre_window_events": dict(sorted(collector.pre_window_events.items())),
         "post_window_ignored": collector.post_window_ignored,
         "source_ts_regressions": dict(sorted(collector.source_ts_regressions.items())),
+        "tick_regressions_by_minute": {
+            "totals": {
+                relation: sum(counts[relation] for counts in collector.tick_regressions_by_minute.values())
+                for relation in ("same_minute", "earlier_minute")
+            },
+            "by_symbol": {symbol: dict(collector.tick_regressions_by_minute[symbol])
+                          for symbol in sorted(collector.tick_regressions_by_minute)},
+            "first_examples_by_symbol": {symbol: dict(collector.tick_regression_first_examples[symbol])
+                                         for symbol in sorted(collector.tick_regression_first_examples)},
+        },
         "duplicate_source_ts": dict(sorted(collector.duplicate_source_ts.items())),
         "naive_source_timestamps": collector.naive_source_timestamps,
         "samples": list(collector.samples),
@@ -885,6 +926,9 @@ def render_console(report: dict[str, Any], *, max_rows: int = 50) -> str:
         f"pre-window={sum(a['pre_window_events'].values())} post-window={a['post_window_ignored']} "
         f"ts-regressions={sum(a['source_ts_regressions'].values())} duplicates={sum(a['duplicate_source_ts'].values())}"
     )
+    tick_rels = a["tick_regressions_by_minute"]["totals"]
+    lines.append(f"Tick regressions vs source high-water: same-minute={tick_rels['same_minute']} "
+                 f"earlier-minute={tick_rels['earlier_minute']}")
     lines.append("Note: " + report["interpretation"][0] + " " + report["interpretation"][1])
     return "\n".join(lines) + "\n"
 

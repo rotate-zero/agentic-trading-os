@@ -269,6 +269,75 @@ def test_source_timestamp_regressions_duplicates_and_naive_timestamps():
     assert c.stats["AAPL"]["candles_1m"].count == 3
     assert c.stats["AAPL"]["candles_1m"].last_source == datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
     assert c.stats["AAPL"]["candles_1m"].as_dict()["last_received_offset_s"] == 3.0
+    assert all(not any(counts.values()) for counts in c.tick_regressions_by_minute.values())
+
+
+def test_tick_regressions_classify_source_minutes_per_symbol_and_report_high_water():
+    c = started_collector()
+    m = c.window_start_mono
+    script = [
+        tick("AAPL", "2026-01-05T14:31:02Z"),
+        tick("AAPL", "2026-01-05T14:31:01+00:00"),  # same UTC minute
+        tick("AAPL", "2026-01-05T14:30:59.999Z"),  # earlier UTC minute
+        tick("AAPL", "2026-01-05T09:31:01-05:00"),  # offset normalizes to same UTC minute
+        tick("MSFT", "2026-01-05T14:30:10Z"),
+        tick("MSFT", "2026-01-05T14:29:59Z"),
+    ]
+    for i, raw in enumerate(script, 1):
+        assert c.process(raw, m + i, utc(i)) == "event"
+
+    assert c.source_ts_regressions["ticks"] == 4
+    assert c.tick_regressions_by_minute == {
+        "AAPL": {"same_minute": 2, "earlier_minute": 1},
+        "MSFT": {"same_minute": 0, "earlier_minute": 1},
+        "NVDA": {"same_minute": 0, "earlier_minute": 0},
+    }
+    assert [sample["minute_relation"] for sample in c.samples] == [
+        "same_minute", "earlier_minute", "same_minute", "earlier_minute"]
+    assert c.samples[1]["source_ts"] == "2026-01-05T14:30:59.999+00:00"
+    assert c.samples[1]["high_water_source_ts"] == "2026-01-05T14:31:02.000+00:00"
+    assert c.samples[2]["source_ts"] == "2026-01-05T14:31:01.000+00:00"
+    assert c.samples[2]["high_water_source_ts"] == "2026-01-05T14:31:02.000+00:00"
+
+    config = cfg(symbols="AAPL,MSFT,NVDA", duration_s=60)
+    report = sc.build_report(
+        config=config, collector=c, monitored=config.symbols, status="completed", end_reason="window_elapsed",
+        window_elapsed_s=60, started_utc=utc(0), ended_utc=utc(60), diagnostics_start=None,
+        diagnostics_end=None, connection={"interrupted": False})
+    breakdown = report["anomalies"]["tick_regressions_by_minute"]
+    assert breakdown == {
+        "totals": {"same_minute": 2, "earlier_minute": 2},
+        "by_symbol": c.tick_regressions_by_minute,
+        "first_examples_by_symbol": c.tick_regression_first_examples,
+    }
+    assert breakdown["first_examples_by_symbol"]["AAPL"]["earlier_minute"] == {
+        "source_ts": "2026-01-05T14:30:59.999+00:00",
+        "high_water_source_ts": "2026-01-05T14:31:02.000+00:00",
+        "received_offset_s": 3.0,
+    }
+    assert breakdown["first_examples_by_symbol"]["NVDA"] == {
+        "same_minute": None, "earlier_minute": None}
+    assert sum(breakdown["totals"].values()) == report["anomalies"]["source_ts_regressions"]["ticks"]
+    assert "same-minute=2 earlier-minute=2" in sc.render_console(report)
+
+
+def test_tick_regression_counts_continue_after_bounded_samples_fill():
+    c = started_collector(monitored=("AAPL",))
+    m = c.window_start_mono
+    c.process(tick("AAPL", "2026-01-05T14:31:50Z"), m + 1, utc(1))
+    for i in range(sc.MAX_ANOMALY_SAMPLES + 5):
+        c.process(tick("AAPL", "2026-01-05T14:31:00Z"), m + 2 + i * 0.1, utc(2 + i * 0.1))
+    c.process(tick("AAPL", "2026-01-05T14:30:00Z"), m + 5, utc(5))
+    assert c.tick_regressions_by_minute["AAPL"] == {
+        "same_minute": sc.MAX_ANOMALY_SAMPLES + 5, "earlier_minute": 1}
+    assert c.source_ts_regressions["ticks"] == sc.MAX_ANOMALY_SAMPLES + 6
+    assert len(c.samples) == sc.MAX_ANOMALY_SAMPLES and c.samples_dropped == 6
+    assert all(sample["minute_relation"] == "same_minute" for sample in c.samples)
+    assert c.tick_regression_first_examples["AAPL"]["earlier_minute"] == {
+        "source_ts": "2026-01-05T14:30:00.000+00:00",
+        "high_water_source_ts": "2026-01-05T14:31:50.000+00:00",
+        "received_offset_s": 5.0,
+    }
 
 
 def test_zulu_suffix_source_timestamps_parse():

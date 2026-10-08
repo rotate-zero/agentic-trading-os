@@ -147,9 +147,9 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   protocol (the earlier synthetic check, before the real-feed trial below)
 - ✅ Message parsing edge cases — multiple trades in one message, malformed entries,
   ping/unknown message types — all unit tested
-- ✅ One real Finnhub connection and three-symbol regular-session observation with a
+- ✅ Three real Finnhub connections and three-symbol regular-session observations with a
   configured key on 2026-10-08: AAPL/MSFT/NVDA all produced ticks, closed 1m candles
-  and 1m feature updates at `/ws` during a 180-second window (`TESTING.md`).
+  and 1m feature updates at `/ws` during each 180-second window (`TESTING.md`).
 - ❌ Provider acknowledgement, account capacity, lossless delivery, real outage/reconnect,
   and full-union/100-symbol coverage remain unverified.
 
@@ -394,7 +394,9 @@ python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000
 
 Exit `0` = completed window (zero events is a valid measurement), `2` = invalid input, `3` = failed setup (including an empty captured set or malformed beginning subscription diagnostics), `4` = interrupted/incomplete, `5` = JSON report not written. A malformed end diagnostic is recorded without failing a completed window. `last_source_ts` is the source time on the last event received in that category, including when source times regress. It reports events observed at the backend WebSocket boundary only: no provider capacity, lossless delivery or protective-coverage claim, and no threshold. Details and diagrams: `docs/architecture/scanner-design.md` section 18.17.
 
-One three-symbol real Finnhub session has been measured during regular hours (2026-10-08); see `TESTING.md` for counts, diagnostics and limits. It does not establish full-union or 100-symbol coverage.
+The JSON report and console also split tick source-time regressions by symbol into `same_minute` and `earlier_minute` relative to the preceding source high-water mark. At most 20 general anomaly samples retain the two source timestamps and class; the JSON report separately keeps the first timestamp pair for each monitored symbol and class, even after that cap fills. This describes observed ordering, not its cause.
+
+Three three-symbol real Finnhub windows have been measured during regular hours (2026-10-08); see `TESTING.md` for counts, diagnostics, database effects and limits. They do not establish full-union or 100-symbol coverage.
 
 ## Running tests
 
