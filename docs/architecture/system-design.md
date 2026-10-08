@@ -429,9 +429,12 @@ Finnhub badge, when disconnected:
      2. retire previous bridge: stop() now, then await settle
      3. only then: _streaming_provider/_streaming_bridge = new,
         request_protected_feed_reconcile()
+     failure before install: retire the uninstalled new bridge;
+         connect route disconnects its unregistered provider
    clear_streaming_provider()   (sync)  ──► stop() now; cleanup deferred
    settle_retired_bridges()  ◄── next takeover, /disconnect routes, lifespan shutdown
-   retire_streaming_bridge() ◄── lifespan shutdown (provider roles untouched)
+   retire_streaming_bridge() ◄── lifespan shutdown, even after a provider
+                                  disconnect error (provider roles untouched)
 ```
 
 **Internal bridge flow:**
@@ -455,6 +458,8 @@ stop()   [sync, idempotent]                    aclose()  [async, idempotent]
 ```
 
 **What retirement prevents, precisely.** After `stop()` returns: (1) no new handler task is created by a late provider callback; (2) handlers created but not yet started never run, and a handler suspended inside a publish is cancelled; (3) no publish call is started from this bridge, whether by a queued handler, a handler resuming, or the flush loop; (4) partially filled buckets are dropped rather than published, so a retired source cannot emit a candle the replacement also produces for that minute. **What it cannot prevent:** an envelope already put on the Event Bus queue before `stop()` cannot be retracted and subscribers may still process it. `EventBus.publish()` is an unbounded `Queue.put`, so a publish never suspends on the production bus and cannot be interrupted halfway. A replacement bridge built by a connect route admits from its own construction, so a short overlap with the old bridge before `take_over_streaming()` is called is unchanged.
+
+**Failure cleanup (decision #195, correcting #194's failed-disconnect wording).** If takeover fails before installing the candidate bridge, the registry awaits its retirement; the IBKR and Polygon connect paths also close their unregistered provider and clear any Polygon route/historical reference they just created. The old streaming owner stays registered and active when its disconnect raises. On lifespan shutdown, each provider disconnect error is logged and teardown continues; bridge retirement runs in a `finally` block around provider disconnection so a failed disconnect cannot leave admission open or skip the remaining service stops.
 
 **Callback limitation.** `MarketDataProvider` has no public removal method. The bridge calls `remove_tick_callback(callback)` only if a provider offers it (none shipped does) and otherwise leaves its callback registered but inert. A provider that outlives many bridges therefore keeps one dead bound method per retired bridge; each costs one state check per tick and nothing else. The registry never edits a provider's private callback list. A same-instance Finnhub reconnect re-uses its one adapter, callback and active bridge, so it neither duplicates callbacks nor retires anything. `take_over_streaming()` calls are still not serialized against each other.
 

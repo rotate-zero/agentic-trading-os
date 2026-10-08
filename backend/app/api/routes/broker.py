@@ -54,7 +54,16 @@ async def connect() -> dict:
         ) from exc
 
     bridge = TickIngestBridge(adapter, get_event_bus())
-    await broker_registry.take_over_streaming(adapter, bridge)
+    try:
+        await broker_registry.take_over_streaming(adapter, bridge)
+    except BaseException:
+        if broker_registry.get_streaming_provider() is not adapter:
+            await bridge.aclose()
+            try:
+                await adapter.disconnect()
+            except Exception:  # noqa: BLE001 — preserve the takeover failure
+                logger.exception("IBKR cleanup after failed streaming takeover failed")
+        raise
     broker_registry.set_historical_provider(adapter)
     return {"status": "connected"}
 

@@ -54,7 +54,20 @@ async def connect_polygon() -> PolygonAdapter:
 
     if broker_registry.get_streaming_provider() is None:
         bridge = TickIngestBridge(provider, get_event_bus())
-        await broker_registry.take_over_streaming(provider, bridge)
+        try:
+            await broker_registry.take_over_streaming(provider, bridge)
+        except BaseException:
+            if broker_registry.get_streaming_provider() is not provider:
+                await bridge.aclose()
+                if broker_registry.get_historical_provider() is provider:
+                    broker_registry.clear_historical_provider()
+                if _provider is provider:
+                    _provider = None
+                try:
+                    await provider.disconnect()
+                except Exception:  # noqa: BLE001 — preserve the takeover failure
+                    logger.exception("Polygon cleanup after failed streaming takeover failed")
+            raise
 
     return provider
 

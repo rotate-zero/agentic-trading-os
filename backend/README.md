@@ -90,7 +90,8 @@ Exit criteria for this phase: [`../docs/roadmap/phase-roadmap.md`](../docs/roadm
   `take_over_streaming()` safely hands off the streaming role without disconnecting a
   provider still needed for historical, and always retires the previous `TickIngestBridge`
   (admission off immediately, owned tasks settled) so a retained historical provider can
-  no longer publish live events (decision #194). `IBKRAdapter`, once connected, takes over
+  no longer publish live events (decisions #194–#195). A failed takeover retires the uninstalled
+  bridge, and the connect route closes its unregistered provider. `IBKRAdapter`, once connected, takes over
   both roles (it's capable of both) — that's always a deliberate manual action, so
   it's allowed to override whatever auto-connected at startup.
 - `POST /market-data/connect`, `/subscribe`, `/unsubscribe`, `/disconnect`,
@@ -387,7 +388,7 @@ python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000
 python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000 --scanner-universe --duration 600 --json-report ./coverage-report.json
 ```
 
-Exit `0` = completed window (zero events is a valid measurement), `2` = invalid input, `3` = failed setup (including an empty captured set), `4` = interrupted/incomplete, `5` = JSON report not written. It reports events observed at the backend WebSocket boundary only: no provider capacity, lossless delivery or protective-coverage claim, and no threshold. Details and diagrams: `docs/architecture/scanner-design.md` section 18.17.
+Exit `0` = completed window (zero events is a valid measurement), `2` = invalid input, `3` = failed setup (including an empty captured set or malformed beginning subscription diagnostics), `4` = interrupted/incomplete, `5` = JSON report not written. A malformed end diagnostic is recorded without failing a completed window. `last_source_ts` is the source time on the last event received in that category, including when source times regress. It reports events observed at the backend WebSocket boundary only: no provider capacity, lossless delivery or protective-coverage claim, and no threshold. Details and diagrams: `docs/architecture/scanner-design.md` section 18.17.
 
 ## Running tests
 
@@ -411,7 +412,7 @@ PostgreSQL for a complete suite rather than treating a skip-only run as final va
 | `test_streaming_coverage.py` | Streaming-coverage logic without I/O: input validation, credential redaction, acknowledgement-gated window, deterministic per-symbol aggregates, timeframe filtering, unmonitored/malformed/regression/duplicate handling, deadline cut-off, bounded retained state, diagnostics reduction, report/console/atomic writer |
 | `test_streaming_coverage_runtime.py` | Streaming-coverage command against a controlled local WebSocket/HTTP server: acks, interleaved symbols, zero-event symbols, delayed events, connection loss, cancellation/stop/SIGINT/SIGTERM with clean close, setup failures, credentials, bounded memory, and the real script end to end as a subprocess (synthetic traffic only) |
 | `test_streaming_coverage_contract.py` | The same command against the production `/ws` router, `WebSocketGateway`, `EventBus`, event models and the real subscription-status/universe routes under uvicorn, with a provider double |
-| `test_tick_bridge_retirement.py` | Retired `TickIngestBridge` isolation (decision #194): late callbacks create no work, queued/paused handlers and flush are cancelled, retained historical provider cannot publish after takeover, immediate clear, idempotent lifecycle, same-provider replacement, new-provider candles, Finnhub same-instance reconnect, settled shutdown. Controlled providers/bus only. |
+| `test_tick_bridge_retirement.py` | Retired `TickIngestBridge` isolation (decision #194): late callbacks create no work, queued/paused handlers and flush are cancelled, retained historical provider cannot publish after takeover, rejected candidates are retired, connect-route provider cleanup, immediate clear, idempotent lifecycle, same-provider replacement, new-provider candles, Finnhub same-instance reconnect, settled shutdown including a disconnect failure. Controlled providers/bus; one real lifespan test may access the local development database during optional startup. |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
 | `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Also covers `count`'s `[1, 1000]` bound directly: `0`/negative → 422, `1`/`1000` still reach the route's own logic unchanged. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
 | `test_rate_limiter.py` | The shared token-bucket rate limiter (confirmed decision #30): calls within budget don't wait, a call beyond budget genuinely waits for the window to clear, concurrent acquires don't race past the limit |

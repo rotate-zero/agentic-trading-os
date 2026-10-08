@@ -1,7 +1,9 @@
 """Retired TickIngestBridge isolation (task retired-tick-bridge-isolation).
 
-All providers, sockets and buses here are controlled fakes: no network, no
-real credentials, no database. Tests tagged [baseline-failing] exercise only
+All providers, sockets and buses here are controlled fakes: no external
+network or real credentials. One shutdown test enters the real lifespan,
+whose optional execution startup may read the configured local database.
+Tests tagged [baseline-failing] exercise only
 API that already existed before this task (stop(), take_over_streaming(),
 clear_streaming_provider(), emit) so they can be replayed against the
 pre-change source and shown to FAIL there for behavioural reasons; the rest
@@ -331,13 +333,91 @@ async def test_failed_old_disconnect_leaves_old_bridge_live_and_registry_unchang
     old_bridge = TickIngestBridge(old, bus)
     await broker_registry.take_over_streaming(old, old_bridge)
     old.fail_disconnect = True
+    new_bridge = TickIngestBridge(new, bus)
     with pytest.raises(RuntimeError):
-        await broker_registry.take_over_streaming(new, TickIngestBridge(new, bus))
+        await broker_registry.take_over_streaming(new, new_bridge)
     assert broker_registry.get_streaming_provider() is old
     assert old_bridge.state is BridgeState.ACTIVE
+    assert new_bridge.state is BridgeState.RETIRED
+    new.emit()
+    await _drain()
+    assert bus.published == []
     old.emit()
     await _drain()
     assert len(bus.published) == 1
+    await old_bridge.aclose()
+
+
+@pytest.mark.asyncio
+async def test_ibkr_connect_failure_disconnects_uninstalled_provider(monkeypatch):
+    from app.api.routes import broker
+
+    bus = _Bus()
+    old = _Provider("old")
+    old_bridge = TickIngestBridge(old, bus)
+    await broker_registry.take_over_streaming(old, old_bridge)
+    old.fail_disconnect = True
+
+    class Candidate(_Provider):
+        def __init__(self):
+            super().__init__("candidate")
+            candidates.append(self)
+
+        async def connect(self):
+            pass
+
+        def is_connected(self):
+            return not self.disconnected
+
+    candidates = []
+    monkeypatch.setattr(broker, "IBKRAdapter", Candidate)
+    monkeypatch.setattr(broker, "get_event_bus", lambda: bus)
+    with pytest.raises(RuntimeError, match="disconnect failed"):
+        await broker.connect()
+    candidate = candidates[0]
+    candidate.emit()
+    await _drain()
+    assert candidate.disconnected
+    assert bus.published == []
+    assert broker_registry.get_streaming_provider() is old
+    await old_bridge.aclose()
+
+
+@pytest.mark.asyncio
+async def test_polygon_connect_failure_clears_uninstalled_provider(monkeypatch):
+    from app.api.routes import market_data
+
+    bus = _Bus()
+
+    class Candidate(_Provider):
+        def __init__(self):
+            super().__init__("candidate")
+            candidates.append(self)
+
+        async def connect(self):
+            pass
+
+        def is_connected(self):
+            return not self.disconnected
+
+    candidates = []
+
+    async def failed_takeover(provider, bridge):
+        raise RuntimeError("takeover failed")
+
+    monkeypatch.setattr(market_data, "PolygonAdapter", Candidate)
+    monkeypatch.setattr(market_data, "get_event_bus", lambda: bus)
+    monkeypatch.setattr(broker_registry, "take_over_streaming", failed_takeover)
+    monkeypatch.setattr(market_data, "_provider", None)
+    with pytest.raises(RuntimeError, match="takeover failed"):
+        await market_data.connect_polygon()
+    candidate = candidates[0]
+    candidate.emit()
+    await _drain()
+    assert candidate.disconnected
+    assert market_data._provider is None
+    assert broker_registry.get_historical_provider() is None
+    assert bus.published == []
 
 
 @pytest.mark.asyncio
@@ -351,6 +431,24 @@ async def test_shutdown_retires_registered_bridge_without_changing_roles():
     assert bridge.state is BridgeState.RETIRED and _owned_tasks() == []
     assert broker_registry.get_streaming_provider() is provider
     assert broker_registry.get_historical_provider() is provider
+    provider.emit()
+    await _drain()
+    assert bus.published == []
+
+
+@pytest.mark.asyncio
+async def test_lifespan_shutdown_retires_bridge_after_provider_disconnect_failure(monkeypatch):
+    import app.main as main_module
+    from app.core.config import Settings
+
+    settings = Settings(_env_file=None, finnhub_api_key=None, polygon_api_key=None)
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    bus, provider = _Bus(), _Provider("failing")
+    async with main_module.app.router.lifespan_context(main_module.app):
+        bridge = TickIngestBridge(provider, bus)
+        await broker_registry.take_over_streaming(provider, bridge)
+        provider.fail_disconnect = True
+    assert bridge.state is BridgeState.RETIRED
     provider.emit()
     await _drain()
     assert bus.published == []

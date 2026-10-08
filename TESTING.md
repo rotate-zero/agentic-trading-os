@@ -1,3 +1,17 @@
+<!-- BEGIN DELIVERY SECTION: streaming-isolation-coverage-corrections -->
+# TESTING — `streaming-isolation-coverage-corrections`
+
+Base: GitHub `main` `9e486aa`. Targeted checks ran serially; no full backend suite, frontend build, real provider, or real-feed trial. Controlled providers and the measurement's synthetic local server were used. The real lifespan shutdown check may attempt optional startup reads against the configured local development PostgreSQL database; it creates no task-specific persistent records.
+
+- `tests/test_tick_bridge_retirement.py` — **24 passed**. Added failed-takeover candidate retirement and no publish, IBKR/Polygon route cleanup, and real-lifespan shutdown retirement after a provider disconnect error; existing late callback, retained historical provider, bucket, reconnect and idempotence checks still pass.
+- `tests/test_streaming_coverage.py` — **61 passed**. Updated the source-time regression assertion to require the last received event's source time, while keeping regression detection; malformed diagnostics dictionaries are rejected.
+- `tests/test_streaming_coverage_runtime.py` — **37 passed**. Malformed beginning diagnostics fail setup before opening a WebSocket; malformed end diagnostics are recorded while the completed-window exit remains `0`.
+- `tests/test_streaming_coverage_contract.py` — **1 passed** against the production gateway and route shapes with a controlled provider.
+- Affected existing checks, serial: `tests/test_broker_registry.py` — **7 passed**; `tests/test_finnhub_reconnect.py` — **19 passed**. `git diff --check` checked during implementation.
+
+Final targeted verification: **149 passed across six files**, each run serially; `git diff --check` was clean. One earlier bridge-file run encountered a transient local database connection error during optional lifespan startup; an isolated shutdown test and then the complete bridge file passed on rerun and in final verification. These tests do not establish live provider delivery or capacity.
+<!-- END DELIVERY SECTION: streaming-isolation-coverage-corrections -->
+
 <!-- BEGIN DELIVERY SECTION: streaming-coverage-measurement -->
 # TESTING — `streaming-coverage-measurement`
 

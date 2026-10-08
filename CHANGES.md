@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: streaming-isolation-coverage-corrections -->
+# CHANGES — `streaming-isolation-coverage-corrections`
+
+Base: GitHub `main` `9e486aa` (verified before decision numbering). This delivery corrects findings from the review of `retired-tick-bridge-isolation` and `streaming-coverage-measurement`; it does not reimplement either delivery. Decision #195 corrects #194's failed-disconnect wording without editing #194. No commit or push.
+
+- `backend/app/services/broker_registry.py`: a takeover that fails before installing its candidate now settles that candidate bridge, leaving the old registered owner unchanged. `backend/app/api/routes/broker.py` and `market_data.py` also close an unregistered candidate provider; Polygon clears the route and historical references it had created. Finnhub's existing cleanup path remains in use.
+- `backend/app/main.py`: logs individual market-data disconnect failures and continues shutdown; bridge retirement is guaranteed around the provider-disconnect loop, so the remaining service teardown can proceed.
+- `backend/app/measurement/streaming_coverage.py`: requires the existing subscription-status response shape before treating a diagnostics read as usable. A malformed beginning response fails setup before WebSocket connection; a malformed end response is recorded without invalidating a completed window. `last_source_ts` now holds the last received event's source time; an internal source high-water mark still detects timestamp regressions and duplicates.
+- Tests: `backend/tests/test_tick_bridge_retirement.py`, `test_streaming_coverage.py`, and `test_streaming_coverage_runtime.py` cover the corrected failure and reporting paths. Documentation: `docs/architecture/system-design.md`, `scanner-design.md`, `docs/decisions/confirmed-decisions.md` and `INDEX.md`, `backend/README.md`, this file and `TESTING.md`.
+
+The already documented boundaries remain: an event already queued on the Event Bus cannot be retracted; candidate bridges can admit during the brief interval before takeover is attempted; the measurement command still observes only backend WebSocket delivery and makes no provider capacity or lossless-delivery claim. No real-feed trial was run.
+<!-- END DELIVERY SECTION: streaming-isolation-coverage-corrections -->
+
 <!-- BEGIN DELIVERY SECTION: streaming-coverage-measurement -->
 # CHANGES — `streaming-coverage-measurement`
 

@@ -267,7 +267,8 @@ def test_source_timestamp_regressions_duplicates_and_naive_timestamps():
     assert c.source_ts_regressions["candles_1m"] == 1 and c.source_ts_regressions["ticks"] == 0
     assert c.naive_source_timestamps == 1
     assert c.stats["AAPL"]["candles_1m"].count == 3
-    assert c.stats["AAPL"]["candles_1m"].last_source == datetime(2026, 1, 5, 14, 31, tzinfo=timezone.utc)  # high-water mark kept
+    assert c.stats["AAPL"]["candles_1m"].last_source == datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
+    assert c.stats["AAPL"]["candles_1m"].as_dict()["last_received_offset_s"] == 3.0
 
 
 def test_zulu_suffix_source_timestamps_parse():
@@ -327,7 +328,9 @@ def test_reduce_subscription_status_unavailable_inventory_and_bad_shapes():
     assert r["inventory"]["availability"] == "unavailable" and r["monitored_locally_listed"] is None
     assert sc.reduce_subscription_status([1], ("AAPL",)) == {"read_ok": False, "error": "unexpected_response_shape"}
     junk = sc.reduce_subscription_status({"status": 5, "provider": "x", "connected": "yes", "inventory": {"count": True}}, ())
-    assert junk["status"] is None and junk["provider"] is None and junk["connected"] is None and junk["inventory"]["count"] is None
+    assert junk == {"read_ok": False, "error": "unexpected_response_shape"}
+    assert sc.reduce_subscription_status({}, ("AAPL",)) == junk
+    assert sc.reduce_subscription_status({**STATUS_BODY, "inventory": {"availability": "available"}}, ()) == junk
 
 
 def test_compare_identity_flags_changes_and_never_claims_continuity():

@@ -287,6 +287,13 @@ async def test_end_diagnostics_failure_is_recorded_without_failing_the_window(st
     assert r["diagnostics"]["identity"]["comparable"] is False
 
 
+async def test_malformed_end_diagnostics_is_recorded_without_failing_the_window(start_backend):
+    backend = await start_backend(status_bodies=[STATUS_A, {}])
+    m = make_measurement(backend, duration=0.3)
+    assert await m.run() == sc.EXIT_OK
+    assert m.report()["diagnostics"]["end"] == {"read_ok": False, "error": "unexpected_response_shape"}
+
+
 # =========================================================================== precondition / setup failures
 
 async def test_empty_scanner_universe_is_a_precondition_failure_before_any_connection(start_backend):
@@ -312,6 +319,16 @@ async def test_unreadable_start_diagnostics_fail_setup_before_connecting(start_b
     m = make_measurement(backend)
     assert await m.run() == sc.EXIT_SETUP_FAILED
     assert m.report()["setup_failure"] == {"code": "start_diagnostics_unavailable", "detail": "http_status_500"}
+    assert backend.ws_connections == 0
+
+
+async def test_malformed_start_diagnostics_fail_setup_before_connecting(start_backend):
+    backend = await start_backend(status_bodies=[{}])
+    m = make_measurement(backend)
+    assert await m.run() == sc.EXIT_SETUP_FAILED
+    assert m.report()["setup_failure"] == {
+        "code": "start_diagnostics_unavailable", "detail": "unexpected_response_shape",
+    }
     assert backend.ws_connections == 0
 
 

@@ -129,19 +129,28 @@ async def take_over_streaming(
     expose the new provider/bridge or wake the protected-feed owner. A
     historical-only provider that stays connected therefore can no longer
     publish live events through its old bridge. If old.disconnect() raises,
-    nothing has been retired and the registry is unchanged (as before).
+    the old registered bridge and provider remain unchanged; the uninstalled
+    candidate bridge is retired so it cannot publish outside the registry.
     """
     global _streaming_provider, _streaming_bridge
-    old = _streaming_provider
-    if old is not None and old is not new_provider and _historical_provider is not old:
-        await old.disconnect()
-    # Read AFTER the await: a clear/takeover may have run while disconnecting.
-    if _streaming_bridge is not None and _streaming_bridge is not bridge:
-        _retire_bridge(_streaming_bridge)
-    await settle_retired_bridges()
-    _streaming_provider = new_provider
-    _streaming_bridge = bridge
-    request_protected_feed_reconcile()
+    try:
+        old = _streaming_provider
+        if old is not None and old is not new_provider and _historical_provider is not old:
+            await old.disconnect()
+        # Read AFTER the await: a clear/takeover may have run while disconnecting.
+        if _streaming_bridge is not None and _streaming_bridge is not bridge:
+            _retire_bridge(_streaming_bridge)
+        await settle_retired_bridges()
+        _streaming_provider = new_provider
+        _streaming_bridge = bridge
+        request_protected_feed_reconcile()
+    except BaseException:
+        # The caller may have constructed an admitting bridge before this
+        # call. If installation failed, it must not keep publishing outside
+        # the registry (including when old.disconnect() raised).
+        if bridge is not None and _streaming_bridge is not bridge:
+            await bridge.aclose()
+        raise
 
 
 def clear_streaming_provider() -> None:

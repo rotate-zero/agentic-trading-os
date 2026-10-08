@@ -314,7 +314,7 @@ def _parse_source_ts(value: object) -> tuple[datetime | None, bool]:
 class _CategoryStats:
     __slots__ = (
         "count", "first_source", "last_source", "first_off", "last_off",
-        "first_utc", "last_utc", "max_gap", "_last_mono",
+        "first_utc", "last_utc", "max_gap", "_last_mono", "_max_source",
     )
 
     def __init__(self) -> None:
@@ -327,6 +327,7 @@ class _CategoryStats:
         self.last_utc: datetime | None = None
         self.max_gap: float | None = None
         self._last_mono: float | None = None
+        self._max_source: datetime | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -543,15 +544,16 @@ class CoverageCollector:
             gap = mono - (mono if stats._last_mono is None else stats._last_mono)
             if stats.max_gap is None or gap > stats.max_gap:
                 stats.max_gap = gap
-            if stats.last_source is not None:
-                if source < stats.last_source:
+            if stats._max_source is not None:
+                if source < stats._max_source:
                     self.source_ts_regressions[category] += 1
                     self._sample("source_ts_regression", mono, channel=channel, symbol=symbol)
-                elif source == stats.last_source and category in self.duplicate_source_ts:
+                elif source == stats._max_source and category in self.duplicate_source_ts:
                     self.duplicate_source_ts[category] += 1
                     self._sample("duplicate_source_ts", mono, channel=channel, symbol=symbol)
-        if stats.last_source is None or source >= stats.last_source:
-            stats.last_source = source
+        if stats._max_source is None or source > stats._max_source:
+            stats._max_source = source
+        stats.last_source = source
         stats.count += 1
         stats.last_off, stats.last_utc, stats._last_mono = offset, utc, mono
         self.last_accepted_mono = mono
@@ -610,9 +612,32 @@ def reduce_subscription_status(body: object, monitored: tuple[str, ...]) -> dict
     provider = body.get("provider")
     inventory = body.get("inventory")
     connected = body.get("connected")
+    status = body.get("status")
+    if status not in ("available", "unavailable") or not isinstance(inventory, dict):
+        return {"read_ok": False, "error": "unexpected_response_shape"}
+    if status == "available":
+        if (not isinstance(provider, dict)
+                or not isinstance(provider.get("id"), str) or not provider["id"]
+                or not isinstance(provider.get("class_name"), str) or not provider["class_name"]
+                or not (connected is None or isinstance(connected, bool))):
+            return {"read_ok": False, "error": "unexpected_response_shape"}
+    elif provider is not None or connected is not None:
+        return {"read_ok": False, "error": "unexpected_response_shape"}
+    availability = inventory.get("availability")
+    symbols = inventory.get("symbols")
+    count = inventory.get("count")
+    if inventory.get("basis") != "locally_tracked_requests":
+        return {"read_ok": False, "error": "unexpected_response_shape"}
+    if availability == "available":
+        if (status != "available" or connected is not True
+                or not isinstance(symbols, list) or not all(isinstance(s, str) for s in symbols)
+                or not isinstance(count, int) or isinstance(count, bool) or count != len(symbols)):
+            return {"read_ok": False, "error": "unexpected_response_shape"}
+    elif availability != "unavailable" or symbols is not None or count is not None:
+        return {"read_ok": False, "error": "unexpected_response_shape"}
     out: dict[str, Any] = {
         "read_ok": True,
-        "status": _short(body.get("status")),
+        "status": status,
         "reason": _short(body.get("reason")),
         "provider": None,
         "connected": connected if isinstance(connected, bool) else None,
@@ -621,18 +646,14 @@ def reduce_subscription_status(body: object, monitored: tuple[str, ...]) -> dict
     }
     if isinstance(provider, dict):
         out["provider"] = {"id": _short(provider.get("id")), "class_name": _short(provider.get("class_name"))}
-    if isinstance(inventory, dict):
-        count = inventory.get("count")
-        out["inventory"] = {
-            "availability": _short(inventory.get("availability")),
-            "reason": _short(inventory.get("reason")),
-            "basis": _short(inventory.get("basis")),
-            "count": count if isinstance(count, int) and not isinstance(count, bool) else None,
-        }
-        symbols = inventory.get("symbols")
-        if inventory.get("availability") == "available" and isinstance(symbols, list) \
-                and all(isinstance(s, str) for s in symbols):
-            out["monitored_locally_listed"] = len(set(monitored) & set(symbols))
+    out["inventory"] = {
+        "availability": availability,
+        "reason": _short(inventory.get("reason")),
+        "basis": _short(inventory.get("basis")),
+        "count": count,
+    }
+    if availability == "available":
+        out["monitored_locally_listed"] = len(set(monitored) & set(symbols))
     return out
 
 

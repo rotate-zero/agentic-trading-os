@@ -522,11 +522,16 @@ async def lifespan(app: FastAPI):
         # Settle the only subscription owner before disconnecting providers.
         if protected_feed_reconciler is not None:
             await protected_feed_reconciler.stop()
-        for provider in broker_registry.get_all_active_providers():
-            await provider.disconnect()
-        # Retire the registered bridge and settle every retired bridge's
-        # tasks (no provider-role change) so none outlive the lifespan.
-        await broker_registry.retire_streaming_bridge()
+        try:
+            for provider in broker_registry.get_all_active_providers():
+                try:
+                    await provider.disconnect()
+                except Exception as exc:  # noqa: BLE001 — finish shutdown after a provider failure
+                    logger.warning("Market-data provider disconnect failed during shutdown (%s)", type(exc).__name__)
+        finally:
+            # Admission must stop even if a provider disconnect raises or
+            # shutdown is cancelled while awaiting it.
+            await broker_registry.retire_streaming_bridge()
 
         # ContextEngine stops here, BEFORE the bus — it's a pure
         # publisher, not a subscriber like the engines below, so decision
