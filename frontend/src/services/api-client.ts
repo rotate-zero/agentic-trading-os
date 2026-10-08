@@ -1325,6 +1325,10 @@ export interface ScannerObservationRowWireShape {
   score: number | null;
   inputs_available: number;
   features: Record<string, number | null>;
+  /** ISO-8601 UTC `candle_ts` of the 1m FeatureSet that supplied this row's
+   * score inputs (task `scanner-observation-source-timestamps`) — the data
+   * time, NOT when the scan ran. `null`/absent = unknown; never inferred. */
+  source_candle_ts?: string | null;
 }
 
 export interface ScannerObservationDetailWireShape {
@@ -1343,6 +1347,10 @@ export interface ScannerObservationWireShape {
   reason: string | null;
   worker: { running: boolean; cycle_running: boolean } | null;
   observation: ScannerObservationDetailWireShape | null;
+  /** Server clock (ISO-8601 UTC) at the single snapshot read behind this
+   * response. The only reference a source age is measured against — not a
+   * live counter and not a freshness verdict. Absent from an older backend. */
+  read_at?: string | null;
 }
 
 export async function fetchScannerObservation(): Promise<ScannerObservationWireShape> {

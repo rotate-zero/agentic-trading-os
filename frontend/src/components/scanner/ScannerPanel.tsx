@@ -128,7 +128,39 @@ function formatUtc(iso: string | null): string {
   return Number.isNaN(date.getTime()) ? iso : `${date.toISOString().slice(0, 19).replace("T", " ")} UTC`;
 }
 
-function ObservationRow({ row }: { row: ScannerObservationRowWireShape }) {
+function parseUtcMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime();
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Whole-second duration as its two largest units (e.g. "2d 17h", "5m 3s"). */
+function formatDuration(totalSeconds: number): string {
+  const s = Math.floor(totalSeconds);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
+/** The row's source-candle line. Unknown stays unknown; a source time after
+ * the server read time is stated as such (no age, no clamping to 0); the age
+ * is always labelled as relative to the server read time of this response. */
+function formatSourceTime(sourceIso: string | null | undefined, readAtIso: string | null | undefined): string {
+  if (!sourceIso) return "Source candle time unknown";
+  const sourceMs = parseUtcMs(sourceIso);
+  if (sourceMs === null) return `Source candle ${sourceIso} (unreadable timestamp)`;
+  const label = `Source candle ${formatUtc(sourceIso)}`;
+  const readMs = parseUtcMs(readAtIso);
+  if (readMs === null) return `${label} · age unavailable (no server read time)`;
+  if (sourceMs > readMs) return `${label} · later than the server read time — age not shown`;
+  return `${label} · age ${formatDuration((readMs - sourceMs) / 1000)} at server read`;
+}
+
+function ObservationRow({ row, readAt }: { row: ScannerObservationRowWireShape; readAt: string | null | undefined }) {
   const lowConfidence = row.inputs_available < 2;
   const features = FEATURE_DISPLAY_ORDER.filter((k) => typeof row.features[k] === "number");
 
@@ -162,6 +194,57 @@ function ObservationRow({ row }: { row: ScannerObservationRowWireShape }) {
           })}
         </div>
       )}
+      <div data-testid="observation-source-time" className="font-mono text-[9px] text-text-muted">
+        {formatSourceTime(row.source_candle_ts, readAt)}
+      </div>
+    </div>
+  );
+}
+
+/** Earliest/latest known source candle across the retained rows, plus how
+ * many rows have no usable source time. Descriptive only — no threshold. */
+function summarizeSourceTimes(rows: ScannerObservationRowWireShape[]): { earliest: string; latest: string; unknown: number } | null {
+  let earliest: { ms: number; iso: string } | null = null;
+  let latest: { ms: number; iso: string } | null = null;
+  let unknown = 0;
+  for (const row of rows) {
+    const ms = parseUtcMs(row.source_candle_ts);
+    if (ms === null || !row.source_candle_ts) {
+      unknown += 1;
+      continue;
+    }
+    if (earliest === null || ms < earliest.ms) earliest = { ms, iso: row.source_candle_ts };
+    if (latest === null || ms > latest.ms) latest = { ms, iso: row.source_candle_ts };
+  }
+  if (earliest === null || latest === null) return unknown > 0 ? { earliest: "", latest: "", unknown } : null;
+  return { earliest: earliest.iso, latest: latest.iso, unknown };
+}
+
+function ObservationSourceTimes({
+  observation,
+  readAt,
+}: {
+  observation: ScannerObservationDetailWireShape;
+  readAt: string | null | undefined;
+}) {
+  const summary = summarizeSourceTimes(observation.results);
+  if (observation.results.length === 0 || summary === null) return null;
+  return (
+    <div data-testid="observation-source-summary" className="px-2 py-1 font-mono text-[10px] text-text-muted">
+      <div>
+        Scan completed {formatUtc(observation.last_success_at)}
+        {readAt ? ` · server read ${formatUtc(readAt)}` : ""}
+      </div>
+      <div>
+        {summary.earliest
+          ? `Source candles ${formatUtc(summary.earliest)}${summary.latest !== summary.earliest ? ` – ${formatUtc(summary.latest)}` : ""}`
+          : "Source candle times unknown"}
+        {summary.earliest && summary.unknown > 0 ? ` · ${summary.unknown} unknown` : ""}
+      </div>
+      <div className="text-[9px]">
+        Scan completion time and data time differ: a scan finishing just now can still score older feature candles. Ages
+        are measured from the server read time shown, not a live counter, and are not a freshness verdict.
+      </div>
     </div>
   );
 }
@@ -269,13 +352,14 @@ function ObservationBody() {
               {observation.skipped.length}
             </div>
           )}
+          <ObservationSourceTimes observation={observation} readAt={data.read_at} />
           {observation.results.length > 0 && (
             <>
               <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
                 Activity observations — not execution recommendations.
               </div>
               {observation.results.map((r) => (
-                <ObservationRow key={r.symbol} row={r} />
+                <ObservationRow key={r.symbol} row={r} readAt={data.read_at} />
               ))}
             </>
           )}

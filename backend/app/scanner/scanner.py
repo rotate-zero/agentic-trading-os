@@ -23,6 +23,12 @@ class ObservedScanRow:
     score: float
     inputs_available: int
     features: Mapping[str, float]
+    # `scanner-observation-source-timestamps`: candle_ts of the 1m FeatureSet
+    # that supplied this row's score inputs (captured by run_scan from the
+    # same snapshot). Belongs to the retained successful result: a later
+    # failed cycle replaces only error/attempt fields, never rows. None =
+    # unknown (never fabricated).
+    source_candle_ts: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -176,7 +182,15 @@ class ScannerObservationWorker:
             # Copy mutable runner payloads before publication. FeatureEngine
             # snapshots and the scorer stay on this owning event loop.
             rows = tuple(
-                ObservedScanRow(r.symbol, r.score, r.inputs_available, MappingProxyType(dict(r.features)))
+                ObservedScanRow(
+                    r.symbol,
+                    r.score,
+                    r.inputs_available,
+                    MappingProxyType(dict(r.features)),
+                    # getattr: an injected `scan` double that predates the
+                    # field yields "unknown", not an AttributeError.
+                    getattr(r, "source_candle_ts", None),
+                )
                 for r in results
             )
             if not stop_event.is_set() and generation == self._generation:

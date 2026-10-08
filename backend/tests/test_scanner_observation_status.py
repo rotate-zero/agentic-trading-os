@@ -168,8 +168,11 @@ async def test_populated_success_returns_complete_results_in_order_with_utc_time
     assert [r["symbol"] for r in obs["results"]] == ["BBB", "AAA", "CCC"]
     assert obs["results"][0] == {
         "symbol": "BBB", "score": 2.5, "inputs_available": 3, "features": {"rvol": 2.5, "gap_pct": -1.25},
+        "source_candle_ts": None,  # additive field (scanner-observation-source-timestamps): a row built without one is unknown
     }
-    assert obs["results"][2] == {"symbol": "CCC", "score": 0.0, "inputs_available": 0, "features": {}}
+    assert obs["results"][2] == {
+        "symbol": "CCC", "score": 0.0, "inputs_available": 0, "features": {}, "source_candle_ts": None,
+    }
     assert obs["last_attempt_at"] == "2026-10-08T14:30:00Z"
     assert obs["last_success_at"] == "2026-10-08T14:30:02Z"
     assert obs["last_attempt_at"].endswith("Z") and obs["last_success_at"].endswith("Z")

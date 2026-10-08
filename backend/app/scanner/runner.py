@@ -22,6 +22,7 @@ second source of truth to route around.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.feature_engine.engine import get_feature_engine
 from app.scanner.scorer import score_symbol
@@ -43,6 +44,15 @@ class ScanResult:
     score: float
     inputs_available: int
     features: dict[str, float]  # whichever of _DISPLAY_KEYS this symbol actually has right now
+    # Task `scanner-observation-source-timestamps`: the 1m FeatureSet's
+    # `candle_ts` (which candle close the scored inputs were computed from),
+    # taken from the SAME snapshot row that supplied `features` and the
+    # score -- never from a second FeatureEngine read. Defaulted so every
+    # existing positional/keyword constructor of ScanResult keeps working;
+    # None means "not known" (a caller that did not supply it), never a
+    # guessed time. It says when the source candle closed, not when the scan
+    # ran and not that the feed is healthy.
+    source_candle_ts: datetime | None = None
 
 
 def run_scan(
@@ -91,6 +101,9 @@ def run_scan(
                 score=activity.score,
                 inputs_available=activity.inputs_available,
                 features=display_features,
+                # Same FeatureSet object that was just scored (built from the
+                # one get_snapshot() row above) -- paired by construction.
+                source_candle_ts=feature_set.candle_ts,
             )
         )
 

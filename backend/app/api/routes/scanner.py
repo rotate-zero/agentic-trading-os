@@ -37,6 +37,13 @@ narrow `get_scanner_observation_reader` dependency below; nothing installs
 that reader yet (lifespan wiring is a separately approved task), so the
 production response is "unavailable". GET /scanner/state and universe CRUD
 are unchanged and independent of it.
+
+Task `scanner-observation-source-timestamps` adds two additive fields to that
+response only: a per-row `source_candle_ts` (the 1m FeatureSet candle the
+row's score inputs came from, UTC, `null` when unknown) and a top-level
+`read_at` (the server clock at the moment of the one snapshot read), so a
+client can state a source age relative to that read without using its own
+clock. Neither is a freshness classification or feed-health evidence.
 """
 from __future__ import annotations
 
@@ -179,6 +186,11 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _utcnow() -> datetime:
+    # Module-level so tests can pin the server read clock.
+    return datetime.now(timezone.utc)
+
+
 def _utc_iso(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -236,6 +248,9 @@ def _project_observation(snapshot: ObservationSnapshot) -> dict[str, Any]:
                     "score": _finite_or_none(row.score),
                     "inputs_available": row.inputs_available,
                     "features": {key: _finite_or_none(value) for key, value in row.features.items()},
+                    # Candle time of the source FeatureSet, not scan time. A
+                    # future value is reported as stored -- never clamped.
+                    "source_candle_ts": _utc_iso(row.source_candle_ts),
                 }
                 for row in snapshot.results
             ],
@@ -266,8 +281,13 @@ async def get_scanner_observation(
             "reason": "No scheduled observation reader is installed in this backend process.",
             "worker": None,
             "observation": None,
+            "read_at": _utc_iso(_utcnow()),
         }
-    return _project_observation(reader.get_snapshot())
+    snapshot = reader.get_snapshot()
+    read_at = _utcnow()  # taken immediately after the single snapshot read
+    projected = _project_observation(snapshot)
+    projected["read_at"] = _utc_iso(read_at)
+    return projected
 
 
 @router.get("/universe")
