@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
-from app.broker_adapters.base import HistoricalDataUnavailableError, SymbolNotFoundError
+from app.broker_adapters.base import HistoricalDataUnavailableError, SubscriptionInventory, SymbolNotFoundError
 from app.core.market_clock import get_market_clock
 from app.services import broker_registry, candle_aggregator, candle_store, live_tick_relay
 
@@ -248,3 +248,120 @@ async def get_feed_status(symbol: str = Query(...)) -> dict:
         "latest_recorded_candle_ts": latest_candle_ts,
         "staleness_seconds": staleness_seconds,
     }
+
+
+# Fixed wording, returned on every response so no consumer can read the
+# inventory as more than it is.
+_SUBSCRIPTION_STATUS_NOTE = (
+    "Inventory is the active streaming provider adapter's own local record of "
+    "subscribe/unsubscribe calls that returned without raising. It is not "
+    "provider acknowledgement, not proof that ticks are being delivered, and "
+    "not evidence of how many subscriptions the account may hold; capacity and "
+    "delivery are unknown."
+)
+
+
+def _subscription_status_body(
+    *,
+    status: str,
+    reason: str | None,
+    provider: dict | None,
+    connected: bool | None,
+    inventory_reason: str | None,
+    symbols: list[str] | None,
+) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "provider": provider,
+        "connected": connected,
+        "inventory": {
+            "availability": "available" if symbols is not None else "unavailable",
+            "reason": inventory_reason,
+            "basis": "locally_tracked_requests",
+            "count": len(symbols) if symbols is not None else None,
+            "symbols": symbols,
+        },
+        # No concrete runtime evidence exists in this repository for either
+        # (scanner-design.md §7, §18.6 CAP1): never inferred from a provider
+        # name or from documentation.
+        "capacity": {"status": "unknown", "limit": None},
+        "delivery": {"status": "unknown"},
+        "note": _SUBSCRIPTION_STATUS_NOTE,
+    }
+
+
+@router.get("/subscription-status")
+async def get_subscription_status() -> dict:
+    """
+    Read-only diagnostic: what the CURRENT streaming provider's adapter has
+    locally recorded as subscribed (task `provider-subscription-diagnostics`).
+
+    Strictly a registry read. It never constructs, connects, subscribes,
+    unsubscribes or disconnects anything, awaits nothing, and makes no
+    network request — the adapter's snapshot is an in-memory copy.
+
+    `status` says whether a streaming provider is registered at all
+    ("unavailable" + reason `no_streaming_provider` otherwise). `inventory`
+    is a separate verdict: "unavailable" (never an empty confirmed list) when
+    the provider is disconnected — an adapter keeps its local record across
+    a disconnect, and that retained record is not an active inventory — when
+    the adapter has no snapshot capability (existing doubles, future
+    providers), or when the snapshot read fails or returns something other
+    than a sequence of strings. Distinct from GET /market/feed-status, which
+    measures recorded-candle age for one symbol and says nothing about
+    subscriptions.
+    """
+    provider = broker_registry.get_streaming_provider()
+    if provider is None:
+        return _subscription_status_body(
+            status="unavailable",
+            reason="no_streaming_provider",
+            provider=None,
+            connected=None,
+            inventory_reason="no_streaming_provider",
+            symbols=None,
+        )
+
+    provider_id = getattr(provider, "provider_id", None)
+    identity = {
+        "id": provider_id if isinstance(provider_id, str) and provider_id else "unknown",
+        "class_name": type(provider).__name__,
+    }
+
+    try:
+        connected: bool | None = bool(provider.is_connected())
+    except Exception:  # noqa: BLE001 — a diagnostic must not 500 on a misbehaving provider
+        logger.exception("subscription-status: is_connected() failed for %s", identity["class_name"])
+        connected = None
+
+    def body(inventory_reason: str | None, symbols: list[str] | None) -> dict:
+        return _subscription_status_body(
+            status="available",
+            reason=None,
+            provider=identity,
+            connected=connected,
+            inventory_reason=inventory_reason,
+            symbols=symbols,
+        )
+
+    if connected is None:
+        return body("connection_state_unknown", None)
+    if not connected:
+        return body("provider_not_connected", None)
+    if not isinstance(provider, SubscriptionInventory):
+        return body("inventory_not_supported", None)
+
+    try:
+        raw = provider.get_subscription_snapshot()
+    except Exception:  # noqa: BLE001 — see above
+        logger.exception("subscription-status: snapshot failed for %s", identity["class_name"])
+        return body("snapshot_failed", None)
+
+    if not isinstance(raw, (tuple, list, frozenset, set)) or not all(isinstance(s, str) for s in raw):
+        logger.warning("subscription-status: %s returned an invalid snapshot", identity["class_name"])
+        return body("snapshot_failed", None)
+
+    # Fresh, deterministically ordered list: the response never shares
+    # structure with anything the adapter holds.
+    return body(None, sorted(raw))

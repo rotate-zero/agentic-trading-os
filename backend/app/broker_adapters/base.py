@@ -43,7 +43,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -52,6 +52,7 @@ from app.schemas.events.market_data import CandleClosed as Candle
 __all__ = [
     "MarketDataProvider",
     "BrokerAdapter",
+    "SubscriptionInventory",
     "Candle",
     "Tick",
     "OrderRequest",
@@ -154,6 +155,35 @@ class MarketDataProvider(ABC):
 
     @abstractmethod
     def on_tick(self, callback: Callable[[Tick], None]) -> None: ...
+
+
+@runtime_checkable
+class SubscriptionInventory(Protocol):
+    """
+    Optional, read-only capability (task `provider-subscription-diagnostics`):
+    "which symbols has THIS adapter instance itself asked its provider to
+    stream?" Deliberately NOT an abstract method on MarketDataProvider —
+    adding one would break every existing implementation and test double,
+    and a provider that cannot answer honestly must be able to say so by
+    simply not having the method (callers treat that as "inventory
+    unavailable", never as an empty confirmed set).
+
+    Contract for implementers:
+      - Returns a NEW tuple of symbols, sorted ascending, built from the
+        adapter's own local bookkeeping. Never the internal collection.
+      - Synchronous, in-memory only: no network request, no provider call,
+        no state change, no lock held across an await.
+      - The inventory is the adapter's LOCAL record of subscribe/unsubscribe
+        calls that returned without raising. It is NOT provider
+        acknowledgement, NOT proof that ticks are being delivered, and NOT
+        evidence of how many subscriptions the account may hold.
+      - It makes no claim about connection state. An adapter that keeps its
+        record across a disconnect returns that retained record; the
+        caller decides whether to present it (see GET
+        /market/subscription-status, which does not while disconnected).
+    """
+
+    def get_subscription_snapshot(self) -> tuple[str, ...]: ...
 
 
 class BrokerAdapter(MarketDataProvider):

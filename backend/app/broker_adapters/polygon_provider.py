@@ -39,6 +39,7 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from typing import ClassVar
 
 from polygon import RESTClient
 from polygon.exceptions import AuthError, BadResponse
@@ -87,6 +88,8 @@ def _is_plan_limitation(exc: BadResponse) -> bool:
 
 
 class PolygonAdapter(MarketDataProvider):
+    provider_id: ClassVar[str] = "polygon"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -220,6 +223,14 @@ class PolygonAdapter(MarketDataProvider):
 
     def on_tick(self, callback: Callable[[Tick], None]) -> None:
         self._tick_callbacks.append(callback)
+
+    # --- diagnostics -----------------------------------------------------
+
+    def get_subscription_snapshot(self) -> tuple[str, ...]:
+        """Sorted copy of the symbols this adapter has locally recorded as
+        requested (see base.SubscriptionInventory). Local bookkeeping only:
+        no provider acknowledgement, delivery or capacity is implied."""
+        return tuple(sorted(self._symbols))
 
     # --- internals ------------------------------------------------------
 

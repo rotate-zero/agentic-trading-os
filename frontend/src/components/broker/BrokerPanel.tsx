@@ -1,5 +1,7 @@
 import { useRef, useState } from "react";
 import { useBrokerStatus } from "../../hooks/useBrokerStatus";
+import { useSubscriptionStatus } from "../../hooks/useSubscriptionStatus";
+import type { SubscriptionStatusWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established
 // (MIN_WIDTH/MAX_WIDTH/COLLAPSED_WIDTH, drag-to-resize, "starts
@@ -96,6 +98,128 @@ function SubscribeForm({
           Subscribe
         </button>
       </div>
+    </div>
+  );
+}
+
+// Plain-language text per backend `inventory.reason`. An unknown future
+// reason falls back to showing the raw code rather than guessing.
+function unavailableText(reason: string | null): string {
+  switch (reason) {
+    case "no_streaming_provider":
+      return "No streaming provider is registered, so there is no inventory to show.";
+    case "provider_not_connected":
+      return "The provider is not connected. Any record it retained from before is not shown — it would not be an active inventory.";
+    case "inventory_not_supported":
+      return "This provider cannot report a subscription inventory.";
+    case "snapshot_failed":
+      return "The provider's inventory could not be read.";
+    case "connection_state_unknown":
+      return "The provider's connection state could not be read, so no inventory is shown.";
+    default:
+      return `Inventory unavailable${reason ? ` (${reason})` : ""}.`;
+  }
+}
+
+function connectionText(connected: boolean | null): string {
+  if (connected === null) return "unknown";
+  return connected ? "connected" : "not connected";
+}
+
+function DiagnosticsReading({ data }: { data: SubscriptionStatusWireShape }) {
+  const { inventory, provider } = data;
+  return (
+    <>
+      {provider ? (
+        <div className="px-2 py-1 font-mono text-[10px] text-text-muted">
+          Provider: <span className="text-text-primary">{provider.id}</span> ({provider.class_name}) —{" "}
+          {connectionText(data.connected)}
+        </div>
+      ) : (
+        <div className="px-2 py-1 font-mono text-[10px] text-text-muted">Provider: none registered</div>
+      )}
+
+      {inventory.availability === "unavailable" && (
+        <div className="px-2 py-1 font-mono text-[11px] text-text-muted">{unavailableText(inventory.reason)}</div>
+      )}
+      {inventory.availability === "available" && inventory.count === 0 && (
+        <div className="px-2 py-1 font-mono text-[11px] text-text-muted">
+          Connected; no subscribe requests are locally recorded.
+        </div>
+      )}
+      {inventory.availability === "available" && inventory.symbols !== null && inventory.symbols.length > 0 && (
+        <div className="px-2 py-1">
+          <div className="font-mono text-[10px] text-text-muted">{inventory.count} locally tracked</div>
+          <div className="mt-1 flex max-h-28 flex-wrap gap-1 overflow-y-auto">
+            {inventory.symbols.map((s) => (
+              <span key={s} className="rounded border border-base-border px-1 font-mono text-[10px] text-text-primary">
+                {s}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
+        Capacity: {data.capacity.status} · Delivery: {data.delivery.status}
+      </div>
+      <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
+        Locally tracked requests only — not provider acknowledgement, proof of live delivery, ownership or capacity.
+      </div>
+    </>
+  );
+}
+
+function SubscriptionDiagnosticsBody() {
+  const { data, error, loadedAt, loading, refresh } = useSubscriptionStatus();
+
+  return (
+    <div className="max-h-64 overflow-y-auto pb-1">
+      <div className="flex items-center justify-between px-2 py-1">
+        <span className="font-mono text-[9px] text-text-muted">
+          {loadedAt ? `Read at ${loadedAt.toLocaleTimeString()}` : ""}
+        </span>
+        {/* Never disabled: a newer Refresh supersedes a pending or hung one. */}
+        <button
+          onClick={refresh}
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+        >
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+
+      {loading && data === null && error === null && (
+        <div className="px-2 py-2 font-mono text-[11px] text-text-muted">Loading subscription diagnostics…</div>
+      )}
+      {error !== null && data === null && (
+        <div className="px-2 py-2 font-mono text-[11px] text-bear">Failed to load subscription diagnostics: {error}</div>
+      )}
+      {error !== null && data !== null && (
+        <div className="px-2 py-1 font-mono text-[10px] text-bear">
+          Refresh failed — showing the last successful reading: {error}
+        </div>
+      )}
+      {data !== null && <DiagnosticsReading data={data} />}
+    </div>
+  );
+}
+
+function SubscriptionDiagnosticsSection() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="shrink-0 border-t border-base-border">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1 px-2 py-1 text-left font-mono text-[10px] font-semibold text-text-muted hover:text-text-primary"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>Subscription diagnostics</span>
+      </button>
+      {/* Mounted only while expanded: collapsing unmounts the body, which
+          invalidates any in-flight request. Re-expanding loads afresh. */}
+      {open && <SubscriptionDiagnosticsBody />}
     </div>
   );
 }
@@ -242,6 +366,8 @@ export function BrokerPanel() {
               symbolActionError={symbolActionError}
               onSubscribe={subscribe}
             />
+
+            <SubscriptionDiagnosticsSection />
           </>
         )}
       </div>

@@ -257,6 +257,18 @@ Mutation compatibility (what the hook refuses synchronously): `connect`/`disconn
 
 Known limits: requests are not cancelled (a superseded POST may still complete on the backend; the UI only stops reporting it, and a subscribe superseded by a failed-then-retried disconnect is not recorded locally); a status read slower than the 10 s poll interval is always superseded and never shown, so a backend that slow leaves the panel on its last reading/"Checking…"; the panel still reads connection state from `GET /broker/status`, which reports any streaming provider (provider-identity question documented in `ibkr-broker-panel-validation.md` P1, out of scope here).
 
+**Provider subscription diagnostics (task `provider-subscription-diagnostics`; no decision number — it adds a read surface and changes no decided policy).** Before this, nothing could say which symbols the streaming adapter had requested: `GET /broker/status` is a bare connected flag and the Broker panel's list records only its own actions. The adapters now optionally expose a read-only snapshot, `GET /market/subscription-status` reports it for the **current streaming provider**, and `BrokerPanel` has a collapsible "Subscription diagnostics" section (manual Refresh). The inventory is the adapter's **local record** of subscribe/unsubscribe calls that returned without raising — not provider acknowledgement, not proof of tick delivery, not ownership and not capacity (both reported as `unknown`; nothing is inferred from provider names). With no streaming provider, a disconnected one, or one lacking the capability, the route says the inventory is **unavailable** rather than returning an empty confirmed list; it never constructs, connects or mutates a provider. `GET /market/feed-status` (recorded-candle age) is unchanged and measures something else. Full flows, response contract and limits: `scanner-design.md` §18.11.
+
+```
+BrokerPanel ──(expand / Refresh)──► GET /market/subscription-status ──► broker_registry.get_streaming_provider()
+                                                                              │ read only
+        FinnhubAdapter / PolygonAdapter / IBKRAdapter ◄── get_subscription_snapshot() ── tuple(sorted(local set))
+        (any provider without the method ─► "inventory not supported")        no network · no state change
+
+route verdicts:  no provider │ not connected │ not supported │ snapshot failed │ available(count, symbols)
+                 capacity: unknown   delivery: unknown   (always)
+```
+
 ### 4.2 Market Data Engine
 The only module allowed to talk to a broker for data.
 

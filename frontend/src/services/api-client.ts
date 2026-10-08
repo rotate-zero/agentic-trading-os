@@ -1994,6 +1994,41 @@ export async function fetchBrokerStatus(): Promise<BrokerStatusWireShape> {
   return (await res.json()) as BrokerStatusWireShape;
 }
 
+/**
+ * GET /market/subscription-status — read-only view of the CURRENT streaming
+ * provider's LOCALLY TRACKED subscription requests (task
+ * `provider-subscription-diagnostics`). The inventory is the backend
+ * adapter's own record of subscribe/unsubscribe calls that returned without
+ * raising: not provider acknowledgement, not proof of tick delivery, not
+ * evidence of capacity or ownership. `capacity`/`delivery` are always
+ * "unknown". `inventory.availability: "unavailable"` (with a `reason`) is
+ * distinct from an available-but-empty inventory (`count: 0`).
+ */
+export interface SubscriptionStatusWireShape {
+  status: "available" | "unavailable"; // is a streaming provider registered at all
+  reason: string | null;
+  provider: { id: string; class_name: string } | null;
+  connected: boolean | null;
+  inventory: {
+    availability: "available" | "unavailable";
+    reason: string | null;
+    basis: "locally_tracked_requests";
+    count: number | null;
+    symbols: string[] | null; // ascending; null whenever unavailable
+  };
+  capacity: { status: "unknown"; limit: number | null };
+  delivery: { status: "unknown" };
+  note: string;
+}
+
+export async function fetchSubscriptionStatus(): Promise<SubscriptionStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/market/subscription-status`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as SubscriptionStatusWireShape;
+}
+
 export interface BrokerConnectResultWireShape {
   status: "connected" | "already_connected";
 }

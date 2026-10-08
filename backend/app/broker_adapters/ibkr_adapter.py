@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime
+from typing import ClassVar
 
 from ib_async import IB, Stock
 
@@ -69,6 +70,8 @@ def _duration_str(start: datetime, end: datetime) -> str:
 
 
 class IBKRAdapter(BrokerAdapter):
+    provider_id: ClassVar[str] = "ibkr"
+
     def __init__(
         self,
         host: str | None = None,
@@ -249,6 +252,14 @@ class IBKRAdapter(BrokerAdapter):
 
     def is_connected(self) -> bool:
         return self._ib.isConnected()
+
+    # --- diagnostics -----------------------------------------------------
+
+    def get_subscription_snapshot(self) -> tuple[str, ...]:
+        """Sorted copy of the symbols this adapter has locally recorded as
+        requested (see base.SubscriptionInventory). Local bookkeeping only:
+        no provider acknowledgement, delivery or capacity is implied."""
+        return tuple(sorted(self._contracts))
 
     # --- internals --------------------------------------------------------
 

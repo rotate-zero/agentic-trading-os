@@ -644,7 +644,7 @@ Frontend-only; no backend, `api-client.ts`, `useScannerState`, ranking, scoring,
 
 ---
 
-## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`; context hot-add built as `context-universe-hot-add`; status read built as `scanner-observation-status`)
+## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`; context hot-add built as `context-universe-hot-add`; status read built as `scanner-observation-status`; provider subscription inventory read built as `provider-subscription-diagnostics`)
 
 This section records the verified full-system design and, in §18.8, the tested observation worker core. The worker is **not started by the application**, so continuous scanning and promotion are not deployed. Decision #189 confirms only the directions identified in §18.7; the remaining filter and switch details are recommendations. It supersedes the *as-built* implications of §§0, 4–5: the old cadence table is a draft, `ScannerRankingUpdated` does not exist, `GET /scanner/state` already exists but recomputes per request, `StrategyScheduler` already exists but has no scanner eligibility input, and relay activation does not control strategy evaluation. Scanner scores are activity observations, not authorizations to execute.
 
@@ -655,7 +655,7 @@ This section records the verified full-system design and, in §18.8, the tested 
 | Universe | `backend/app/scanner/universe.py`: `DbUniverseProvider` reads `scanner_universe_symbols`; add/remove/list are persistent, format-only operations. `backend/app/api/routes/scanner.py:get_scanner_state` falls back to `TEST_UNIVERSE` on an empty DB universe and accepts a validated `?symbols=` override. | The observation worker now rereads this table each admitted cycle and treats empty as a successful empty result (§18.8). Startup ownership and feed coverage remain open. |
 | Score | `backend/app/scanner/scorer.py:score_symbol` consumes existing 1m `FeatureSet` values; `backend/app/scanner/runner.py:run_scan` reads `FeatureEngine.get_snapshot()` and ranks on demand. It skips symbols with no 1m snapshot, but **includes** a snapshot with zero usable inputs and score zero. `GET /scanner/state?top_n=` cuts only the response. | The observation worker now retains full results, skipped symbols and status (§18.8). A promotion filter remains unapproved. |
 | Strategy | `backend/app/strategy_engine/scheduler.py:StrategyScheduler._on_market_state_changed` triggers on every per-symbol `MarketStateChanged` with matching cached features and context, then applies strategy gate conditions. It reads no scanner set. `backend/app/context_engine/engine.py` loads the DB universe at startup and, since `context-universe-hot-add` (§18.9), rereads it after each successful `POST /scanner/universe` to start per-symbol context loops for newly added symbols. Removal never stops a loop. | A narrow **entry-evaluation** eligibility read at the scheduler. The ContextEngine refresh for additions is built (§18.9); a ContextEngine retirement/ownership rule for removed symbols is not. Neither scanner membership nor score may be read by Governor or Execution as authorization. |
-| Feed | `backend/app/api/routes/market.py:subscribe` calls the current streaming provider. `FinnhubAdapter`, `PolygonAdapter` and `IBKRAdapter` each own their own transient subscription sets (`backend/app/broker_adapters/`); there is no central manual-subscription owner or general capacity registry. `backend/app/main.py:lifespan` connects providers but does not subscribe the scanner universe or restored holdings. Finnhub has no automatic reconnect after a WebSocket close. | Explicit, additive feed subscription for symbols needed to score and to monitor existing exposure; track manual needs to compute the full union; re-establish after provider connection/reconnection. Provider capacity and data quality require real validation. |
+| Feed | `backend/app/api/routes/market.py:subscribe` calls the current streaming provider. `FinnhubAdapter`, `PolygonAdapter` and `IBKRAdapter` each own their own transient subscription sets (`backend/app/broker_adapters/`); there is no central manual-subscription owner or general capacity registry. `backend/app/main.py:lifespan` connects providers but does not subscribe the scanner universe or restored holdings. Finnhub has no automatic reconnect after a WebSocket close. | Explicit, additive feed subscription for symbols needed to score and to monitor existing exposure; track manual needs to compute the full union; re-establish after provider connection/reconnection. Provider capacity and data quality require real validation. Since `provider-subscription-diagnostics` (§18.11) the active streaming adapter's own **local** subscription record can be read (`GET /market/subscription-status`); it is neither a central owner nor capacity or delivery evidence. |
 | Relay | `backend/app/services/live_tick_relay.py:LiveTickRelay.set_active_symbols` replaces a maximum-eight set; its `PriceUpdated` subscriber emits throttled `PriceSnapshot` only for that set. `POST /market/active-symbols` can set it manually. | Optional scanner-owned chart activation, with a defined interaction with manual relay settings. It is **not** a provider subscription or a strategy eligibility gate. |
 | UI | `ScannerPanel` / `useScannerState` poll on-demand `GET /scanner/state`; `useScannerUniverse` edits the DB universe. Chart/watchlist subscriptions use `frontend/src/hooks/useLatestPrices.ts` and the market subscribe route; broker-panel subscriptions have their own local UI record. | The scheduled-result read surface is built (§18.10: `GET /scanner/observation` plus the "Scheduled observation" section) but reports unavailable until a lifecycle task installs the worker; staleness policy and promote visibility remain open. UI selection must not become the scanner's authority. |
 | Protection | `backend/app/position_monitor/engine.py:PositionMonitor` reads `PortfolioStatePositionReader` and bus-wide `PriceUpdated`/`CandleClosed`, journals ticks before held-position visibility can settle, and has an EOD timer. `SimulatedVenue`, `ReferencePriceTracker` and Portfolio State consume their own tick/order paths. | A durable feed-need reconciliation from restored open positions and working orders. Scanner exclusion must never stop those observations. Existing monitor journal capacity/loss behavior remains a separate limit. |
@@ -741,7 +741,7 @@ For this minimum slice, keep scanner subscriptions additive and never use `provi
 | `backend/app/scanner/runner.py`, `scorer.py` | Reuse unchanged unless a focused test finds a genuine contract gap; keep zero-input rows in on-demand output, filter only at promotion. |
 | `backend/app/strategy_engine/scheduler.py` | Inject optional eligibility reader; check before each new strategy evaluation, with pass-through default for off/observe and existing backtest/tests. Do not change `gate_conditions` or opportunity payloads. |
 | `backend/app/context_engine/engine.py` | **Built for additions (§18.9, `context-universe-hot-add`):** `refresh_symbol_loops()` rereads the universe and starts loops for new symbols without restarting global calendar work or changing per-symbol context contracts. Retiring loops for removed symbols is not built. |
-| `backend/app/services/live_tick_relay.py`, `backend/app/api/routes/market.py`, provider-specific subscription routes | No relay semantic change; coordinate optional scanner chart writes and manual set ownership per C4. Record manual provider needs in a shared, inspectable owner so the full-union capacity check is possible, and coordinate direct provider unsubscribe safety. Preserve route contracts. |
+| `backend/app/services/live_tick_relay.py`, `backend/app/api/routes/market.py`, provider-specific subscription routes | No relay semantic change; coordinate optional scanner chart writes and manual set ownership per C4. Record manual provider needs in a shared, inspectable owner so the full-union capacity check is possible, and coordinate direct provider unsubscribe safety. Preserve route contracts. *Partially informed by §18.11:* a read-only per-adapter local record now exists; it is not that shared owner. |
 | `backend/app/portfolio_state/*`, `backend/app/execution_engine/*` | Read existing restored position/working-order state through a narrow adapter; no exit or accounting policy changes. Add transition notifications only if needed to reassert feed need promptly. |
 | `backend/app/main.py`, `backend/app/core/config.py` | Validate simulated-only mode and approved schedule/filter settings; start owner after required dependencies, stop it before provider disconnect and normal bus drain. |
 | `backend/app/api/routes/scanner.py` | Keep on-demand state/universe endpoints intact; the distinct scheduled status/results read is **built** (§18.10, `scanner-observation-status`) with no scan-triggering side effect. |
@@ -984,3 +984,93 @@ The section loads once when expanded and thereafter only on manual Refresh. It s
 - **Reader failure is not masked.** An exception from a reader's `get_snapshot()` propagates as a 500; the real worker's read cannot raise.
 - **Timestamps** in the response are UTC; the panel's "Read" time is the browser's local time of the read.
 - **Not proven here:** real feed delivery or coverage, a real lifespan install, and real FeatureEngine contents (tests use controlled readers and a real worker with an injected clock, universe and scanner). The frontend has no committed test runner; its race behavior was exercised with a temporary jsdom harness outside the repository, as in earlier frontend deliveries.
+
+### 18.11 Provider subscription diagnostics (`provider-subscription-diagnostics`)
+
+**Purpose.** §18.1 and §18.4 observe that provider subscriptions are transient, adapter-owned and unreadable, which blocks any later full-union capacity check. This delivery adds only a **read**: the active streaming adapter's own record of which symbols it has requested, shown by `GET /market/subscription-status` and a collapsible "Subscription diagnostics" section in `BrokerPanel`. It adds no ownership registry, reconciliation, automatic subscription, capacity enforcement, reconnect or trading control, changes no existing route or adapter behavior, and does not replace `GET /market/feed-status` (recorded-candle age for one symbol — a different measurement). No decision number was needed: the delivery adds a read surface and changes no decided policy (the canonical index and log were re-checked at base `8097abd`: both end at #189). Decision #189 and open items C1–C4 are untouched.
+
+**What the inventory is — and is not.** It is the adapter instance's **local bookkeeping**: a symbol is in it once the adapter's own `subscribe()` call returned without raising (Finnhub: after the WebSocket `send`; IBKR: after qualification and `reqMktData`; Polygon: when added to the polled set) and leaves it on `unsubscribe()`. A successful subscribe call does not establish provider acknowledgement, live tick delivery, ownership by any consumer, or that the account may hold that many subscriptions. The response says so on every call (`basis: "locally_tracked_requests"`, a fixed `note`), and `capacity` and `delivery` are always `{"status": "unknown"}` with no limit: the repository holds no concrete runtime evidence for either (§7's Finnhub ceiling question and §18.6 CAP1 stay open, decision #169 measured only downstream processing), and nothing is inferred from a provider's name or documentation. Because it is per adapter instance, it reflects every caller of that instance (this panel, other tabs, `curl`, provider-specific routes) — unlike the panel's own `subscribedSymbols`, which records only actions taken through that one browser hook and is unchanged.
+
+**Component data flow:**
+
+```
+Browser                                         Backend (read path only)
+BrokerPanel ── expand section / Refresh ──► GET /market/subscription-status
+ "Subscription diagnostics"                            │
+        ▲                                              ▼
+        │                              broker_registry.get_streaming_provider()   (registry read —
+        │                                              │                            never constructs,
+        │                                              │                            connects or replaces)
+        │                     ┌────────────────────────┼─────────────────────────────┐
+        │                  None                  provider present                      │
+        │                     │                        │ is_connected()  (local flag / ib.isConnected())
+        │                     │                        ▼                              │
+        │                     │      FinnhubAdapter ── get_subscription_snapshot() ◄──┤  in-memory copy:
+        │                     │      PolygonAdapter ──        (optional capability)   │  tuple(sorted(local set))
+        │                     │      IBKRAdapter    ──                                │  no socket, no REST,
+        │                     │      anything else ── no method ─► "not supported"    │  no API call
+        └──── JSON ◄──────────┴────────────────────────┘
+        (unavailable | available) · count · symbols · capacity unknown · delivery unknown
+
+ Not touched by a read: connect / subscribe / unsubscribe / disconnect, TickIngestBridge, Event Bus,
+ LiveTickRelay, scanner universe, ContextEngine, candle store, the historical role, execution venue.
+ Not replaced: GET /market/feed-status, POST /market/subscribe, POST /market/active-symbols,
+ /broker/*, /finnhub/*, /market-data/* (all unchanged).
+```
+
+**Internal read flow (route):**
+
+```
+GET /market/subscription-status          (async, awaits nothing; one synchronous pass)
+  provider = registry.get_streaming_provider()
+  ├─ None ───────────────────────────► status "unavailable", reason no_streaming_provider
+  │                                      provider null · connected null · inventory unavailable
+  └─ present: identity = {id: class attr provider_id | "unknown", class_name}
+        connected = is_connected()      raises → null  ─► inventory unavailable: connection_state_unknown
+        ├─ not connected ─────────────► inventory unavailable: provider_not_connected
+        │                                 (a retained local record is NOT presented as an inventory)
+        ├─ lacks the capability ──────► inventory unavailable: inventory_not_supported
+        ├─ snapshot() raises, or returns something other than a sequence of str
+        │                             ─► inventory unavailable: snapshot_failed   (logged; still HTTP 200)
+        └─ ok ─► symbols = sorted(copy)   inventory available: count, symbols (count 0 = genuinely empty)
+  every body: basis, capacity unknown, delivery unknown, fixed note
+```
+
+**Adapter capability.** `SubscriptionInventory` (`broker_adapters/base.py`) is a `runtime_checkable` Protocol with one synchronous method, `get_subscription_snapshot() -> tuple[str, ...]`. It is deliberately **not** an abstract method of `MarketDataProvider`, so existing implementations and test doubles keep working and a provider that cannot answer honestly simply lacks it. `FinnhubAdapter`, `PolygonAdapter` and `IBKRAdapter` implement it as `tuple(sorted(<their own set/dict>))` and each gains a `provider_id` class attribute (`finnhub`, `polygon`, `ibkr`). The tuple is a new immutable object; the adapters' internal collections are never exposed, and a later subscribe cannot change an earlier snapshot. The adapters keep their local record across `disconnect()` (existing behavior, unchanged), so the route — not the adapter — decides not to show it while disconnected.
+
+**Response contract.**
+
+| Field | Values |
+|---|---|
+| `status` / `reason` | `available`, or `unavailable` + `no_streaming_provider` — whether a streaming provider is registered at all |
+| `provider` | `{id, class_name}` (`id` is `unknown` for a provider without `provider_id`) or `null` |
+| `connected` | `true` / `false` / `null` (read failed or no provider) |
+| `inventory.availability` | `available` or `unavailable` — never an empty list standing in for "unknown" |
+| `inventory.reason` | `null`, `no_streaming_provider`, `provider_not_connected`, `inventory_not_supported`, `snapshot_failed`, `connection_state_unknown` |
+| `inventory.count` / `symbols` | integer and ascending list when available, else `null` |
+| `capacity`, `delivery` | `{status: "unknown", limit: null}`, `{status: "unknown"}` |
+
+**Frontend flow:**
+
+```
+BrokerPanel   (connect / disconnect / subscribe form / panel-local list — unchanged, never trigger a diagnostics read)
+ └─ SubscriptionDiagnosticsSection   collapsed by default; header toggles `open`
+        open ─► SubscriptionDiagnosticsBody mounts ─► useSubscriptionStatus
+                   │ mount: load() = request #1          Refresh click: load() = request #n+1 (never disabled)
+                   ▼ fetchSubscriptionStatus ─ GET /market/subscription-status
+        completion:  requestId === latest ?  apply : discard
+           success ─► reading replaced, error cleared     failure ─► last reading kept, error set
+        collapse the section / collapse the panel / unmount ─► body unmounts ─► cleanup bumps the counter
+        (re-expanding mounts a new body that loads afresh; no polling, no timer, no WebSocket)
+```
+
+Distinct states: loading; request failure with nothing loaded (shown as a failure, not as "unavailable"); failed Refresh with the last reading kept and labelled; unavailable with a reason-specific sentence (no provider, not connected, unsupported, read failed, connection unknown; an unrecognized future reason is shown as its code); available-but-empty ("Connected; no subscribe requests are locally recorded"); and populated (count plus symbols in backend order). Every reading is labelled "Locally tracked requests only — not provider acknowledgement, proof of live delivery, ownership or capacity" and shows "Capacity: unknown · Delivery: unknown".
+
+**Limitations.**
+
+- **Local record only.** After a provider-side rejection, silent server drop, or reconnect, the local set can disagree with what the provider is actually streaming; nothing here detects that. A Finnhub `send` that raised partway through a multi-symbol subscribe leaves earlier symbols recorded and the failing one not.
+- **Retained record across disconnect.** All three adapters keep their set after `disconnect()` or an unexpected close. Through today's routes this is unreachable as a stale inventory: each connect route constructs a **new** adapter, and the diagnostics route hides a disconnected provider's record. Reconnecting the *same* adapter instance (no route does) would not re-send retained symbols, and Finnhub's `subscribe()` would skip them; this is pre-existing, unchanged, and a candidate for the reconnect/ownership work in §18.4, not part of this task.
+- **Streaming role only.** A provider that holds only the historical role (e.g. Polygon when Finnhub streams) is not reported; Polygon's REST polling budget remains unmeasured.
+- **Full-union capacity is still unmeasured.** The read lists one adapter's requests; it does not include open-position or working-order needs (§18.4), and it cannot say whether the account may hold the §18.2 union.
+- **No refresh coupling.** The section reads on expand and on manual Refresh only; subscribing from the panel does not update it until Refresh.
+- **Not proven here:** any real Finnhub, Polygon or IBKR session. Tests use the real adapters over fake transports; the frontend has no committed test runner and was exercised with a temporary jsdom harness outside the repository, as in earlier frontend deliveries.
