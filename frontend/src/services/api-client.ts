@@ -2037,6 +2037,77 @@ export async function fetchSubscriptionStatus(): Promise<SubscriptionStatusWireS
   return (await res.json()) as SubscriptionStatusWireShape;
 }
 
+/**
+ * GET /market/protected-feed-status — read-only view of the protected-symbol
+ * subscription owner's LAST ATTEMPT (task `protected-feed-reconciliation-status`).
+ * Request evidence only: "locally_present" is the provider adapter's own
+ * record, "request_returned" is a subscribe call that returned without
+ * raising. Neither is provider acknowledgement, proof of tick delivery or
+ * confirmed protection. `protected_set.symbols: null` (never read) is distinct
+ * from `[]` (a successful empty read); a failed read keeps the last successful
+ * set and its own `read_at`. Error detail is a fixed code or coarse class only.
+ */
+export type ProtectedFeedState =
+  | "never_attempted"
+  | "first_attempt_in_progress"
+  | "completed"
+  | "completed_with_failures"
+  | "protected_set_read_failed"
+  | "no_streaming_provider"
+  | "provider_disconnected"
+  | "provider_check_failed"
+  | "interrupted";
+
+export type ProtectedFeedRequestOutcome =
+  | "locally_present"
+  | "request_returned"
+  | "request_failed"
+  | "no_outcome";
+
+export interface ProtectedFeedStatusWireShape {
+  status: "available" | "unavailable";
+  reason: string | null; // "reconciler_not_installed" | "snapshot_read_failed" | null
+  reconciler: {
+    state: ProtectedFeedState | string;
+    running: boolean;
+    cycle_in_progress: boolean;
+    interval_seconds: number;
+    attempts_started: number;
+    attempts_completed: number;
+    last_attempt_at: string | null;
+    last_completed_at: string | null;
+    last_cycle_outcome: string | null;
+  } | null;
+  protected_set: {
+    availability: "read" | "never_read";
+    read_at: string | null; // time of the last SUCCESSFUL read
+    symbols: string[] | null;
+    count: number | null;
+    latest_read: "succeeded" | "failed" | null;
+    latest_read_attempt_at: string | null;
+    latest_read_error: string | null;
+  } | null;
+  provider: { id: string; class_name: string; connected: boolean | null } | null;
+  requests: {
+    recorded_at: string; // start of the cycle these outcomes belong to
+    provider: { id: string; class_name: string };
+    inventory_available: boolean;
+    basis: "request_evidence_only";
+    counts: Record<string, number>;
+    entries: { symbol: string; outcome: ProtectedFeedRequestOutcome | string; error_class: string | null }[];
+  } | null;
+  note: string;
+  read_at: string | null; // server time of this read
+}
+
+export async function fetchProtectedFeedStatus(): Promise<ProtectedFeedStatusWireShape> {
+  const res = await fetch(`${API_BASE_URL}/market/protected-feed-status`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as ProtectedFeedStatusWireShape;
+}
+
 export interface BrokerConnectResultWireShape {
   status: "connected" | "already_connected";
 }

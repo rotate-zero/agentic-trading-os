@@ -269,6 +269,18 @@ route verdicts:  no provider │ not connected │ not supported │ snapshot fa
                  capacity: unknown   delivery: unknown   (always)
 ```
 
+**Protected feed reconciliation status (task `protected-feed-reconciliation-status`; no decision number — it adds a read surface and changes no decided policy).** The protected-symbol subscription owner (decision #189) previously reported failures only in logs. It now keeps an immutable snapshot of its last attempt, and `GET /market/protected-feed-status` reads it through an optional `app.state` reader that the lifespan installs after the owner starts and clears first at shutdown. Panel: Broker panel "Protected feed" section, manual Refresh.
+
+```
+Broker panel ─(expand / Refresh)─► GET /market/protected-feed-status ─► app.state.protected_feed_status_reader ─► get_snapshot()
+                                                                      (None ─► "reconciler_not_installed")        │ sync, no I/O
+ProtectedFeedReconciler cycle ─► frozen ProtectedFeedSnapshot ◄───────────────────────────────────────────────────┘
+   read failed ─► last successful set retained (never an empty set) · provider none/disconnected ─► reason recorded
+   per symbol: locally_present │ request_returned │ request_failed │ no_outcome     = request evidence, not delivery
+```
+
+See `scanner-design.md` §18.14 for the full state table, retention rules and internal flow.
+
 ### 4.2 Market Data Engine
 The only module allowed to talk to a broker for data.
 

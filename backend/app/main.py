@@ -235,6 +235,7 @@ async def lifespan(app: FastAPI):
     app.state.world_view_portfolio_reader = None
     app.state.position_monitor = None
     app.state.execution_startup_status = None
+    app.state.protected_feed_status_reader = None
     try:
         execution_venue = SimulatedVenue(event_bus=bus)
         await execution_venue.connect()
@@ -372,6 +373,9 @@ async def lifespan(app: FastAPI):
             # #189's 60-second interval against the current registry role.
             protected_feed_reconciler = ProtectedFeedReconciler(SessionLocal)
             protected_feed_reconciler.start()
+            # Read-only status view (GET /market/protected-feed-status); it
+            # exposes only get_snapshot() and is cleared before the owner stops.
+            app.state.protected_feed_status_reader = protected_feed_reconciler
 
             # Recorder failure cannot change an otherwise ready execution pipeline.
             try:
@@ -415,6 +419,7 @@ async def lifespan(app: FastAPI):
         broker_registry.clear_execution_venue()
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
+        app.state.protected_feed_status_reader = None
         if protected_feed_reconciler is not None:
             await protected_feed_reconciler.stop()
         if authorizer_stub is not None:
@@ -447,6 +452,7 @@ async def lifespan(app: FastAPI):
         app.state.context_engine = None
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
+        app.state.protected_feed_status_reader = None
         # Same "no active lifespan" reset as the two lines above — a route
         # hit after shutdown must report "unavailable", not a stale "ready"/
         # "reconciliation_blocked"/"startup_failed" from before this process

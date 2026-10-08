@@ -644,7 +644,7 @@ Frontend-only; no backend, `api-client.ts`, `useScannerState`, ranking, scoring,
 
 ---
 
-## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`; context hot-add built as `context-universe-hot-add`; status read built as `scanner-observation-status`; provider subscription inventory read built as `provider-subscription-diagnostics`; observation source candle timestamps built as `scanner-observation-source-timestamps`; protected feed requests built as `protected-feed-reconciliation`)
+## 18. Continuous scanner design (`continuous-scanner-design`; observation core built as `scanner-observation-worker`; context hot-add built as `context-universe-hot-add`; status read built as `scanner-observation-status`; provider subscription inventory read built as `provider-subscription-diagnostics`; observation source candle timestamps built as `scanner-observation-source-timestamps`; protected feed requests built as `protected-feed-reconciliation`; protected feed request status built as `protected-feed-reconciliation-status`)
 
 This section records the verified full-system design and, in §18.8, the tested observation worker core. The worker is **not started by the application**, so continuous scanning and promotion are not deployed. Decision #189 confirms only the directions identified in §18.7; the remaining filter and switch details are recommendations. It supersedes the *as-built* implications of §§0, 4–5: the old cadence table is a draft, `ScannerRankingUpdated` does not exist, `GET /scanner/state` already exists but recomputes per request, `StrategyScheduler` already exists but has no scanner eligibility input, and relay activation does not control strategy evaluation. Scanner scores are activity observations, not authorizations to execute.
 
@@ -1178,4 +1178,68 @@ shutdown ─► stop/cancel and settle owned cycle ─► provider disconnect
 
 The loop has one in-flight cycle; additional attempts during it are skipped. Every cycle rereads the ledger and the current streaming role, so a replacement receives its own requests. Finnhub and IBKR discard old-session local subscription bookkeeping when disconnected, allowing requests after a later same-instance connection; Polygon retains its in-process polling set. Providers without usable inventory receive repeated requests under the adapter's idempotent subscription behavior. Inventory only avoids unnecessary calls: neither its presence nor a returned `subscribe()` establishes provider acknowledgement, capacity or continuing tick delivery. The loop never unsubscribes, so shrinking needs leaves manual and earlier requested symbols alone. A provider switch during a request is rechecked before the next symbol; the next cycle targets the new role.
 
-The 60-second interval starts after each completed cycle. A new exposure or reconnected provider may wait up to the next cycle **plus that cycle's read and subscription duration** before a request; failure adds another retry interval. This does not promise uninterrupted protective coverage. Actual provider reconnection, verified capacity across the full manual/scanner/protected union, provider acknowledgement and continuous delivery remain prerequisites outside this slice. Finnhub's WebSocket close still requires a separate reconnect action; Polygon's free-tier feed remains delayed. Existing direct unsubscribe routes can still create a gap until the next cycle.
+The 60-second interval starts after each completed cycle. A new exposure or reconnected provider may wait up to the next cycle **plus that cycle's read and subscription duration** before a request; failure adds another retry interval. This does not promise uninterrupted protective coverage. Actual provider reconnection, verified capacity across the full manual/scanner/protected union, provider acknowledgement and continuous delivery remain prerequisites outside this slice. Finnhub's WebSocket close still requires a separate reconnect action; Polygon's free-tier feed remains delayed. Existing direct unsubscribe routes can still create a gap until the next cycle. The owner's last attempt is readable through §18.14.
+
+### 18.14 Protected feed reconciliation status (`protected-feed-reconciliation-status`)
+
+§18.13's owner made protected-symbol subscription requests, but its failures were visible only in logs. This slice adds a **read-only status view of the owner's last attempt**. It adds no policy: decision #189, the 60-second cadence, the symbol-selection rules, the retry behavior and the shutdown ordering are unchanged, and no new decision number was needed. The unresolved scanner policies (Top-N/filter, switch details, capacity verification, operator-enabled automation) stay open.
+
+**What it records.** `ProtectedFeedReconciler.get_snapshot()` returns a `ProtectedFeedSnapshot`: a frozen dataclass whose fields are scalars, datetimes and tuples only (no list, dict or set), so a consumer cannot mutate the owner's state. It carries: running and cycle-in-progress flags, the configured interval, attempts started/finished, latest attempt start and finish times, the latest cycle outcome, the latest read attempt and its outcome, the **last successful** protected-set read (its own time and sorted symbols), the provider seen by the latest lookup and its connection state, and a retained per-symbol `RequestRecord` (the cycle's start time, provider identity, whether the provider's local inventory was readable, and one outcome per symbol).
+
+**Distinctions made explicit**
+
+| Condition | Where it shows |
+|---|---|
+| No reconciler installed | route `status: "unavailable"`, `reason: "reconciler_not_installed"` (reader absent from `app.state`) |
+| Installed, never attempted | `reconciler.state: "never_attempted"`, no timestamps, `protected_set.availability: "never_read"` |
+| First attempt still running | `reconciler.state: "first_attempt_in_progress"` |
+| Protected-set read failed | `reconciler.state: "protected_set_read_failed"`, `protected_set.latest_read: "failed"` with the fixed code `protected_set_read_failed`; nothing was requested |
+| No / disconnected / unreadable streaming provider | `no_streaming_provider`, `provider_disconnected`, `provider_check_failed` |
+| Successful empty set | `protected_set.availability: "read"`, `symbols: []`, `count: 0`, `latest_read: "succeeded"` |
+| Locally present subscription | per-symbol `locally_present` (found in the adapter's own record; no request made) |
+| Request returned | per-symbol `request_returned` (`subscribe()` returned without raising) |
+| Request failed | per-symbol `request_failed` with a coarse `error_class` (`timeout`, `connection`, `other`) |
+| Cycle ended before a symbol had a result | per-symbol `no_outcome`; cycle state `interrupted` or `provider_disconnected` |
+
+**Retention rules.** A later failed database read never overwrites the last successful read and never appears as an empty set: the route returns the retained symbols with their own `read_at` and a separate `latest_read: "failed"` marker. Likewise the request outcomes are replaced only by a cycle that reached the request step (provider present and connected); a later cycle that failed earlier leaves them in place, labelled with their own cycle time and provider. Reading status never changes any of this.
+
+**Evidence wording.** `locally_present` and `request_returned` are request evidence only. The route and panel never call them verified delivery, acknowledgement or confirmed protection, and say the periodic re-check means a new position or working order can wait up to one interval (plus that cycle's work) before it is requested. This still does not establish continuous tick delivery, capacity for the full manual/scanner/protected union, or provider reconnection.
+
+**Safe errors.** The route carries fixed codes and coarse classes only. Raw exception text (which can contain connection strings or credentials) stays in the backend logs, unchanged from §18.13.
+
+**Component data flow:**
+
+```
+main.py lifespan ─ owns ─► ProtectedFeedReconciler ─ installs after start ─► app.state.protected_feed_status_reader
+        │                         │                                                     │ (cleared before the owner stops,
+        │                         │ cycle writes (event loop only)                      │  on rollback, and in the final finally)
+        │                         ▼                                                     ▼
+        │              ProtectedFeedSnapshot (frozen)  ◄── get_snapshot() ◄── GET /market/protected-feed-status
+        │                                                   (sync, I/O-free)      │  one read; projects to a fresh dict
+        ▼                                                                         ▼
+ provider disconnect (after owner stop)                              BrokerPanel "Protected feed" section
+                                                                      (manual Refresh · useProtectedFeedStatus)
+                                       beside the existing "Subscription diagnostics" section
+```
+
+The status route never starts a cycle, reads the database, subscribes or touches a provider; it does not take the reconciler's lock.
+
+**Internal snapshot flow:**
+
+```
+reconcile_once ─► (stopping or lock held? skip: not an attempt) ─► take lock
+   ├─ snapshot ◄─ cycle_in_progress, attempts_started+1, last_attempt_at
+   ├─ _cycle(attempt)        _Attempt = private mutable accumulator (never exposed)
+   │     ├─ read ──fails──► attempt.read_failed ; outcome protected_set_read_failed
+   │     ├─ read ──ok────► attempt.read_symbols (empty set is a real result)
+   │     ├─ provider lookup ─► none │ check failed │ disconnected ─► outcome set, stop here
+   │     └─ inventory ─► per symbol: locally_present │ request_returned │ request_failed(class)
+   │           └─ stopping / provider replaced / disconnected mid-cycle ─► rest = no_outcome
+   └─ finally _record(attempt)   (also on cancellation, as "interrupted")
+         builds ONE new frozen snapshot and swaps the reference (no await in between)
+         ├─ last_set_read replaced only by a successful read
+         └─ request_record replaced only by a cycle that reached the request step
+get_snapshot() ─► copy of the current reference with `running` filled in ─► consumer
+```
+
+**Frontend.** `BrokerPanel` gains a distinct collapsible "Protected feed" section next to "Subscription diagnostics". It loads once on expanding and on each manual Refresh (no polling), shows protected symbols with the time of their last successful read, the latest attempt start/finish times, the provider and its connection state, and per-symbol outcomes. Initial loading, an HTTP failure, a backend "unavailable" answer and a worker failure state are shown differently. After a failed Refresh the last reading stays on screen with its server read time and a notice; a later success clears it. Each request is numbered so a superseded response is ignored, and unmounting (collapsing the section or panel) invalidates anything in flight. Existing connect, disconnect, subscribe and diagnostics behavior is unchanged.

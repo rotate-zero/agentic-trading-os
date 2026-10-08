@@ -3468,6 +3468,17 @@ one immediate cycle, then 60 seconds after each completion:
 
 The owner never unsubscribes or changes position/order accounting. Local inventory suppresses duplicate requests only; subscription success is not a feed health verdict. A new exposure can wait up to the next 60-second cycle plus its work duration for a request. Provider reconnect and observed tick delivery remain separate concerns; capacity for the full required union is unverified. See `scanner-design.md` §18.13 for ownership and adapter details.
 
+**Status of the owner's last attempt (`protected-feed-reconciliation-status`).** The owner exposes an immutable, request-evidence-only snapshot (`get_snapshot()`), published as `app.state.protected_feed_status_reader` by the same lifespan that starts the owner and cleared before it stops, and read by `GET /market/protected-feed-status`. Reading it neither starts a cycle nor touches the ledger or a provider; cadence, selection, retries and shutdown ordering are unchanged.
+
+```
+owner cycle ─► frozen snapshot ◄─ get_snapshot() ◄─ GET /market/protected-feed-status ◄─ Broker panel "Protected feed"
+   read failed ─► last successful set kept (never shown as empty)
+   provider none/disconnected ─► nothing requested, reason recorded
+   per symbol: locally_present │ request_returned │ request_failed │ no_outcome   (request evidence, not delivery)
+```
+
+See `scanner-design.md` §18.14.
+
 ### 6.10 Configuration (EX-4) — three limits, configurable, not hardcoded
 
 All values live in `core/config.py`'s `Settings` (the repository's single source of configuration — nothing else reads the environment), overridable by environment/`.env`, validated at startup (each must be positive), and **recorded on every authorization** as `limits_snapshot` so a decision's basis is auditable after the limits change. Changes take effect at restart in v1.

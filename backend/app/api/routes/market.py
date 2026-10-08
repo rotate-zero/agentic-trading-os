@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
 from app.broker_adapters.base import HistoricalDataUnavailableError, SubscriptionInventory, SymbolNotFoundError
 from app.core.market_clock import get_market_clock
 from app.services import broker_registry, candle_aggregator, candle_store, live_tick_relay
+from app.services.protected_feed_reconciliation import ProtectedFeedSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -365,3 +367,150 @@ async def get_subscription_status() -> dict:
     # Fresh, deterministically ordered list: the response never shares
     # structure with anything the adapter holds.
     return body(None, sorted(raw))
+
+
+# --- GET /market/protected-feed-status -------------------------------------
+# Task `protected-feed-reconciliation-status`.
+
+_PROTECTED_FEED_NOTE = (
+    "Request evidence only. The protected-feed owner re-checks about every "
+    "interval_seconds, so a change in held positions or working orders can take "
+    "up to one interval to be requested. A symbol listed as locally present was "
+    "found in the provider adapter's own record; one listed as request returned "
+    "had a subscribe call that returned without raising. Neither is provider "
+    "acknowledgement, proof that ticks are arriving, or confirmed protection."
+)
+
+
+class ProtectedFeedStatusReader(Protocol):
+    """The only thing this route may use from the reconciler: one synchronous,
+    I/O-free snapshot read. It cannot start a cycle, read the database,
+    subscribe or contact a provider through this route."""
+
+    def get_snapshot(self) -> ProtectedFeedSnapshot: ...
+
+
+def get_protected_feed_status_reader(request: Request) -> ProtectedFeedStatusReader | None:
+    """Optional lifespan-owned object on `app.state`, `None` when absent. Never
+    constructs, starts or looks up a reconciler itself."""
+    return getattr(request.app.state, "protected_feed_status_reader", None)
+
+
+def _protected_feed_utcnow() -> datetime:
+    # Module-level so tests can pin the server read clock.
+    return datetime.now(timezone.utc)
+
+
+def _protected_feed_iso(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _protected_feed_body(*, status: str, reason: str | None, reconciler: dict | None, protected_set: dict | None,
+                         provider: dict | None, requests: dict | None) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "reconciler": reconciler,
+        "protected_set": protected_set,
+        "provider": provider,
+        "requests": requests,
+        "note": _PROTECTED_FEED_NOTE,
+        "read_at": _protected_feed_iso(_protected_feed_utcnow()),
+    }
+
+
+def _protected_feed_provider(identity) -> dict | None:
+    if identity is None:
+        return None
+    return {"id": identity.provider_id, "class_name": identity.class_name}
+
+
+def _project_protected_feed(snapshot: ProtectedFeedSnapshot) -> dict:
+    if snapshot.attempts_completed == 0:
+        state = "never_attempted" if snapshot.attempts_started == 0 else "first_attempt_in_progress"
+    else:
+        state = snapshot.last_cycle_outcome or "interrupted"
+
+    read = snapshot.last_set_read
+    latest_read_failed = snapshot.last_read_outcome == "failed"
+    protected_set = {
+        # "never_read" is distinct from a successful empty set (count 0).
+        "availability": "read" if read is not None else "never_read",
+        "read_at": _protected_feed_iso(read.read_at) if read is not None else None,
+        "symbols": list(read.symbols) if read is not None else None,
+        "count": len(read.symbols) if read is not None else None,
+        "latest_read": snapshot.last_read_outcome,
+        "latest_read_attempt_at": _protected_feed_iso(snapshot.last_read_attempt_at),
+        # Fixed code only; raw exception detail stays in the backend logs.
+        "latest_read_error": "protected_set_read_failed" if latest_read_failed else None,
+    }
+
+    requests = None
+    record = snapshot.request_record
+    if record is not None:
+        counts = {"locally_present": 0, "request_returned": 0, "request_failed": 0, "no_outcome": 0}
+        entries = []
+        for item in record.requests:
+            counts[item.outcome] = counts.get(item.outcome, 0) + 1
+            entries.append({"symbol": item.symbol, "outcome": item.outcome, "error_class": item.error_class})
+        requests = {
+            "recorded_at": _protected_feed_iso(record.recorded_at),
+            "provider": _protected_feed_provider(record.provider),
+            "inventory_available": record.inventory_available,
+            "basis": "request_evidence_only",
+            "counts": counts,
+            "entries": entries,
+        }
+
+    reconciler = {
+        "state": state,
+        "running": snapshot.running,
+        "cycle_in_progress": snapshot.cycle_in_progress,
+        "interval_seconds": snapshot.interval_seconds,
+        "attempts_started": snapshot.attempts_started,
+        "attempts_completed": snapshot.attempts_completed,
+        "last_attempt_at": _protected_feed_iso(snapshot.last_attempt_at),
+        "last_completed_at": _protected_feed_iso(snapshot.last_completed_at),
+        "last_cycle_outcome": snapshot.last_cycle_outcome,
+    }
+    provider = _protected_feed_provider(snapshot.last_provider)
+    if provider is not None:
+        provider["connected"] = snapshot.last_provider_connected
+    return _protected_feed_body(
+        status="available", reason=None, reconciler=reconciler,
+        protected_set=protected_set, provider=provider, requests=requests,
+    )
+
+
+@router.get("/protected-feed-status")
+async def get_protected_feed_status(
+    reader: ProtectedFeedStatusReader | None = Depends(get_protected_feed_status_reader),
+) -> dict:
+    """Read-only view of the protected-symbol subscription owner's last attempt.
+
+    Exactly one synchronous `get_snapshot()` per request: no reconciliation
+    cycle, database read, subscribe, unsubscribe or provider connection is
+    started here. With no reader installed (`reconciler_not_installed`) the
+    answer is "unavailable" — distinct from an installed owner that has not
+    yet attempted (`reconciler.state == "never_attempted"`). A failed
+    protected-set read never appears as an empty set: the last successful read
+    is kept, with its own timestamp, next to the latest read outcome. Error
+    detail is limited to fixed codes and coarse classes.
+    """
+    if reader is None:
+        return _protected_feed_body(
+            status="unavailable", reason="reconciler_not_installed",
+            reconciler=None, protected_set=None, provider=None, requests=None,
+        )
+    try:
+        return _project_protected_feed(reader.get_snapshot())
+    except Exception:  # noqa: BLE001 — a diagnostic must not 500 on a misbehaving reader
+        logger.exception("protected-feed-status: snapshot read failed")
+        return _protected_feed_body(
+            status="unavailable", reason="snapshot_read_failed",
+            reconciler=None, protected_set=None, provider=None, requests=None,
+        )

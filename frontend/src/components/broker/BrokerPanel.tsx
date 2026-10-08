@@ -1,7 +1,8 @@
 import { useRef, useState } from "react";
 import { useBrokerStatus } from "../../hooks/useBrokerStatus";
+import { useProtectedFeedStatus } from "../../hooks/useProtectedFeedStatus";
 import { useSubscriptionStatus } from "../../hooks/useSubscriptionStatus";
-import type { SubscriptionStatusWireShape } from "../../services/api-client";
+import type { ProtectedFeedStatusWireShape, SubscriptionStatusWireShape } from "../../services/api-client";
 
 // Same collapsible-width convention ScannerPanel.tsx established
 // (MIN_WIDTH/MAX_WIDTH/COLLAPSED_WIDTH, drag-to-resize, "starts
@@ -224,6 +225,214 @@ function SubscriptionDiagnosticsSection() {
   );
 }
 
+// ---- Protected feed (task `protected-feed-reconciliation-status`) ----------
+
+function utcText(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : `${d.toISOString().slice(0, 19).replace("T", " ")} UTC`;
+}
+
+// Plain-language text per reconciler `state`. An unknown future state falls
+// back to its raw code rather than guessing.
+function protectedStateText(state: string): { text: string; failure: boolean } {
+  switch (state) {
+    case "never_attempted":
+      return { text: "Installed, but no attempt has run yet.", failure: false };
+    case "first_attempt_in_progress":
+      return { text: "The first attempt is still running.", failure: false };
+    case "completed":
+      return { text: "Last attempt completed: every protected symbol was already recorded locally or had a request return.", failure: false };
+    case "completed_with_failures":
+      return { text: "Last attempt completed, but some subscription requests failed.", failure: true };
+    case "protected_set_read_failed":
+      return { text: "Last attempt could not read the protected set, so it requested nothing.", failure: true };
+    case "no_streaming_provider":
+      return { text: "Last attempt found no streaming provider, so it requested nothing.", failure: true };
+    case "provider_disconnected":
+      return { text: "Last attempt found the streaming provider disconnected.", failure: true };
+    case "provider_check_failed":
+      return { text: "Last attempt could not check the streaming provider's connection.", failure: true };
+    case "interrupted":
+      return { text: "Last attempt was interrupted (shutdown or provider change) before finishing.", failure: true };
+    default:
+      return { text: `Last attempt state: ${state}.`, failure: false };
+  }
+}
+
+function requestOutcomeText(outcome: string, errorClass: string | null): string {
+  switch (outcome) {
+    case "locally_present":
+      return "locally recorded (no request)";
+    case "request_returned":
+      return "request returned";
+    case "request_failed":
+      return `request failed${errorClass ? ` (${errorClass})` : ""}`;
+    case "no_outcome":
+      return "no outcome (cycle ended first)";
+    default:
+      return outcome;
+  }
+}
+
+function ProtectedFeedReading({ data }: { data: ProtectedFeedStatusWireShape }) {
+  if (data.status === "unavailable" || data.reconciler === null) {
+    const reason =
+      data.reason === "reconciler_not_installed"
+        ? "No protected-feed reconciler is installed in this backend process (execution startup did not complete or is not running)."
+        : data.reason === "snapshot_read_failed"
+          ? "The reconciler's status could not be read."
+          : `Protected-feed status unavailable${data.reason ? ` (${data.reason})` : ""}.`;
+    return <div className="px-2 py-1 font-mono text-[11px] text-text-muted">{reason}</div>;
+  }
+
+  const { reconciler, protected_set: set, provider, requests } = data;
+  const state = protectedStateText(reconciler.state);
+
+  return (
+    <>
+      <div className={`px-2 py-1 font-mono text-[11px] ${state.failure ? "text-bear" : "text-text-muted"}`}>
+        {state.text}
+      </div>
+      <div className="px-2 py-1 font-mono text-[10px] text-text-muted">
+        {reconciler.running ? "Running" : "Not running"}
+        {reconciler.cycle_in_progress ? " · cycle in progress" : ""} · {reconciler.attempts_started} attempt(s) started,{" "}
+        {reconciler.attempts_completed} finished
+        <br />
+        Last attempt started: {utcText(reconciler.last_attempt_at)}
+        <br />
+        Last attempt finished: {utcText(reconciler.last_completed_at)}
+      </div>
+
+      {set !== null && (
+        <div className="px-2 py-1">
+          {set.availability === "never_read" ? (
+            <div className="font-mono text-[11px] text-text-muted">
+              The protected set has not been read successfully yet — this is not an empty set.
+            </div>
+          ) : set.count === 0 ? (
+            <div className="font-mono text-[11px] text-text-muted">
+              Protected set read OK at {utcText(set.read_at)}: no simulated positions or working orders need a feed.
+            </div>
+          ) : (
+            <>
+              <div className="font-mono text-[10px] text-text-muted">
+                {set.count} protected symbol(s) · last successful read {utcText(set.read_at)}
+              </div>
+              <div className="mt-1 flex max-h-20 flex-wrap gap-1 overflow-y-auto">
+                {(set.symbols ?? []).map((s) => (
+                  <span key={s} className="rounded border border-base-border px-1 font-mono text-[10px] text-text-primary">
+                    {s}
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+          {set.latest_read === "failed" && (
+            <div className="mt-1 font-mono text-[10px] text-bear">
+              The latest read ({utcText(set.latest_read_attempt_at)}) failed
+              {set.latest_read_error ? ` (${set.latest_read_error})` : ""}.
+              {set.availability === "read" ? ` Showing the symbols retained from the successful read at ${utcText(set.read_at)}.` : ""}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="px-2 py-1 font-mono text-[10px] text-text-muted">
+        {provider
+          ? `Provider at last attempt: ${provider.id} (${provider.class_name}) — ${connectionText(provider.connected)}`
+          : "Provider at last attempt: none registered or not yet looked up"}
+      </div>
+
+      {requests !== null && (
+        <div className="px-2 py-1">
+          <div className="font-mono text-[10px] text-text-muted">
+            Request outcomes from the attempt started {utcText(requests.recorded_at)} · {requests.provider.id} (
+            {requests.provider.class_name}) · provider inventory {requests.inventory_available ? "readable" : "unavailable"}
+            {reconciler.last_attempt_at && reconciler.last_attempt_at !== requests.recorded_at
+              ? " — retained; a later attempt did not reach the request step"
+              : ""}
+          </div>
+          {requests.entries.length === 0 ? (
+            <div className="font-mono text-[10px] text-text-muted">No symbols needed a request in that attempt.</div>
+          ) : (
+            <ul className="mt-1 max-h-28 overflow-y-auto">
+              {requests.entries.map((e) => (
+                <li
+                  key={e.symbol}
+                  className={`font-mono text-[10px] ${e.outcome === "request_failed" ? "text-bear" : "text-text-primary"}`}
+                >
+                  {e.symbol}: {requestOutcomeText(e.outcome, e.error_class)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
+        Re-checked about every {reconciler.interval_seconds}s, so a new position or working order can take up to that
+        long to be requested. These are request records only — not provider acknowledgement, proof that ticks are
+        arriving, or confirmed protection.
+      </div>
+    </>
+  );
+}
+
+function ProtectedFeedBody() {
+  const { data, error, loadedAt, loading, refresh } = useProtectedFeedStatus();
+
+  return (
+    <div className="max-h-72 overflow-y-auto pb-1">
+      <div className="flex items-center justify-between px-2 py-1">
+        <span className="font-mono text-[9px] text-text-muted">
+          {data?.read_at ? `Server read ${utcText(data.read_at)}` : loadedAt ? `Read at ${loadedAt.toLocaleTimeString()}` : ""}
+        </span>
+        {/* Never disabled: a newer Refresh supersedes a pending or hung one. */}
+        <button
+          onClick={refresh}
+          className="rounded border border-base-border px-1.5 py-0.5 font-mono text-[10px] text-text-muted hover:border-signal hover:text-text-primary"
+        >
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+
+      {loading && data === null && error === null && (
+        <div className="px-2 py-2 font-mono text-[11px] text-text-muted">Loading protected-feed status…</div>
+      )}
+      {error !== null && data === null && (
+        <div className="px-2 py-2 font-mono text-[11px] text-bear">Failed to load protected-feed status: {error}</div>
+      )}
+      {error !== null && data !== null && (
+        <div className="px-2 py-1 font-mono text-[10px] text-bear">
+          Refresh failed — showing the last successful reading{data.read_at ? ` (server read ${utcText(data.read_at)})` : ""}: {error}
+        </div>
+      )}
+      {data !== null && <ProtectedFeedReading data={data} />}
+    </div>
+  );
+}
+
+function ProtectedFeedSection() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="shrink-0 border-t border-base-border">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1 px-2 py-1 text-left font-mono text-[10px] font-semibold text-text-muted hover:text-text-primary"
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>Protected feed</span>
+      </button>
+      {/* Mounted only while expanded: collapsing unmounts the body, which
+          invalidates any in-flight request. Re-expanding loads afresh. */}
+      {open && <ProtectedFeedBody />}
+    </div>
+  );
+}
+
 export function BrokerPanel() {
   const [collapsed, setCollapsed] = useState(true); // third sidebar in a row shouldn't grab space by default either — same posture Scanner/FeatureEngine/Backtest all start with
   const [widthPx, setWidthPx] = useState(DEFAULT_WIDTH);
@@ -368,6 +577,7 @@ export function BrokerPanel() {
             />
 
             <SubscriptionDiagnosticsSection />
+            <ProtectedFeedSection />
           </>
         )}
       </div>
