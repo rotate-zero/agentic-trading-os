@@ -377,6 +377,18 @@ POSTGRES_DB=candle_acceptance python scripts/candle_to_simulated_trade_acceptanc
 
 The same database rules apply as for the simulated-MVP command (explicit `--database` equal to `POSTGRES_DB`, a disposable-looking name, migrated to head, empty; never truncated; no provider credentials or IBKR Gateway needed). Exit code `0` = PASS, `1` = a milestone failed, `2` = a precondition failed, `3` = watchdog. It proves a synthetic candle-to-trade path; it does not prove tick acquisition, real-feed coverage, profitability or broker execution. Details: `docs/architecture/execution-engine-design.md` section 6.13.
 
+## Streaming coverage measurement
+
+A read-only command observes a **running** backend's `/ws` boundary for an explicit window and reports which monitored symbols produced ticks, closed 1m candles and 1m feature updates. It never connects a provider, requests feeds, edits the universe or trades; request feeds first with the existing manual action (Universe tab **Request universe feeds**, or `POST /scanner/request-universe-feeds`), then measure:
+
+```bash
+cd backend
+python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000 --symbols AAPL,MSFT,NVDA --duration 300
+python scripts/measure_streaming_coverage.py --backend-url http://127.0.0.1:8000 --scanner-universe --duration 600 --json-report ./coverage-report.json
+```
+
+Exit `0` = completed window (zero events is a valid measurement), `2` = invalid input, `3` = failed setup (including an empty captured set), `4` = interrupted/incomplete, `5` = JSON report not written. It reports events observed at the backend WebSocket boundary only: no provider capacity, lossless delivery or protective-coverage claim, and no threshold. Details and diagrams: `docs/architecture/scanner-design.md` section 18.17.
+
 ## Running tests
 
 ```bash
@@ -396,6 +408,9 @@ PostgreSQL for a complete suite rather than treating a skip-only run as final va
 | `test_ibkr_adapter.py` | `IBKRAdapter`'s pure logic: `_duration_str`/`_bar_size_for` helpers, ABC compliance against both `MarketDataProvider` and `BrokerAdapter`, a minimal fake proving `MarketDataProvider` is satisfiable with zero execution methods (confirmed decision #28), the symbol-qualification-failure path (simulates `qualifyContractsAsync`'s real `None`-on-failure behavior), and the disconnect handler (fires the same `eventkit` event `ib_async` fires internally on a real drop) |
 | `test_ibkr_historical.py` | DB-free mocked IBKR acquisition: canonical candles, serial chunks, exact filtering, UTC normalization/order, overlap dedup/conflict detection, auxiliary lookbacks, error/event mapping, zero bars, and cleanup without streaming or order calls |
 | `test_ibkr_backtest_route.py` | Real-PostgreSQL sibling-route validation, configuration/client-ID rules, 24-hour cap, stable failure responses, no run row on acquisition failure, successful preloaded-provider persistence, and the IBKR live-provider `409` guard |
+| `test_streaming_coverage.py` | Streaming-coverage logic without I/O: input validation, credential redaction, acknowledgement-gated window, deterministic per-symbol aggregates, timeframe filtering, unmonitored/malformed/regression/duplicate handling, deadline cut-off, bounded retained state, diagnostics reduction, report/console/atomic writer |
+| `test_streaming_coverage_runtime.py` | Streaming-coverage command against a controlled local WebSocket/HTTP server: acks, interleaved symbols, zero-event symbols, delayed events, connection loss, cancellation/stop/SIGINT/SIGTERM with clean close, setup failures, credentials, bounded memory, and the real script end to end as a subprocess (synthetic traffic only) |
+| `test_streaming_coverage_contract.py` | The same command against the production `/ws` router, `WebSocketGateway`, `EventBus`, event models and the real subscription-status/universe routes under uvicorn, with a provider double |
 | `test_tick_bridge_retirement.py` | Retired `TickIngestBridge` isolation (decision #194): late callbacks create no work, queued/paused handlers and flush are cancelled, retained historical provider cannot publish after takeover, immediate clear, idempotent lifecycle, same-provider replacement, new-provider candles, Finnhub same-instance reconnect, settled shutdown. Controlled providers/bus only. |
 | `test_tick_ingest.py` (renamed from `test_ibkr_ingest.py`, confirmed decision #31) | Tick→candle bucketing: same-minute ticks aggregate into one bucket, a minute rollover finalizes and publishes it, multiple symbols bucket independently — same tests, now proven provider-agnostic rather than IBKR-specific |
 | `test_market_routes.py` | `GET /market/candles`, `POST /market/subscribe` (the generic, provider-agnostic route the frontend actually uses), and `POST /broker/subscribe`'s error paths — not-connected → 400, unresolvable symbol → 400, unsupported timeframe → 400, plus a successful-subscribe happy path. Also covers `count`'s `[1, 1000]` bound directly: `0`/negative → 422, `1`/`1000` still reach the route's own logic unchanged. Uses a hand-built fake adapter, not a real `IBKRAdapter`, so no network access happens |
