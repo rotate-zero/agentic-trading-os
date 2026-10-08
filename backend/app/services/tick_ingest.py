@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -56,6 +58,46 @@ class BridgeState(str, Enum):
     ACTIVE = "active"
     RETIRING = "retiring"
     RETIRED = "retired"
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolCandleExclusions:
+    """Per-symbol candle-exclusion counts of one bridge (immutable)."""
+
+    symbol: str
+    older_than_active_bucket: int
+    already_closed_minute: int
+
+    @property
+    def total(self) -> int:
+        return self.older_than_active_bucket + self.already_closed_minute
+
+
+@dataclass(frozen=True, slots=True)
+class TickBridgeDiagnostics:
+    """Immutable, copied read of one bridge's candle-exclusion counters
+    (task late-tick-candle-diagnostics).
+
+    ``bridge_id`` identifies this bridge INSTANCE: two reads are comparable
+    only when their ids are equal. Counts are cumulative since that
+    instance's construction (``created_at``) and describe ONLY ticks the
+    bridge kept out of 1m candle construction; the raw ticks were still
+    published as PriceUpdated. They say nothing about ticks that never
+    reached the bridge. ``by_symbol`` is sorted by symbol and holds only
+    symbols with at least one exclusion.
+    """
+
+    bridge_id: str
+    state: BridgeState
+    created_at: datetime
+    read_at: datetime
+    older_than_active_bucket: int
+    already_closed_minute: int
+    by_symbol: tuple[SymbolCandleExclusions, ...]
+
+    @property
+    def total(self) -> int:
+        return self.older_than_active_bucket + self.already_closed_minute
 
 
 class _MinuteBucket:
@@ -109,6 +151,16 @@ class TickIngestBridge:
         # Keep same-symbol closes ordered across the bus publish await.
         self._bucket_locks: dict[str, asyncio.Lock] = {}
         self._state = BridgeState.ACTIVE
+        # Candle-exclusion diagnostics (task late-tick-candle-diagnostics).
+        # Instance identity + two per-symbol counters. Entries are created
+        # only at an actual exclusion, which can only happen for a symbol
+        # that already owns a bucket / last-closed entry above, so storage is
+        # bounded by tracked symbols and never grows per tick. Counters are
+        # never reset (stop() leaves them readable, frozen).
+        self._bridge_id = uuid.uuid4().hex
+        self._created_at = datetime.now(timezone.utc)
+        self._excluded_older_than_active: dict[str, int] = {}
+        self._excluded_already_closed: dict[str, int] = {}
         # Every task this bridge creates (per-tick handlers + the flush
         # loop) is owned here until it finishes, so retirement can cancel
         # and settle exactly the work it created — and nothing else.
@@ -209,6 +261,30 @@ class TickIngestBridge:
             self._draining.clear()
             self._state = BridgeState.RETIRED
 
+    # --- diagnostics ----------------------------------------------------------
+
+    def get_diagnostics_snapshot(self) -> TickBridgeDiagnostics:
+        """Synchronous, I/O-free, side-effect-free copy of the candle-exclusion
+        counters. Takes no lock and awaits nothing (single-threaded event
+        loop: counters change only between awaits, so a read is a consistent
+        point-in-time view). The result shares no mutable state with the
+        bridge and works in any lifecycle state."""
+        older = dict(self._excluded_older_than_active)
+        closed = dict(self._excluded_already_closed)
+        rows = tuple(
+            SymbolCandleExclusions(symbol, older.get(symbol, 0), closed.get(symbol, 0))
+            for symbol in sorted(set(older) | set(closed))
+        )
+        return TickBridgeDiagnostics(
+            bridge_id=self._bridge_id,
+            state=self._state,
+            created_at=self._created_at,
+            read_at=datetime.now(timezone.utc),
+            older_than_active_bucket=sum(older.values()),
+            already_closed_minute=sum(closed.values()),
+            by_symbol=rows,
+        )
+
     # --- tick path ------------------------------------------------------------
 
     def _on_tick(self, tick: Tick) -> None:
@@ -251,10 +327,14 @@ class TickIngestBridge:
             minute_ts = tick.exchange_ts.replace(second=0, microsecond=0)
             closed_minute = self._last_closed_minute.get(tick.symbol)
             if closed_minute is not None and minute_ts <= closed_minute:
-                return  # raw tick published, but never reopen a closed candle
+                # raw tick published, but never reopen a closed candle
+                self._excluded_already_closed[tick.symbol] = self._excluded_already_closed.get(tick.symbol, 0) + 1
+                return
             bucket = self._buckets.get(tick.symbol)
             if bucket is not None and minute_ts < bucket.minute_ts:
-                return  # an older tick must not close a newer minute
+                # an older tick must not close a newer minute
+                self._excluded_older_than_active[tick.symbol] = self._excluded_older_than_active.get(tick.symbol, 0) + 1
+                return
             if bucket is not None and minute_ts > bucket.minute_ts:
                 await self._bus.publish(
                     make_envelope(EventType.CANDLE_CLOSED, bucket.to_candle_closed(), symbol=tick.symbol)

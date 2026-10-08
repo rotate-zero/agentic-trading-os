@@ -59,8 +59,11 @@ def feature(symbol, ts="2026-01-05T14:30:00+00:00", tf="1m"):
 
 class FakeBackend:
     def __init__(self, *, script=None, status_bodies=None, universe=None, on_ack=None, withhold_ack=None,
-                 ws_http_status=None):
+                 ws_http_status=None, bridge_bodies=None):
         self.script = script
+        # None = an older backend without GET /market/tick-bridge-status (404).
+        self.bridge_bodies = list(bridge_bodies) if bridge_bodies is not None else None
+        self._bridge_calls = 0
         self.status_bodies = list(status_bodies if status_bodies is not None else [STATUS_A, STATUS_A])
         self.universe = universe if universe is not None else {"symbols": ["AAPL", "MSFT", "NVDA"]}
         self.on_ack = on_ack or {}
@@ -94,6 +97,10 @@ class FakeBackend:
             idx = min(self._status_calls, len(self.status_bodies) - 1)
             self._status_calls += 1
             body = self.status_bodies[idx]
+        elif path == sc.BRIDGE_STATUS_PATH and self.bridge_bodies is not None:
+            idx = min(self._bridge_calls, len(self.bridge_bodies) - 1)
+            self._bridge_calls += 1
+            body = self.bridge_bodies[idx]
         elif path == sc.UNIVERSE_PATH:
             self._universe_calls += 1
             body = self.universe[self._universe_calls - 1] if isinstance(self.universe, list) else self.universe
@@ -206,7 +213,7 @@ async def test_end_to_end_interleaved_filtered_zero_event_and_malformed(start_ba
 
     # the measurement socket subscribed ONLY to the three existing channels and sent nothing else
     assert backend.subscribes == list(sc.CHANNELS) and backend.other_client_messages == []
-    assert backend.http_paths == [sc.STATUS_PATH, sc.STATUS_PATH]  # read-only GETs, begin and end
+    assert backend.http_paths == [sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH, sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH]  # read-only GETs, begin and end
     await until(lambda: backend.closed_codes)
     assert backend.closed_codes == [1000]  # clean close on timeout
     assert backend.script_error is None
@@ -262,7 +269,7 @@ async def test_scanner_universe_is_captured_once_and_reported(start_backend):
     r = m.report()
     assert code == sc.EXIT_OK
     assert r["monitored"]["source"] == "scanner_universe" and r["monitored"]["symbols"] == ["AAPL", "NVDA"]
-    assert backend.http_paths == [sc.UNIVERSE_PATH, sc.STATUS_PATH, sc.STATUS_PATH]  # one capture only
+    assert backend.http_paths == [sc.UNIVERSE_PATH, sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH, sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH]  # one capture only
 
 
 async def test_subscription_diagnostics_recorded_at_begin_and_end_without_capacity_claims(start_backend):
@@ -464,7 +471,7 @@ async def test_credentials_are_sent_as_basic_auth_but_never_reported(start_backe
     backend = await start_backend()
     m = make_measurement(backend, duration=0.3, url=f"http://op:{PASSWORD}@127.0.0.1:{backend.port}")
     assert await m.run() == sc.EXIT_OK
-    assert backend.http_auth == [basic("op", PASSWORD)] * 2 and backend.ws_auth == [basic("op", PASSWORD)]
+    assert backend.http_auth == [basic("op", PASSWORD)] * 4 and backend.ws_auth == [basic("op", PASSWORD)]
     dumped = sc.render_json(m.report()) + sc.render_console(m.report())
     assert PASSWORD not in dumped and "op:" not in dumped
 
@@ -631,3 +638,140 @@ async def test_cli_help_lists_the_documented_options():
     assert code == 0
     for flag in ("--backend-url", "--symbols", "--scanner-universe", "--duration", "--json-report"):
         assert flag in out
+
+
+# =========================================================================== bridge candle-exclusion diagnostics
+# (task late-tick-candle-diagnostics)
+
+def bridge_body(*, bridge_id="b1", state="active", rows=None):
+    rows = rows or {}
+    older = sum(r[0] for r in rows.values())
+    closed = sum(r[1] for r in rows.values())
+    return {
+        "status": "available", "reason": None,
+        "bridge": {"id": bridge_id, "state": state, "created_at": "2026-01-05T14:00:00+00:00"},
+        "read_at": "2026-01-05T14:30:00+00:00",
+        "candle_exclusions": {
+            "basis": "bridge_candle_construction",
+            "totals": {"older_than_active_bucket": older, "already_closed_minute": closed, "total": older + closed},
+            "by_symbol": {k: {"older_than_active_bucket": o, "already_closed_minute": c, "total": o + c}
+                          for k, (o, c) in rows.items()},
+        },
+        "note": "n",
+    }
+
+
+BRIDGE_UNAVAILABLE = {"status": "unavailable", "reason": "no_streaming_bridge", "bridge": None, "read_at": None,
+                      "candle_exclusions": None, "note": "n"}
+
+
+async def _bridge_run(start_backend, bodies, duration=0.3):
+    backend = await start_backend(bridge_bodies=bodies)
+    m = make_measurement(backend, duration=duration)
+    code = await m.run()
+    return backend, m, code, m.report()["diagnostics"]["bridge_candle_exclusions"]
+
+
+async def test_bridge_delta_is_end_minus_start_for_the_same_bridge_with_monitored_subset(start_backend):
+    start = bridge_body(rows={"AAPL": (1, 0), "ZZZ": (4, 1)})
+    end = bridge_body(rows={"AAPL": (3, 2), "MSFT": (0, 5), "ZZZ": (4, 1)})
+    backend, m, code, sec = await _bridge_run(start_backend, [start, end])
+    d = sec["delta"]
+    assert code == sc.EXIT_OK and d["availability"] == "available" and d["bridge_id"] == "b1"
+    assert (d["older_than_active_bucket"], d["already_closed_minute"], d["total"]) == (2, 7, 9)
+    assert d["by_symbol"] == {"AAPL": {"older_than_active_bucket": 2, "already_closed_minute": 2, "total": 4},
+                              "MSFT": {"older_than_active_bucket": 0, "already_closed_minute": 5, "total": 5}}
+    assert d["monitored_symbols"] == {"older_than_active_bucket": 2, "already_closed_minute": 7, "total": 9}
+    assert sec["start"]["read_ok"] and sec["end"]["totals"] == {"older_than_active_bucket": 7, "already_closed_minute": 8}
+    assert backend.http_paths == [sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH, sc.STATUS_PATH, sc.BRIDGE_STATUS_PATH]
+
+
+async def test_bridge_interval_is_labelled_as_diagnostic_reads_not_the_websocket_window(start_backend):
+    _, m, _, sec = await _bridge_run(start_backend, [bridge_body(), bridge_body()])
+    iv = sec["interval"]
+    assert iv["basis"] == "diagnostic_read_to_diagnostic_read" and iv["matches_websocket_window"] is False
+    assert iv["start_read_at"] == iv["end_read_at"] == "2026-01-05T14:30:00+00:00" and iv["read_interval_s"] == 0.0
+    assert "different span" in iv["note"] and "one-to-one" in iv["note"]
+    text = " ".join(m.report()["interpretation"])
+    assert "different interval" in text and "upstream loss" in text
+    assert "diagnostic read to read" in sc.render_console(m.report())
+
+
+async def test_zero_delta_is_available_zero_only_for_a_comparable_bridge(start_backend):
+    _, _, _, sec = await _bridge_run(start_backend, [bridge_body(rows={"AAPL": (2, 2)}), bridge_body(rows={"AAPL": (2, 2)})])
+    assert sec["delta"]["availability"] == "available" and sec["delta"]["total"] == 0 and sec["delta"]["by_symbol"] == {}
+
+
+async def test_replaced_bridge_gives_unavailable_delta_not_zero(start_backend):
+    _, _, _, sec = await _bridge_run(start_backend, [bridge_body(bridge_id="old", rows={"AAPL": (5, 5)}),
+                                                      bridge_body(bridge_id="new")])
+    d = sec["delta"]
+    assert d["availability"] == "unavailable" and d["reason"] == "bridge_replaced"
+    assert d["total"] is None and d["by_symbol"] is None and d["older_than_active_bucket"] is None
+
+
+@pytest.mark.parametrize("end_rows", [{"AAPL": (1, 5)}, {"AAPL": (4, 4)}, {"MSFT": (9, 9)}])
+async def test_reset_counters_under_the_same_id_are_unavailable(start_backend, end_rows):
+    _, _, _, sec = await _bridge_run(start_backend, [bridge_body(rows={"AAPL": (3, 5)}), bridge_body(rows=end_rows)])
+    assert sec["delta"]["availability"] == "unavailable" and sec["delta"]["reason"] == "counters_not_comparable"
+
+
+async def test_missing_endpoint_on_an_older_backend_completes_with_diagnostics_unavailable(start_backend):
+    backend = await start_backend()  # bridge route answers 404
+    m = make_measurement(backend, duration=0.3)
+    code = await m.run()
+    r = m.report()
+    sec = r["diagnostics"]["bridge_candle_exclusions"]
+    assert code == sc.EXIT_OK and r["status"] == "completed"
+    assert sec["start"] == {"read_ok": False, "error": "http_status_404"} == sec["end"]
+    assert sec["delta"]["availability"] == "unavailable" and sec["delta"]["reason"] == "endpoint_not_available"
+    assert r["diagnostics"]["start"]["read_ok"] and "Bridge candle exclusions" in sc.render_console(r)
+
+
+async def test_no_registered_bridge_is_unavailable_not_zero(start_backend):
+    _, _, code, sec = await _bridge_run(start_backend, [BRIDGE_UNAVAILABLE, BRIDGE_UNAVAILABLE])
+    assert code == sc.EXIT_OK and sec["delta"]["reason"] == "bridge_unavailable" and sec["delta"]["total"] is None
+    assert sec["start"]["status"] == "unavailable" and sec["start"]["totals"] is None
+
+
+async def test_bridge_appearing_or_disappearing_between_reads_is_unavailable(start_backend):
+    _, _, _, appear = await _bridge_run(start_backend, [BRIDGE_UNAVAILABLE, bridge_body(rows={"AAPL": (9, 9)})])
+    _, _, _, vanish = await _bridge_run(start_backend, [bridge_body(rows={"AAPL": (9, 9)}), BRIDGE_UNAVAILABLE])
+    assert appear["delta"]["reason"] == vanish["delta"]["reason"] == "bridge_unavailable"
+
+
+@pytest.mark.parametrize("bad", [{}, [], {"status": "available"}, 500,
+                                 dict(bridge_body(), candle_exclusions={"basis": "x", "totals": {}, "by_symbol": {}}),
+                                 {**bridge_body(rows={"AAPL": (1, 1)}), "candle_exclusions": {
+                                     **bridge_body(rows={"AAPL": (1, 1)})["candle_exclusions"],
+                                     "totals": {"older_than_active_bucket": 9, "already_closed_minute": 1, "total": 10}}}])
+async def test_malformed_or_failing_end_read_never_fails_the_window_or_yields_a_delta(start_backend, bad):
+    _, _, code, sec = await _bridge_run(start_backend, [bridge_body(rows={"AAPL": (1, 1)}), bad])
+    assert code == sc.EXIT_OK and sec["end"]["read_ok"] is False
+    assert sec["delta"]["availability"] == "unavailable" and sec["delta"]["reason"] == "read_failed"
+
+
+def test_reduce_rejects_bool_negative_and_inconsistent_counts():
+    good = bridge_body(rows={"AAPL": (1, 2)})
+    assert sc.reduce_bridge_status(good)["read_ok"] is True
+    for mutate in (lambda b: b["candle_exclusions"]["totals"].update(total=True),
+                   lambda b: b["candle_exclusions"]["by_symbol"]["AAPL"].update(already_closed_minute=-1),
+                   lambda b: b["candle_exclusions"]["by_symbol"]["AAPL"].update(older_than_active_bucket=2)):
+        b = bridge_body(rows={"AAPL": (1, 2)})
+        mutate(b)
+        assert sc.reduce_bridge_status(b) == {"read_ok": False, "error": "unexpected_response_shape"}
+
+
+def test_delta_helper_is_unavailable_when_a_read_is_missing():
+    assert sc.compute_bridge_delta(None, None, ("AAPL",))["reason"] == "not_read"
+    ok = sc.reduce_bridge_status(bridge_body())
+    assert sc.compute_bridge_delta(ok, None, None)["availability"] == "unavailable"
+
+
+async def test_failed_setup_report_has_unavailable_bridge_section(start_backend):
+    backend = await start_backend(status_bodies=[500], bridge_bodies=[bridge_body()])
+    m = make_measurement(backend, duration=0.3)
+    assert await m.run() == sc.EXIT_SETUP_FAILED
+    sec = m.report()["diagnostics"]["bridge_candle_exclusions"]
+    assert sec["start"] is None and sec["delta"]["reason"] == "not_read"
+    assert backend.http_paths == [sc.STATUS_PATH]  # bridge not read once setup failed

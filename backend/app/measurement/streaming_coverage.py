@@ -9,9 +9,10 @@ WHAT THIS IS NOT
 It never connects a market-data provider, requests feeds, edits the scanner
 universe or starts trading. Its only side effects on the backend are one
 extra WebSocket connection that subscribes to three existing outbound
-channels, and two read-only HTTP GETs per run (``/market/subscription-status``
-at the beginning and end, plus ``/scanner/universe`` when the saved universe
-is the monitored set).
+channels, and four read-only HTTP GETs per run (``/market/subscription-status``
+and ``/market/tick-bridge-status`` at the beginning and end, plus
+``/scanner/universe`` when the saved universe is the monitored set). The
+bridge read is optional: a backend without it is measured normally.
 
 Counts are events observed at the backend WebSocket boundary. They do not
 prove provider capacity, lossless upstream delivery, profitability or full
@@ -63,6 +64,7 @@ CATEGORIES: tuple[str, ...] = tuple(CATEGORY_BY_CHANNEL.values())
 TIMEFRAME = "1m"
 
 STATUS_PATH = "/market/subscription-status"
+BRIDGE_STATUS_PATH = "/market/tick-bridge-status"
 UNIVERSE_PATH = "/scanner/universe"
 WS_PATH = "/ws"
 
@@ -87,6 +89,8 @@ INTERPRETATION: tuple[str, ...] = (
     "Beginning/end subscription snapshots cannot prove that no provider change occurred between them.",
     "Local inventory is the adapter's own record of requests, not provider acknowledgement or verified capacity.",
     "Tick regression classes compare source minutes against each symbol's prior high-water mark; they do not diagnose the cause.",
+    "Bridge candle-exclusion counts cover the interval between two diagnostic reads, which can bracket a different interval from the WebSocket collection window.",
+    "Bridge candle exclusions count ticks the bridge kept out of 1m candles after publishing them; they are not matched one-to-one with observed timestamp regressions and cannot show upstream loss.",
     "No automation-enablement threshold is defined, and counts alone do not support a no-dropped-ticks claim.",
 )
 
@@ -707,6 +711,132 @@ def compare_identity(start: dict[str, Any] | None, end: dict[str, Any] | None) -
     return {"comparable": True, "changed": bool(changed), "changed_fields": changed, "note": note}
 
 
+
+# ---------------------------------------------------------------------------
+# Bridge candle-exclusion diagnostics (task late-tick-candle-diagnostics)
+# ---------------------------------------------------------------------------
+
+_BRIDGE_ENDPOINT_MISSING = ("http_status_404", "http_status_405")
+_BRIDGE_CATEGORIES = ("older_than_active_bucket", "already_closed_minute")
+
+
+def _count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def reduce_bridge_status(body: object) -> dict[str, Any]:
+    """Reduce GET /market/tick-bridge-status; any unexpected shape is unreadable, never zero."""
+    bad = {"read_ok": False, "error": "unexpected_response_shape"}
+    if not isinstance(body, dict):
+        return bad
+    status, bridge, exclusions = body.get("status"), body.get("bridge"), body.get("candle_exclusions")
+    if status == "unavailable":
+        if bridge is not None or exclusions is not None:
+            return bad
+        return {"read_ok": True, "status": "unavailable", "reason": _short(body.get("reason")),
+                "bridge": None, "read_at": None, "totals": None, "by_symbol": None}
+    if status != "available" or not isinstance(bridge, dict) or not isinstance(exclusions, dict):
+        return bad
+    if (not isinstance(bridge.get("id"), str) or not bridge["id"] or not isinstance(bridge.get("state"), str)
+            or not isinstance(body.get("read_at"), str) or not body["read_at"]):
+        return bad
+    totals, by_symbol = exclusions.get("totals"), exclusions.get("by_symbol")
+    if exclusions.get("basis") != "bridge_candle_construction" or not isinstance(totals, dict) or not isinstance(by_symbol, dict):
+        return bad
+    if not all(_count(totals.get(k)) for k in (*_BRIDGE_CATEGORIES, "total")):
+        return bad
+    if totals["total"] != totals[_BRIDGE_CATEGORIES[0]] + totals[_BRIDGE_CATEGORIES[1]]:
+        return bad
+    rows: dict[str, dict[str, int]] = {}
+    for symbol, row in by_symbol.items():
+        if not isinstance(symbol, str) or not isinstance(row, dict) or not all(_count(row.get(k)) for k in _BRIDGE_CATEGORIES):
+            return bad
+        rows[symbol] = {k: row[k] for k in _BRIDGE_CATEGORIES}
+    if any(sum(r[k] for r in rows.values()) != totals[k] for k in _BRIDGE_CATEGORIES):
+        return bad
+    return {
+        "read_ok": True, "status": "available", "reason": None,
+        "bridge": {"id": _short(bridge["id"]), "state": _short(bridge["state"]), "created_at": _short(bridge.get("created_at"))},
+        "read_at": _short(body["read_at"]),
+        "totals": {k: totals[k] for k in _BRIDGE_CATEGORIES},
+        "by_symbol": rows,
+    }
+
+
+def _unavailable_delta(reason: str) -> dict[str, Any]:
+    return {"availability": "unavailable", "reason": reason, "bridge_id": None, "start_state": None, "end_state": None,
+            "older_than_active_bucket": None, "already_closed_minute": None, "total": None,
+            "by_symbol": None, "monitored_symbols": None}
+
+
+def compute_bridge_delta(start: dict[str, Any] | None, end: dict[str, Any] | None,
+                         monitored: tuple[str, ...] | None) -> dict[str, Any]:
+    """End minus start, only when both reads came from the SAME bridge instance and the
+    counters are comparable. Anything else is "unavailable" with a reason — never zero."""
+    if start is None or end is None:
+        return _unavailable_delta("not_read")
+    for read in (start, end):
+        if not read.get("read_ok"):
+            reason = "endpoint_not_available" if read.get("error") in _BRIDGE_ENDPOINT_MISSING else "read_failed"
+            return _unavailable_delta(reason)
+    if start["status"] != "available" or end["status"] != "available":
+        return _unavailable_delta("bridge_unavailable")
+    if start["bridge"]["id"] != end["bridge"]["id"]:
+        return _unavailable_delta("bridge_replaced")
+    s_rows, e_rows = start["by_symbol"], end["by_symbol"]
+    decreased = any(end["totals"][k] < start["totals"][k] for k in _BRIDGE_CATEGORIES)
+    # Counters are never removed within one bridge instance, so a vanished or smaller entry means a reset.
+    decreased = decreased or any(
+        sym not in e_rows or any(e_rows[sym][k] < row[k] for k in _BRIDGE_CATEGORIES) for sym, row in s_rows.items())
+    if decreased:
+        return _unavailable_delta("counters_not_comparable")
+    zero = {k: 0 for k in _BRIDGE_CATEGORIES}
+    by_symbol: dict[str, dict[str, int]] = {}
+    for sym in sorted(e_rows):
+        base = s_rows.get(sym, zero)
+        d = {k: e_rows[sym][k] - base[k] for k in _BRIDGE_CATEGORIES}
+        if any(d.values()):
+            by_symbol[sym] = {**d, "total": sum(d.values())}
+    delta = {k: end["totals"][k] - start["totals"][k] for k in _BRIDGE_CATEGORIES}
+    watched = set(monitored or ())
+    mon = {k: sum(v[k] for sym, v in by_symbol.items() if sym in watched) for k in _BRIDGE_CATEGORIES}
+    return {
+        "availability": "available", "reason": None, "bridge_id": start["bridge"]["id"],
+        "start_state": start["bridge"]["state"], "end_state": end["bridge"]["state"],
+        **delta, "total": sum(delta.values()), "by_symbol": by_symbol,
+        "monitored_symbols": {**mon, "total": sum(mon.values())} if monitored is not None else None,
+    }
+
+
+def _read_seconds(start: dict[str, Any] | None, end: dict[str, Any] | None) -> float | None:
+    try:
+        a = datetime.fromisoformat(start["read_at"])  # type: ignore[index]
+        b = datetime.fromisoformat(end["read_at"])  # type: ignore[index]
+    except (TypeError, KeyError, ValueError):
+        return None
+    if a.tzinfo is None or b.tzinfo is None:
+        return None
+    return _r((b - a).total_seconds())
+
+
+def build_bridge_section(start: dict[str, Any] | None, end: dict[str, Any] | None,
+                         monitored: tuple[str, ...] | None) -> dict[str, Any]:
+    return {
+        "start": start,
+        "end": end,
+        "interval": {
+            "basis": "diagnostic_read_to_diagnostic_read",
+            "start_read_at": start.get("read_at") if start else None,
+            "end_read_at": end.get("read_at") if end else None,
+            "read_interval_s": _read_seconds(start, end),
+            "matches_websocket_window": False,
+            "note": ("The start read precedes the WebSocket subscription and the end read follows its close, so this interval "
+                     "can bracket a different span from the collection window. Bridge counts and WebSocket counts are separate "
+                     "observations; no one-to-one relationship is implied."),
+        },
+        "delta": compute_bridge_delta(start, end, monitored),
+    }
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -725,6 +855,8 @@ def build_report(
     diagnostics_end: dict[str, Any] | None,
     connection: dict[str, Any],
     setup_failure: dict[str, str] | None = None,
+    bridge_start: dict[str, Any] | None = None,
+    bridge_end: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "schema": SCHEMA,
@@ -749,6 +881,7 @@ def build_report(
             "start": diagnostics_start,
             "end": diagnostics_end,
             "identity": compare_identity(diagnostics_start, diagnostics_end),
+            "bridge_candle_exclusions": build_bridge_section(bridge_start, bridge_end, monitored),
         },
         "connection": connection,
         "setup_failure": setup_failure,
@@ -858,6 +991,17 @@ def _name_list(names: list[str], limit: int = 20) -> str:
     return shown if len(names) <= limit else f"{shown} (+{len(names) - limit} more)"
 
 
+def _render_bridge_line(section: dict[str, Any]) -> str:
+    d, iv = section["delta"], section["interval"]
+    label = "Bridge candle exclusions (diagnostic read to read, not the WebSocket window)"
+    if d["availability"] != "available":
+        return f"{label}: unavailable ({d['reason']})"
+    mon = d["monitored_symbols"]
+    return (f"{label}: older-than-active={d['older_than_active_bucket']} already-closed={d['already_closed_minute']} "
+            f"total={d['total']}" + (f" monitored-total={mon['total']}" if mon else "")
+            + f" over {iv['read_interval_s']}s, bridge {str(d['bridge_id'])[:8]}")
+
+
 def render_console(report: dict[str, Any], *, max_rows: int = 50) -> str:
     m, mon = report["measurement"], report["monitored"]
     lines = [
@@ -889,6 +1033,7 @@ def render_console(report: dict[str, Any], *, max_rows: int = 50) -> str:
     ident = report["diagnostics"]["identity"]
     if ident["comparable"]:
         lines.append(f"Identity snapshots changed: {ident['changed']} {ident['changed_fields'] or ''}".rstrip())
+    lines.append(_render_bridge_line(report["diagnostics"]["bridge_candle_exclusions"]))
     if "symbols" not in report:
         return "\n".join(lines) + "\n"
 
@@ -950,6 +1095,8 @@ class Measurement:
         self.collector: CoverageCollector | None = None
         self.diagnostics_start: dict[str, Any] | None = None
         self.diagnostics_end: dict[str, Any] | None = None
+        self.bridge_start: dict[str, Any] | None = None
+        self.bridge_end: dict[str, Any] | None = None
         self.setup_failure: dict[str, str] | None = None
         self.connection: dict[str, Any] = {"interrupted": False, "reason": None, "close_code": None,
                                            "close_reason": None, "interrupted_at_offset_s": None}
@@ -977,6 +1124,7 @@ class Measurement:
             end_reason=self.end_reason, window_elapsed_s=elapsed, started_utc=self._started_utc,
             ended_utc=self._ended_utc, diagnostics_start=self.diagnostics_start, diagnostics_end=self.diagnostics_end,
             connection=self.connection, setup_failure=self.setup_failure,
+            bridge_start=self.bridge_start, bridge_end=self.bridge_end,
         )
 
     # -- http ------------------------------------------------------------------
@@ -1013,6 +1161,16 @@ class Measurement:
         except Exception as exc:  # noqa: BLE001 - recorded, never raised
             return {"read_ok": False, "error": f"unexpected_{type(exc).__name__}"}
         return reduce_subscription_status(body, monitored)
+
+    async def _read_bridge(self) -> dict[str, Any]:
+        """Never raises and never fails the window: an older backend without the route is just 'unavailable'."""
+        try:
+            body = await self._get(BRIDGE_STATUS_PATH)
+        except HttpReadError as exc:
+            return {"read_ok": False, "error": exc.code}
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised
+            return {"read_ok": False, "error": f"unexpected_{type(exc).__name__}"}
+        return reduce_bridge_status(body)
 
     # -- websocket -------------------------------------------------------------
     async def _read_loop(self, ws: Any) -> None:
@@ -1109,6 +1267,7 @@ class Measurement:
         self.diagnostics_start = await self._read_diagnostics(self.monitored)
         if not self.diagnostics_start.get("read_ok"):
             raise SetupError("start_diagnostics_unavailable", str(self.diagnostics_start.get("error")))
+        self.bridge_start = await self._read_bridge()
         await self._open_and_subscribe()
 
         collector, reader = self.collector, self._reader
@@ -1142,6 +1301,7 @@ class Measurement:
         await self._close()
         # Read the end snapshot after the connection is closed so no further events are attributed.
         self.diagnostics_end = await self._read_diagnostics(self.monitored)
+        self.bridge_end = await self._read_bridge()
 
 
 # ---------------------------------------------------------------------------

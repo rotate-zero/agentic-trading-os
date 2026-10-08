@@ -38,7 +38,7 @@ from collections.abc import Callable
 from app.broker_adapters.base import MarketDataProvider
 from app.broker_adapters.order_venue import OrderVenue
 from app.core.config import get_settings
-from app.services.tick_ingest import BridgeState, TickIngestBridge
+from app.services.tick_ingest import BridgeState, TickBridgeDiagnostics, TickIngestBridge
 
 _streaming_provider: MarketDataProvider | None = None
 _streaming_bridge: TickIngestBridge | None = None
@@ -167,6 +167,18 @@ def clear_streaming_provider() -> None:
 
 def get_streaming_provider() -> MarketDataProvider | None:
     return _streaming_provider
+
+
+def get_streaming_bridge_diagnostics() -> TickBridgeDiagnostics | None:
+    """Narrow read for GET /market/tick-bridge-status (task
+    late-tick-candle-diagnostics): an immutable counter snapshot of the
+    CURRENTLY REGISTERED streaming bridge, or None when none is registered.
+    Exposes neither the bridge nor the provider, calls no provider and
+    mutates nothing. Retired bridges are not reachable through it."""
+    bridge = _streaming_bridge
+    if bridge is None:
+        return None
+    return bridge.get_diagnostics_snapshot()
 
 
 def set_historical_provider(provider: MarketDataProvider) -> None:

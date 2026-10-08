@@ -1,3 +1,20 @@
+<!-- BEGIN DELIVERY SECTION: late-tick-candle-diagnostics -->
+# CHANGES — `late-tick-candle-diagnostics`
+
+Base: pushed `main` `fb478f2` (`Classify streaming tick timestamp regressions by minute`), assignment reference `fb478f2`. No decision number: this adds a read-only diagnostic surface and changes no decided policy (checked against the tail of `confirmed-decisions.md`, `INDEX.md` and the archive filenames, latest #195). **Finalization pending:** Instance 1's `outcome-snapshot-json-serialization` was not on `main` when this was prepared, so `CHANGES.md`/`TESTING.md` must be re-integrated on top of it before this ZIP is copied.
+
+After `late-tick-candle-ordering`, `TickIngestBridge` publishes every admitted tick as `PriceUpdated` but keeps some out of 1m candles. The streaming-coverage command could observe source-time regressions at `/ws` but could not tell whether the bridge excluded any ticks. This delivery exposes that count.
+
+- `backend/app/services/tick_ingest.py`: two per-symbol counters incremented at the actual exclusion point, once per excluded tick, in the existing precedence (`already_closed_minute` first, then `older_than_active_bucket`), after the existing retirement re-check and under the same per-symbol lock. New frozen `TickBridgeDiagnostics` / `SymbolCandleExclusions` and `get_diagnostics_snapshot()` (instance id, state, `created_at`, `read_at`, totals, per-symbol tuple). Entries exist only for symbols that already own bucket state, so storage is bounded by tracked symbols. Candle OHLCV, ordering, locks, flush, retirement and `PriceUpdated` publication are unchanged.
+- `backend/app/services/broker_registry.py`: `get_streaming_bridge_diagnostics()`, a narrow reader returning the registered bridge's snapshot or `None`.
+- `backend/app/api/routes/market.py`: `GET /market/tick-bridge-status` — registry read only (no provider call, publish or mutation); no bridge or a failed read is `unavailable`, never zero.
+- `backend/app/measurement/streaming_coverage.py`: reads the endpoint at measurement start and end (never fatal), reduces it with a strict shape check, and reports `diagnostics.bridge_candle_exclusions` with `start`, `end`, an `interval` block (`diagnostic_read_to_diagnostic_read`, `matches_websocket_window: false`) and a `delta`. The delta exists only for the same bridge id with non-decreasing counters; replacement, reset, a missing bridge, a failed read or an older backend (404/405) gives an unavailable delta with a reason. Two interpretation lines and one console line added. Bridge counts stay separate from timestamp-regression counts.
+- Tests: new `backend/tests/test_tick_bridge_diagnostics.py` (20); `backend/tests/test_streaming_coverage_runtime.py` extended (fake backend serves/omits the new route; three existing assertions updated for the two added GETs, plus bridge delta/identity/reset/missing-endpoint cases).
+- Documentation: `docs/architecture/system-design.md` (new paragraph with data-flow and counter/read diagram after the late-minute guard), `docs/architecture/scanner-design.md` §18.17 (flow, delta diagram, interval and interpretation limits), `backend/README.md`, this file and `TESTING.md`.
+
+**Limits.** Counts are cumulative per bridge instance and cover only ticks the bridge received; they cannot prove or rule out upstream loss. The measurement interval runs from one diagnostic read to the other and can differ from the WebSocket window. No one-to-one relationship with observed timestamp regressions is claimed. No new tick-order policy, alert, scoring or frontend change; earlier real-feed regression counts are not reclassified. No deletions or renames.
+<!-- END DELIVERY SECTION: late-tick-candle-diagnostics -->
+
 <!-- BEGIN DELIVERY SECTION: streaming-tick-regression-minute-breakdown -->
 # CHANGES — `streaming-tick-regression-minute-breakdown`
 

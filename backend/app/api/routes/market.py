@@ -369,6 +369,83 @@ async def get_subscription_status() -> dict:
     return body(None, sorted(raw))
 
 
+# --- GET /market/tick-bridge-status ----------------------------------------
+# Task `late-tick-candle-diagnostics`.
+
+_TICK_BRIDGE_NOTE = (
+    "Counts ticks the registered TickIngestBridge kept out of 1m candle "
+    "construction since that bridge instance was created: tick minute older "
+    "than the symbol's active bucket, or already closed. Each excluded tick was "
+    "still published as a raw price update. Counts are per bridge instance and "
+    "are not comparable across a different bridge_id. They do not measure ticks "
+    "that never reached the bridge, so they cannot prove or rule out upstream "
+    "loss, and they are not a one-to-one match for source-timestamp "
+    "regressions observed at the WebSocket."
+)
+
+
+def _tick_bridge_status_body(*, status: str, reason: str | None, bridge: dict | None,
+                             read_at: str | None, exclusions: dict | None) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "bridge": bridge,
+        "read_at": read_at,
+        "candle_exclusions": exclusions,
+        "note": _TICK_BRIDGE_NOTE,
+    }
+
+
+@router.get("/tick-bridge-status")
+async def get_tick_bridge_status() -> dict:
+    """
+    Read-only diagnostic: cumulative candle-exclusion counters of the CURRENT
+    streaming TickIngestBridge instance.
+
+    A registry read only: no provider call, no connection, no subscription, no
+    event publication and no pipeline mutation. `status` is "unavailable"
+    (never zero counts) when no bridge is registered or its snapshot cannot be
+    read. `bridge.id` identifies the bridge instance; two reads may be
+    differenced only when it is equal. Distinct from /market/subscription-status
+    (adapter subscription record) and /market/feed-status (recorded-candle age).
+    """
+    try:
+        snapshot = broker_registry.get_streaming_bridge_diagnostics()
+    except Exception:  # noqa: BLE001 — a diagnostic must not 500
+        logger.exception("tick-bridge-status: snapshot failed")
+        return _tick_bridge_status_body(status="unavailable", reason="snapshot_failed",
+                                        bridge=None, read_at=None, exclusions=None)
+    if snapshot is None:
+        return _tick_bridge_status_body(status="unavailable", reason="no_streaming_bridge",
+                                        bridge=None, read_at=None, exclusions=None)
+    return _tick_bridge_status_body(
+        status="available",
+        reason=None,
+        bridge={
+            "id": snapshot.bridge_id,
+            "state": snapshot.state.value,
+            "created_at": snapshot.created_at.isoformat(),
+        },
+        read_at=snapshot.read_at.isoformat(),
+        exclusions={
+            "basis": "bridge_candle_construction",
+            "totals": {
+                "older_than_active_bucket": snapshot.older_than_active_bucket,
+                "already_closed_minute": snapshot.already_closed_minute,
+                "total": snapshot.total,
+            },
+            "by_symbol": {
+                row.symbol: {
+                    "older_than_active_bucket": row.older_than_active_bucket,
+                    "already_closed_minute": row.already_closed_minute,
+                    "total": row.total,
+                }
+                for row in snapshot.by_symbol
+            },
+        },
+    )
+
+
 # --- GET /market/protected-feed-status -------------------------------------
 # Task `protected-feed-reconciliation-status`.
 

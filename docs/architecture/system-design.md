@@ -413,6 +413,29 @@ Finnhub badge, when disconnected:
 
 **Late-minute candle guard (`late-tick-candle-ordering`).** Every admitted tick still publishes `PriceUpdated`. For 1m bucketing, a tick from an older minute than the active bucket, or from a minute already closed by rollover or the wall-clock flush, is excluded from candle aggregation. A tick with an earlier source time **inside the active minute** remains in that bucket; OHLC follows bucket-processing order as before. The bridge keeps the last closed minute per symbol until retirement. One per-symbol lock serializes bucket updates, rollover publication and wall-clock closes, so a later minute cannot publish its close while an earlier one is still pending. This prevents an older tick from rolling the bucket backward or reopening a closed minute within one bridge lifetime. It does not reorder provider ticks, revise an already closed candle, or establish that the 22 tick timestamp regressions in the 2026-10-08 real Finnhub trial crossed minute boundaries (`TESTING.md`).
 
+**Candle-exclusion diagnostics (`late-tick-candle-diagnostics`; no decision number — it adds a read surface and changes no decided policy).** The guard above excludes some admitted ticks from candles, but until now nothing could say how many: the streaming-coverage command sees source-time regressions at `/ws` and cannot tell whether the bridge excluded them. `TickIngestBridge` now keeps two per-symbol counters at the **actual exclusion point**, once per excluded tick: `already_closed_minute` (the tick minute is at or before the symbol's last closed minute — checked first, as in the existing code) and `older_than_active_bucket` (otherwise, the minute precedes the active bucket). A tick that reaches neither branch — including a same-minute earlier-second tick — is not counted. Counters are incremented under the same per-symbol lock after the existing retirement re-check, never reset, never cleared by `stop()`, and entries exist only for symbols that already own bucket state (storage is bounded by tracked symbols; there is no per-tick history). Candle OHLCV, ordering, locks, flush behaviour, retirement semantics and the raw `PriceUpdated` publication are unchanged.
+
+`bridge.get_diagnostics_snapshot()` returns a frozen `TickBridgeDiagnostics` (bridge instance id, lifecycle state, `created_at`, `read_at`, totals, a tuple of frozen per-symbol rows sorted by symbol); it takes no lock, awaits nothing and shares no mutable state. `broker_registry.get_streaming_bridge_diagnostics()` is the narrow reader (the registered bridge's snapshot, or `None`; retired bridges are unreachable), and `GET /market/tick-bridge-status` serialises it. No registered bridge or a failed read is `status: "unavailable"`, never zero counts; the route calls no provider and mutates nothing. `bridge.id` identifies the instance: two reads may be differenced only when it is equal.
+
+```
+Provider ─► TickIngestBridge._on_tick ─► _handle_tick ─► PriceUpdated published (always, for every admitted tick)
+                                              │
+                                  per-symbol lock ─► minute <= last closed minute? ──yes─► already_closed_minute[sym] += 1 ─► return
+                                              │ no
+                                  minute <  active bucket minute?   ──────────yes─► older_than_active_bucket[sym] += 1 ─► return
+                                              │ no                     (counted once, at this point; candle untouched)
+                                  rollover / open / add to bucket  (unchanged)
+
+GET /market/tick-bridge-status ─► broker_registry.get_streaming_bridge_diagnostics() ─► registered bridge.get_diagnostics_snapshot()
+      (read only: no provider call, no publish, no lock)                                  frozen copy: id · state · created_at · read_at · totals · by_symbol
+      no bridge / read failure ─► status "unavailable" (not zero)
+
+measure_streaming_coverage.py:  read ─► [ws window] ─► read      delta = end − start only if bridge id equal and no counter decreased
+      different id │ missing bridge │ 404 on an older backend │ decreased/vanished counter ─► delta "unavailable" with a reason
+```
+
+**Scope and limits.** Counts are cumulative for one bridge instance and describe only ticks the bridge **received and kept out of 1m candles**. They cannot show ticks that never reached the bridge, so they neither prove nor rule out upstream loss. The measurement command's counts come from two diagnostic reads that bracket the start read to the end read, which can span a different interval from its WebSocket collection window (the start read precedes subscription and the end read follows close); they are reported separately from gateway-observed timestamp regressions, with no one-to-one relationship implied — a regression seen at `/ws` need not be an exclusion and an exclusion need not have been seen. Full flows: `scanner-design.md` §18.17.
+
 **Component data flow (live path and retirement):**
 
 ```
