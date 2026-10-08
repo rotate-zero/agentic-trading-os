@@ -33,6 +33,8 @@ A third, separately-typed role was added for the Execution Engine
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from app.broker_adapters.base import MarketDataProvider
 from app.broker_adapters.order_venue import OrderVenue
 from app.core.config import get_settings
@@ -41,6 +43,27 @@ from app.services.tick_ingest import TickIngestBridge
 _streaming_provider: MarketDataProvider | None = None
 _streaming_bridge: TickIngestBridge | None = None
 _historical_provider: MarketDataProvider | None = None
+_protected_feed_wake: Callable[[], None] | None = None
+
+
+def register_protected_feed_wake(callback: Callable[[], None]) -> None:
+    """One lifecycle-owned, nonblocking signal for the protected-feed owner."""
+    global _protected_feed_wake
+    if _protected_feed_wake is not None and _protected_feed_wake is not callback:
+        raise RuntimeError("protected-feed wake owner is already registered")
+    _protected_feed_wake = callback
+
+
+def unregister_protected_feed_wake(callback: Callable[[], None]) -> None:
+    global _protected_feed_wake
+    if _protected_feed_wake is callback:
+        _protected_feed_wake = None
+
+
+def request_protected_feed_reconcile() -> None:
+    callback = _protected_feed_wake
+    if callback is not None:
+        callback()
 
 # Third role, added for the Execution Engine (EX-3, decision #170) —
 # deliberately a THIRD, separately-typed global, not folded into
@@ -86,6 +109,7 @@ async def take_over_streaming(
         _streaming_bridge.stop()
     _streaming_provider = new_provider
     _streaming_bridge = bridge
+    request_protected_feed_reconcile()
 
 
 def clear_streaming_provider() -> None:
@@ -94,6 +118,7 @@ def clear_streaming_provider() -> None:
         _streaming_bridge.stop()
     _streaming_provider = None
     _streaming_bridge = None
+    request_protected_feed_reconcile()
 
 
 def get_streaming_provider() -> MarketDataProvider | None:
@@ -156,3 +181,5 @@ def clear_all() -> None:
     clear_streaming_provider()
     clear_historical_provider()
     clear_execution_venue()
+    global _protected_feed_wake
+    _protected_feed_wake = None

@@ -39,6 +39,7 @@ from app.execution_engine.ports import (
 )
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.execution import OrderApproved, OrderFilled, OrderStatusChanged
+from app.services import broker_registry
 
 logger = logging.getLogger(__name__)
 
@@ -258,6 +259,8 @@ class ExecutionEngine:
     async def _service_exit_position(self, position_id: Any, venue: Any) -> None:
         assert self._exit_ledger is not None
         prepared = await asyncio.to_thread(self._exit_ledger.prepare_exit, position_id)
+        if prepared.created_order:
+            broker_registry.request_protected_feed_reconcile()  # post-commit, no DB work here
         if prepared.cancelled_order_id is not None and self._portfolio_state is not None:
             await self._portfolio_state.refresh()  # proven-unsent expiry changed an order row
         if prepared.disposition in {
@@ -387,6 +390,9 @@ class ExecutionEngine:
             # log, send nothing further, no second venue submission.
             logger.info("OrderApproved %s already in the ledger — duplicate delivery, no venue call", client_order_id)
             return
+
+        if insert_result.order.execution_mode == "simulated":
+            broker_registry.request_protected_feed_reconcile()  # approved order row is committed
 
         # Route the committed instruction. Concrete adapters verify incoming
         # terms against the durable authorization before returning it.

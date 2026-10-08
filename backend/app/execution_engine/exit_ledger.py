@@ -158,6 +158,7 @@ class PrepareResult:
     expired_now: bool = False             # this call recorded the expiry
     cancelled_order_id: str | None = None  # proven-unsent EOD reservation cancelled by this call
     reason: str | None = None
+    created_order: bool = False            # this call committed a new non-terminal close order
 
 
 class ClaimDisposition(str, Enum):
@@ -576,7 +577,8 @@ class PostgresExitLedger:
             position.exit_attempt = attempt
             session.flush()
             return PrepareResult(PrepareDisposition.SUBMIT, position_id,
-                                 ExitAction("submit", order_id, position.symbol, side, position.qty, reason), **common)
+                                 ExitAction("submit", order_id, position.symbol, side, position.qty, reason),
+                                 created_order=True, **common)
 
     # ------------------------------------------------------------------
     # Final guard and dispatch claim

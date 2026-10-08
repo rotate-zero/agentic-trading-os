@@ -19,6 +19,7 @@ from app.event_bus.events import make_envelope
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.execution import OrderApproved, OrderFilled, OrderStatusChanged, PositionClosed
 from app.schemas.events.market_data import PriceUpdated
+from app.services import broker_registry
 
 from .accounting import MODES, PositionState, apply_fill, aware, decimal
 from .ports import FillApplication, InFlightOrder, LedgerState, ORDER_STATUSES, PositionLedgerError, PositionLedgerPort, RealizedFill
@@ -230,6 +231,9 @@ class PortfolioState:
                 self._ledger.commit_fill,
                 FillApplication(fill, result.position, attribution, self._state.cursor),
             )
+            if (committed.applied and result.position.execution_mode == "simulated"
+                    and result.position.qty > 0 and result.position.status in {"open", "closing"}):
+                broker_registry.request_protected_feed_reconcile()  # position row is committed
             if committed.state.cursor < fill.ledger_seq:
                 raise PositionLedgerError("commit returned a checkpoint behind its fill")
             self._install_state(committed.state)

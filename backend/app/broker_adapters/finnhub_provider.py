@@ -274,6 +274,11 @@ class FinnhubAdapter(MarketDataProvider):
                         continue
                     delay = self._retry_initial
                     logger.info("Finnhub WebSocket reconnected; local requests restored")
+                    # The role may have changed while this socket was opening.
+                    # Only the current owner may wake protected reconciliation.
+                    from app.services import broker_registry
+                    if broker_registry.get_streaming_provider() is self:
+                        broker_registry.request_protected_feed_reconcile()
                     break
         except asyncio.CancelledError:
             pass

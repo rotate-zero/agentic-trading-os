@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: protected-feed-event-wake -->
+# CHANGES — `protected-feed-event-wake`
+
+Base: GitHub `main` `bbb43f3` (assignment reference; fetched before implementation and before decision numbering). No commit or push. Decision #191 records the wake/coalescing lifecycle.
+
+- `backend/app/services/protected_feed_reconciliation.py` and `broker_registry.py`: one synchronous, nonblocking wake signal for the existing owner, represented by one pending event. It is cleared before each cycle so a signal received during work causes one follow-up. The 60-second cycle remains the fallback; failed/deferred cycles impose a short cooldown on wake-driven retries. Registry takeover signals after installing the new streaming owner. Stop unregisters the callback, rejects late wakes and settles the worker before provider shutdown. The protected-symbol query, additive request logic and immutable status outcomes are unchanged.
+- `backend/app/execution_engine/engine.py`, `exit_ledger.py`, and `portfolio_state/engine.py`: signal after the committed new simulated entry order, new close-order reservation, or positive open/closing simulated position. A `created_order` result distinguishes a new close reservation from a reused one; the earlier bus events do not serve as commit markers.
+- `backend/app/broker_adapters/finnhub_provider.py`: after a same-instance reconnect restores desired requests, signal only if that adapter is still the current streaming owner. `backend/app/api/routes/market.py` and `frontend/src/components/broker/BrokerPanel.tsx` explain prompt wakes and the periodic fallback without changing status fields or outcome meanings.
+- `backend/tests/test_protected_feed_event_wake.py` and `test_exit_ledger_eod_postgres.py`: deterministic wake/coalescing, provider takeover/reconnect, lifecycle and post-commit PostgreSQL regressions. `docs/architecture/scanner-design.md`, `execution-engine-design.md`, `system-design.md`, `docs/decisions/confirmed-decisions.md`, `docs/decisions/INDEX.md`, this file and `TESTING.md` document the flow and limits.
+
+Limits: in-memory signals can be lost between commit and observation, so the periodic scan remains necessary. Requests are local evidence, with provider acknowledgement, capacity and continuous delivery unverified. No scanner promotion, removal policy, broker execution or schema change.
+<!-- END DELIVERY SECTION: protected-feed-event-wake -->
+
 <!-- BEGIN DELIVERY SECTION: finnhub-stream-reconnect -->
 # CHANGES — `finnhub-stream-reconnect`
 

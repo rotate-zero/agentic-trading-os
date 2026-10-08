@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: protected-feed-event-wake -->
+# TESTING — `protected-feed-event-wake`
+
+Base: GitHub `main` `bbb43f3`. Tests ran serially from `backend/`; controlled providers and WebSocket transports used no real credentials, feed or broker. PostgreSQL integration used isolated unique `trading_workspace` test rows, removed after each case. No migration or full-suite run.
+
+- Baseline sensitivity: the new immediate-wake regression failed against an isolated archive of untouched `bbb43f3` with missing `request_reconcile()`. The provider-takeover and same-instance Finnhub-reconnection regressions both timed out against that archive; all three pass with this delivery.
+- Affected tests: `.venv/bin/pytest -q --disable-warnings tests/test_protected_feed_event_wake.py tests/test_protected_feed_reconciliation.py tests/test_protected_feed_status.py -k 'not lifespan and not reader_is_not_installed and not rollback_when_the_owner' tests/test_broker_registry.py tests/test_finnhub_reconnect.py` — **59 passed, 3 deselected**. The deselected cases are `TestClient` lifespan cases whose local Python 3.14/Starlette portal hung in the prior delivery; status projection and owner behavior were exercised without that portal here.
+- Exit ledger: `.venv/bin/pytest -q --disable-warnings tests/test_exit_ledger_eod_postgres.py` — **41 passed**. It asserts that a newly committed close reservation carries the new marker; existing reservation/retry state-machine checks remain green.
+- New deterministic cases cover prompt exposure/provider wakes without advancing the periodic clock, a 100-request burst, a wake during blocked subscription causing exactly one follow-up, failed-read cooldown and omitted-notification periodic recovery, current-owner takeover, restart/stop and late-wake rejection, responsive critical EventBus dispatch while a subscription blocks, committed order and position rows visible to the protected query, new-versus-reused exit reservation signaling, and same-instance Finnhub reconnect. Existing status retention, request evidence, replay and registry regressions are included in the affected run.
+
+These checks prove local request scheduling and PostgreSQL commit visibility under controlled ordering. A commit-to-signal crash window remains, recovered on a later periodic/startup cycle. They do not verify real provider acknowledgement, capacity, feed delivery or continuous protection.
+<!-- END DELIVERY SECTION: protected-feed-event-wake -->
+
 <!-- BEGIN DELIVERY SECTION: finnhub-stream-reconnect -->
 # TESTING — `finnhub-stream-reconnect`
 

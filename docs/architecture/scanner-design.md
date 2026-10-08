@@ -1148,8 +1148,12 @@ Decision #189's protective feed requirement is now an application-owned subscrip
 **Component data flow:**
 
 ```
-positions (simulated, open/closing, qty > 0) ─┐
-                                               ├─► read_protected_symbols ─► ProtectedFeedReconciler
+committed simulated entry/exit order or position ─► synchronous wake signal ─┐
+registry takeover / current Finnhub reconnection ─► synchronous wake signal ─┤
+60-second fallback timer ──────────────────────────────────────────────────────┤
+                                                                             ▼
+positions (simulated, open/closing, qty > 0) ─┐                    ProtectedFeedReconciler
+                                               ├─► read_protected_symbols ──────┤
 orders (simulated, non-terminal) ───────────────┘          (owned DB session)          │
                                                                                        ▼
 current broker_registry streaming provider ─► local inventory ─► missing request symbols
@@ -1164,7 +1168,7 @@ current broker_registry streaming provider ─► local inventory ─► missing
 **Internal reconciliation flow:**
 
 ```
-execution ready ─► start one owner ─► immediate cycle ─► wait 60 seconds ─► repeat
+execution ready ─► start one owner ─► immediate cycle ─► wait for wake or 60 seconds ─► repeat
                                   │
                                   └─ worker thread opens/closes DB session
                                      ├─ read fails ─► log, retry later (never infer empty)
@@ -1174,15 +1178,23 @@ execution ready ─► start one owner ─► immediate cycle ─► wait 60 sec
                                            ├─ failure ─► log, continue; retry later
                                            └─ success ─► request recorded locally, delivery still unknown
 shutdown ─► stop/cancel and settle owned cycle ─► provider disconnect
+
+request_reconcile(): if running, set one pending flag; no DB/provider work and no task
+cycle start: clear flag BEFORE reading ─► wake during blocked work survives
+cycle end: pending flag gives ONE follow-up; repeated requests coalesce
+failed/deferred cycle: at least min(1 second, interval) before a wake-driven retry
+stop: unregister callback ─► reject late wakes ─► cancel and settle owner
 ```
 
 The loop has one in-flight cycle; additional attempts during it are skipped. Every cycle rereads the ledger and the current streaming role, so a replacement receives its own requests. Finnhub retains desired symbols across an unexpected socket loss but clears its current-socket inventory, then restores desired requests through its adapter-local retry owner (`system-design.md` §4.2). Manual disconnect clears both sets. IBKR discards old-session local bookkeeping when disconnected; Polygon retains its in-process polling set. Providers without usable inventory receive repeated requests under the adapter's idempotent subscription behavior. Inventory only avoids unnecessary calls: neither its presence nor a returned `subscribe()` establishes provider acknowledgement, capacity or continuing tick delivery. The loop never unsubscribes, so shrinking needs leaves manual and earlier requested symbols alone. A provider switch during a request is rechecked before the next symbol; the next cycle targets the new role.
 
-The 60-second interval starts after each completed cycle. A new exposure or reconnected provider may wait up to the next cycle **plus that cycle's read and subscription duration** before a request; failure adds another retry interval. This does not promise uninterrupted protective coverage. Finnhub now reconnects after an unexpected WebSocket close and restores retained desired requests; a symbol first needed during the outage still waits for reconciliation. Verified capacity across the full manual/scanner/protected union, provider acknowledgement and continuous delivery remain prerequisites outside this slice. Polygon's free-tier feed remains delayed. Existing direct unsubscribe routes can still create a gap until the next cycle. The owner's last attempt is readable through §18.14.
+`protected-feed-event-wake` adds a synchronous, nonblocking signal to this same owner. Execution signals only after the new simulated entry-order insert, new close-order reservation, or positive open/closing position commit returns. `OrderApproved` precedes the order row and `OrderFilled` precedes the position commit, so those bus events cannot prove the protected query will see the change. Provider installation signals after the registry role changes; Finnhub signals after a same-instance reconnect restores its desired requests, and only if it is still the registry owner. The owner always rereads the authoritative ledger and the **current** provider; callbacks do no query or subscription work. Signals are in-memory and can be lost across process failure or a narrow commit-to-notification window. A query already in flight can predate a commit; the pending wake then causes one follow-up if delivered. The 60-second interval still starts after a completed cycle and recovers missed signals, failures and later state changes. Failed or deferred cycles enforce a short cooldown against event-driven retry storms. A wake reduces request delay but cannot guarantee instant or continuous protection.
+
+Finnhub reconnects after an unexpected WebSocket close and restores retained desired requests; a symbol first needed during the outage is requested after the reconnection wake (or a later periodic cycle). Verified capacity across the full manual/scanner/protected union, provider acknowledgement and continuous delivery remain prerequisites outside this slice. Polygon's free-tier feed remains delayed. Existing direct unsubscribe routes can still create a gap until a later cycle. The owner's last attempt is readable through §18.14.
 
 ### 18.14 Protected feed reconciliation status (`protected-feed-reconciliation-status`)
 
-§18.13's owner made protected-symbol subscription requests, but its failures were visible only in logs. This slice adds a **read-only status view of the owner's last attempt**. It adds no policy: decision #189, the 60-second cadence, the symbol-selection rules, the retry behavior and the shutdown ordering are unchanged, and no new decision number was needed. The unresolved scanner policies (Top-N/filter, switch details, capacity verification, operator-enabled automation) stay open.
+§18.13's owner made protected-symbol subscription requests, but its failures were visible only in logs. This slice adds a **read-only status view of the owner's last attempt**. It added no policy at delivery: decision #189, the original 60-second cadence, the symbol-selection rules, the retry behavior and the shutdown ordering were unchanged, and no new decision number was needed then. The later `protected-feed-event-wake` adds prompt signals while retaining this snapshot's fields and outcome meanings. The unresolved scanner policies (Top-N/filter, switch details, capacity verification, operator-enabled automation) stay open.
 
 **What it records.** `ProtectedFeedReconciler.get_snapshot()` returns a `ProtectedFeedSnapshot`: a frozen dataclass whose fields are scalars, datetimes and tuples only (no list, dict or set), so a consumer cannot mutate the owner's state. It carries: running and cycle-in-progress flags, the configured interval, attempts started/finished, latest attempt start and finish times, the latest cycle outcome, the latest read attempt and its outcome, the **last successful** protected-set read (its own time and sorted symbols), the provider seen by the latest lookup and its connection state, and a retained per-symbol `RequestRecord` (the cycle's start time, provider identity, whether the provider's local inventory was readable, and one outcome per symbol).
 
@@ -1203,7 +1215,7 @@ The 60-second interval starts after each completed cycle. A new exposure or reco
 
 **Retention rules.** A later failed database read never overwrites the last successful read and never appears as an empty set: the route returns the retained symbols with their own `read_at` and a separate `latest_read: "failed"` marker. Likewise the request outcomes are replaced only by a cycle that reached the request step (provider present and connected); a later cycle that failed earlier leaves them in place, labelled with their own cycle time and provider. Reading status never changes any of this.
 
-**Evidence wording.** `locally_present` and `request_returned` are request evidence only. The route and panel never call them verified delivery, acknowledgement or confirmed protection, and say the periodic re-check means a new position or working order can wait up to one interval (plus that cycle's work) before it is requested. This still does not establish continuous tick delivery, capacity for the full manual/scanner/protected union, or provider reconnection.
+**Evidence wording.** `locally_present` and `request_returned` are request evidence only. The route and panel never call them verified delivery, acknowledgement or confirmed protection. They explain that committed exposure and provider changes prompt a re-check, the periodic interval recovers misses, and a cycle or outage can still delay requests. This still does not establish continuous tick delivery or capacity for the full manual/scanner/protected union.
 
 **Safe errors.** The route carries fixed codes and coarse classes only. Raw exception text (which can contain connection strings or credentials) stays in the backend logs, unchanged from §18.13.
 

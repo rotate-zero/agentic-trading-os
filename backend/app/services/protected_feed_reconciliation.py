@@ -160,15 +160,17 @@ def read_protected_symbols(session_factory: Callable[[], Session]) -> frozenset[
 
 
 class ProtectedFeedReconciler:
-    """One lifecycle owner; one cycle at a time, with a 60-second retry."""
+    """One lifecycle owner; one cycle, one coalesced wake, periodic fallback."""
 
     def __init__(self, session_factory: Callable[[], Session], *, interval_seconds: float = 60.0) -> None:
         self._session_factory = session_factory
         self._interval_seconds = interval_seconds
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        self._wake_event = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._stopping = False
+        self._wake_callback = self.request_reconcile
         self._snapshot = ProtectedFeedSnapshot(
             running=False, cycle_in_progress=False, interval_seconds=interval_seconds,
             attempts_started=0, attempts_completed=0, last_attempt_at=None,
@@ -190,11 +192,20 @@ class ProtectedFeedReconciler:
             return
         self._stopping = False
         self._stop_event.clear()
+        self._wake_event.clear()
+        broker_registry.register_protected_feed_wake(self._wake_callback)
         self._task = asyncio.create_task(self._run(), name="protected-feed-reconciliation")
+
+    def request_reconcile(self) -> None:
+        """Synchronous O(1) signal; never reads the ledger or provider."""
+        if not self._stopping and self._task is not None and not self._task.done():
+            self._wake_event.set()
 
     async def stop(self) -> None:
         self._stopping = True
+        broker_registry.unregister_protected_feed_wake(self._wake_callback)
         self._stop_event.set()
+        self._wake_event.clear()
         if self._task is not None:
             self._task.cancel()
             try:
@@ -209,11 +220,30 @@ class ProtectedFeedReconciler:
 
     async def _run(self) -> None:
         while not self._stopping:
+            # Clear BEFORE the cycle. A signal during any await in that cycle
+            # remains set for exactly one follow-up; no clear-after-wait race.
+            self._wake_event.clear()
             await self.reconcile_once()
             if self._stopping:
                 break
+            wait_remaining = self._interval_seconds
+            if self._snapshot.last_cycle_outcome in {
+                CYCLE_READ_FAILED, CYCLE_NO_PROVIDER, CYCLE_PROVIDER_DISCONNECTED,
+                CYCLE_PROVIDER_CHECK_FAILED, CYCLE_COMPLETED_WITH_FAILURES,
+            }:
+                # A stream of exposure signals must not turn a failing DB or
+                # provider into an unbounded immediate retry loop. Keep the
+                # pending wake for the next pass after a small cooldown.
+                cooldown = min(1.0, self._interval_seconds)
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=cooldown)
+                except asyncio.TimeoutError:
+                    pass
+                if self._stopping:
+                    break
+                wait_remaining -= cooldown
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=self._interval_seconds)
+                await asyncio.wait_for(self._wake_event.wait(), timeout=wait_remaining)
             except asyncio.TimeoutError:
                 pass
 

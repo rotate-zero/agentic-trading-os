@@ -281,6 +281,15 @@ ProtectedFeedReconciler cycle ─► frozen ProtectedFeedSnapshot ◄───�
 
 See `scanner-design.md` §18.14 for the full state table, retention rules and internal flow.
 
+**Protected-feed wake (`protected-feed-event-wake`).** Durable simulated entry/exit-order and positive position transitions signal the one application-owned reconciler only after their commit; streaming-role installation and a current Finnhub owner's reconnect also signal it. A signal is an in-memory request to re-check, with no database or subscription work in the caller. The existing 60-second scan remains the recovery path for missed notifications and failures. `scanner-design.md` §18.13 shows the component and coalescing flows. The status route remains read-only and its outcomes remain request evidence.
+
+```
+committed simulated ledger transition ─┐
+streaming role install / Finnhub resume ├─► one pending wake ─► protected-set query ─► current streaming provider
+60-second fallback timer ───────────────┘                              │
+                                                                  additive subscribe requests
+```
+
 ### 4.2 Market Data Engine
 The only module allowed to talk to a broker for data.
 
@@ -330,6 +339,8 @@ app/main.py lifespan (startup, soft-fail)     curl / DataFeedStatus.tsx's own
 ```
 
 Deliberately read-only for Polygon; Finnhub's existing manual "Reconnect" button calls the shared `POST /finnhub/connect` path. As built in `finnhub-stream-reconnect`, one Finnhub adapter now supervises its WebSocket after a successful initial connection. A remote exception or clean iterator termination clears current-socket requests, closes that socket and retries with positive, capped exponential delays (`FINNHUB_RETRY_INITIAL_SECONDS`, default 1; `FINNHUB_RETRY_MAX_SECONDS`, default 30). Initial connect failure still returns a route error without background retry. During an outage the route returns `reconnecting` and keeps the existing owner and bridge. The 120-second status poll shows `connected: false` until a replacement socket is established and desired requests are restored. Polygon has no persistent socket to recover.
+
+Once that same Finnhub adapter restores its desired requests, it signals protected-feed reconciliation only while still the registry's streaming owner. This lets a newly protected symbol arising during the outage be requested against the restored socket without waiting for the periodic scan. A retired adapter has no such callback path; local requests still do not verify delivery or feed capacity.
 
 **Finnhub reconnect component flow:**
 

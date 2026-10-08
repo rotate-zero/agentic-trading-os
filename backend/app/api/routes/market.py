@@ -373,9 +373,10 @@ async def get_subscription_status() -> dict:
 # Task `protected-feed-reconciliation-status`.
 
 _PROTECTED_FEED_NOTE = (
-    "Request evidence only. The protected-feed owner re-checks about every "
-    "interval_seconds, so a change in held positions or working orders can take "
-    "up to one interval to be requested. A symbol listed as locally present was "
+    "Request evidence only. Committed simulated exposure and streaming-provider "
+    "changes wake the protected-feed owner; it also re-checks every interval_seconds "
+    "to recover missed signals or failures. Requests can still be delayed by an "
+    "in-progress cycle or outage. A symbol listed as locally present was "
     "found in the provider adapter's own record; one listed as request returned "
     "had a subscribe call that returned without raising. Neither is provider "
     "acknowledgement, proof that ticks are arriving, or confirmed protection."

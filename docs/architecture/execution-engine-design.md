@@ -3456,7 +3456,7 @@ shutdown ─► stop and settle owner ─► disconnect providers
 ```
 
 ```
-one immediate cycle, then 60 seconds after each completion:
+one immediate cycle, then a wake or 60 seconds after each completion:
   open worker DB session ─► select positive open/closing positions + non-terminal orders
     ├─ error: log, keep prior requests, retry later
     └─ distinct symbols ─► read current registry provider and connection state
@@ -3466,9 +3466,11 @@ one immediate cycle, then 60 seconds after each completion:
              └─ returned request: no delivery assertion
 ```
 
-The owner never unsubscribes or changes position/order accounting. Local inventory suppresses duplicate requests only; subscription success is not a feed health verdict. A new exposure can wait up to the next 60-second cycle plus its work duration for a request. Provider reconnect and observed tick delivery remain separate concerns; capacity for the full required union is unverified. See `scanner-design.md` §18.13 for ownership and adapter details.
+`protected-feed-event-wake` signals the same owner after `PostgresOrderLedger.insert_order` commits a new simulated entry, after `PostgresExitLedger.prepare_exit` commits a new close reservation, and after `PostgresPositionLedger.commit_fill` commits a positive simulated open/closing position. A reused exit reservation does not signal. `OrderApproved` is published before the order insert and `OrderFilled` before position accounting, so those bus events are insufficient commit markers. These hooks only set one in-memory wake flag; the owner still makes every database read and subscription request. Registry takeover and current-owner Finnhub reconnection signal the same owner. The 60-second fallback recovers missed in-memory notifications or failures; a query that began before the commit may need the pending follow-up, and process loss between commit and notification falls back to the periodic scan after restart. Stop unregisters the signal before settling the worker and before provider shutdown. See `scanner-design.md` §18.13 for the component and internal wake diagrams.
 
-**Status of the owner's last attempt (`protected-feed-reconciliation-status`).** The owner exposes an immutable, request-evidence-only snapshot (`get_snapshot()`), published as `app.state.protected_feed_status_reader` by the same lifespan that starts the owner and cleared before it stops, and read by `GET /market/protected-feed-status`. Reading it neither starts a cycle nor touches the ledger or a provider; cadence, selection, retries and shutdown ordering are unchanged.
+The owner never unsubscribes or changes position/order accounting. Local inventory suppresses duplicate requests only; subscription success is not a feed health verdict. A new exposure is usually considered on a prompt wake, but cycle duration, outage and lost notifications can delay the request. Provider reconnect and observed tick delivery remain separate concerns; capacity for the full required union is unverified.
+
+**Status of the owner's last attempt (`protected-feed-reconciliation-status`).** The owner exposes an immutable, request-evidence-only snapshot (`get_snapshot()`), published as `app.state.protected_feed_status_reader` by the same lifespan that starts the owner and cleared before it stops, and read by `GET /market/protected-feed-status`. Reading it neither starts a cycle nor touches the ledger or a provider. The later event-wake delivery changes scheduling while preserving this read surface, selection and outcome meanings.
 
 ```
 owner cycle ─► frozen snapshot ◄─ get_snapshot() ◄─ GET /market/protected-feed-status ◄─ Broker panel "Protected feed"

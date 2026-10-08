@@ -371,9 +371,9 @@ function ProtectedFeedReading({ data }: { data: ProtectedFeedStatusWireShape }) 
       )}
 
       <div className="px-2 py-1 font-mono text-[9px] text-text-muted">
-        Re-checked about every {reconciler.interval_seconds}s, so a new position or working order can take up to that
-        long to be requested. These are request records only — not provider acknowledgement, proof that ticks are
-        arriving, or confirmed protection.
+        Committed simulated exposure and provider changes prompt a re-check. A {reconciler.interval_seconds}s periodic
+        check recovers missed signals or failures; requests can still be delayed by a cycle or outage. These are request
+        records only — not provider acknowledgement, proof that ticks are arriving, or confirmed protection.
       </div>
     </>
   );

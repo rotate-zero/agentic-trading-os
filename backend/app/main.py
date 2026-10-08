@@ -369,8 +369,8 @@ async def lifespan(app: FastAPI):
             app.state.execution_startup_status = _execution_startup_status("ready")
 
             # Protective feed needs are independent of scanner membership.
-            # The owner makes an immediate request and repeats at decision
-            # #189's 60-second interval against the current registry role.
+            # The owner runs immediately, on coalesced durable/provider wakes,
+            # and at decision #189's 60-second fallback interval.
             protected_feed_reconciler = ProtectedFeedReconciler(SessionLocal)
             protected_feed_reconciler.start()
             # Read-only status view (GET /market/protected-feed-status); it

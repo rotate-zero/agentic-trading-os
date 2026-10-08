@@ -119,6 +119,7 @@ def reserve_eod(ledger, position_id):
     assert ledger.observe_exit(EodIntent(position_id)).disposition is O.STORED
     result = ledger.prepare_exit(position_id)
     assert result.disposition is P.SUBMIT
+    assert result.created_order  # the returned reservation is committed and can wake protected feeds
     return result.action
 
 
