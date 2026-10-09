@@ -761,7 +761,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Strategy Engine | `trading_intelligence/strategy_engine/` → `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `trading_intelligence/opportunity_engine.py` → `ai_decisions` |
 | Decision Engine | `trading_intelligence/decision_engine.py` → `ai_decisions` |
-| Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft); single `plan(TradeRequest)` interface, see §18. **Not built;** the simulated-slice contract proposes a pure `backend/app/trade_planning/` package and no draft row — `execution-engine-design.md` §6.14 |
+| Trade Planning Engine | The P1 simulated auto core is **built but not connected** at `backend/app/trade_planning/` (`plan_entry` and immutable values); it creates no draft row. The general `plan(TradeRequest)` interface and P2 Governor integration remain unbuilt — `execution-engine-design.md` §6.14. |
 | Governor (widened decision schema) | `governor/governor.py`, `risk_rules.py`, `position_sizing.py` → `trades` (approved/rejected) |
 | Position Monitor | `position_monitor/monitor.py` → `positions` |
 | Performance Intelligence | `performance_intelligence/analyzer.py` → `strategy_outcomes` |
@@ -839,6 +839,8 @@ class TradePlan(BaseModel):
 `origin` carries forward from `TradeRequest` into `TradePlan` unchanged, which is what lets Governor's reasons, the Approval Queue, and Performance Intelligence (§14) distinguish manual from AI-originated trades without special-casing — same "widen now, narrow implementation" pattern as `GovernorDecision` (confirmed decision #6).
 
 **As-built reconciliation (`trade-planning-contract-design`, design only — the Trade Planning Engine is not built).** The `TradePlan` above is the planning-layer *value*; the event that exists in code is `TradePlanned` (`schemas/events/execution.py`, decision #171), and the two names are kept for two jobs: `plan(...)`'s in-process result (`TradePlan`, with `symbol`) and the event published after authorization commits (`TradePlanned`, `symbol` on the envelope only, approved path only). Field names follow the code: `max_hold_seconds` (whole seconds, never `max_hold_minutes`) and `size` at the plan layer, `qty` on `OrderApproved` and in the ledger. For the first simulated slice the planning-type work (reference price, stop-side check, fixed-notional sizing, planned risk, R) is specified as a pure function called by the authorizer worker; origin is always `auto` and the manual path, Kelly sizing and `corroboration` stay out of scope. Contract, diagrams, identities and acceptance criteria: `execution-engine-design.md` §6.14.
+
+**P1 implementation status (`simulated-trade-planning-core`).** The first simulated `TradePlan` value and pure `plan_entry` are built under `backend/app/trade_planning/`, but **not connected** to the authorizer. The paragraph above records the earlier design-only state and its broader interface remains future work. Current Governor rule 5 still sizes entries until P2 moves its call path to this core.
 
 ### 18.4 Success-rate evaluation — corroboration, not a fabricated score
 
@@ -1187,6 +1189,8 @@ These are sequential deliveries unless the row explicitly states independence. S
 | I1 `simulated-decision-pipeline-cutover` | Sol High; P2/R1/C2/D1/D2/G1 and §19.8 | One feature-controlled coordinator replaces the stub entry subscription; lifecycle wiring and tests | Exactly one entry consumer/publisher; durable selection trace to trade/order/outcome; unique-candidate success; multi-candidate abstention; all recovery/duplicate scenarios and existing simulated acceptance commands. |
 
 P1/C1 and later the pure D1 core can be developed independently, but shared documentation and ZIP finalization are sequential after refreshing main. Do not split P2, R1 or I1 into concurrent edits to startup/ledger code.
+
+**Current P1 status:** built but not connected. `ReferenceObservation`, `FixedNotionalSizing`, `TradePlan`, `PlanningRefusal` and `plan_entry` implement the P1 row; focused pure tests pass. The current Governor, price tracker, ledger and event path still use their original contracts. P2 must connect the planner and carry the two observation clocks, proposal snapshot and sole sizing authority through authorization.
 
 **Reusable task instruction:** “Implement only `<ID and slug>` from trading-intelligence-architecture.md §19.7 against fresh main. Inspect AGENTS.md and the listed contracts first; reuse landed prerequisites. Complete code, focused tests, relevant PostgreSQL checks and canonical docs together. Do not activate later phases, invent D4 weights/freshness values, or implement reserved Governor branches. Report an actual unresolved product choice rather than guessing. Use the delivery slug during work and assign a decision number only if needed at final integration. Deliver complete changed files at project-root-relative paths in a ZIP; exclude packaging helpers and patches.”
 

@@ -4208,3 +4208,10 @@ Exactly six files change: this file, `TESTING.md`, the roadmap, the scanner
 design header, and the two live decision-log files. No other documentation,
 application code, test code, migration, archive, Git history, or existing
 decision content changes.
+<!-- BEGIN DELIVERY SECTION: simulated-trade-planning-core -->
+# CHANGES — `simulated-trade-planning-core`
+
+Base: clean local `main` at `7c5f41c` (decision #196 already present). The P1 core is **built but not connected**. Added immutable `ReferenceObservation`, `FixedNotionalSizing`, `TradePlan` and `PlanningRefusal` values, plus pure `plan_entry(symbol, opportunity, reference, fixed_notional_usd, now)` under `backend/app/trade_planning/`. It validates reference, structural stop, whole-share quantity and auto target in documented order, retains the Governor's valid-input `floor(notional / price)` expression, computes stop-out risk from decimal string operands, then calculates R. Local observation and exchange times remain distinct; no age threshold is applied.
+
+Added focused pure tests. Updated `docs/architecture/trading-intelligence-architecture.md` and `docs/architecture/execution-engine-design.md` to show P1's status. Decision #196 already settles this behavior, so no new decision was added. The Governor, tracker, Event Bus, ledger, database, startup and execution path remain on their existing contracts. P2 must connect the planner to the authorizer, capture both price clocks, surface refusals at rule 5 while preserving rules 0–4, pass planned Decimal risk to rule 6, persist versioned proposals, and retain existing event and reservation quantities/order.
+<!-- END DELIVERY SECTION: simulated-trade-planning-core -->

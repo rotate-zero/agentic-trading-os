@@ -4850,3 +4850,8 @@ CHANGES.md                            61faa01cf81ca90eac4b29fcf82e69312edbb5a787
 TESTING.md                            41723b3f0ffd301495e45f806968b3c1cb61037241e6d601ecade799473ce83e
 docs/roadmap/phase-roadmap.md         473239117a5c5f08ffa2a0930a981a27963c3e252445d9d5a842933bb8380651
 ```
+<!-- BEGIN DELIVERY SECTION: simulated-trade-planning-core -->
+# TESTING — `simulated-trade-planning-core`
+
+Base: clean local `main` at `7c5f41c`. From `backend/`, `.venv/bin/pytest -q tests/test_trade_planning.py` — **38 passed**. Cases cover long and short plans, validation precedence and non-finite inputs, whole-share boundaries, decimal stop-out risk, R, separate local/source timestamps, immutable values, invalid configured notional, and differential sizing against a test-local copy of the Governor formula. Existing pytest-asyncio/FastAPI deprecation warnings remain. No database, broker, full backend suite or production call path was involved. `git diff --check` passed.
+<!-- END DELIVERY SECTION: simulated-trade-planning-core -->

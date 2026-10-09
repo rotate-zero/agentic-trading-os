@@ -3780,9 +3780,11 @@ Exit codes: `0` PASS, `1` a milestone failed (named), `2` a precondition failed 
 
 **Sensitivity check performed.** With `FeatureEngine._update_gap` temporarily made to return `{}`, the positive scenario fails at milestone C1.10 (calculated gap features absent) with exit code 1; the production change was reverted and is not part of the delivery.
 
-### 6.14 Trade Planning contract for the first simulated slice — design only, not built
+### 6.14 Trade Planning contract for the first simulated slice — P1 core built but not connected
 
-**Status.** Original design `trade-planning-contract-design` inspected `40df705`; refinement `opportunity-decision-planning-governor-contract-refinement` inspected pushed `main` `f7f5c51`. No production code, test, setting or migration is changed by either documentation delivery. The first-slice contract below incorporates decision #196; Q1–Q5's dispositions are recorded in §6.14.11. The wider cross-module contract and bounded task sequence are in `trading-intelligence-architecture.md` §19. The Trade Planning Engine remains unbuilt.
+**Design baseline.** Original design `trade-planning-contract-design` inspected `40df705`; refinement `opportunity-decision-planning-governor-contract-refinement` inspected pushed `main` `f7f5c51`. Neither documentation delivery changed production code, tests, settings or migrations. The first-slice contract below incorporates decision #196; Q1–Q5's dispositions are recorded in §6.14.11. The wider cross-module contract and bounded task sequence are in `trading-intelligence-architecture.md` §19. At that baseline the Trade Planning Engine was unbuilt.
+
+**P1 as-built update (`simulated-trade-planning-core`).** The immutable values in `backend/app/trade_planning/plan.py` and pure `plan_entry` in `planner.py` now implement §6.14.4's auto entry contract and §6.14.6's validation order. They are **built but not connected**: no production caller uses them, and Governor rule 5 still owns current sizing. No event, ledger, tracker, database or startup path was changed. P2 owns the integration described in §6.14.9 steps 2–5, including timestamp capture, proposal persistence, Governor delegation and removal of the old sizing calculation.
 
 **Purpose.** Today one component, `AuthorizerStub`, both *plans* a simulated entry (reads a reference price, validates stop geometry, sizes it, derives R, assembles the `TradePlanned` payload) and *authorizes* it (mode, session, snapshots, slots, daily-loss gate, identity minting, commit). This section specifies the smallest separation that gives planning its own contract, preserves the valid-input behavior of the simulated pipeline with explicit invalid-price/stop/target validation corrections, and leaves exactly one sizing authority.
 
