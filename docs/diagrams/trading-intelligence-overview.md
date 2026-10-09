@@ -1,6 +1,6 @@
 # Trading intelligence: flowcharts
 
-Solid arrows are live communication or reads. Dashed arrows are future wiring. Events pass through the Event Bus; snapshot arrows are direct reads.
+Solid arrows are live communication or reads. Dashed arrows are future wiring. Events pass through the Event Bus; snapshot arrows are direct reads. Updated against `f7f5c51` for `opportunity-decision-planning-governor-contract-refinement`; canonical future module/internal flows are in trading-intelligence-architecture.md §19 and execution-engine-design.md §6.14.6.
 
 ## 1. Live component flow
 
@@ -41,11 +41,24 @@ Market State and Context are separate inputs to strategy evaluation. The Scanner
 
 ```mermaid
 flowchart TD
-    CACHE[Opportunity Cache] -. future ranking .-> OE[Opportunity Engine]
-    OE -.-> DECIDE[Decision / Trade Planning / Governor]
-    DECIDE -.-> EXEC[Execution / Position Monitor]
-    EXEC -. closed outcomes .-> PERF[Performance Intelligence]
+    BUS["OpportunityCreated"] --> STUB["AuthorizerStub: simulated only"]
+    PORT["Portfolio State and reference price"] --> STUB
+    STUB --> COMMIT["Decision and reservation commit"]
+    COMMIT --> ORDER["OrderApproved"]
+    ORDER --> EX["Execution and SimulatedVenue"]
+    EX --> PS["Portfolio State"]
+    PS --> MON["Position Monitor: protective observations"]
+    MON --> EXIT["Execution: durable reduce-only exits"]
+    EXIT --> PS
+    PS --> OUT["OutcomeRecorder: simulated auto trades"]
+    OUT --> PERF["Performance Intelligence"]
+    CACHE["Opportunity Cache"] -. future eligible candidates .-> RANK["Ranking and Decision"]
+    RANK -. future selection .-> PLAN["Pure Trade Planning"]
+    PLAN -. future authorization .-> GOV["Governor"]
+    GOV -. future replacement entry path .-> COMMIT
 ```
+
+The future path replaces the stub subscription at explicit simulated cutover; both may not authorize concurrently. The present cache is descriptive and cannot become eligible state without the lifecycle contract in §19.2. D4 ranking remains open.
 
 ## 2. Feature Engine
 
@@ -147,7 +160,7 @@ Separate read-only status view (`scanner-observation-status`); it never scans, s
 flowchart TD
     PANEL[Scheduled observation section: manual Refresh] --> ROUTE[GET /scanner/observation]
     ROUTE --> SLOT{Reader installed on app.state?}
-    SLOT -- no, production today --> UNAVAILABLE[status: unavailable]
+    SLOT -- no --> UNAVAILABLE[status: unavailable]
     SLOT -- yes --> READ[One in-memory snapshot read]
     READ --> VIEW[Worker running/cycle state + retained results + skipped + attempt/success times + last error]
 ```
@@ -172,19 +185,21 @@ flowchart TD
 
 The trigger is `MarketStateChanged`, after Market State has updated its cache. The Scheduler publishes opportunities; the cache does not rank them.
 
-## 8. Performance evidence: built paths and missing live caller
+## 8. Performance evidence: built simulated and backtest writers
 
 ```mermaid
 flowchart TD
-    MARKET[Market State snapshot] --> CAPTURE[Capture entry / exit context]
-    CONTEXT[Context snapshot] --> CAPTURE
-    CAPTURE -. future Execution / Position Monitor caller .-> OUTCOME[StrategyOutcome]
-    OUTCOME --> VALIDATE[Validate closed-trade quantity invariant]
-    VALIDATE --> WRITE[record_strategy_outcome]
-    WRITE --> DB[(strategy_outcomes)]
-    DB --> QUERY[Performance queries / opportunity view]
+    M["Market State and Context"] --> CAP["JSON-safe snapshot capture"]
+    CAP --> ENTRY["Simulated entry snapshot hook"]
+    CAP --> EXIT["OutcomeRecorder exit capture"]
+    FILL["Committed closure receipts"] --> EXIT
+    ENTRY --> EXIT
+    EXIT --> DB["strategy_outcomes and trade link"]
+    BT["Backtest Runner"] --> DB
+    DB --> QUERY["Mode-separated performance queries"]
+    QUERY -. future attributed evidence .-> R["Ranking and Decision"]
 ```
 
-The outcome schema, capture function, write path, and read queries exist; live fill and exit callers do not.
+Simulated auto-trade and backtest outcome writing exist. Paper/live/manual writers remain outside those slices. Acceptance fixtures prove lifecycle mechanics, not predictive edge. Rejected and non-selected candidates are audit records, never realized outcomes.
 
 Detailed contracts: [trading intelligence architecture](../architecture/trading-intelligence-architecture.md), [system design](../architecture/system-design.md), [Daily Levels design](../architecture/daily-levels-design.md), and [strategy design](../architecture/strategy-engine-design.md) (plus its siblings [backtest runner design](../architecture/backtest-runner-design.md), [open decisions](../architecture/strategy-engine-open-decisions.md), and [build history](../architecture/strategy-engine-build-history.md)).

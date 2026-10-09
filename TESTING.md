@@ -1,3 +1,18 @@
+<!-- BEGIN DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
+# TESTING — `opportunity-decision-planning-governor-contract-refinement`
+
+Base: pushed `main` `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. Documentation-only delivery. No pytest, full backend suite, database mutation, feed session or broker operation was run. Future behavioral acceptance criteria are specified, not claimed passed.
+
+Validation performed for this delivery:
+- `git diff --check`; changed-file allowlist confirms documentation only.
+- Decision index and append-only log numbering checked against archive ranges; prior log/index content and every archive preserved, new #196 appended after #195. Remote main rechecked at packaging.
+- Relative Markdown file targets and fenced-block balance in changed documents; new Mermaid graphs reviewed for module ownership, branching and source/target relationships. No Mermaid renderer was available; no rendered-image verification is claimed.
+- Cross-document checks: D1 resolved/D4 open; Planning invalid-target refusal and source-time provenance; simulated-only as-built status; separate accepted trade identity; proposed rather than built new event/tables; no shadow authorization; bounded task dependencies and acceptance gates.
+- ZIP integrity, complete changed-file membership, root-relative paths, byte equality to reviewed working files, and no helper/patch/build/repository metadata included.
+
+Code-reading evidence: Scheduler and OpportunityCache/view; Opportunity/event models; ReferencePriceTracker and `make_envelope`/TickIngestBridge (exchange time versus local envelope time); Governor rules/engine/ports/Postgres adapter; Portfolio State adapter/ledger/reconciliation; execution order adapter and ledger models. Existing code supports cancelled entry rows, reservation-matched order insertion and duplicate-order refusal; the newly described recovery and candidate coordinator remain unimplemented.
+<!-- END DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
+
 <!-- BEGIN DELIVERY SECTION: trade-planning-contract-design -->
 # TESTING — `trade-planning-contract-design`
 

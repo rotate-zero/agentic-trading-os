@@ -444,21 +444,25 @@ Planned initial strategy set: ORB, Momentum, First Pullback, VWAP, Gap, Reversal
 
 ## 9. Opportunity Engine
 
+**Implementation contract:** §19 below (decision #196) refines §§9–12 against the current simulated lifecycle. It settles responsibilities, not D4 scoring weights. None of these four full modules is marked built by that design.
+
 Reads every Opportunity Object produced for a symbol across all strategies and ranks them. **It does not decide anything.** Its entire job is answering "which opportunities currently exist, and how do they compare" — arbitration is explicitly not its responsibility, which is why Decision Engine exists as a separate stage.
 
 ---
 
 ## 10. Decision Engine
 
-Arbitrates when opportunities compete — same symbol, conflicting directions (Momentum says BUY, Reversal says SELL), or multiple symbols competing for the same limited capital. Reads Portfolio State (current exposure, correlation to existing positions) to make that call. Outputs at most one `OpportunitySelected` per available capital slot — everything else is discarded at this stage, not silently overridden later.
+Arbitrates when opportunities compete — same symbol, conflicting directions (Momentum says BUY, Reversal says SELL), or multiple symbols competing for the same limited capital. Reads Portfolio State (current exposure, correlation to existing positions) to make that call. Produces provisional selections against the captured candidate set and Portfolio State; §19 specifies one candidate at a time, explicit abstention and auditable non-selection. Governor makes the final capacity reservation. Selection never guarantees execution.
 
 This is the layer that resolves: *Opportunity: 95% confidence. Trade Planner: ready. Decision Engine still has to decide whether this opportunity gets acted on at all before planning even starts.*
 
-**Direction-locked, not yet built:** once Performance Intelligence (§14) has real outcome data, context-sliced performance evidence becomes a new arbitration input here — a tie-breaker between competing opportunities, not a replacement for Portfolio State. `strategy-engine-design.md` §6 (decision #87). Whether Decision Engine and Governor (§12) eventually merge into one component is explicitly left open there, not decided.
+**Direction-locked, not yet built:** once Performance Intelligence (§14) has real outcome data, context-sliced performance evidence becomes a new arbitration input here — a tie-breaker between competing opportunities, not a replacement for Portfolio State. `strategy-engine-design.md` §6 (decision #87). Decision and Governor now remain separate responsibilities with typed contracts; they may share one serialized coordinator (§19; D1 resolved by this refinement). Performance-based arbitration and D4 scoring remain deferred.
 
 ---
 
 ## 11. Trade Planning Engine
+
+**Scope:** the list below is the long-term capability set. The first simulated build uses fixed-notional sizing and structural stop/target unchanged, with no hold-time enforcement, Kelly, scaling or trailing. Its binding first-slice specification is `execution-engine-design.md` §6.14, as refined by §19.5 here.
 
 Answers *"if we trade this, how?"* — a fundamentally different question from *"should we trade?"* (that's Decision Engine and Governor's job). Produces:
 
@@ -474,6 +478,8 @@ Answers *"if we trade this, how?"* — a fundamentally different question from *
 ---
 
 ## 12. Governor (Risk & Policy)
+
+**Scope:** the examples below describe eventual policies. The built authorizer supports only its documented rules 0–6. Buying-power, correlation and performance derating require real input contracts and explicit rules before activation (§19.6); missing capabilities are never silently described as enforced.
 
 The heart of the system — not because it calculates anything sophisticated, but because it's the layer allowed to say **no** after everything upstream said yes.
 
@@ -1001,3 +1007,193 @@ frontend/src/input/
 | 11 | Fully generic Input Layer, no trading knowledge | **Adopted** — Action Category routing means Navigation/UI actions never construct a `TradeRequest` | §18.10 |
 
 The one place the suggestion as literally written wasn't taken: unconditional "Governor + `ExecutionMode` decide" (point 1) would let an algorithmically-sized, never-reviewed idea fire with zero human look in Auto mode. Kept the review step; moved what triggers it from "which command was pressed" to "was a size actually given."
+
+
+## 19. Opportunity, Decision, Planning and Governor implementation contract
+
+**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path.
+
+### 19.1 Existing foundations and responsibility boundaries
+
+| Component | Verified baseline | Refined responsibility |
+|---|---|---|
+| Feature / Market State / Context | Built snapshots; Scheduler reacts to `MarketStateChanged` and caches full FeatureSets | Remain the owners of their facts. Consumers record timestamps and relevant evidence, never recalculate indicators or fabricate unavailable context. |
+| Scanner | On-demand scoring, optional observation and manual feed requests | Activity/universe selection only. Scanner score is not trade quality, feed subscription is not execution permission, and automated promotion remains separate. |
+| Strategy Scheduler | Seven v1 strategies, central gates, individual `OpportunityCreated` publication | Own evaluation completion facts, including no result, gate failure and evaluation errors; it does not rank. |
+| Opportunity Cache/view | Latest per `(symbol, strategy)` indefinitely; agreement/conflict only | Keep this descriptive view compatible. New eligible-candidate state is a distinct contract with lifecycle rules (§19.2). |
+| Opportunity ranking | Unbuilt; D4 open | Compare eligible candidates using a named, versioned policy and valid evidence; may report `unranked`. No capital reservation or order authority. |
+| Decision | Unbuilt | Select or abstain within a captured candidate set, considering available Portfolio State; record alternatives and reasons. |
+| Planning | Performed inside `AuthorizerStub` today | Pure proposed geometry, sizing and planned risk. One sizing authority. |
+| Governor | Simulated-only stub rules 0–6 | Final policy enforcement and durable reservation; no strategy retirement or modification. |
+| Portfolio State / Execution / OutcomeRecorder | Simulated lifecycle built, including durable entry/exit ledgers and simulated outcomes | Preserve ledger authority, mode isolation, reduce-only protective exits and outcome attribution. No new Governor round-trip on existing protective exits. |
+
+**D1 resolution:** keep four separate domain responsibilities. Use pure ranking/selection/planning/rule functions inside one serialized coordinator where practical; a separate queue, service or database per module is not required. This is compatible with the modular monolith and synchronous snapshot readers. External events remain owned by one publisher. Existing `AuthorizerStub` continues to operate until an explicit cutover task replaces its entry subscription.
+
+```mermaid
+flowchart TD
+    S["Scheduler: completed evaluations"] --> C["Eligible candidate state"]
+    C --> R["Ranking: ordered or unranked"]
+    H["Performance evidence"] --> R
+    R --> D["Decision: select or abstain"]
+    P["Portfolio State"] --> D
+    D --> T["Planning: proposed trade"]
+    T --> G["Governor: policy and reservation"]
+    P --> G
+    X["Context and reference observation"] --> G
+    G -->|Approved commit| E["Execution: existing order contract"]
+    G -->|Rejected| A["Decision audit"]
+    A -. Bounded next candidate .-> D
+    E --> O["Portfolio State and outcomes"]
+    O --> H
+```
+
+All links in this diagram describe the target contract, not deployed wiring. The current bypass remains `OpportunityCreated → AuthorizerStub → committed reservation → OrderApproved → Execution`.
+
+### 19.2 Eligible candidates: lifecycle, identity and coherent inputs
+
+The raw cache cannot be treated as an eligible list: it retains old signals when a later evaluation returns `None`. Introduce a completed-evaluation batch contract before automated ranking. One batch covers one symbol/timeframe/source candle and the registered strategy versions eligible for that trigger. Each strategy has a terminal disposition: `opportunity`, `no_opportunity`, `gated`, or `error`. An unavailable prerequisite invalidates that batch for selection. An untriggered strategy is not falsely recorded as having evaluated.
+
+The Scheduler remains the only producer. Publish one proposed new `StrategyEvaluationCompleted` event on the normal lane after all strategies for the trigger have completed; its payload contains the complete dispositions and opportunities, so eligibility never depends on separately delivered `OpportunityCreated` events. Keep existing opportunity events for current consumers. This new event is a future schema addition, not present in the baseline. Validate matching FeatureSet and MarketState `timeframe`/`candle_ts`; a mismatch is unavailable input, not permission to combine different candles. The Scheduler's existing input caching must be inspected in task C2 to implement this check without pretending it already exists.
+
+**Candidate identity (new, distinct from accepted-trade identity):** a deterministic, versioned encoding of `(symbol, strategy, strategy_version, trigger_timeframe, source_candle_ts, direction)`. Normalize UTC timestamps and use a documented canonical serialization before hashing. `evaluation_id` excludes direction; `candidate_id` includes it. Do not use receive time, a random UUID, mutable confidence, or an assumed stable `setup_detected_at` as the key. This identifies one evaluation, not a whole multi-candle setup. Conflicting contents for the same evaluation identity are an error, never silently last-write-wins. Identical redelivery is a no-op. Real replay/backtest state remains isolated from the live candidate store.
+
+**Eligibility:** only the latest complete evaluation for that strategy/version/symbol is eligible; it must be actionable, within the configured candidate-age policy, in the current trading session and permitted mode. A newer `None`/gate/error disposition removes the earlier candidate from eligibility. Retire disabled versions. Clear eligibility at session change, provider ownership change and restart; rebuild from new coherent evaluations. Maintain a reset boundary and reject delayed pre-reset batches; after provider change/restart require source candle intervals beginning at or after that boundary before admission. Resetting an in-memory dictionary alone is insufficient because old bus events can still arrive. This deliberately waits for a fully post-reset candle; it does not claim queued old-source events were retracted. Historical cache/display rows need not be deleted. `expected_horizon_minutes` stays descriptive; `wait_expires_at` remains a waiting-model field and is not reused as actionable expiry.
+
+Store source candle time, local completion/receive time, and invalidation reason separately. Age is measured from the source interval's close, using the producer's candle timestamp convention and MarketClock, not from arbitrary delivery time. Positive maximum ages are explicit policy inputs required for entry cutover (§19.8). No universal seconds threshold is invented here. Until cutover, shadow output may say `freshness_policy_unconfigured`; that is not an eligible execution candidate.
+
+```mermaid
+flowchart TD
+    B["Completed evaluation batch"] --> V{"Coherent and newer?"}
+    V -->|No| Q["Ignore identical duplicate or report conflict"]
+    V -->|Yes| I["Invalidate superseded candidates"]
+    I --> A{"Actionable opportunity?"}
+    A -->|No| N["Record no-result, gate or error"]
+    A -->|Yes| F{"Session and freshness valid?"}
+    F -->|No| U["Unavailable or expired"]
+    F -->|Yes| C["Eligible candidate with stable ID"]
+```
+
+### 19.3 Ranking: honest evidence and deliberate non-ranking
+
+`rank(candidate_snapshot, evidence_snapshot, ranking_policy) -> RankingResult` is a pure contract. A result records candidate IDs, policy/version, as-of times, comparability groups, component evidence, and `ranked | unranked | unavailable` plus reasons. A stable ID sort is permitted for display/reproducibility only and must not select a winner.
+
+D4 remains deliberately open: no multiplication formula, arbitrary weights, confidence threshold, minimum sample count or Kelly edge estimate is approved here. A strategy confidence value is a heuristic, not an established probability. The first ranking adapter returns `unranked` when no approved policy exists; it can supply descriptive evidence and explicit same/opposite-direction groups. Agreement among correlated strategies is not independent confirmation and receives no automatic bonus.
+
+Evidence must preserve strategy/configuration version, context slice, sample size, observation period, outcome definition, execution mode/venue, and backtest run/sweep/data/feature provenance. Query existing Performance Intelligence, never mix simulated and backtest populations silently. Empty evidence stays unavailable. Synthetic acceptance outcomes establish mechanics only and cannot satisfy a profitability/calibration gate. Evidence used in an as-of decision must have been available then; no future outcome leakage. Determining sufficient evidence and approving an empirically checked ranking policy is a later D4 task, not a task for an implementation model to guess.
+
+```mermaid
+flowchart TD
+    C["Eligible candidate snapshot"] --> E["Read attributed performance evidence"]
+    E --> V{"Comparable and approved policy?"}
+    V -->|No| U["Unranked with evidence gaps"]
+    V -->|Yes| S["Compute versioned score components"]
+    S --> T["Return order and explicit tie groups"]
+    U --> A["Auditable RankingResult"]
+    T --> A
+```
+
+### 19.4 Decision: provisional selection, abstention and feedback
+
+`select(ranking_result, portfolio_snapshot, attempted_candidate_ids) -> SelectionResult` is pure. Outputs are `selected(candidate_id)` or `abstained(reasons)`, together with the considered IDs, exclusions, conflict groups, ranking/policy versions, captured input times and an audit ID. `OpportunitySelected` is already an enum name but has no built payload/producer contract; the eventual wire schema must follow this result and must not masquerade as authorization.
+
+The coordinator freezes the latest completed batches present at a recorded arrival-sequence cutoff; it never acts partway through one symbol's strategy batch. Different symbols are asynchronous. No barrier assumes all 100 symbols reported the same minute. Determinism means the same captured input set and policy yield the same result; it does not mean future or not-yet-arrived signals were considered. A new completed batch or relevant portfolio change requests the next coalesced cycle.
+
+**First conservative simulated selection policy, `unique_candidate_v1`:** after hard eligibility, existing-symbol exposure and slot checks, select only when exactly one candidate remains globally. Multiple same-direction strategies on one symbol still count as competing candidates; opposite directions, equal scores, multiple symbols or missing required Portfolio State produce abstention. This can be tested in shadow mode without D4 and must be explicitly chosen at cutover. It is deliberately restrictive and does not silently use arrival order, alphabetic order or raw confidence as a tie-break. Ranked competition is a later policy under D4.
+
+Select at most one candidate at a time; the coordinator may consider another only after the previous approval's reservation is durably visible in refreshed Portfolio State. Freshness here includes completed ledger synchronization/readiness, not merely a newly generated snapshot `as_of` timestamp. Planning failure or an ordinary Governor rejection may try the next still-eligible ranked candidate within the same captured set, at most once per candidate. With `unique_candidate_v1`, an ambiguous set stays abstained; rejection is not a reason to force a winner from it. Unknown portfolio state, failed persistence or a global entry halt ends the cycle. New candidates wait for the next cycle. There is no busy retry loop.
+
+**Redelivery and re-entry:** enforce unique acceptance of `(execution_mode, candidate_id)` atomically with authorization, before cutover. Same candidate never automatically enters again after closure or restart. A genuinely newer source-candle evaluation is a new candidate and may re-enter subject to the same rules. This first simulated policy adds no multi-candle cooldown and does not claim two evaluations represent different economic setups; stronger setup-based cooldown needs strategy-owned setup identity and remains a later policy. Document this limitation in the UI/audit when selection is activated.
+
+Selection audit is a separate record type, not a fake approved/rejected trade or `StrategyOutcome`. The pure/shadow core returns complete records to an injected sink. Before entry cutover, implement the following durable schema contract (table names are proposed, no migration exists yet):
+
+| Record | Required fields / constraints | Write owner and replay |
+|---|---|---|
+| `selection_attempts` | `selection_id` UUID primary key; UTC `created_at`; `execution_mode`; `shadow` boolean; `policy_version`; `result` selected/abstained; nullable `selected_candidate_id` (required iff selected); `schema_version`; strict finite JSONB `evidence` containing captured candidate IDs, relevant evidence, exclusions/reasons, source times, snapshot cutoff and portfolio as-of | Decision journal adapter appends before planning. Same ID + identical canonical record is a no-op; different record conflicts. No updates or fabricated realized outcome. Durable-write failure stops an entry cycle; shadow sink failure reports unavailable audit. |
+| `candidate_acceptances` | Composite primary key `(execution_mode, candidate_id)`; unique `trade_id` FK to `trades`; `selection_id` FK to non-shadow selected attempt | Governor ledger adapter inserts in the SAME transaction as approved trade/proposal/reservation, verifying mode and selected candidate. Competing claim fails without a second approval or reservation. Replays verify complete equality. Retain after closure and after proven-unsent cancellation: that candidate was consumed. |
+
+New tables join the existing transaction lock order after its existing tables, consistently in every participating adapter; do not reorder the established `trades → orders → trade_reservations` prefix. No backfill invents identities for legacy approvals. Old trades remain valid without acceptance rows; only the new coordinator requires the new claim. The audit's relevant evidence must not duplicate whole FeatureSets. A ranking policy or input cutoff change creates a new selection attempt. Non-selected candidates have no realized P&L; counterfactual testing requires a separate explicitly identified research dataset.
+
+```mermaid
+flowchart TD
+    S["Freeze candidate set and portfolio read"] --> K{"Required state available?"}
+    K -->|No| A["Abstain with reasons"]
+    K -->|Yes| R["Apply configured selection policy"]
+    R --> U{"One permitted winner?"}
+    U -->|No| A
+    U -->|Yes| P["Provisional selection to Planning"]
+    P --> G{"Plan and Governor accept?"}
+    G -->|Yes| C["Commit then refresh exposure"]
+    G -->|Ordinary rejection| N["Mark attempted; bounded reconsideration"]
+    N --> R
+    G -->|Unavailable or persistence failure| A
+```
+
+### 19.5 Planning: first implementation and validation precedence
+
+Use `execution-engine-design.md` §6.14 with these settled refinements:
+
+- Extract a pure `plan_entry` into `backend/app/trade_planning/`; retain one authorizer worker, one commit and one event publisher. The eventual public `plan(TradeRequest)` remains the origin-neutral interface from decision #22; no manual queue is built now.
+- Persist immutable, versioned `thesis["proposal"]` for approved and plan-bearing risk-rejected decisions, in the existing transaction. Rejected records retain their existing prohibition on accepted IDs/reservations; proposal size is audit data, not an authorized quantity.
+- Keep `floor(fixed_notional_usd / reference_price)`, whole shares and the existing configured notional. Planned stop-out risk uses exact decimal arithmetic. Governor converts existing I15 monetary inputs through their canonical string representations to Decimal before combining them with that value; no float/Decimal mix and no second candidate-risk formula. Cap equality/just-over boundaries are tested explicitly; last-bit float-boundary corrections are disclosed, while the risk equation and limits remain the same. Structural stop and target are unchanged. Quantity is computed once and equals plan size, approval qty and reservation qty.
+- Validate in this order: missing/non-finite/non-positive reference → `no_reference_price`; non-finite/non-positive or wrong-side stop → `invalid_stop_geometry`; size below one share → `notional_below_one_share`; non-finite/non-positive or wrong-side auto target → **`invalid_target_geometry`**. Long requires `stop < entry < target`; short requires `target < entry < stop`. Reject target equality. Only then compute R; no absolute-value reward may disguise an adverse target. Absent required structural fields are rejected by Opportunity validation before the planner (the existing logged-drop path); positive finite notional is a configuration precondition, not a guessed default. Pass envelope `symbol` explicitly to the planner because Opportunity has no symbol field.
+- Earlier Governor rules 0–4 retain precedence. A planner refusal surfaces at rule 5; daily-loss checks remain rule 6. Valid-input payloads stay compatible. Invalid target/price cases intentionally change behavior; these exceptions must be explicit in tests and release notes.
+- Capture both `PriceUpdated.exchange_ts` (source observation time) and envelope timestamp (local event creation time), plus `planned_at`. The baseline envelope clock is local, not exchange time. For compatibility `reference_observed_at` retains its proposed envelope-time meaning; add `reference_exchange_ts` and `reference_source_age_seconds` explicitly. Missing source time remains null. This extraction records ages without adding thresholds. Cutover freshness checks use source time and reject unknown/invalid age; late exchange timestamps must not refresh a price's apparent source age.
+- Additive proposal fields do not alter `TradePlanned`'s wire payload. `TradePlanned` remains the post-authorization notification, not the Governor's input event. `TradePlan` is the in-process value. `entry` is the proposed reference, never an actual fill.
+- No hold-time, scaling, trailing or Kelly behavior is implied by nullable fields. Existing reduce-only stop/target/EOD enforcement stays with Position Monitor and Execution.
+
+The internal branch flow is §6.14.6. Q1 and Q5 are accepted; Q2 is observation-only for extraction with freshness required at cutover; Q3 now rejects invalid targets; Q4 remains outside extraction with the concrete identity contract in §§19.2/19.4.
+
+### 19.6 Governor: enforceable rules, reservation authority and recovery
+
+Keep approved/rejected as the only active branches. `approved_reduced`, `delayed` and `watch_only` remain schema-only; they do not bypass validation. A future reduction must return a constraint to the sole planner and revalidate a new immutable proposal revision before authorization; a future delay must expire and recheck inputs rather than resume an old approval blindly. These branches are not first-slice tasks.
+
+Rule inputs are explicit snapshots. Enforce only capabilities actually present: current Portfolio State provides positions, in-flight reservations, P&L and marks, but the narrow Governor port does not provide settled buying-power or correlation contracts. Do not infer buying power from configured notional or treat absent correlation as zero. Activating a rule requires its source, availability/freshness contract, arithmetic, priority and rejection code to be documented and tested. Until then, report that rule as unsupported; do not claim the full long-term risk policy is implemented.
+
+**Authorization invariant:** recheck session/mode, candidate validity, reference freshness, portfolio readiness, slots and risk against current inputs immediately before committing. Selection is advisory. The commit atomically establishes approved decision, proposal, candidate acceptance uniqueness and reservation. Before any subsequent entry evaluation, refresh the ledger-backed Portfolio State; failure stops new entries. One coordinator owns entry authorization in the initial deployment; multiple API workers must not independently authorize against one portfolio. G1 must enforce this with an exclusive PostgreSQL session advisory lock scoped to this admission service and execution mode, held on a dedicated connection for its lifetime; failure to acquire or loss of that session prevents new admission. Authorizing transactions must use that lock-owning database connection, so losing it also prevents their commit; a check on a separate connection is not sufficient fencing. Stop/drain the worker before releasing ownership. Ordinary per-transaction locks do not replace lifetime ownership. The durable acceptance key and serialized reservation path need concurrent-claim tests. Scaling to multiple authorizers requires a transaction-level admission design, not merely another worker.
+
+Existing daily-loss semantics (I15) remain: `max(0, -realized_pnl_today)` plus existing exposure loss plus candidate stop-out loss, rejecting unknown exposure. No change to how profits offset losses, commissions, or the configured limits is authorized by this design. This estimate is not a guarantee against slippage or gaps. Mode labels `simulated/paper/live/backtest` remain distinct from the future placement choice `auto/manual`.
+
+**F10 resolution direction — cancel proven-unsent orphan approvals on startup, never automatically replay stale entries.** Before admission starts, reconciliation finds a simulated approved trade/reservation with no order. Verify the venue has neither that client-order ID nor contradictory fills/positions; uncertainty blocks admission. Under the existing ledger lock, recheck absence and insert a terminal cancelled entry order using the original reservation terms and a machine-readable `approval_not_dispatched_on_restart` reason. Keep the original approval/reservation immutable. Portfolio State then sees a terminal order rather than an indefinitely in-flight orphan. A late `OrderApproved` finds that same order and cannot submit it. A venue match follows existing reconciliation or blocks; never cancel/delete evidence to make state look clean. No timeout-based sweep may cancel an approval while its live worker could still dispatch it. Runtime dispatch failures remain a visible halt/recovery condition; startup-only recovery does not promise uninterrupted liveness.
+
+This recovery is a separate code task. Inspect actual `Order` constraints, reconciliation ordering and adapters before implementing the narrow ledger method; reuse the existing cancelled-entry semantics and do not call a broker or change protective exit ownership.
+
+```mermaid
+flowchart TD
+    P["Plan and current inputs"] --> V{"Rules and availability pass?"}
+    V -->|No| R["Commit rejection with proposal if present"]
+    V -->|Yes| C["Atomic approval, acceptance key and reservation"]
+    C --> E["Publish existing approval events"]
+    E --> O["Execution inserts order before venue call"]
+    C -. Crash before order .-> S["Startup reconciliation"]
+    S --> K{"Proven unsent and no contradiction?"}
+    K -->|Yes| T["Persist cancelled order; refresh exposure"]
+    K -->|No| B["Reconcile known state or block admission"]
+```
+
+### 19.7 Bounded implementation tasks and handoff contracts
+
+These are sequential deliveries unless the row explicitly states independence. Suggested model allocations reflect task complexity, not a requirement for a particular vendor. No Astra session is required for routine implementation within these contracts. Each task reads AGENTS.md and its listed sections, updates canonical docs plus CHANGES/TESTING, and reports exact tests. Never assign a final decision number until integration against current main.
+
+| ID / delivery slug | Model and dependencies | Scope and likely files | Completion evidence |
+|---|---|---|---|
+| P1 `simulated-trade-planning-core` | Sol Medium or Sonnet 5.5 Medium; first | Pure value types/planner under `backend/app/trade_planning/`; §6.14 + §19.5; not wired | Long/short geometry; invalid prices/stops/targets; quantity boundaries; planned-risk decimal correctness and boundary cases; valid-input sizing differential checks. No production call path changes. |
+| P2 `simulated-trade-planning-integration` | Sol High; P1 | `governor/{engine,rules,reference_price,ports,postgres}.py`; proposal persistence and source/local timestamps | Existing rule precedence; valid payload equivalence; new invalid-target refusal; transaction rollback; identical/different proposal replay on real PostgreSQL; both existing simulated acceptance commands pass. |
+| R1 `undispatched-approval-startup-recovery` | Sol High; can precede P1, finalize separately from P2 | Execution/Portfolio startup reconciliation and ledger ports/adapters; §19.6 F10 | Crash after approval before order; repeated restart; late approval event; contradictory venue state; terminal order frees exposure; no venue submission. PostgreSQL required. |
+| C1 `opportunity-candidate-contract-core` | Sol Medium or Sonnet 5.5 Medium; independent of P1/R1 | Pure candidate/batch models, canonical IDs and reducer under `trading_intelligence/`; §19.2 | Same-ID duplicate/conflict; newer none/gate/error removes old eligibility; old batch cannot resurrect it; version/session/reset and source-age behavior. No live subscriber. |
+| C2 `strategy-evaluation-batch-observation` | Sol High; C1 | Scheduler completion publication, event schema and observation-only candidate reader; existing strategy events retained | All batch outcomes including errors; no mid-batch snapshot; feature/state timestamp mismatch; same-candle redelivery; resets and no added order/authorization side effects. |
+| D1 `decision-selection-shadow-core` | Sol Medium or Sonnet 5.5 Medium; C1 | Pure `RankingResult`/`SelectionResult`, unranked adapter and `unique_candidate_v1`; §§19.3–19.4 | Zero/one/many candidates; direction conflict and tie abstention; no confidence fallback; missing portfolio; bounded retry and captured-set determinism. No order events. |
+| D2 `decision-selection-audit-contract` | Sol High; C2/D1 | Implement the specified append-only selection journal and acceptance claim schema/ports; §19.4 | Real PostgreSQL migration, identical replay/conflicting replay, atomic rollback and two concurrent claims for one mode/candidate. Old trades remain valid; no claim inferred from legacy rows. No authorization cutover. |
+| G1 `governor-admission-policy-contract` | Sol High; P2/D2 | Freshness policy validation, input/readiness checks, one-coordinator admission and refreshed reservation visibility | Explicit missing/unconfigured-policy refusal; clock/source-age boundaries; late tick; stale portfolio; two coordinators cannot own admission; lock loss halts entries; sequential competing candidates; failed refresh halts next entry. Shadow use only. |
+| I1 `simulated-decision-pipeline-cutover` | Sol High; P2/R1/C2/D1/D2/G1 and §19.8 | One feature-controlled coordinator replaces the stub entry subscription; lifecycle wiring and tests | Exactly one entry consumer/publisher; durable selection trace to trade/order/outcome; unique-candidate success; multi-candidate abstention; all recovery/duplicate scenarios and existing simulated acceptance commands. |
+
+P1/C1 and later the pure D1 core can be developed independently, but shared documentation and ZIP finalization are sequential after refreshing main. Do not split P2, R1 or I1 into concurrent edits to startup/ledger code.
+
+**Reusable task instruction:** “Implement only `<ID and slug>` from trading-intelligence-architecture.md §19.7 against fresh main. Inspect AGENTS.md and the listed contracts first; reuse landed prerequisites. Complete code, focused tests, relevant PostgreSQL checks and canonical docs together. Do not activate later phases, invent D4 weights/freshness values, or implement reserved Governor branches. Report an actual unresolved product choice rather than guessing. Use the delivery slug during work and assign a decision number only if needed at final integration. Deliver complete changed files at project-root-relative paths in a ZIP; exclude packaging helpers and patches.”
+
+### 19.8 Activation gates and intentionally open policy
+
+Architecture is defined sufficiently to implement P1 through shadow contracts without another general redesign. Entry cutover additionally requires: (1) explicit positive candidate and source-price maximum ages with clock-anomaly behavior; unknown, negative or future source age is unavailable in v1, (2) explicit choice of `unique_candidate_v1` or a later approved ranking policy, (3) durable journal/acceptance key plus authoritative reservation refresh, (4) R1 recovery, and (5) acceptance evidence on the selected simulated venue lifecycle. Missing policy prevents enabling the new path; it never chooses a hidden fallback.
+
+D4 weights, evidence sufficiency/calibration, stronger setup cooldowns, correlation/buying-power rules, Kelly, manual Approval Queue, partial/scale/trailing rules and real broker venues remain open/deferred under their existing decisions. No model should infer approval to implement them from this refinement. The existing simulated stub can continue while shadow work is built; it must not run alongside an enabled replacement authorizer. Shadow selection/audit cannot mint accepted trade IDs, reserve exposure or emit `OrderApproved`.
+
+**Acceptance matrix for the integration owner:** stale cache after a newer no-result; competing strategies from the same batch; asynchronous symbols with captured cutoff; equal/absent evidence; long and short invalid target; zero/non-finite reference; delayed tick with fresh envelope; duplicate candidate before and after closure; candidate content conflict; capacity changing between selection and authorization; failed commit/refresh; crash before and after order insertion; late approval after orphan cancellation; restart with existing positions; strategy-to-outcome attribution and no fake outcomes for rejected/abstained candidates. These are behavioral gates, not a requirement to rerun the full backend suite for every isolated task.

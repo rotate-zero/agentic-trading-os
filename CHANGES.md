@@ -1,3 +1,21 @@
+<!-- BEGIN DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
+# CHANGES — `opportunity-decision-planning-governor-contract-refinement`
+
+Base: pushed `main` `f7f5c515f914f8cd515ca0ba2343052b95c260fc` (`Trade planning contract design`), rechecked before assigning decision #196. Documentation only: no application code, test, migration, setting or live service changed. Saqib authorized refinement of the four modules against existing development and requested bounded tasks for Sol Medium/High and Sonnet 5.5 Medium.
+
+**Canonical result.** `trading-intelligence-architecture.md` §19 defines module ownership, completed-evaluation candidate lifecycle, deterministic candidate identities distinct from accepted trade IDs, unranked evidence contracts, conservative unique-candidate selection/abstention, bounded rejection feedback, append-only selection and atomic acceptance schemas, Planning validation, Governor ownership/reservation rules, startup recovery for orphan approvals, and explicit activation gates. Nine task rows specify dependencies, likely files, suggested models and completion evidence. Module/internal diagrams accompany the contracts. D1 is resolved; D4 scoring and numeric freshness values remain open.
+
+**Planning corrections.** `execution-engine-design.md` §6.14 now settles Q1–Q5: versioned proposal in the existing transaction; both exchange/source and local envelope clocks; strict invalid-target refusal; candidate identity deferred only from the narrow extraction; refusal of invalid reference/stop/target inputs. `symbol` is explicit because Opportunity has no symbol field. The in-process corroboration value is immutable. Existing rule precedence, valid-input fixed-notional sizing and wire contracts remain the baseline. A12 now tests one sizing authority in the simulated-entry path rather than banning unrelated backtest arithmetic. A15/A16 cover geometry and source-time provenance. Rule 6 consumes Decimal risk with explicitly converted I15 operands and cap-boundary tests; last-bit float-boundary differences are disclosed numerical corrections, not new risk settings. Earlier §6.14 verified findings retain their historical as-built status.
+
+**Integration and recovery.** Selection remains advisory and the Governor owns reservations. Future shadow modules cannot emit approvals. F10's later recovery creates a terminal cancelled order for a proven-unsent orphan, preserving original approval evidence; uncertain state blocks. Startup ownership and durable uniqueness prevent two entry authorities. Existing reduce-only exits and simulated outcomes stay authoritative.
+
+**Files updated.** Trading-intelligence, execution, system and strategy architecture; open-decision lookup; phase roadmap; standalone trading-intelligence diagrams; decision index/log; CHANGES and TESTING. The standalone diagram's old “execution/outcome caller unbuilt” claims now reflect the built simulated lifecycle. No unrelated historical decision body or archive is rewritten.
+
+**Applying the ZIP.** It contains complete changed files at project-root-relative paths, no enclosing folder, patches or `_delivery` directory. Against this exact base, extract outside the checkout and copy the files to the project root, review the diff and commit with the delivery slug. If local changes or newer main overlap these files, integrate those changes rather than copying over them. At integration recheck decision #196 is still free/this delivery; if another delivery used it, renumber only this new entry and its references to the next free number. Never renumber historical decisions. No Git commit/push was performed by this delivery.
+
+**Next implementation task:** P1 `simulated-trade-planning-core` — Sol Medium or Sonnet 5.5 Medium; task contract and reusable instruction in §19.7. P2 and ledger/startup integrations are assigned Sol High. Astra is reserved for genuinely new unresolved architecture choices, not routine implementation of these contracts.
+<!-- END DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
+
 <!-- BEGIN DELIVERY SECTION: trade-planning-contract-design -->
 # CHANGES — `trade-planning-contract-design`
 
