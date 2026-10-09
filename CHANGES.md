@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: opportunity-candidate-contract-core -->
+# CHANGES — `opportunity-candidate-contract-core`
+
+Base: pushed `main` `95bceb1891c84e9a0c5a21adb88ef8b91712cdf7` (`simulated-trade-planning-core`), the assignment reference `95bceb1`. Implements only C1 from `trading-intelligence-architecture.md` §19.7, following §19.2 and decision #196. The C1 core is **built but not connected**: no subscriber, Scheduler publication, database migration, ranking score, Governor wiring or order event was added, and `OpportunityCache`/view and `AuthorizerStub` are unchanged. C2 live observation and the entry cutover remain unbuilt.
+
+**What was added** (new files under `backend/app/trading_intelligence/`, no clock, I/O, logging or application-service import):
+- `candidate_contract.py` — `EvaluationBatch` for one symbol/timeframe/source candle, with a terminal `StrategyDisposition` per evaluated strategy version (`opportunity`, `no_opportunity`, `gated`, `error`) or an explicit `UnavailablePrerequisite` list; immutable, detached `OpportunityContent`. Versioned `evaluation_id` (`evl1:` + SHA-256, excludes direction) and `candidate_id` (`cnd1:` + SHA-256, includes direction) over a documented JSON-array encoding with fixed-width UTC timestamps. Confidence, receive/completion time and evidence never affect identity. Candidate IDs are distinct from accepted-trade UUIDs.
+- `candidate_state.py` — immutable `CandidateState` and pure `apply_batch`, `apply_reset`, `retire_strategy_versions`. Identical redelivery is a no-op; differing content under the same identity is an explicit, atomic conflict; a newer complete no-result/gated/error evaluation removes earlier eligibility; an older batch cannot resurrect a superseded candidate. Session/provider/restart resets clear eligibility and reject delayed batches whose interval began before the boundary. Disabled strategy versions are retired and refused. Source, completion and receive times stay separate.
+- `candidate_eligibility.py` — explicit `CandidateFreshnessPolicy` (positive finite maximum ages by timeframe, no defaults) and `assess_candidates(state, as_of, policy)`. Age is measured from the source interval close; a missing policy yields `freshness_policy_unconfigured` and the candidate is not eligible. Returns a detached, deterministically ordered snapshot with ordered reason codes.
+- Three focused test files, 95 tests (see `TESTING.md`).
+
+**Documentation updated:** `docs/architecture/trading-intelligence-architecture.md` (§19 status line, §19.2 C1 as-built notes with the candidate data-flow diagram and the internal reduction/reset diagram, §19.7 C1 status) and `docs/roadmap/phase-roadmap.md` (one sentence). CHANGES/TESTING preserve every earlier section.
+
+**Decision number:** none assigned or needed; the behavior is covered by decision #196 and the choices listed in §19.2 are implementation details within it. The canonical log tail remained #196 at packaging.
+
+**Implementation choices C2 should confirm** (documented in §19.2): batches carry explicit interval start/close instead of deriving `candle_ts + timeframe` (a session-trailing bucket can be shorter than its nominal width); a batch with unavailable prerequisites also invalidates earlier opportunity records of that symbol/timeframe; the inclusive maximum age and negative-age-unavailable rule; one reset admission rule for all three reset kinds.
+
+**Not done, by design:** `StrategyEvaluationCompleted` event and Scheduler input-coherence checks (C2), shadow ranking/selection (D1), durable audit and acceptance tables (D2), freshness values or any maximum age (explicit policy input only), Governor/Planning wiring, order events.
+
+**Provenance note:** the P1 delivery's CHANGES/TESTING sections sit at the end of these files, not the top; this delivery follows the newest-first ordering of the other sections and leaves P1's untouched.
+<!-- END DELIVERY SECTION: opportunity-candidate-contract-core -->
+
 <!-- BEGIN DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
 # CHANGES — `opportunity-decision-planning-governor-contract-refinement`
 

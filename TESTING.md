@@ -1,3 +1,24 @@
+<!-- BEGIN DELIVERY SECTION: opportunity-candidate-contract-core -->
+# TESTING — `opportunity-candidate-contract-core`
+
+Base: pushed `main` `95bceb1891c84e9a0c5a21adb88ef8b91712cdf7`. Python 3.13.16, pytest 8.4.2, backend requirements installed in a fresh virtualenv. Pure core: no PostgreSQL, frontend build, full backend suite, Event Bus, feed or network was used.
+
+**Focused tests.** From `backend/`: `pytest -q tests/test_opportunity_candidate_contract.py tests/test_opportunity_candidate_reducer.py tests/test_opportunity_candidate_eligibility.py` — **95 passed** (22 contract/identity/purity, 45 reducer, 28 eligibility). Adjacent suites `tests/test_opportunity_cache.py tests/test_opportunity_view.py tests/test_trade_planning.py` — **64 passed** (unchanged behavior).
+
+**Coverage.**
+- Identity: long/short share `evaluation_id` but not `candidate_id`; each documented input changes the ID; timezone-equivalent instants and microsecond differences; golden vectors fix the version-1 encoding; separator-injection cannot collide; confidence and times do not affect identity; candidate IDs are not UUIDs; naive timestamps and malformed inputs are refused.
+- Models: opportunity evidence is copied, canonical and fresh on every read (caller payloads neither mutated nor referenced); dispositions and batches validate shape, UTC normalization, interval containment, ordering determinism and the unavailable-prerequisite rules.
+- Reducer: identical redelivery (receive time preserved) is a no-op; changed confidence, evidence, stop, target, horizon, status, direction or completion time conflicts; conflicts are atomic; newer no-result/gated/error removes eligibility; an older batch cannot resurrect it; out-of-order arrival converges; untriggered strategies keep their record; independent symbols/versions; timeframe binding; unavailable-input invalidation, floor, redelivery and same-candle conflicts; reset boundaries for all three kinds (delayed pre-reset rejection, straddling candle, exact-boundary admission, monotonic boundary, epochs); mode isolation; version retirement; separate source/completion/receive times; state, snapshots and caller dicts read-only or detached; deterministic replay of a fixed sequence.
+- Eligibility: missing, empty and per-timeframe-missing policy give `freshness_policy_unconfigured`; invalid policy values refused; no module-level numeric default exists; age boundaries just below, at and just above the maximum, at the interval close and just before it; age independent of delivery time; session-trailing stub interval and in-interval candle stamps use the explicit close; descriptive horizon is not an expiry; fixed reason order; deterministic ordering; explicit `as_of` required.
+- Purity: an AST scan of the three modules finds no import outside the standard library and the two sibling modules and no call to a clock, sleep, randomness, `open` or `print`; a subprocess import of the core loads no `app.*` module outside `app.trading_intelligence`.
+
+**Mutation check.** With each of these temporarily applied, the focused tests failed and were restored byte-identical afterwards (95 passed again): no stale-batch check, reset boundary ignored, exclusive instead of inclusive maximum age, missing policy treated as eligible, direction included in the evaluation ID, non-atomic conflicts, retired versions accepted.
+
+**Documentation checks.** The two new diagrams are plain-ASCII `text` fences; every term and reason code in them was cross-checked against the code. The aggregated-timeframe convention note was verified in `feature_engine/engine.py` (`_compute_aggregated` passes `bucket_start` to `_apply_close`). `git diff --check` and the clean-checkout ZIP verification are reported in the handoff because they run against the final archive.
+
+**Limits.** C1 is unwired, so nothing here shows behavior against live Scheduler events, real feeds, restart timing or concurrency; those belong to C2 and integration. Eligibility ordering across symbols is lexical and for reproducibility only, not a selection rule.
+<!-- END DELIVERY SECTION: opportunity-candidate-contract-core -->
+
 <!-- BEGIN DELIVERY SECTION: opportunity-decision-planning-governor-contract-refinement -->
 # TESTING — `opportunity-decision-planning-governor-contract-refinement`
 

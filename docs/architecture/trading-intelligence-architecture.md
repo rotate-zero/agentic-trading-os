@@ -1013,7 +1013,7 @@ The one place the suggestion as literally written wasn't taken: unconditional "G
 
 ## 19. Opportunity, Decision, Planning and Governor implementation contract
 
-**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path.
+**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path. **Build status:** the pure P1 planner and the pure C1 candidate core are built but not connected (§19.7); no entry path, subscriber or publication uses them.
 
 ### 19.1 Existing foundations and responsibility boundaries
 
@@ -1074,6 +1074,95 @@ flowchart TD
     F -->|No| U["Unavailable or expired"]
     F -->|Yes| C["Eligible candidate with stable ID"]
 ```
+
+**C1 implementation status (`opportunity-candidate-contract-core`).** The pure completed-evaluation batch contract, canonical identities, reducer and eligibility assessment are **built but not connected**. Three modules under `backend/app/trading_intelligence/` implement the contract above with no clock, I/O, logging, Event Bus, database, ranking, Governor or order dependency:
+
+| Module | Responsibility |
+|---|---|
+| `candidate_contract.py` | `EvaluationBatch`, `StrategyDisposition` (`opportunity`/`no_opportunity`/`gated`/`error`), `OpportunityContent`, `UnavailablePrerequisite`; versioned `evaluation_id` (`evl1:` + SHA-256, no direction) and `candidate_id` (`cnd1:` + SHA-256, with direction) over a documented JSON-array encoding with fixed-width UTC timestamps. IDs are not trade UUIDs. |
+| `candidate_state.py` | Immutable `CandidateState` and pure `apply_batch`, `apply_reset`, `retire_strategy_versions`; deterministic `ReductionResult` statuses and reason codes. |
+| `candidate_eligibility.py` | Explicit `CandidateFreshnessPolicy` and `assess_candidates(state, as_of, policy)` returning a detached, ordered `EligibilitySnapshot` with reasons and separate source/completion/receive times. |
+
+Nothing subscribes to the Event Bus, the Scheduler publishes no `StrategyEvaluationCompleted`, `OpportunityCache`/view and `AuthorizerStub` are unchanged, and no table, migration, ranking score or order event exists. **C2 (live observation) and I1 (entry cutover) remain unbuilt.**
+
+```text
+PRODUCER (C2, not built)            C1 CORE (built, not connected)                       LATER CONSUMERS
+------------------------            --------------------------------------------         ---------------
+Strategy Scheduler                  candidate_contract.py
+  one completed trigger  -------->    EvaluationBatch (symbol, timeframe, source candle,
+  (every evaluated strategy             interval start/close, completed_at)
+   disposition, or explicit             StrategyDisposition per strategy version, or
+   unavailable prerequisites)           UnavailablePrerequisite list (no dispositions)
+                                        evaluation_id (no direction) / candidate_id
+                                                    |
+caller-supplied inputs                              v
+  received_at, reset events,        candidate_state.py
+  retired versions       --------->   apply_batch / apply_reset / retire_strategy_versions
+                                        CandidateState (immutable) --> ReductionResult
+                                                    |                   (status, reason, invalidated)
+caller-supplied inputs                              v
+  as_of, freshness policy --------> candidate_eligibility.py
+                                      assess_candidates --> EligibilitySnapshot ----> D1 shadow selection
+                                                                                       (no order events,
+                                                                                        no Governor input)
+```
+
+```text
+apply_batch(state, batch, received_at)
+  |
+  +- batch.mode != state.mode ............................ rejected  mode_mismatch
+  +- interval start < reset boundary ..................... rejected  pre_reset_boundary
+  |
+  +- batch has unavailable prerequisites
+  |     +- candle older than recorded unavailable input .. stale     superseded_by_newer_unavailable_input
+  |     +- same candle: identical / different ............ duplicate / conflict
+  |     +- a slot already evaluated this candle .......... conflict  evaluation_recorded_for_candle
+  |     +- otherwise: record the input floor; older opportunity slots of this
+  |        symbol and timeframe become invalidated ........ applied   prerequisite_unavailable
+  |
+  +- batch is complete (dispositions present)
+        +- candle older than the unavailable floor ....... stale     superseded_by_unavailable_input
+        +- candle equals the unavailable floor ........... conflict  unavailable_input_recorded_for_candle
+        +- per disposition, sorted by strategy and version:
+              +- version retired ......................... rejected  version_retired
+              +- no slot yet ............................. applied
+              +- slot bound to another timeframe ......... rejected  slot_timeframe_mismatch
+              +- candle older than slot candle ........... stale     superseded_by_newer_evaluation
+              +- same candle, identical content .......... duplicate (no-op, receive time kept)
+              +- same candle, different content .......... conflict  evaluation_content_conflict
+              |                                             (the whole batch applies nothing)
+              +- newer candle ............................ applied; an earlier eligible candidate is
+                                                            reported superseded_by_<disposition kind>
+
+apply_reset(kind, boundary)                      retire_strategy_versions(versions, reason, at)
+  kind: session_change | provider_change |         |
+        restart                                    v
+  effective boundary = max(previous, boundary)   slots of those versions dropped;
+  clear every slot and unavailable floor;        later batches for them are rejected
+  retired versions are kept                      (retirement is permanent in this state)
+        |
+        v
+  delayed batch, interval start <  boundary -->  rejected (pre_reset_boundary); cannot repopulate
+  first batch,   interval start >= boundary -->  admitted; eligibility is rebuilt only from these
+
+assess_candidates(state, as_of, policy)   reasons, in this fixed order, for each slot
+  non-opportunity ........................ no_opportunity | gated | error
+  invalidated ............................ invalidated:<reason>
+  status not actionable .................. not_actionable
+  no policy for the timeframe ............ freshness_policy_unconfigured
+  as_of before the interval close ........ source_age_unavailable
+  age strictly above the maximum ......... expired            (age = as_of - interval close)
+  eligible only when none of the above applies
+```
+
+C1 implementation choices, all within decision #196 (no new decision was needed):
+
+- **Explicit interval start and close.** Built producers stamp `candle_ts` at the interval's open (`CandleClosed`, and aggregated `FeatureSet` via `bucket_start`). A batch still carries explicit `source_interval_start`/`source_interval_close` (the candle must lie within them) because a session-trailing bucket can be shorter than its nominal width, so `candle_ts + timeframe` is not hard-coded. C2 supplies them from the producer's convention.
+- **Freshness policy is an input.** Maximum ages are positive finite seconds keyed by trigger timeframe; C1 defines none. No policy, or none for the timeframe, gives `freshness_policy_unconfigured` and the candidate is not eligible. The maximum is inclusive (`age <= max` is fresh); an `as_of` before the interval close is unavailable, never fresh (§19.8).
+- **Unavailable prerequisites.** Such a batch carries no dispositions and contributes no candidate. Conservatively, it also invalidates earlier opportunity records of that symbol/timeframe from older candles; a later-arriving older or same-candle complete batch cannot revive them. This reading of "invalidates that batch for selection" is a C1 choice for C2 to confirm against real Scheduler behavior.
+- **Atomic conflicts.** A content conflict anywhere in a batch applies nothing from it. A strategy absent from a batch keeps its earlier record. A slot `(symbol, strategy, version)` is bound to its first trigger timeframe.
+- **Resets.** All three reset kinds clear eligibility and apply the same admission rule: a candle whose interval begins before the boundary is rejected, so a candle straddling the boundary waits for the next fully post-boundary candle. This does not claim queued old-source events were retracted (§19.2). Applying it to session changes as well as provider changes/restarts is the stricter reading. After a process restart, build a fresh state and call `apply_reset("restart", boundary)`.
+- **Scope of state.** A state is bound to one execution mode, so backtest/replay uses its own instance. Opportunities whose status is not `actionable` are recorded but never eligible. `expected_horizon_minutes` is kept as descriptive data; `wait_expires_at` is not carried and never used as expiry. Session membership comes from reset events plus the age policy; detecting a session change through `MarketClock` belongs to C2.
 
 ### 19.3 Ranking: honest evidence and deliberate non-ranking
 
@@ -1191,6 +1280,8 @@ These are sequential deliveries unless the row explicitly states independence. S
 P1/C1 and later the pure D1 core can be developed independently, but shared documentation and ZIP finalization are sequential after refreshing main. Do not split P2, R1 or I1 into concurrent edits to startup/ledger code.
 
 **Current P1 status:** built but not connected. `ReferenceObservation`, `FixedNotionalSizing`, `TradePlan`, `PlanningRefusal` and `plan_entry` implement the P1 row; focused pure tests pass. The current Governor, price tracker, ledger and event path still use their original contracts. P2 must connect the planner and carry the two observation clocks, proposal snapshot and sole sizing authority through authorization.
+
+**Current C1 status:** built but not connected. `candidate_contract.py`, `candidate_state.py` and `candidate_eligibility.py` implement the C1 row (§19.2 as-built notes and diagrams above); focused pure tests pass, including long/short and timezone-equivalent identities, duplicate/conflict redelivery, newer invalidation, out-of-order batches, reset-boundary delayed delivery, version retirement, source-age boundaries and missing policy. The Scheduler, Event Bus, Opportunity Cache/view, `AuthorizerStub`, database and order path are unchanged. C2 must produce complete batches (including explicit interval start/close and unavailable-prerequisite reporting), call the reducer with explicit receive times and reset events, and resolve the Scheduler input-caching question in §19.2; D1 may consume `EligibilitySnapshot` in shadow only. Entry cutover (I1) remains unbuilt.
 
 **Reusable task instruction:** “Implement only `<ID and slug>` from trading-intelligence-architecture.md §19.7 against fresh main. Inspect AGENTS.md and the listed contracts first; reuse landed prerequisites. Complete code, focused tests, relevant PostgreSQL checks and canonical docs together. Do not activate later phases, invent D4 weights/freshness values, or implement reserved Governor branches. Report an actual unresolved product choice rather than guessing. Use the delivery slug during work and assign a decision number only if needed at final integration. Deliver complete changed files at project-root-relative paths in a ZIP; exclude packaging helpers and patches.”
 
