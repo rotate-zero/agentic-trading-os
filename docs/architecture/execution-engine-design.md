@@ -81,7 +81,7 @@
 | Agreement/conflict view over cached opportunities | built (non-scoring, decision #121) | `backend/app/trading_intelligence/opportunity_view.py` |
 | Opportunity Engine (ranking; D4) | **not built** | no module |
 | Decision Engine (arbitration; D1) | **not built** | no module |
-| Trade Planning Engine (`TradeRequest → TradePlan`) | **not built** | no module |
+| Trade Planning Engine (`TradeRequest → TradePlan`) | **not built** | no module (as of this inventory; a simulated-slice contract is specified in §6.14 and is still unbuilt) |
 | Governor | **partial** — the widened `GovernorDecision` schema only; no rule engine | `schemas/events/execution.py:GovernorDecision` |
 | Portfolio State Engine | **not built** | no module; `world_view/composite.py` returns `portfolio=None` |
 | Execution Engine | **not built** | no module; nothing calls `place_order` |
@@ -328,6 +328,8 @@ With the initial values (§6.10) the `open_exposure_loss` term is zero at a legi
                                              ─► COMMIT trade row + durable entry reservation (decision inputs, thesis, limits, qty, reference price)
                                              ─► publish TradePlanned ─► GovernorDecision(approved) ─► OrderApproved
 ```
+
+**As-built note (`trade-planning-contract-design`).** The rejected branch of the diagram above shows `GovernorDecision(rejected)` before `PlanRejected`. The code publishes `PlanRejected` **alone** on a rejection and publishes `TradePlanned`/`GovernorDecision` only on the approved path (`governor/engine.py` module docstring; `tests/test_governor_engine.py::test_rejected_path_publishes_only_plan_rejected_and_mints_no_opportunity_id`). The diagram body is kept as the historical design; §6.14.1 records the verified behavior and the proposed separation of the planning-type work in rule 5.
 
 **Money and sizing.** USD, US equities. `TradePlanned` carries the intended notional and the integer `qty`; the actual filled notional is whatever the venue reports and is recorded as-is (no adjustment, I3). Entry is a market order in v1; stop and target are `structural_*` exactly as the Backtest Runner does (`final_* == structural_*`).
 
@@ -3778,6 +3780,363 @@ Exit codes: `0` PASS, `1` a milestone failed (named), `2` a precondition failed 
 
 **Sensitivity check performed.** With `FeatureEngine._update_gap` temporarily made to return `{}`, the positive scenario fails at milestone C1.10 (calculated gap features absent) with exit code 1; the production change was reverted and is not part of the delivery.
 
+### 6.14 Trade Planning contract for the first simulated slice (`trade-planning-contract-design`) — design only, not built
+
+**Status.** Design/documentation only, written against pushed `main` `40df705`. No production code is added or changed. **The Trade Planning Engine is not built** and nothing in this section marks it built. No decision number is assigned: everything under "Recommendation" below is a proposal for Saqib to approve, not a decision (§6.14.2 separates the two). The temporary identifier is `trade-planning-contract-design`; a number is assigned only when an implementation is approved and merged, after re-checking the canonical decision log.
+
+**Purpose.** Today one component, `AuthorizerStub`, both *plans* a simulated entry (reads a reference price, validates stop geometry, sizes it, derives R, assembles the `TradePlanned` payload) and *authorizes* it (mode, session, snapshots, slots, daily-loss gate, identity minting, commit). This section specifies the smallest separation that gives planning its own contract, keeps every observable behavior of the simulated pipeline unchanged, and leaves exactly one sizing authority.
+
+#### 6.14.1 Verified current responsibility and event map
+
+Every row was checked against the code at `40df705`. "Planning-type work" marks what the proposal moves; nothing else moves.
+
+| # | Step | Where (file → symbol) | Verified behavior |
+|---|---|---|---|
+| 1 | `OpportunityCreated` published | `strategy_engine/scheduler.py` → `StrategyScheduler` (publish loop) | Publishes every non-`None` `evaluate()` result, normal lane, symbol on the envelope; the module's own docstring says "no dedup or ranking". Payload is `Opportunity` (`strategy_engine/base_strategy.py`): `strategy`, `version`, `direction` (`BUY`/`SELL`), `confidence`, `structural_invalidation`, `structural_target`, optional `expected_horizon_minutes`, `evidence`, `status`, `setup_detected_at`. **No id, no entry price, no symbol field.** |
+| 2 | Subscribe and queue | `governor/engine.py` → `AuthorizerStub._on_opportunity_created`, `_worker_loop` | One queue, one worker, one decision at a time; `deactivate()`/`stop()` drain it. Drops (logs, no row) an event with no `envelope.symbol`. |
+| 3 | Re-validate | `AuthorizerStub._process_one` → `Opportunity.model_validate` | A malformed payload is dropped with a logged exception, **no trade row, no event**. |
+| 4 | Gather inputs (one read each, one `now`) | `_process_one` | `datetime.now(utc)`; `execution_mode_provider()` (`Settings.execution_mode`, validated to `simulated`); `MarketClock.is_regular_session`; `capture_strategy_outcome_snapshots(symbol)` (presence only); `PortfolioStateReader.get_snapshot(mode, trading_day)` (`governor/portfolio_state_reader.py`); `ReferencePriceTracker.get(symbol)`; the three limits from `Settings`. |
+| 5 | **Reference price** *(planning-type)* | `governor/reference_price.py` → `ReferencePriceTracker` | Last `PriceUpdated.price` per symbol as a `float`, process-local, `None` until the first tick. **No observation time, no source.** |
+| 6 | Rules 0–6 | `governor/rules.py` → `evaluate_authorization` | Pure, first-failure-wins, reasons in §6.2's order. Rules 0–4 and 6 are authorization. **Rule 5 is planning-type work:** `no_reference_price`; stop-side check only (`BUY: stop < ref`, `SELL: stop > ref`) → `invalid_stop_geometry`; `qty = math.floor(fixed_notional_usd / reference_price)`, `qty < 1` → `notional_below_one_share`. Rule 6 recomputes `candidate_loss = qty × abs(reference_price − stop)`. |
+| 7 | Identity minted | `_process_one` | Only on approval: `opportunity_id = str(uuid4())`, `client_order_id = f"{opportunity_id}:entry"`. A rejection mints none. |
+| 8 | **Commit** | `governor/postgres.py` → `PostgresTradeLedger.commit_decision` (one `ledger_transaction`) | Approved: `trades` row (`trade_id == opportunity_id`, `decision_record` = full `TradeDecisionRecord` minus evidence, `thesis` = `structural_invalidation/target`, `final_stop/final_target` (equal to the structural values), `confidence`, `setup_detected_at`, optional `evidence`) **plus** `trade_reservations` (`client_order_id`, `qty`, `reference_price` Numeric). A same-id replay is verified field-by-field and returns the stored result. Rejected: a `trades` row with a fresh `uuid4()` audit id, `execution_venue` NULL, **no reservation**; the ledger refuses a rejected record that carries `opportunity_id`, `client_order_id`, `qty` or `reference_price`. |
+| 9 | Publish (only after commit) | `_process_one` | Approved: `TradePlanned` → `GovernorDecision(approved, reasons=[])` → `OrderApproved(order_id=client_order_id, side=BUY/SELL, qty, market, position_effect="open")`. Rejected: **`PlanRejected` alone** (`test_governor_engine.py::test_rejected_path_publishes_only_plan_rejected_and_mints_no_opportunity_id`). `LedgerCommitError` → logged, nothing published. |
+| 10 | `TradePlanned` payload *(planning-type)* | `schemas/events/execution.py` → `TradePlanned` | `direction` (`long`/`short`), `entry` (= the reference price), `stop` (= `structural_invalidation`), `target` (= `structural_target`), `size` (= `qty`), `r_multiple` (`round(abs(target-entry)/abs(entry-stop), 4)` or `None`), `origin="auto"`, `corroboration=[]`, `max_hold_seconds`/`scaling_plan`/`trailing_stop_rule` `None`. **The model exists** (decision #171). |
+| 11 | Execution consumes | `execution_engine/engine.py` → `_on_order_approved`, `_process_one`; `execution_engine/postgres.py` → `PostgresOrderLedger.has_committed_decision`, `insert_order` | Subscribes to `OrderApproved` only. Requires a committed approved decision, then `insert_order` verifies the order's terms equal the **reservation** (`client_order_id`, symbol, side, qty, `open`, `market`, no limit price, mode) — it does not trust the event's quantity. Duplicate `client_order_id` → `inserted=False`, no second venue call. |
+| 12 | Who reads `TradePlanned` / `GovernorDecision` | repo-wide grep of `TRADE_PLANNED` / `GOVERNOR_DECISION` | **No backend subscriber.** Only `api/websocket/channels.py` routes both to `orders.status` and `frontend/src/hooks/useOrderLifecycle.ts` displays them. Neither is persisted or replayed. |
+| 13 | Downstream readers of the planned numbers | `portfolio_state/postgres.py` (`_order`, `_reservation`), `trading_intelligence/outcome_recorder.py` | In-flight exposure uses `reservation.reference_price` and `thesis["final_stop"]`; position `stop`/`target` come from `thesis["final_stop"/"final_target"]`; `StrategyOutcome.opportunity_id = trades.trade_id`, `realized_r` uses `thesis["structural_invalidation"]` (cross-checked against `decision_record`), `slippage_entry = fill avg − reservation.reference_price`. |
+
+```
+ CURRENT (as built at 40df705)
+
+ StrategyScheduler ──OpportunityCreated (normal lane; Opportunity has no id, no entry)──┐
+                                                                                        ▼
+ PriceUpdated ──► ReferencePriceTracker (last price, float, no timestamp) ──get()──► AuthorizerStub worker
+ MarketClock · Settings limits · capture_strategy_outcome_snapshots · PortfolioStateReader ──┤  (one decision at a time)
+                                                                                        ▼
+                                          rules.py  0 mode · 1 session · 2 actionable · 3 snapshots · 4 slots
+                                                    5 REFERENCE PRICE + STOP GEOMETRY + QTY      ◄── planning-type work
+                                                    6 daily-loss gate (candidate_loss = qty × |ref − stop|)
+                                                                                        │
+                              rejected: audit trade row (uuid4, no reservation)         │ approved: mint opportunity_id / client_order_id
+                                        └─► commit ─► PlanRejected                      │   └─► ONE transaction: trades + trade_reservations
+                                                                                        ▼
+                                                              publish TradePlanned ─► GovernorDecision ─► OrderApproved
+                                                                    (display only)                          │
+                                                                                                            ▼
+                                                  ExecutionEngine: has_committed_decision ─► insert_order (terms == reservation) ─► venue
+```
+
+**Verified findings that shape the contract** (none is fixed by this delivery):
+
+- **F1 — A risk rejection keeps no proposal.** `AuthorizationResult` carries `qty`/`reference_price` only when approved, so a rule-6 rejection (`daily_loss_cap_reached`, `projected_loss_exceeds_daily_cap`, `loss_exposure_unknown`) is committed with `qty = None`, `reference_price = None` (and the ledger refuses a rejected record that carries them). The row cannot say what size was refused.
+- **F2 — No reference provenance.** Only the price survives; not when it was observed, and not how old it was at planning time.
+- **F3 — Planned risk is never stored.** It exists only transiently as rule 6's `candidate_loss`; it is derivable (`qty × |reference − stop|`) but not recorded.
+- **F4 — Target side is never validated** (focused check on `evaluate_authorization`, no database): a long with `target` *below* the reference price and a short with `target` *above* it are both approved (`qty=10`). The position's target then sits on the already-crossed side.
+- **F5 — A reference price of exactly `0.0` raises `ZeroDivisionError`** in rule 5 for a short whose stop is above zero (same focused check). The worker's catch-all logs it and moves on: no row, no event. By inspection of the comparisons (not separately run): a negative price reaches `notional_below_one_share` for a short and `invalid_stop_geometry` for a long with a positive stop; `NaN` reaches `invalid_stop_geometry`.
+- **F6 — No opportunity-level duplicate identity.** The scheduler does not deduplicate; the authorizer mints a new `uuid4` for every accepted evaluation. A redelivered `OpportunityCreated` is protected only by the transient `symbol_busy` / `max_concurrent_positions` rules. `commit_decision`'s idempotent-replay branch is reachable only with the *same minted id*, which a redelivered opportunity never has.
+- **F7 — Doc/code mismatch in §6.2.** The §6.2 flow text says a rejection publishes `GovernorDecision(rejected)` then `PlanRejected`; the code publishes `PlanRejected` alone (engine docstring, plus the test above). The code is the contract (system-design.md §10.2); the §6.2 note below records it.
+- **F8 — `system-design.md` drift.** §10.3's `TradePlanned` row lists `max_hold_minutes` and omits `direction`, `origin`, `corroboration`; §4.8's component table says Trade Planning writes `trades (draft)` and that Governor consumes `TradePlanned`. As built there is no draft row and the Governor does not consume `TradePlanned` (row 12). Both are corrected in this delivery.
+- **F9 — Nothing enforces a hold limit.** `max_hold_seconds` is always `None` and no module reads it; `Opportunity.expected_horizon_minutes` is descriptive only (decision #107).
+- **F10 — A reservation with no order row is never released** (related follow-up, outside this slice). Every reader/writer of `TradeReservation` was inspected: `PostgresTradeLedger`, `PostgresOrderLedger`, `outcome_recorder`, `portfolio_state/postgres.py`. Portfolio State counts a reservation lacking an order as an in-flight entry (`_state`, the `reservation.client_order_id not in order_ids` branch), and reconciliation's stale-entry cancel (`_reconcile_unknown_to_venue`) acts on `orders` rows only. A crash after `commit_decision` but before the `OrderApproved` reaches `insert_order` therefore leaves exposure that blocks the symbol and, at `max_concurrent_positions = 1`, every entry. This contract keeps the commit-then-publish order unchanged and neither fixes nor worsens it; it is reported as its own follow-up (§6.14.8).
+
+#### 6.14.2 Established decisions versus recommendations
+
+**Established — the contract builds on these and does not reopen them.**
+
+| Source | What it fixes |
+|---|---|
+| #22 (`archive/001-060.md`) | One public interface, `plan(TradeRequest) -> TradePlan`; Governor and Execution only ever see the resulting plan, never its origin; manual entries join at Trade Planning. |
+| #6 | `GovernorDecision` is widened now, implemented narrow (`approved`/`rejected` only produced). |
+| #170 (EX-4, EX-1, I6, I8, I10, I12, I15) | Fixed sizing, one stub, $1,000 notional / 1 concurrent position / $100 daily loss cap, all configurable; simulated-only and fail-closed; **commit before any publish or venue call**; deterministic client-order ID `<trade_id>:entry`; the ledger is authoritative; daily-loss gate counts the candidate's own stop-out loss. |
+| #170 EX-9(a) — a recommendation proceeded on, built by #171 | `opportunity_id` is minted at the authorizer's acceptance; no `Opportunity` field was added. |
+| #170 EX-13(a), EX-14(a) — recommendations proceeded on, not objected to | Manual mode/Approval Queue out of the first build; `BUY`/`SELL` on orders and outcomes with an explicit `position_effect`; `long`/`short` is the planning-layer word. |
+| #171 | `TradePlanned` exists with `symbol` on the envelope only and `long`/`short` direction; `TradePlanned` and `GovernorDecision` are published **only on the approved path**, immediately before `OrderApproved` (recorded there as a judgment call, built and tested, not reopened here). |
+| #107 | `expected_horizon_minutes` is descriptive metadata, not an expiry. |
+| #120, #186 (§6.7.1) | `StrategyOutcome.opportunity_id` is the authorizer-minted trade UUID; the recorder derives R from the immutable structural basis. |
+
+**Recommendations — not decisions.** Each is stated once here and justified where it appears below.
+
+| ID | Recommendation | Status |
+|---|---|---|
+| R-A | Planning is a pure in-process function called by the authorizer worker; no new subscriber, queue or event in this slice. | proposed |
+| R-B | The in-process plan value is named `TradePlan`; `TradePlanned` stays the event name and wire shape, unchanged. | proposed |
+| R-C | Persist the plan as a versioned JSON snapshot in `trades.thesis["proposal"]` on every decision where a plan was formed; no new table, no migration, no new event. | **Q1** |
+| R-D | Record the reference observation time and age; reject nothing for staleness. | **Q2** |
+| R-E | Record whether the target lies on the profitable side; reject nothing for it. | **Q3** |
+| R-F | No opportunity-level dedupe key in this slice. | **Q4** |
+| R-G | A non-positive or non-finite reference price is refused with the existing `no_reference_price`. | **Q5** |
+
+#### 6.14.3 Proposed minimal separation
+
+```
+ PROPOSED (recommendation R-A: same worker, same queue, same event sequence)
+
+ OpportunityCreated ─► AuthorizerStub worker (unchanged subscriber, queue, drain)
+                              │ gathers inputs exactly as today (one read each, one `now`)
+                              ▼
+        ┌─────────────────────────────────────────────────────────────────────────┐
+        │ trade_planning (NEW, pure — no bus, no DB, no Settings, no clock)       │
+        │   plan_entry(opportunity, reference, fixed_notional_usd, now)           │
+        │        ─► TradePlan  |  PlanningRefusal(reason)                         │
+        └─────────────────────────────────────────────────────────────────────────┘
+                              │ plan or refusal
+                              ▼
+        governor/rules.py  0 mode · 1 session · 2 actionable · 3 snapshots · 4 slots
+                           5 "plan present?"  (surfaces the planner's refusal reason here, in rule 5's old position)
+                           6 daily-loss gate  (uses plan.planned_risk_usd — no second formula)
+                              │
+        rejected ─► commit audit row (+ thesis["proposal"] when a plan existed) ─► PlanRejected
+        approved ─► mint ids ─► ONE transaction: trades (+ thesis["proposal"]) + trade_reservations
+                              ─► publish TradePlanned (built from the plan) ─► GovernorDecision ─► OrderApproved
+                                                                                         │
+                                       ExecutionEngine: unchanged — consumes only OrderApproved,
+                                       trusts only the reservation (qty/price), never the plan
+```
+
+| Concern | Owner after the change | Moves? |
+|---|---|---|
+| Reference-price selection, direction mapping, stop-side validation, quantity, planned risk, R, plan values | **trade planning** (`plan_entry`) | yes — from `rules.py` rule 5 / `engine.py` |
+| Mode, session, actionable, snapshots, slots, daily-loss cap, identity minting, commit, publish order | **Governor** (`AuthorizerStub`, `rules.py`) | no |
+| Order terms, idempotent insert, venue routing, fills | **Execution Engine** | no |
+| Durable authorized quantity and price | `trade_reservations` (unchanged); the plan snapshot is audit, not authority | no |
+
+**One sizing authority (item 5, item 9).** After the change `math.floor(fixed_notional_usd / reference_price)` appears in exactly one place, `plan_entry`; `rules.py` no longer divides by price and rule 6 reads `plan.planned_risk_usd`. `fixed_notional_usd` stays one `Settings` value read once per decision by the authorizer worker; it flows to the planner as an argument and, unchanged, into `limits_snapshot` (so the audit record of the limit is not lost). Execution never recomputes: `insert_order` already requires its terms to equal the reservation. A static test (§6.14.9, A12) fails if a second quantity computation appears.
+
+**Rule ordering is preserved exactly.** The planner runs before `evaluate_authorization` because it is pure and cheap, but its refusal is only *surfaced* at rule 5. A symbol outside the regular session is still rejected `outside_regular_session`, not `no_reference_price`, exactly as today; every existing reason string and order is unchanged.
+
+**Why not a separate subscriber now (R-A).** A standalone engine would need a new event (the `OpportunitySelected`/planning hop), its own queue and its own restart story, and would put a second clock read and a second reference read between the opportunity and the decision — a new window for duplicate or reordered delivery, with no benefit while Decision Engine arbitration is absent. Trade-off: the planner is not independently scheduled. The contract below is a plain value type, so promoting it to a subscriber later (when the Decision Engine produces `OpportunitySelected`) is additive.
+
+**Package placement.** `backend/app/trade_planning/` as a top-level sibling of `governor/`, `execution_engine/` and `position_monitor/`, following the as-built package convention (decision #171 placed `governor/` at `app/governor/`). `trading-intelligence-architecture.md` §17 names `trading_intelligence/trade_planning_engine.py`; that is a pre-build sketch and the §17 row now points here.
+
+#### 6.14.4 The contract
+
+```python
+# backend/app/trade_planning/plan.py  (frozen dataclasses; no Pydantic, no I/O)
+
+@dataclass(frozen=True)
+class ReferenceObservation:
+    price: float                     # last PriceUpdated.price, as the tracker stores it today
+    observed_at: datetime | None     # envelope.timestamp of that PriceUpdated; None = not recorded
+
+@dataclass(frozen=True)
+class TradePlan:                     # TIA §18.3's TradePlan, in-process; symbol IS present here
+    symbol: str
+    direction: Literal["long", "short"]
+    entry: float                     # = reference price. A PROPOSED reference, never a fill.
+    stop: float                      # = Opportunity.structural_invalidation, unmodified
+    target: float | None             # = Opportunity.structural_target, unmodified (required for origin="auto")
+    size: int                        # whole shares
+    r_multiple: float | None         # round(|target-entry| / |entry-stop|, 4), None if target None or risk 0
+    planned_risk_usd: Decimal        # size × |entry − stop|, exact
+    max_hold_seconds: int | None     # always None in this slice
+    origin: Literal["auto", "manual"]   # always "auto" in this slice
+    corroboration: list[str]         # always [] in this slice
+    planned_at: datetime             # the authorizer's single `now`
+    reference_observed_at: datetime | None
+    target_on_profit_side: bool      # Q3: recorded, not enforced
+    sizing: FixedNotionalSizing      # {method: "fixed_notional", fixed_notional_usd}
+
+@dataclass(frozen=True)
+class PlanningRefusal:
+    reason: Literal["no_reference_price", "invalid_stop_geometry", "notional_below_one_share"]
+
+def plan_entry(opportunity, reference: ReferenceObservation | None, fixed_notional_usd: float,
+               now: datetime) -> TradePlan | PlanningRefusal: ...
+```
+
+`scaling_plan` and `trailing_stop_rule` stay on the `TradePlanned` event as `None` and are **not** added to the in-process type until something produces them. The reason vocabulary is exactly rule 5's three existing strings; no new reason is introduced by the planner.
+
+**Naming reconciliations (item 6)** — the code is the contract (system-design.md §10.2); these make the prose agree with it.
+
+| Inconsistency | Resolution |
+|---|---|
+| `TradePlan` (TIA §18.3 prose, decision #22) vs `TradePlanned` (code, `system-design.md` §10.3) | **Two names, two jobs.** `TradePlan` is the in-process proposal value `plan_entry` returns; `TradePlanned` is the event published after authorization commits. `TradePlanned`'s payload is built field-by-field from the plan, dropping `symbol` (envelope-only, #171) and the audit-only fields. The wire shape does not change. Semantics are as built: `TradePlanned` announces a plan that was *authorized*, which is why it is published only on the approved path. |
+| `size` vs `qty` | **Layered, one value.** Plan layer: `size` (TradePlan, `TradePlanned.size`, `thesis["proposal"]["size"]`). Order/ledger layer: `qty` (`OrderApproved.qty`, `trade_reservations.qty`, `orders.qty`). The authorizer is the single translation point (as it already is for `long`/`short` → `BUY`/`SELL`). Invariant, tested: `plan.size == TradePlanned.size == OrderApproved.qty == reservation.qty`. `ManualSize` (§18.2's *input*) remains a separate concept. |
+| `max_hold_minutes` (`system-design.md` §10.3) vs `max_hold_seconds` (`TradePlanned`, TIA §18.3) | **`max_hold_seconds`, whole seconds.** The §10.3 row is corrected. It stays `None` in this slice: it is not derived from `Opportunity.expected_horizon_minutes` (that would be a new policy, and nothing enforces a hold limit — F9). |
+| `direction` | Plan layer `long`/`short` (`TradePlan`, `TradePlanned`); order/ledger layer `BUY`/`SELL` (`Opportunity`, `OrderApproved.side`, `trades.direction`, `orders.side`). Unchanged (EX-14(a)). |
+| `entry` vs reference price | `entry` *is* the reference price. The orders are `market`; the real entry is the fill. §6.14.5 keeps them separate. |
+| `trades (draft)` (system-design §4, TIA §17) | No draft row exists or is introduced. A `trades` row is written once, at decision time, as approved or rejected. |
+
+#### 6.14.5 Field specification: proposed versus actual
+
+| Value | Class | Source / computation | Durable home today → proposed |
+|---|---|---|---|
+| direction | proposed | `BUY→long`, `SELL→short` from `Opportunity.direction` | `trades.direction` (`BUY`/`SELL`) → also `proposal.direction` |
+| entry reference price | **proposed** | last `PriceUpdated.price` at planning time | `trade_reservations.reference_price` (approved only) → `proposal.entry` (every plan) |
+| reference observed at / age | provenance | `PriceUpdated` envelope timestamp; `age_seconds = planned_at − observed_at` | none → `proposal.reference_observed_at`, `proposal.reference_age_seconds` (**Q2**) |
+| stop | proposed | `structural_invalidation`, unmodified | `thesis.structural_invalidation`/`final_stop`, `decision_record` → also `proposal.stop` |
+| target | proposed | `structural_target`, unmodified | `thesis.structural_target`/`final_target` → also `proposal.target` |
+| target side | derived | long: `target > entry`; short: `target < entry` | none → `proposal.target_on_profit_side` (**Q3**) |
+| size | proposed | `floor(fixed_notional_usd / entry)`; compatibility baseline below | `trade_reservations.qty` (approved) → `proposal.size` (every plan) |
+| planned risk (USD) | proposed | `size × |entry − stop|` exact; equals rule 6's `candidate_loss` | none → `proposal.planned_risk_usd` |
+| R multiple | proposed | `round(|target−entry|/|entry−stop|, 4)` | event only → `proposal.r_multiple` |
+| sizing basis | provenance | `{"method": "fixed_notional", "fixed_notional_usd": …}` | `limits_snapshot` (value only) → also `proposal.sizing` |
+| planned at | provenance | the authorizer's single `now` (= `decided_at` in this slice) | `decision_record.decided_at` → also `proposal.planned_at` |
+| opportunity reference | provenance | `strategy`, `version`, `setup_detected_at`, `confidence` | `trades.strategy_*`, `decision_record`, `thesis` → **not duplicated**; evidence stays in `thesis["evidence"]` |
+| **actual** fill price, qty, time | **actual** | venue fill | `fills` (`price`, `qty`, `venue_ts`, `commission`) — never written back into the plan |
+| **actual** average entry, position stop/target | actual | Portfolio State | `positions.avg_price`, `positions.stop/target` (initialised from `thesis.final_*`) |
+| **actual** entry slippage | derived actual | `fill avg − reservation.reference_price` | `strategy_outcomes.slippage_entry` (§6.7.1) |
+| **actual** exit, realised P&L, realised R | actual | fills; R from the structural basis | `strategy_outcomes` (§6.7.1) |
+
+**Immutability.** `proposal` is written once in the decision's commit transaction and never updated. Later divergence (a fill away from the reference, a stop moved by a future position manager) is recorded in the actual-side tables, not by editing the proposal. This keeps "what was planned" and "what happened" separately auditable and keeps `realized_r`'s basis unchanged.
+
+**Fixed-notional compatibility baseline (item 5).** `size = math.floor(fixed_notional_usd / reference_price)` on the same `float` operands, byte-for-byte the current expression; `size < 1` → `notional_below_one_share`. No Kelly sizing, no volatility scaling, no new limit, no performance-based selection, no quantity adjustment. A focused check run for this design found the float expression equal to exact-decimal division (`Decimal(str(price))`) for every two-decimal price from 0.01 to 20,000.00 and every four-decimal price from 0.0001 to 29.9999 at the $1,000 default; that is evidence a later move to exact arithmetic is safe, not a change proposed here. `planned_risk_usd` is computed exactly from `Decimal(str(x))` operands and stored as a decimal string.
+
+#### 6.14.6 Validation, unavailable inputs, duplicates, rejection, persistence
+
+```
+ plan_entry(opportunity, reference, fixed_notional, now)
+        │
+        ├─ reference is None ───────────────────────────────────────► PlanningRefusal("no_reference_price")
+        ├─ price non-finite or ≤ 0  (Q5, R-G) ──────────────────────► PlanningRefusal("no_reference_price")
+        ├─ stop on wrong side of price  (BUY: stop ≥ price, SELL: stop ≤ price)
+        │                                                            ► PlanningRefusal("invalid_stop_geometry")
+        ├─ size = floor(notional / price)  <  1 ────────────────────► PlanningRefusal("notional_below_one_share")
+        └─ otherwise
+              planned_risk = size × |price − stop|      (exact)
+              r_multiple   = round(|target − price| / |price − stop|, 4)
+              target_on_profit_side recorded (Q3: never a refusal)
+              reference_age recorded (Q2: never a refusal)
+                                                                   ► TradePlan
+```
+
+| Situation | Outcome | Persisted | Published |
+|---|---|---|---|
+| Malformed `Opportunity` payload | dropped, logged (as today) | nothing | nothing |
+| Rule 0–4 fails | rejected with that reason (precedes any planning refusal) | audit row; no proposal needed | `PlanRejected` |
+| No reference price / invalid price / bad stop side / notional < 1 share | rejected with the planner's reason, surfaced at rule 5 | audit row, **no proposal** (no plan exists) | `PlanRejected` |
+| Plan formed, rule 6 refuses (`daily_loss_cap_reached`, `projected_loss_exceeds_daily_cap`, `loss_exposure_unknown`) | rejected | audit row **with** `thesis["proposal"]` (closes F1); still no `opportunity_id`, `client_order_id`, reservation | `PlanRejected` |
+| Plan formed, all rules pass | approved | `trades` + `thesis["proposal"]` + `trade_reservations` in **one** transaction | `TradePlanned` → `GovernorDecision` → `OrderApproved` |
+| Portfolio read, snapshot capture or planner raises unexpectedly | worker catch-all logs; nothing committed | nothing | nothing (as today) |
+| `LedgerCommitError` (including an unserializable proposal) | logged; refused explicitly, never repaired | nothing | nothing |
+| Redelivered `OrderApproved` | `insert_order` → `inserted=False` | no second order | no second venue call (existing) |
+| Same-id `commit_decision` replay | verified equal, including the proposal; a differing proposal → `LedgerCommitError("conflicting …")` | no second row | — |
+| Redelivered `OpportunityCreated` | evaluated again; `symbol_busy`/`max_concurrent_positions` reject while exposure exists (F6) | its own rejected audit row | `PlanRejected` |
+
+**Unavailable inputs.** Absence stays absence (principle: honest state over fabricated state). A missing reference price is a refusal, never a zero or a stale substitute; a missing observation time is recorded as `null`, never inferred.
+
+**Stale references (Q2).** No staleness threshold exists in code or in any decision (the only "stale" decision text concerns scanner promotion). This design **does not invent one**: it records `reference_observed_at` and `reference_age_seconds` so a later policy has evidence, and rejects nothing. This needs one additive change outside the planner: `ReferencePriceTracker` must retain `envelope.timestamp` next to the price (a new `get_observation()`; `get()` is unchanged for existing callers).
+
+**Persist-before-publish (I8) — unchanged.** The commit (decision, plan snapshot, reservation) is one `ledger_transaction`; no event is published before it succeeds; the publish order stays `TradePlanned → GovernorDecision → OrderApproved`. A plan snapshot that is not plain finite JSON is refused by the same strict validator `governor/evidence.py` already provides, with the same "refused, never repaired" rule.
+
+```
+ FAILURE / RESTART (unchanged semantics; the new snapshot rides the same transaction)
+
+ worker picks OpportunityCreated
+   ├─ crash before commit ───────────────────────► nothing durable; the opportunity is simply gone
+   ├─ commit fails (LedgerCommitError) ──────────► logged, nothing published, next item
+   ├─ commit succeeds ── crash before publish ───► approved trade + reservation, NO order row
+   │                                                 └─ F10: Portfolio State counts the reservation as in-flight exposure
+   │                                                    and nothing releases it (outside this slice; follow-up)
+   ├─ commit + TradePlanned/GovernorDecision published ── crash before OrderApproved handled
+   │                                                 └─ same as above; the bus is never the recovery source (§6.9)
+   └─ OrderApproved handled ─► insert_order committed ── crash before venue ack
+                                                     └─ reconciliation: order row `approved` + venue has no record
+                                                        ⇒ cancelled `stale_opportunity_not_resubmitted` (existing, §6.9)
+ Restart never replans: a plan is not recomputed from a new price; the stored reservation/proposal is what happened.
+```
+
+#### 6.14.7 Is a persisted plan necessary? (item 8)
+
+**For restart safety: no.** For an approved trade everything restart needs already exists: `trade_reservations` (qty, reference price), `trades.thesis` (stop, target), `decision_record` (timestamps, opportunity natural key), and the deterministic client-order ID. Recovery reads those, never a plan.
+
+**For auditability: partly yes**, because of F1–F3: a risk-rejected decision cannot say what it refused, and no decision records planned risk or reference provenance.
+
+**Smallest contract that closes both (Q1, recommendation R-C):** a versioned JSON object at `trades.thesis["proposal"]`, written in the existing commit transaction for every decision where a plan was formed (approved and risk-rejected), and nothing else:
+
+```json
+{ "schema_version": 1, "origin": "auto", "direction": "long",
+  "entry": "100.0", "entry_basis": "last_price_update",
+  "reference_observed_at": "2026-10-09T14:31:59.250000+00:00", "reference_age_seconds": "0.75",
+  "stop": "99.5", "target": "105.0", "target_on_profit_side": true,
+  "size": 10, "planned_risk_usd": "5.00", "r_multiple": 10.0,
+  "sizing": {"method": "fixed_notional", "fixed_notional_usd": "1000.0"},
+  "planned_at": "2026-10-09T14:32:00+00:00" }
+```
+
+It follows the precedent already set for `thesis["evidence"]`: stored in `thesis`, excluded from `decision_record` (so the replay-comparison shape of `decision_record` is unchanged), validated before the transaction opens, detached from caller-owned dictionaries, never repaired. Money-like values are decimal strings; `r_multiple` stays a float because the event publishes a float. **No new table, no migration, no new event type, no change to `TradePlanned`'s payload, no change to any consumer.** Trade-off: the plan is not independently queryable by a typed column (JSONB paths only) and the history of replans is not kept — acceptable because a decision has exactly one plan and plans are immutable. The heavier alternative (a `trade_plans` table with its own key and migration) buys typed queries and a place for future manual/Kelly plans, at the cost of a migration, a second write inside the commit, and a new consistency rule between two tables; it is better introduced when a second plan origin exists.
+
+#### 6.14.8 Identities and attribution (item 3)
+
+```
+ IDENTITY CHAIN — no new identifier is introduced in this slice
+
+ Opportunity (no id)            natural key: symbol[envelope] + strategy + version + direction + setup_detected_at
+        │  recoverable from trades.decision_record / strategy_name / strategy_version / direction / symbol
+        ▼
+ plan / proposal                identified by the decision row that stores it: trades.trade_id
+        │                        (+ thesis["proposal"].schema_version)         ── no separate plan id (R-C)
+        ▼
+ authorization                  trades.trade_id  ==  opportunity_id  (approved only; minted at acceptance, EX-9(a))
+        │                        rejected attempts: audit-only uuid4 trade_id, never an accepted identity
+        ▼
+ reservation                    trade_reservations.trade_id (PK) · client_order_id "<trade_id>:entry" (UNIQUE) · qty · reference_price
+        ▼
+ order                          orders.client_order_id  (entry "<trade_id>:entry"; exits "<trade_id>:exit:<attempt>")  · orders.trade_id
+        ▼
+ fill → position                fills.client_order_id + venue_fill_id · positions.trade_id
+        ▼
+ outcome                        strategy_outcomes.opportunity_id == trades.trade_id ; trades.outcome_id back-link
+```
+
+A reviewer can walk the whole chain with one key, `trade_id`, in every table. The only gap is the front of the chain: an `Opportunity` has no durable id, so two evaluations of the same setup are two unrelated decisions (F6, Q4). **Recommendation R-F: do not add an opportunity-level key in this slice.** A deterministic key (a UUIDv5 over the natural key) would make the authorizer's identity reproducible and a redelivery idempotent, but it also changes EX-9(a)'s "mint at acceptance", needs a unique constraint (a migration), and forces a policy the system does not have yet: whether the *same* setup may legitimately fire again after a position closes (the scheduler re-emits on every qualifying candle). That policy belongs with the Decision Engine/Governor, not with the plan's shape. Trade-off: until then, double entry is prevented only while exposure exists.
+
+#### 6.14.9 Migration from the stub (item 9) and file-by-file implementation sequence
+
+The migration is behavior-preserving and single-path: there is never a moment with two sizing authorities, two commits per opportunity, or two publishers. Suggested implementation slug (not reserved): `simulated-trade-planning-engine`.
+
+| Step | File(s) | Change | Verification before moving on |
+|---|---|---|---|
+| 1 | `backend/app/trade_planning/__init__.py`, `plan.py`, `planner.py` (new) | Pure `TradePlan`, `PlanningRefusal`, `ReferenceObservation`, `plan_entry`. Not yet called. | Unit tests including a differential test against a **test-local copy of the legacy rule-5 formula** over a price/stop/direction grid (the copy lives only in the test, so it cannot become a second authority). |
+| 2 | `backend/app/governor/reference_price.py` | Store `(price, observed_at)`; add `get_observation()`; `get()` unchanged. | Tracker tests; existing callers untouched. |
+| 3 | `backend/app/governor/rules.py` | `AuthorizationContext` carries `plan`/`planning_refusal` instead of `reference_price`; rule 5 only surfaces the refusal; rule 6 uses `plan.planned_risk_usd`; the division and geometry code are removed here in the same step. | `test_governor_rules.py` updated; every reason string and order identical; planned risk equals the old `candidate_loss`. |
+| 4 | `backend/app/governor/engine.py` | Call `plan_entry` once per decision with the already-gathered inputs; build `TradePlanned` from the plan; keep publish order and identity minting exactly. | `test_governor_engine.py`, `test_entry_lifecycle_wiring.py` pass; golden test: `TradePlanned`/`OrderApproved` payloads equal pre-change values for fixed inputs. |
+| 5 | `backend/app/governor/ports.py`, `postgres.py`, `evidence.py` pattern | `TradeDecisionRecord.proposal: dict | None`, excluded from `decision_record`, written to `thesis["proposal"]` for approved and plan-bearing rejected decisions; strict validation; same-id replay compares it. | `test_authorization_ledger_postgres.py`, `test_governor_evidence_postgres.py` extended on real PostgreSQL; the "rejected must not carry accepted identity/reservation" rule is unchanged. |
+| 6 | `backend/tests/` (new `test_trade_planning.py`; edits above) | Acceptance tests A1–A14 below. | Focused run of the affected files only. |
+| 7 | `backend/scripts/simulated_mvp_acceptance.py`, `candle_to_simulated_trade_acceptance.py` | **No change required.** Run both unmodified; optionally add one read-only milestone asserting `thesis["proposal"]` equals the reservation. | Both exit `0` against a disposable database. |
+| 8 | docs | `execution-engine-design.md` §6.14 status, `trading-intelligence-architecture.md` §18.3, `system-design.md` §10.3, decision entry (number assigned **then**), `CHANGES.md`, `TESTING.md`. | `git diff --check`. |
+
+Rollback is a single revert of steps 3–5; nothing migrates data, and rows written with `thesis["proposal"]` remain valid for the old code, which ignores the key.
+
+Out of this slice by design: opportunity ranking (D4), Decision Engine arbitration (D1), `TradeRequest`/manual origin, the Approval Queue and `ExecutionMode` gate, Kelly or any other sizing, scaling/trailing rules, hold-time enforcement, paper/live venues, a standalone planning subscriber, and the F10 reservation-without-order recovery (a separate follow-up).
+
+#### 6.14.10 Acceptance criteria for the eventual build
+
+| # | Criterion |
+|---|---|
+| A1 | **Long geometry.** `BUY`, reference 100.00, stop 99.50, target 105.00, notional 1000 → `TradePlan(direction="long", entry=100.0, stop=99.5, target=105.0, size=10, planned_risk_usd=5.00, r_multiple=10.0, target_on_profit_side=True)`. A stop of 100.00 or 100.50 → `invalid_stop_geometry`. |
+| A2 | **Short geometry.** `SELL`, reference 100.00, stop 101.00, target 95.00 → `direction="short"`, `size=10`, `planned_risk_usd=10.00`, `r_multiple=5.0`. A stop of 100.00 or 99.50 → `invalid_stop_geometry`. `OrderApproved.side` is `BUY`/`SELL`, `TradePlanned.direction` is `long`/`short`. |
+| A3 | **Exact quantities** at `fixed_notional_usd = 1000`: reference 333.33 → 3; 500.00 → 2; 1000.00 → 1 (exact boundary); 1000.01 → `notional_below_one_share`; 0.07 with a valid stop → `floor(1000/0.07) = 14285`. For every case `size × reference ≤ notional < (size+1) × reference`. A differential test over a grid equals the legacy formula exactly. |
+| A4 | **One value, four places.** `plan.size == TradePlanned.size == OrderApproved.qty == trade_reservations.qty`; `proposal.entry == reservation.reference_price == TradePlanned.entry`; `planned_risk_usd == size × |entry − stop|` and equals rule 6's candidate loss. |
+| A5 | **Unavailable reference.** No tick observed → `rejected`/`no_reference_price`, an audit row is committed, no `TradePlanned`/`GovernorDecision`, `PlanRejected` published, no `opportunity_id`. A price of `0.0` → the same refusal (no `ZeroDivisionError`) if Q5 is approved; negative and `NaN` likewise. |
+| A6 | **Rule precedence.** Outside the regular session with no reference price → `outside_regular_session`; non-actionable with a bad stop → `not_actionable`. Every existing reason string and order is unchanged. |
+| A7 | **Other unavailable inputs.** A missing snapshot half → the existing `snapshot_unavailable:*`; a portfolio read that raises → nothing committed and nothing published (as today). |
+| A8 | **Risk rejection with attribution.** A candidate whose stop-out loss exceeds the cap → `projected_loss_exceeds_daily_cap`; the committed row has `thesis["proposal"]` with `size` and `planned_risk_usd`, **no** reservation, `opportunity_id`/`client_order_id` absent, and `strategy_outcomes` never receives it. |
+| A9 | **Persist before publish.** A `LedgerCommitError` (including a non-JSON proposal) publishes nothing; the proposal is written in the same transaction as the reservation (a fault injected between them leaves neither). |
+| A10 | **Duplicates.** Same `OrderApproved` twice → one order row, one venue call. Same-id `commit_decision` replay with an identical proposal succeeds; a differing proposal → `LedgerCommitError`. A redelivered `OpportunityCreated` while the first position is open → rejected `symbol_busy` with its own audit row and no second reservation. |
+| A11 | **Persisted attribution.** For one approved trade, `trades.trade_id` equals `orders.trade_id`, `positions.trade_id` and `strategy_outcomes.opportunity_id`; `proposal` carries the sizing basis and `planned_at`; actual fill price/qty exist only in `fills`/`positions` and `slippage_entry = fill avg − proposal.entry`. |
+| A12 | **One sizing authority.** A static test fails if quantity (`floor(… / price)`) is computed anywhere under `backend/app/` outside `trade_planning/planner.py`, and if `rules.py` imports a price-division helper. |
+| A13 | **Compatibility.** `TradePlanned`, `GovernorDecision`, `OrderApproved`, `PlanRejected` payloads equal their pre-change values for fixed fixtures; the published event order is unchanged; no new `EventType`, migration or setting; `simulated_mvp_acceptance.py` and `candle_to_simulated_trade_acceptance.py` exit `0` unmodified. |
+| A14 | **Scope guard.** No Kelly/volatility sizing, no new limit, no staleness or target-side rejection (unless Q2/Q3 are approved otherwise), no `TradeRequest`, no new subscriber or event. |
+
+#### 6.14.11 Decisions needed
+
+Each was checked against the decision log and this document first; none is already decided. Defaults below are what the implementation would do if approved as written.
+
+| # | Question | Recommended | Trade-off / alternative |
+|---|---|---|---|
+| **Q1** | Where does the persisted plan live? | `trades.thesis["proposal"]`, written in the existing commit, for approved and plan-bearing rejected decisions. | Not typed-column queryable, no replan history. Alternative: a `trade_plans` table + migration — defer until a second plan origin (manual/Kelly) exists. |
+| **Q2** | Reference staleness. | Record `reference_observed_at` and age; **reject nothing**. | Admits an old price silently, but with evidence. Alternative: a maximum age (a number only Saqib can choose) producing a new rejection reason. |
+| **Q3** | Target on the wrong side of the reference (F4). | Record `target_on_profit_side`; reject nothing (preserves today's behavior). | Such a position's target is already crossed, so Position Monitor-lite (`position_monitor/engine.py:_target_touched`) can fire a target exit on the first bar it evaluates. Alternative: reject with a new `invalid_target_geometry` — safer, but a behavior change to approved trades. |
+| **Q4** | Opportunity-level duplicate identity (F6). | None in this slice; keep `symbol_busy`/`max_concurrent_positions` and the deterministic client-order ID. | Re-entry after a close is unconstrained until a cooldown policy exists. Alternative: UUIDv5 over the natural key + unique constraint (migration, changes EX-9(a), needs the re-entry policy first). |
+| **Q5** | Reference price `0.0`/negative/non-finite (F5). | Refuse with the existing `no_reference_price`. | Only inputs that today raise or mis-reason change behavior. Alternative: leave as-is. |
+
+#### 6.14.12 Follow-ups reported, not addressed here
+
+- **F10** (reservation with no order row is never released) — a restart-safety task of its own: either re-drive `OrderApproved` from committed approvals without an order, or release the reservation through reconciliation with a recorded reason.
+- §6.2's flow diagram, which shows `GovernorDecision(rejected)` before `PlanRejected`, is corrected only by an as-built note beneath it; the historical diagram body is preserved.
+
 ## 7. Forks — six resolved by decision #170, the rest still open
 
 Provisional labels **EX-1 … EX-14**. On 2026-09-22 Saqib resolved EX-1, EX-2, EX-3, EX-4, EX-6 and EX-7; added six requirements (§3, I10–I15); and set the three initial limits (§6.10). EX-10 is settled by the ledger requirement (I12). `simulated-protective-exits` resolves EX-5 for simulated stop/target closes; Saqib approved simulated EOD policy on 2026-09-29 (decision #185), and the simulated EOD path is now built end to end (`simulated-eod-flatten-foundation` through `simulated-eod-flatten-integration`), with session-aware protective retries added by `simulated-protective-session-retry`. EX-12 option (a) is built for simulated auto trades in §6.7.1.
@@ -3859,6 +4218,8 @@ authorization policy here.
 **Settled by decision #170 (I10, I11):** every order has a stable, deterministic client-order ID (`OrderApproved.order_id`), minted before persistence and unique in the ledger; venue order IDs are stored separately as `venue_order_id`; fills carry a venue-supplied (simulated: deterministic) `venue_fill_id`; updates and fills are deduplicated by database constraint.
 **Still open.** *`opportunity_id`:* (a) minted at the **authorizer's acceptance** (matches #128's "mint when the signal is accepted"; no change to `Opportunity`) or (b) at `OpportunityCreated` publish (needs an `Opportunity`/payload field, a `base_strategy` change). *Payloads:* the additive fields in §6.3; new models `TradePlanned`, `PositionClosed` (and reserved `OpportunitySelected`, `PositionAdjusted`); a **venue-level rejection/cancel** needs either a new critical event (e.g. an `OrderStatusChanged`) or reuse of `PlanRejected` (a semantic stretch — that event is plan-level). `TradePlanned`'s two prose definitions disagree (§10, R2).
 **Recommendation.** (a) for id minting; a new order-status event rather than stretching `PlanRejected`; proceed unless Saqib objects.
+
+**Addendum (`trade-planning-contract-design`).** The `TradePlanned` field-set disagreement is reconciled in the built model (decision #171) and the remaining naming questions (`TradePlan` versus `TradePlanned`, `size` versus `qty`, `max_hold_minutes` versus `max_hold_seconds`) are resolved in §6.14.4. Identity across opportunity, plan, authorization, order and outcome is mapped in §6.14.8.
 
 ### EX-10 — Durability  · SETTLED by I12
 **Outcome.** **Ledger-first:** `orders`/`fills`/`trades`/`positions` are committed before events are published (I8) and are authoritative (I12); no durable event log is required. `market_events` remains independent future work. *(Inferred from Saqib's "the database ledger is authoritative" requirement; stated openly so it can be overruled.)*
@@ -3959,7 +4320,7 @@ These are recorded so they are not rediscovered; none is recommended for now.
 ## 10. Findings outside this task's boundary (reported, not fixed — AGENTS.md §9)
 
 - **R1 — Related follow-up. RESOLVED (`execution-doc-drift-r1-r5-r9`, docs-only).** `system-design.md` §4.1 still says "`IBKRAdapter` and `AlpacaAdapter` implement this" although decision #1 revised the Alpaca plan (its own folder tree already says "Alpaca deferred, not stubbed"; §2 principle 1 and the §3 diagram also still name Alpaca). Docs-only fix, unrelated to this design's correctness; left untouched except for the pointer sentences this delivery adds. **Fixed:** §2 principle 1, the §3 diagram's broker box, and §4.1's prose now say IBKR only, with Alpaca noted as deferred (decision #1) rather than implemented.
-- **R2 — Related follow-up.** `TradePlanned`'s prose definitions disagree: `system-design.md` §10.3 has `max_hold_minutes`, `scaling_plan`, `trailing_stop_rule`, while `trading-intelligence-architecture.md` §18.3's `TradePlan` has `max_hold_seconds`, `origin`, `corroboration`. The model does not exist yet (F1), so nothing is broken; the build task must reconcile them (EX-9).
+- **R2 — Related follow-up. RESOLVED in documentation (`trade-planning-contract-design`, §6.14.4; `system-design.md` §10.3 corrected).** `TradePlanned`'s prose definitions disagree: `system-design.md` §10.3 has `max_hold_minutes`, `scaling_plan`, `trailing_stop_rule`, while `trading-intelligence-architecture.md` §18.3's `TradePlan` has `max_hold_seconds`, `origin`, `corroboration`. The model does not exist yet (F1), so nothing is broken; the build task must reconcile them (EX-9).
 - **R3 — Related follow-up.** `trading-intelligence-architecture.md` §18.8 says a filled manual plan is recorded in "the existing `trades` table"; no such table exists (F7).
 - **R4 — Related follow-up.** `performance.py`'s docstring forbids a live caller without a real Execution Engine; when the build lands, that docstring and D17's "live half" note in `strategy-engine-open-decisions.md` need the corresponding update (a docs step for the build task, not for this one).
 - **R5 — Related follow-up. RESOLVED (`execution-doc-drift-r1-r5-r9`, docs-only).** `system-design.md` §4.9 names the `OrderApproved` payload `ApprovedOrder`; no such class exists — the model is `OrderApproved` itself (`schemas/events/execution.py`). Docs-only naming drift, folded into R1's fix. **Fixed:** §4.9's first paragraph now names the payload class correctly and no longer routes it through `BrokerAdapter.place_order` (see R9).

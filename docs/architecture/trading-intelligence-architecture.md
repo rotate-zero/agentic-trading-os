@@ -755,7 +755,7 @@ Every concept above has a concrete home in `system-design.md`. Use this table wh
 | Strategy Engine | `trading_intelligence/strategy_engine/` → `ai_decisions`, `feature_snapshots` |
 | Opportunity Engine | `trading_intelligence/opportunity_engine.py` → `ai_decisions` |
 | Decision Engine | `trading_intelligence/decision_engine.py` → `ai_decisions` |
-| Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft); single `plan(TradeRequest)` interface, see §18 |
+| Trade Planning Engine | `trading_intelligence/trade_planning_engine.py` → `trades` (draft); single `plan(TradeRequest)` interface, see §18. **Not built;** the simulated-slice contract proposes a pure `backend/app/trade_planning/` package and no draft row — `execution-engine-design.md` §6.14 |
 | Governor (widened decision schema) | `governor/governor.py`, `risk_rules.py`, `position_sizing.py` → `trades` (approved/rejected) |
 | Position Monitor | `position_monitor/monitor.py` → `positions` |
 | Performance Intelligence | `performance_intelligence/analyzer.py` → `strategy_outcomes` |
@@ -831,6 +831,8 @@ class TradePlan(BaseModel):
 ```
 
 `origin` carries forward from `TradeRequest` into `TradePlan` unchanged, which is what lets Governor's reasons, the Approval Queue, and Performance Intelligence (§14) distinguish manual from AI-originated trades without special-casing — same "widen now, narrow implementation" pattern as `GovernorDecision` (confirmed decision #6).
+
+**As-built reconciliation (`trade-planning-contract-design`, design only — the Trade Planning Engine is not built).** The `TradePlan` above is the planning-layer *value*; the event that exists in code is `TradePlanned` (`schemas/events/execution.py`, decision #171), and the two names are kept for two jobs: `plan(...)`'s in-process result (`TradePlan`, with `symbol`) and the event published after authorization commits (`TradePlanned`, `symbol` on the envelope only, approved path only). Field names follow the code: `max_hold_seconds` (whole seconds, never `max_hold_minutes`) and `size` at the plan layer, `qty` on `OrderApproved` and in the ledger. For the first simulated slice the planning-type work (reference price, stop-side check, fixed-notional sizing, planned risk, R) is specified as a pure function called by the authorizer worker; origin is always `auto` and the manual path, Kelly sizing and `corroboration` stay out of scope. Contract, diagrams, identities and acceptance criteria: `execution-engine-design.md` §6.14.
 
 ### 18.4 Success-rate evaluation — corroboration, not a fabricated score
 

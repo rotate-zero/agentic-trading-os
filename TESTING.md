@@ -1,3 +1,16 @@
+<!-- BEGIN DELIVERY SECTION: trade-planning-contract-design -->
+# TESTING — `trade-planning-contract-design`
+
+Base: pushed `main` `40df705`. Documentation-only delivery; **no test was added or changed and the test suite was not run** (no full suite, no database, no external feed, no broker connection, as the task requires). Evidence is limited to the focused checks below.
+
+- **Rule behavior (no database).** `app.governor.rules.evaluate_authorization` driven directly with fixed inputs under `python -I`: long, reference 100, stop 99, target 90 (below the reference) → `approved`, `qty=10`; short, reference 100, stop 101, target 110 (above) → `approved`, `qty=10` — the target side is not validated. A short with reference `0.0` and stop 1.0 raises `ZeroDivisionError`. A long at reference 100 with stop 89 → `projected_loss_exceeds_daily_cap` (candidate loss 110 against a 100 cap). These settled findings F4, F5 and the rule-6 candidate-loss equality used by acceptance criterion A4.
+- **Float versus exact division.** For `fixed_notional_usd = 1000`, `math.floor(1000.0 / price)` was compared with `int(Decimal(1000) / Decimal(str(price)))` for all 2,000,000 two-decimal prices from 0.01 to 20,000.00 and all 299,999 four-decimal prices from 0.0001 to 29.9999: **0 differences**. It supports keeping the existing expression as the compatibility baseline; it is not a proof for every possible price.
+- **Code-reading verifications (grep and source reads at `40df705`).** Consumers of `TRADE_PLANNED`/`GOVERNOR_DECISION` (only `api/websocket/channels.py` routing and the frontend display; no backend subscriber); `ExecutionEngine` subscribes to `OrderApproved` only; `PostgresOrderLedger.insert_order` compares order terms to the reservation; `PostgresTradeLedger.commit_decision` refuses a rejected record carrying an accepted identity; every reader/writer of `TradeReservation` (none releases a reservation lacking an order row, F10); `StrategyScheduler` publishes without deduplication; `tests/test_governor_engine.py` asserts a rejection publishes `PlanRejected` alone.
+- **Delivery check.** `git diff --check` clean. The final ZIP was extracted onto a clean checkout of `40df705` and reproduced the working tree byte for byte (see the handoff for the exact result).
+
+Acceptance criteria A1–A14 in `execution-engine-design.md` §6.14.10 are specifications for the future build; none has been run.
+<!-- END DELIVERY SECTION: trade-planning-contract-design -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-snapshot-json-serialization -->
 # TESTING — `outcome-snapshot-json-serialization`
 

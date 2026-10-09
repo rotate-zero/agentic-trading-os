@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: trade-planning-contract-design -->
+# CHANGES — `trade-planning-contract-design`
+
+Base: pushed `main` `40df705` (`Outcome snapshot json serialization`), which is also the assignment reference; `main` did not move during this work. Design/documentation only: no production code, test, migration, setting or event type changed. No decision number is assigned and none is reserved — every proposal below awaits Saqib's approval. **The Trade Planning Engine is not built and no roadmap line says it is.**
+
+**What this delivers.** An implementation-ready contract for the first simulated Trade Planning step, written as `docs/architecture/execution-engine-design.md` §6.14. Today `AuthorizerStub` both plans (reference price, stop-side check, fixed-notional quantity, R, `TradePlanned` payload) and authorizes. The contract separates the planning-type work into one pure function the authorizer worker calls, leaves the Governor with authorization and the Execution Engine consuming only `OrderApproved` and the reservation, and keeps a single sizing authority.
+
+- `docs/architecture/execution-engine-design.md`: new **§6.14** — verified responsibility/event map with file/symbol references and a current data-flow diagram; ten verified findings (F1–F10); established decisions kept apart from recommendations; proposed separation with a data-flow diagram; the `TradePlan`/`PlanningRefusal` contract; proposed-versus-actual field specification; validation/failure tables with an internal planning flow and a failure/restart flow; the persisted-plan analysis; the identity chain; migration and a file-by-file sequence; fourteen acceptance criteria; five decision questions with a recommendation and trade-off each. Small additive notes elsewhere: §1.5 Trade Planning row, an as-built note under §6.2's flow diagram (a rejection publishes `PlanRejected` alone), an EX-9 addendum, and R2 marked resolved in documentation. Historical text and decision bodies are untouched.
+- `docs/architecture/trading-intelligence-architecture.md`: §18.3 as-built reconciliation (`TradePlan` versus `TradePlanned`, `max_hold_seconds`, `size` versus `qty`); §17 Trade Planning row marked not built with a pointer.
+- `docs/architecture/system-design.md`: §10.3 `TradePlanned` row corrected to the built model (it listed `max_hold_minutes` and omitted `direction`, `origin`, `corroboration`); §4.8 Trade Planning and Governor rows annotated to match the as-built flow.
+- `docs/roadmap/phase-roadmap.md`: two sentences state the contract is designed, design only, not built.
+- `CHANGES.md`, `TESTING.md`: this section and its testing counterpart; every earlier section is preserved.
+
+**Verified code findings that the contract rests on** (details and evidence in §6.14.1): a risk-rejected decision keeps no proposed quantity or planned risk; reference price has no observation time; a wrong-side target is approved (long target below the reference, short target above); a reference price of `0.0` raises `ZeroDivisionError` in rule 5; redelivered opportunities have no durable identity beyond transient `symbol_busy`; nothing in the backend subscribes to `TradePlanned` or `GovernorDecision`; and a reservation with no order row is counted as in-flight exposure and never released.
+
+**Unchanged on purpose.** Every `TradePlanned`/`GovernorDecision`/`OrderApproved`/`PlanRejected` payload and the publish order, every rejection reason and its precedence, the fixed-notional sizing expression, all three limits, persist-before-publish, the ledger schema, the acceptance commands, and no Kelly sizing, ranking, Decision Engine, manual queue or paper/live venue.
+
+**Open choices (recommendations, not decisions).** Q1 persist the plan as `trades.thesis["proposal"]` (no table, no migration); Q2 record reference age but set no staleness threshold; Q3 record whether the target lies on the profitable side but do not reject; Q4 no opportunity-level duplicate key yet; Q5 refuse a non-positive or non-finite reference price with the existing `no_reference_price`.
+
+**Limits.** Pure documentation: nothing was executed against the real application. The two focused checks (rule behavior, float versus exact division) used only the pure `rules.py` module and plain arithmetic. F10 is reported, not fixed.
+<!-- END DELIVERY SECTION: trade-planning-contract-design -->
+
 <!-- BEGIN DELIVERY SECTION: outcome-snapshot-json-serialization -->
 # CHANGES — `outcome-snapshot-json-serialization`
 
