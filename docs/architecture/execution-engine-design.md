@@ -3786,6 +3786,8 @@ Exit codes: `0` PASS, `1` a milestone failed (named), `2` a precondition failed 
 
 **P1 as-built update (`simulated-trade-planning-core`).** The immutable values in `backend/app/trade_planning/plan.py` and pure `plan_entry` in `planner.py` now implement §6.14.4's auto entry contract and §6.14.6's validation order. They are **built but not connected**: no production caller uses them, and Governor rule 5 still owns current sizing. No event, ledger, tracker, database or startup path was changed. P2 owns the integration described in §6.14.9 steps 2–5, including timestamp capture, proposal persistence, Governor delegation and removal of the old sizing calculation.
 
+**Proposal serialization as-built update (`planning-proposal-serialization-core`).** `backend/app/trade_planning/proposal.py` adds the pure, strict conversion boundary for the §6.14.7 snapshot: `serialize_proposal(plan)`, `validate_proposal(value)`, `proposals_equal(stored, requested)` and the `ProposalError`/`UnsupportedProposalVersion` errors. It is **built but not connected** — an unwired persistence boundary. No Governor, reference tracker, ledger, migration, event, backfill or entry-cutover change was made; Governor rule 5 still owns sizing and production behavior is unchanged. P2 will call these helpers instead of duplicating the conversion. See the as-built subsection at the end of §6.14.7.
+
 **Purpose.** Today one component, `AuthorizerStub`, both *plans* a simulated entry (reads a reference price, validates stop geometry, sizes it, derives R, assembles the `TradePlanned` payload) and *authorizes* it (mode, session, snapshots, slots, daily-loss gate, identity minting, commit). This section specifies the smallest separation that gives planning its own contract, preserves the valid-input behavior of the simulated pipeline with explicit invalid-price/stop/target validation corrections, and leaves exactly one sizing authority.
 
 #### 6.14.1 Verified current responsibility and event map
@@ -4062,6 +4064,58 @@ flowchart TD
 
 It follows the precedent already set for `thesis["evidence"]`: stored in `thesis`, excluded from `decision_record` (so the replay-comparison shape of `decision_record` is unchanged), validated before the transaction opens, detached from caller-owned dictionaries, never repaired. Money-like values are decimal strings; `r_multiple` stays a float because the event publishes a float. **No new table, no migration, no new event type, no change to `TradePlanned`'s payload, no change to any consumer.** Trade-off: the plan is not independently queryable by a typed column (JSONB paths only) and the history of replans is not kept — acceptable because a decision has exactly one plan and plans are immutable. The heavier alternative (a `trade_plans` table with its own key and migration) buys typed queries and a place for future manual/Kelly plans, at the cost of a migration, a second write inside the commit, and a new consistency rule between two tables; it is better introduced when a second plan origin exists.
 
+**As-built: the serialization boundary (`planning-proposal-serialization-core`).** The shape above is implemented once, in `backend/app/trade_planning/proposal.py`, as a pure module (standard library plus `plan.py`; no clock, I/O, logging, Event Bus or database). It *carries* the landed `TradePlan` values; it never recalculates size, planned risk, R or authorization, and it adds no freshness threshold.
+
+```text
+ DATA FLOW  (solid = built here; "P2" = future consumer, not wired)
+
+   Opportunity ─┐
+   notional    ─┼─► plan_entry ─► TradePlan ──► serialize_proposal ──► proposal dict ──► [P2] TradeDecisionRecord.proposal
+   now         ─┤   (planner.py)   (plan.py)    (proposal.py)          detached, strict      └► trades.thesis["proposal"] (JSONB,
+   reference   ─┘                                                       plain JSON                same transaction as the decision)
+                                                                                                         │
+   [P2] same-id commit replay:   stored JSONB ───► validate_proposal ─┐                                  │
+                                 requested dict ─► validate_proposal ─┴─► proposals_equal ─► True  : identical replay
+                                                                                           False : conflicting replay ─► LedgerCommitError
+                                                                                           raises: invalid/unsupported ─► refused, never repaired
+```
+
+```text
+ INTERNAL FLOW  (proposal.py)
+
+ serialize_proposal(plan)                         validate_proposal(value)
+   │ not a TradePlan ───────────► ProposalError     │ not an object ─────────────────► ProposalError
+   │ direction/origin/sizing unknown ► ProposalError │ schema_version missing/non-int ─► ProposalError
+   │ max_hold_seconds set, or corroboration ≠ ()     │ schema_version ≠ 1 ────────────► UnsupportedProposalVersion
+   │   (not representable in v1) ───► ProposalError  │ missing/extra/non-str keys ────► ProposalError
+   │ size not int ≥ 1, bool flag not bool,           │ decimal strings: plain positional, no exponent/NaN/"+"/
+   │   non-finite float/Decimal, negative risk,      │   space; entry, stop, target, notional > 0;
+   │   naive datetime ──────────────► ProposalError  │   risk ≥ 0 ──────────────────────► ProposalError
+   ▼                                                 │ size int ≥ 1; flag bool; r finite or null ► ProposalError
+ encode: floats → Decimal(repr(x)) → "f" string      │ timestamps: canonical UTC "+00:00" only ────► ProposalError
+         Decimal risk → "f" string (own digits)      │ each age == planned_at − its clock exactly;
+         aware datetimes → UTC isoformat             │   null clock ⇔ null age ─────────► ProposalError
+         age = planned_at − clock, exact seconds     ▼
+         (negative kept, null stays null)          detached normalized copy (key order fixed)
+   ▼
+ validate_proposal(result)  ── self-check: the emitted object must pass the same validator a replay uses
+```
+
+Encoding and comparison rules:
+
+| Value | Representation | Notes |
+|---|---|---|
+| `entry`, `stop`, `target`, `sizing.fixed_notional_usd` | exact decimal string | `Decimal(repr(float))`, plain positional notation (e.g. `1e-05` → `"0.00001"`); a non-float, bool, non-finite or non-positive value is refused rather than coerced |
+| `planned_risk_usd` | exact decimal string | the plan's own `Decimal`, its digits preserved (`Decimal("5.0")` → `"5.0"`; the `"5.00"` in the illustrative JSON above is only an example of the string form); non-finite or negative refused |
+| `size` | JSON integer | `True`, `10.0` and `"10"` are refused |
+| `target_on_profit_side` | JSON boolean | `1`/`0` are refused |
+| `r_multiple` | finite JSON number or `null` | float from the plan; NaN/±Infinity refused; a store that returns `10` for `10.0` is accepted and normalized, since JSON has one number type |
+| `reference_observed_at`, `reference_exchange_ts`, `planned_at` | canonical UTC ISO-8601 (`+00:00`) | aware inputs of any offset are normalized to UTC; naive refused; a missing reference clock is `null`, never replaced by a local time |
+| `reference_age_seconds`, `reference_source_age_seconds` | exact decimal string of `planned_at − clock` | independent bases (local envelope vs source exchange); `null` iff its clock is `null`; **negative values (a clock after `planned_at`) are recorded as they are** — no clamp, no threshold; cutover's unknown/negative/future-age refusal remains in `trading-intelligence-architecture.md` §19.8 |
+| `symbol` | not in the proposal | the decision row that stores it already identifies the symbol |
+
+`proposals_equal` validates both arguments first and raises on an invalid or unsupported-version value (fail closed — a caller maps this to `LedgerCommitError`), so malformed data never silently compares as "different". Decimal strings compare by value (`"5.0"` equals `"5.00"`); a bool never equals an int; everything else compares exactly. The version-2 path is deliberately absent: a future schema must add its own validator and migration note.
+
 #### 6.14.8 Identities and attribution (item 3)
 
 ```
@@ -4093,7 +4147,7 @@ The migration preserves valid-input behavior and has one call path; Q3/Q5 and in
 
 | Step | File(s) | Change | Verification before moving on |
 |---|---|---|---|
-| 1 | `backend/app/trade_planning/__init__.py`, `plan.py`, `planner.py` (new) | Pure `TradePlan`, `PlanningRefusal`, `ReferenceObservation`, `plan_entry`. Not yet called. | Unit tests including a differential test against a **test-local copy of the legacy rule-5 formula** over a price/stop/direction grid (the copy lives only in the test, so it cannot become a second authority). |
+| 1 | `backend/app/trade_planning/__init__.py`, `plan.py`, `planner.py` (new); `proposal.py` (new, `planning-proposal-serialization-core`) | Pure `TradePlan`, `PlanningRefusal`, `ReferenceObservation`, `plan_entry`; plus the strict `serialize_proposal`/`validate_proposal`/`proposals_equal` boundary P2 step 5 consumes. Not yet called. | Unit tests including a differential test against a **test-local copy of the legacy rule-5 formula** over a price/stop/direction grid (the copy lives only in the test, so it cannot become a second authority). |
 | 2 | `backend/app/governor/reference_price.py` | Store price, local observed time and source exchange time; add `get_observation()`; `get()` unchanged. | Tracker tests; existing callers untouched. |
 | 3 | `backend/app/governor/rules.py` | `AuthorizationContext` carries `plan`/`planning_refusal` instead of `reference_price`; rule 5 only surfaces the refusal; rule 6 uses `plan.planned_risk_usd`; the division and geometry code are removed here in the same step. | `test_governor_rules.py` updated; existing reason precedence plus the new target refusal; planned risk follows the same candidate-loss equation, with decimal boundary tests. |
 | 4 | `backend/app/governor/engine.py` | Call `plan_entry` once per decision with the already-gathered inputs; build `TradePlanned` from the plan; keep publish order and identity minting exactly. | `test_governor_engine.py`, `test_entry_lifecycle_wiring.py` pass; golden test: `TradePlanned`/`OrderApproved` payloads equal pre-change values for fixed inputs. |

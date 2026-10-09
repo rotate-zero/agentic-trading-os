@@ -1,3 +1,30 @@
+<!-- BEGIN DELIVERY SECTION: planning-proposal-serialization-core -->
+# TESTING — `planning-proposal-serialization-core`
+
+Base: pushed `main` `cac993f160a0e454caa46adb2fd557d20e1a9149`. Python 3.13.16, pytest 8.4.2, backend requirements installed in a fresh virtualenv. Pure core: no PostgreSQL, frontend build, full backend suite, Event Bus or network was used.
+
+**Focused tests.** From `backend/`: `pytest -q tests/test_trade_planning_proposal.py` — **181 passed**. Existing planning core `tests/test_trade_planning.py` — **38 passed** (unchanged behavior). Adjacent Governor checks `tests/test_governor_evidence.py tests/test_governor_rules.py tests/test_governor_engine.py` — **63 passed** (24 + 30 + 9; the strict evidence validator is untouched).
+
+**Coverage** (all valid inputs come from real `plan_entry` outputs):
+- Valid long and short proposals; the long proposal equals the §6.14.7 shape field-for-field and in key order; `symbol` absent; plan values are carried, not recalculated (a deliberately inconsistent plan serializes as given).
+- Null optionals: both reference clocks missing, each missing alone, `target`/`r_multiple` null; a missing clock never takes the local time.
+- Both age bases independently (fresh envelope with an old source tick), microsecond-exact ages, zero age, and negative/future ages recorded unclamped and still valid; no freshness threshold (a 400-day-old tick validates).
+- Timezone normalization: +06:00 and −04:00 inputs equal the UTC-equivalent proposal; every timestamp ends in `+00:00`.
+- Exact numerics: a case where float risk arithmetic drifts yields the exact decimal string; tiny and very large values never use exponent notation; integer vs bool vs float distinctions for `size`, `target_on_profit_side`, `r_multiple`.
+- Serializer rejections (39 parametrized plan mutations): NaN/±Infinity floats and Decimals, zero/negative prices, int/bool/str prices, bad size, signed or negative risk, non-Decimal risk, unknown direction/origin/sizing method, hold time, corroboration, naive and non-datetime timestamps, wrong plan type. Nothing is stringified.
+- Validator rejections: unsupported versions (0, 2, 99, −1 → `UnsupportedProposalVersion`), malformed versions (None, `"1"`, `1.0`, `True`, a list), missing/extra/non-string keys, every field required, 63 malformed field values and 6 malformed sizing objects (exponent/NaN/signed/spaced decimals, non-canonical or non-UTC timestamps, wrong ages, null-clock/age mismatch, bad sizing), non-objects.
+- Detachment: serialized dicts and validated copies share no mutable state with the plan, the input or each other; the frozen plan is untouched.
+- Strict JSON round trip (`json.dumps(allow_nan=False)` → `json.loads`) preserves every agreed value and type for long, short, null-clock and fractional-price plans; the proposal also passes the existing `detach_evidence` plain-finite-JSON validator; a JSONB-style `10.0 → 10` normalization is not a conflict.
+- Comparison: identical proposals equal; `"5.0"` vs `"5.00"` equal; 13 single-field changes plus clock differences are conflicts; invalid or unsupported inputs raise instead of comparing.
+- Contracts and purity: `TradePlan`/`ReferenceObservation`/`FixedNotionalSizing` field lists unchanged; an AST scan shows only standard-library and `app.trade_planning.plan` imports and no clock/sleep/random/`open`/`print`/logger calls.
+
+**Mutation check.** With each of these temporarily applied, the focused tests failed and the module was restored byte-identical afterwards (181 passed again): negative ages clamped to zero (1 failed), bool accepted as int (4), UTC normalization removed (1), version 2 accepted (5).
+
+**Documentation checks.** The two new diagrams are plain-ASCII `text` fences; every function, error name, field and rule in them was cross-checked against `proposal.py`. `git diff --check` and the clean-checkout ZIP verification are reported in the handoff because they run against the final archive.
+
+**Limits.** This is an unwired pure boundary: nothing here shows behavior inside the Governor transaction, against real JSONB storage, the reference tracker or restart/replay timing; those belong to P2 and its PostgreSQL tests. Float-valued fields rely on `repr` round-tripping, so exactness is of the float's shortest decimal form, not of any prior exchange text.
+<!-- END DELIVERY SECTION: planning-proposal-serialization-core -->
+
 <!-- BEGIN DELIVERY SECTION: opportunity-candidate-contract-core -->
 # TESTING — `opportunity-candidate-contract-core`
 

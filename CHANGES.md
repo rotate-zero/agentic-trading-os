@@ -1,3 +1,29 @@
+<!-- BEGIN DELIVERY SECTION: planning-proposal-serialization-core -->
+# CHANGES — `planning-proposal-serialization-core`
+
+Base: pushed `main` `cac993f160a0e454caa46adb2fd557d20e1a9149` (`Opportunity candidate contract core`, i.e. Instance 1's C1 delivery is already on `main`; its CHANGES/TESTING sections and §19.2 notes were verified present and are preserved). Assignment reference `95bceb1`. Implements the pure serialization boundary for the existing `TradePlan` so P2 can later persist an auditable versioned proposal without duplicating conversion logic. It is an **unwired persistence boundary**: no Governor, reference-tracker, ledger, migration, backfill, event, entry-cutover or candidate change was made, and Governor rule 5 still owns sizing. Production behavior is unchanged.
+
+**What was added** (`backend/app/trade_planning/proposal.py`, standard library plus `plan.py`; no clock, I/O, logging, Event Bus or database):
+- `serialize_proposal(plan)` — turns a landed `TradePlan` into the versioned `trades.thesis["proposal"]` object of `execution-engine-design.md` §6.14.7 (schema_version 1). It carries the plan's size, planned risk and R as given — nothing is recalculated and nothing is authorized. Money-like values are exact decimal strings (floats via `Decimal(repr(x))`, plain positional notation; the plan's own `Decimal` risk keeps its digits); `size` is an integer, flags are booleans, `r_multiple` is a finite number or `null`. Both reference clocks (local envelope time and source exchange time) and their descriptive ages `planned_at − clock` are recorded independently, aware timestamps are normalized to UTC, missing clocks and ages stay `null` (no local-clock substitute) and negative/future ages are recorded as they are — no clamp, no threshold. The result is detached and strict-JSON safe.
+- `validate_proposal(value)` — strictly re-validates a stored or requested proposal against the same schema and returns a detached normalized copy: exact key set, types, canonical UTC timestamps, plain decimal strings, ages that equal `planned_at − clock`, null-clock ⇔ null-age. Unsupported versions raise `UnsupportedProposalVersion`; everything else malformed raises `ProposalError`. Nothing is repaired, defaulted, stringified or dropped.
+- `proposals_equal(stored, requested)` — the identical-versus-conflicting replay helper: validates both (invalid input raises, fail closed) and compares by meaning (decimal strings by value, bool ≠ int). This is the only comparison helper; there is no generic serialization framework.
+- `backend/app/trade_planning/__init__.py` additionally exports the new names; `TradePlan`, `plan_entry`, `ReferenceObservation`, `FixedNotionalSizing`, `PlanningRefusal` and every event contract are untouched.
+- `backend/tests/test_trade_planning_proposal.py` — 181 tests on real `plan_entry` outputs (see `TESTING.md`).
+
+**Documentation updated:** `docs/architecture/execution-engine-design.md` (§6.14 as-built note; new as-built subsection at the end of §6.14.7 with the data-flow diagram, the internal serialize/validate flow diagram and the encoding/comparison table; §6.14.9 step 1 row) and `docs/architecture/trading-intelligence-architecture.md` (Trade Planning row, P1 status line, new §19.7 serialization-boundary status). CHANGES/TESTING preserve every earlier section.
+
+**Decision number:** none assigned or needed. The behavior implements decision #196's Q1/Q2 contract; the implementation choices below are details inside it. The canonical log tail was #196 at packaging.
+
+**Implementation choices P2 should confirm** (all documented in §6.14.7):
+- `symbol` is not in the proposal (the decision row identifies it), exactly as the §6.14.7 shape lists no symbol.
+- `max_hold_seconds` (always `None` in this slice) and `corroboration` (always `()`) have no place in schema_version 1; a plan that sets them is *refused*, not truncated.
+- Price-like plan fields must be real `float`s, as `TradePlan` declares; an `int` is refused rather than coerced.
+- The illustrative `"planned_risk_usd": "5.00"` in §6.14.7 is only a string-form example; the real serializer emits the plan Decimal's own digits (`"5.0"` for the 10 × 0.5 case).
+- Ages are exact seconds in canonical form (`"0.75"`, `"1.0"`, `"-2.5"`, `"0.0"`).
+
+**Not done, by design:** Governor/rule integration, timestamp capture in `reference_price.py`, `TradeDecisionRecord.proposal`, ledger writes and replay wiring, migrations, backfill of old rows, freshness thresholds and entry cutover (§19.8), candidate/selection code, any change to strict strategy-evidence validation (`governor/evidence.py` is only imported by a test as the existing strict-JSON bar).
+<!-- END DELIVERY SECTION: planning-proposal-serialization-core -->
+
 <!-- BEGIN DELIVERY SECTION: opportunity-candidate-contract-core -->
 # CHANGES — `opportunity-candidate-contract-core`
 
