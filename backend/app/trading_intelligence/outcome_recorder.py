@@ -19,7 +19,11 @@ from app.schemas.events.envelope import EventType
 from app.schemas.events.execution import OrderFilled, PositionClosed
 from app.schemas.performance import StrategyOutcome
 from app.trading_intelligence.performance import record_strategy_outcome_in_session
-from app.trading_intelligence.state_snapshot import capture_strategy_outcome_snapshots
+from app.trading_intelligence.state_snapshot import (
+    capture_context_snapshot,
+    capture_market_state_snapshot,
+    capture_strategy_outcome_snapshots,
+)
 
 logger = logging.getLogger(__name__)
 _STOP = object()
@@ -51,15 +55,30 @@ def realized_r(entry, exit, basis, direction):
 def _capture(symbol: str, suffix: str, *, missing_reason: str = "engine_cold_start"):
     market = context = None
     reasons = {}
+    failed = set()
     try:
         snapshots = capture_strategy_outcome_snapshots(symbol)
         market, context = snapshots.market_state, snapshots.context
     except Exception:
-        logger.exception("Outcome snapshot capture failed for %s", symbol)
-        missing_reason = "snapshot_capture_error"
+        # One half failing (for example a value the snapshot contract cannot
+        # serialize) must not discard the other half: retry each on its own.
+        logger.exception("Outcome snapshot capture failed for %s; retrying each half separately", symbol)
+        for key, capture in ((f"market_state_at_{suffix}", capture_market_state_snapshot),
+                             (f"context_at_{suffix}", capture_context_snapshot)):
+            try:
+                value = capture(symbol)
+            except Exception:
+                logger.exception("Outcome snapshot %s unavailable for %s", key, symbol)
+                value = None
+            if key.startswith("market_state"):
+                market = value
+            else:
+                context = value
+            if value is None:
+                failed.add(key)
     for key, value in ((f"market_state_at_{suffix}", market), (f"context_at_{suffix}", context)):
         if value is None:
-            reasons[key] = missing_reason
+            reasons[key] = "snapshot_capture_error" if key in failed else missing_reason
     return market, context, reasons
 
 

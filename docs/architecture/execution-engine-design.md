@@ -68,7 +68,7 @@
 |---|---|---|
 | `StrategyOutcome` contract (`origin: auto\|manual`, `is_backtest`, `direction: BUY\|SELL`, …) | built | `backend/app/schemas/performance.py:StrategyOutcome` |
 | `record_strategy_outcome()` — synchronous (own `SessionLocal()`), raises on `entry_qty != exit_qty`, docstring forbids wiring it into a live pipeline "without a real Execution Engine/Position Monitor" | built; **one application user** (`BacktestRunner.run()`, which passes it to `asyncio.to_thread`), plus its own tests | `backend/app/trading_intelligence/performance.py:record_strategy_outcome`; `backend/app/backtest_runner/runner.py` |
-| `capture_strategy_outcome_snapshots(symbol)` — returns `market_state`/`context`, each `None` for a cold-start symbol; the market-state dict carries the last-computed `candle_ts`, the context dict carries no timestamp | built; one real caller (Backtest Runner) | `backend/app/trading_intelligence/state_snapshot.py`; `MarketStateEngine.get_snapshot` |
+| `capture_strategy_outcome_snapshots(symbol)` — returns `market_state`/`context`, each `None` for a cold-start symbol; the market-state dict carries the last-computed `candle_ts`, the context dict carries no timestamp. Both are detached, JSON-safe copies (aware datetimes as UTC `Z` ISO strings, `date` as `YYYY-MM-DD`); an unsupported value raises `SnapshotSerializationError` at capture (§6.7.1 F) | built; callers: Backtest Runner and the simulated `OutcomeRecorder` | `backend/app/trading_intelligence/state_snapshot.py`; `MarketStateEngine.get_snapshot` |
 | Read queries (win rate by hour, expectancy by session type) filter on `is_backtest` as a strict selector — live and backtest populations are never blended | built | `backend/app/trading_intelligence/performance_queries.py:_common_filters` |
 | World View `portfolio` slot | built as `None` ("source unavailable", never "empty account") | `backend/app/world_view/composite.py` |
 
@@ -2623,7 +2623,7 @@ protective candle freshness and delayed-tick venue fill semantics remain documen
 |---|---|
 | **C1 Partial reductions** | No outcome until the position is fully closed. The recorder acts only on a trade whose `trades.status = 'closed'` **and** whose replayed position ends at `qty = 0`. A `closing` position is invisible to it. Reductions and adds fold into one row: entry VWAP over all opening fills, exit VWAP over all reducing fills, `exit_filled_at` = last reduction, `entry_filled_at` = first opening fill. `exit_reason` is the closing fill's order's reason; earlier partial reductions under a different reason are not represented (`StrategyOutcome` has no field for it). |
 | **C2 Commissions** | Sum only what fills reported. If every fill carries a commission: `commission_total = fees` and `realized_pnl = gross - fees` (a negative fee, i.e. a rebate, adds). If any fill's commission is `NULL`: `commission_total = NULL` and `realized_pnl = gross`, exactly what the Backtest Runner does; nothing is estimated. Every simulated outcome is in the second case until `SimulatedVenue` reports fees. Consequence to accept: a `NULL` commission means "not surfaced", and `realized_pnl` is then gross. |
-| **C3 Missing snapshots** | Never discard, never `{}`. Entry side: read the `trades` columns; if `entry_snapshot_captured_at` and `entry_snapshot_missing_reasons` are both `NULL`, the hook never ran and the reason is `recorder_unavailable`. Exit side: capture with `capture_strategy_outcome_snapshots()` only if `now - closed_at <= outcome_snapshot_max_lag_seconds` (proposed default 60); a later recovery pass records `NULL` with `recorder_unavailable`, because a snapshot taken minutes late is a wrong snapshot, not a missing one. A capture that returns `None` records `engine_cold_start`; one that raises records `snapshot_capture_error`; `engine_state_lost_on_restart` is used only when the entry fill predates this process's start and the capture returns `None`. |
+| **C3 Missing snapshots** | Never discard, never `{}`. Entry side: read the `trades` columns; if `entry_snapshot_captured_at` and `entry_snapshot_missing_reasons` are both `NULL`, the hook never ran and the reason is `recorder_unavailable`. Exit side: capture with `capture_strategy_outcome_snapshots()` only if `now - closed_at <= outcome_snapshot_max_lag_seconds` (proposed default 60); a later recovery pass records `NULL` with `recorder_unavailable`, because a snapshot taken minutes late is a wrong snapshot, not a missing one. A capture that returns `None` records `engine_cold_start`; one that raises records `snapshot_capture_error` — including a value the snapshot contract cannot serialize, which fails only its own half (§6.7.1 F); `engine_state_lost_on_restart` is used only when the entry fill predates this process's start and the capture returns `None`. |
 | **C4 Missing R basis** | `realized_r` is `NOT NULL` and is never invented. The basis is the authorization-time `structural_invalidation` (checked equal in `trades.thesis` and `trades.decision_record`), never `positions.stop`; the `PositionClosed` docstring says the current stop is not that basis. If it is absent or non-finite, if the two copies disagree, or if `abs(entry_price - structural_invalidation)` quantizes to zero, the trade is `blocked` with reason `r_basis_unavailable`. Prices are quantized to 6 places (`ROUND_HALF_UP`, as the `positions` projection does) before `float` conversion. |
 | **C5 Duplicate closure notifications** | Harmless by construction. The event only enqueues `trade_id`; the worker de-duplicates the queue by `trade_id`; and the linking transaction takes `SELECT ... FOR UPDATE` on the `trades` row and returns `already_recorded` if `outcome_id` is set. A second recorder process is serialized by the same row lock. Verified in scratch: the second call inserted nothing. |
 | **C6 Failed writes** | Transient errors (connection, lock timeout) roll back, then a separate small transaction sets `outcome_status = 'pending_retry'` if `outcome_id IS NULL`; if that also fails, `NULL` already means pending. The next sweep retries. Deterministic failures set `blocked` and log at ERROR or CRITICAL with `trade_id` and a reason code: `evidence_unavailable`, `r_basis_unavailable`, `unsupported_mode`, `multi_position_trade`, `multi_day_position`, `exit_reason_unavailable`, `ledger_inconsistent` (replay disagrees with `positions`, or `entry_qty != exit_qty`), `contract_validation_failed`, `write_rejected` (an `IntegrityError`). Nothing is dropped: the ledger still holds the closure. No reason column exists, so reasons live in logs; a `blocked` trade is re-armed by setting `outcome_status` back to `NULL`. |
@@ -3267,6 +3267,75 @@ only the requested row returned despite a shared `opportunity_id`; 404 and 422 (
 `transaction_read_only = on`, `repeatable read` observed on every statement, the server refusing an `UPDATE` inside the
 helper's transaction, and an unchanged table fingerprint; a blocked read not blocking `/health`. The frontend behavior was
 verified with a temporary jsdom harness (not shipped); see `TESTING.md`.
+
+
+#### F. Snapshot capture and JSON serialization boundary (`outcome-snapshot-json-serialization`)
+
+**Why it exists.** `FundamentalsProvider` returns the `symbol_fundamentals` row as read: `profile_updated_at`, `market_cap_updated_at`, `financials_updated_at` and `earnings_updated_at` are timezone-aware `datetime` values (`timestamptz`), and `next_earnings_date` is a `date`. `ContextEngine.get_snapshot()` hands those objects out inside shallow-copied dicts, so a capture both aliased live engine state and carried values JSONB cannot store. On the first real Finnhub trial the entry write for a simulated MSFT trade failed with `Object of type datetime is not JSON serializable`; at exit the same defect left the outcome in `pending_retry`, because the resulting `StatementError` is a `SQLAlchemyError` and is retried as transient.
+
+**Boundary.** The fix sits in `state_snapshot.py`, the one place both callers (OutcomeRecorder entry and exit, Backtest Runner entry and exit) obtain snapshots, so the entry hook, the exit capture and the backtest writer share it and nothing downstream changes. `capture_market_state_snapshot` and `capture_context_snapshot` return `to_json_safe_snapshot(...)`: a rebuilt, detached copy that is valid JSON before it leaves the capture function.
+
+| Input value | Result |
+|---|---|
+| `None`, `bool`, `int`, `str`, finite `float` | unchanged |
+| nested `dict` (string keys), `list`, `tuple` | rebuilt structure; tuples become lists |
+| timezone-aware `datetime` | `astimezone(UTC).isoformat()` with `+00:00` written as `Z` (the form `trade_detail` and `authorization_history` already emit) |
+| `date` | `YYYY-MM-DD` |
+| naive `datetime` | **rejected**: no zone is guessed (same stance as `stored_history._to_utc`) |
+| `Decimal`, `set`, `bytes`, enums, arbitrary objects, non-finite floats, non-string keys, cycles | **rejected**: `SnapshotSerializationError` naming the path and the type, never the value |
+
+Nothing is stringified, dropped or replaced. An unavailable value stays `null`; a symbol with no state still returns `None` (unchanged missing-snapshot semantics, §6.7.1 C3). Only the types the provider and the engines actually produce are supported. The Governor's strict strategy-evidence contract and the `StrategyOutcome` schema are untouched.
+
+**Failure isolation.** Capture runs after the fill is durable and outside every ledger lock, so a rejected value can never touch fill, position or receipt accounting. `capture_strategy_outcome_snapshots()` stays strict (the Backtest Runner sees the exception). `OutcomeRecorder._capture` catches it, retries each half on its own, and records `NULL` + `snapshot_capture_error` for only the failing half; the valid half is stored. No new reason code and no schema change are needed. Historical rows are not backfilled: the failed trial entry snapshot cannot be reconstructed honestly and stays `NULL` with its recorded reason.
+
+**Data flow between components**
+
+```
+ symbol_fundamentals (PostgreSQL, timestamptz / date)
+        │ read, never written here
+        ▼
+ FundamentalsProvider ──raw datetime/date──► ContextEngine._latest_by_symbol (live, mutable)
+ CalendarProvider ─────────────────────────► ContextEngine._latest_global
+                                                   │ get_snapshot() — shallow copy
+ MarketStateEngine.get_snapshot() ─ JSON dicts ┐   │
+                                               ▼   ▼
+                    state_snapshot.capture_market_state_snapshot / capture_context_snapshot
+                              to_json_safe_snapshot()  ◄── serialization boundary
+                         (detached copy, UTC Z strings, or SnapshotSerializationError)
+                                               │
+              ┌────────────────────────────────┴───────────────────────────┐
+              ▼                                                            ▼
+   OutcomeRecorder._capture (entry / exit)                  BacktestRunner (entry / exit)
+   per-half fallback, reasons dict                          strict: None → D17 discard
+              │                                                            │
+   trades.entry_market_state / entry_context (JSONB)        record_strategy_outcome()
+   StrategyOutcome.*_at_exit ─► strategy_outcomes (JSONB)   ─► strategy_outcomes (JSONB)
+```
+
+**Internal flow of the capture and serialization step**
+
+```
+ capture_strategy_outcome_snapshots(symbol)
+   ├─ capture_market_state_snapshot ─► engine snapshot ─► None? ──► None (cold start)
+   │                                        └─► to_json_safe_snapshot ─► ok │ SnapshotSerializationError
+   └─ capture_context_snapshot      ─► engine snapshot ─► None? ──► None (cold start)
+                                            └─► to_json_safe_snapshot ─► ok │ SnapshotSerializationError
+
+ to_json_safe_snapshot(value, path)
+   scalar (None/bool/int/str/finite float) ─► same value
+   aware datetime ─► UTC "…Z"   │ naive datetime ─► reject
+   date ─► "YYYY-MM-DD"
+   dict / list / tuple ─► rebuild, recurse (string keys only; cycle guard)
+   anything else ─► SnapshotSerializationError(path, type)
+
+ OutcomeRecorder._capture
+   combined capture ok ─► (market, context); a None half ─► engine_cold_start / engine_state_lost_on_restart
+   combined capture raises ─► log, retry each half separately
+        half ok ─► stored │ half None ─► snapshot_capture_error │ half raises ─► NULL + snapshot_capture_error
+   ─► _store_entry / _record_locked persist the already-JSON-safe values; fills are never in this transaction
+```
+
+Verified by `tests/test_outcome_snapshot_serialization.py` (see `TESTING.md`).
 
 
 ### 6.8 Persistence sketch (implemented incrementally by #172 and entry-lifecycle-wiring — #174 was frontend-only and built no table here)

@@ -39,6 +39,15 @@ below are trivial wrappers over each engine's own `get_snapshot()` —
 no new coupling, no strategy-specific assumption baked into either
 engine to make this work.
 
+**Detached and JSON-safe (`outcome-snapshot-json-serialization`).** Both
+capture functions return a rebuilt copy that is valid JSON, so neither the
+engines' live cached state nor a database JSONB column can be changed through
+it. Aware datetimes become UTC ISO strings with a `Z` suffix and `date` becomes
+`YYYY-MM-DD`; any other value the contract cannot store raises
+`SnapshotSerializationError` here, at capture, rather than failing later inside
+a persistence transaction. See `to_json_safe_snapshot` and
+execution-engine-design.md §6.7.1 F.
+
 **Honest state over fabricated state** (strategy-engine-design.md §11)
 governs every field here: a symbol MarketStateEngine/ContextEngine
 haven't computed anything for yet returns `None` for that half of the
@@ -47,11 +56,73 @@ would look like real data to a later reader.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from typing import Any
 
 from app.context_engine.engine import get_context_engine
 from app.market_state_engine.engine import get_market_state_engine
+
+
+class SnapshotSerializationError(ValueError):
+    """A captured snapshot holds a value the snapshot contract cannot store as JSON.
+
+    Raised at capture time, before anything is persisted, so a bad value can
+    never reach a JSONB column or leave a half-written outcome row. The message
+    names the path and the offending *type* only — never the value itself.
+    """
+
+
+def _json_safe(value: Any, path: str, active: set[int]) -> Any:
+    # Exact JSON scalars pass through unchanged (bool is checked by type, not
+    # isinstance, so only real bool/int/float/str/None are accepted here).
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise SnapshotSerializationError(f"{path}: non-finite float is not valid JSON")
+        return value
+    # datetime must be tested before date: datetime is a date subclass.
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.utcoffset() is None:
+            # Same stance as stored_history._to_utc: refuse rather than guess a zone.
+            raise SnapshotSerializationError(f"{path}: timezone-naive datetime is not supported")
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (dict, list, tuple)):
+        if id(value) in active:
+            raise SnapshotSerializationError(f"{path}: circular reference")
+        active.add(id(value))
+        try:
+            if isinstance(value, dict):
+                out = {}
+                for key, item in value.items():
+                    if type(key) is not str:
+                        raise SnapshotSerializationError(f"{path}: non-string key of type {type(key).__name__}")
+                    out[key] = _json_safe(item, f"{path}.{key}", active)
+                return out
+            return [_json_safe(item, f"{path}[{index}]", active) for index, item in enumerate(value)]
+        finally:
+            active.discard(id(value))
+    raise SnapshotSerializationError(f"{path}: unsupported value of type {type(value).__name__}")
+
+
+def to_json_safe_snapshot(value: Any, *, name: str = "snapshot") -> Any:
+    """Return a detached, JSON-safe deep copy of a captured snapshot.
+
+    - Containers are rebuilt, so later mutation of the engines' cached state
+      cannot change a captured snapshot, nor the reverse.
+    - Nested structure, nulls and exact JSON scalars are preserved as they are.
+    - Aware datetimes become UTC ISO strings with a ``Z`` suffix (the repo's
+      existing wire form); ``date`` becomes ``YYYY-MM-DD``.
+    - Anything else (naive datetimes, Decimal, sets, bytes, arbitrary objects,
+      non-finite floats, non-string keys, cycles) raises
+      :class:`SnapshotSerializationError`. Nothing is stringified, dropped or
+      replaced with a made-up value.
+    """
+    return _json_safe(value, name, set())
 
 
 def capture_market_state_snapshot(symbol: str) -> dict[str, Any] | None:
@@ -70,12 +141,15 @@ def capture_market_state_snapshot(symbol: str) -> dict[str, Any] | None:
     `None` if SPY/QQQ/IWM haven't all reported yet — that's a separate,
     already-existing honesty rule (`MarketStateEngine._compute_cross_
     symbol`), preserved here rather than papered over.
+
+    The result is a detached, JSON-safe copy; raises
+    `SnapshotSerializationError` for a value the contract cannot store.
     """
     snapshot = get_market_state_engine().get_snapshot(symbol)
     symbol_state = snapshot["symbols"].get(symbol)
     if symbol_state is None:
         return None
-    return {**symbol_state, "market": snapshot["market"]}
+    return to_json_safe_snapshot({**symbol_state, "market": snapshot["market"]}, name="market_state")
 
 
 def capture_context_snapshot(symbol: str) -> dict[str, Any] | None:
@@ -90,12 +164,16 @@ def capture_context_snapshot(symbol: str) -> dict[str, Any] | None:
     alone (Calendar) isn't treated as "context for this symbol" on its
     own, matching `get_snapshot()`'s own "absent means not-yet"
     convention.
+
+    The result is a detached, JSON-safe copy (aware datetimes as UTC `Z`
+    strings, `date` as ISO); raises `SnapshotSerializationError` for a value
+    the contract cannot store.
     """
     snapshot = get_context_engine().get_snapshot(symbol)
     symbol_context = snapshot["symbols"].get(symbol)
     if symbol_context is None:
         return None
-    return symbol_context["providers"]
+    return to_json_safe_snapshot(symbol_context["providers"], name="context")
 
 
 @dataclass(frozen=True)

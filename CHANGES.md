@@ -1,3 +1,23 @@
+<!-- BEGIN DELIVERY SECTION: outcome-snapshot-json-serialization -->
+# CHANGES — `outcome-snapshot-json-serialization`
+
+Base: pushed `main` `e425c51` (`Late tick candle diagnostics`); assignment reference `fb478f2`. `main` advanced from `fb478f2` to `e425c51` during this work (streaming diagnostics only, no snapshot, recorder or backtest files); `CHANGES.md`, `TESTING.md` and `system-design.md` were re-based on top of it and its sections are preserved unchanged. No decision number: this corrects a defect against existing contracts (#98 capture contract, #186 simulated outcomes) and decides no new policy; checked against the tail of `confirmed-decisions.md`, `INDEX.md` and the archive filenames, latest #195.
+
+**Problem.** In the real Finnhub trial (recorded in the `streaming-tick-regression-minute-breakdown` testing section, which is kept as written) the simulated MSFT entry snapshot was not captured: `FundamentalsProvider` returns `profile_updated_at`, `market_cap_updated_at`, `financials_updated_at` and `earnings_updated_at` as timezone-aware `datetime` values and `next_earnings_date` as a `date`, `ContextEngine.get_snapshot()` passed them through a shallow copy, and nothing converted them before the JSONB write. Reproduced against `e425c51` with the real provider reading PostgreSQL: the entry write raised `StatementError: Object of type datetime is not JSON serializable`; at exit the same error is a `SQLAlchemyError`, so the recorder treated it as transient and left the closed trade in `pending_retry` indefinitely; the backtest writer failed the same way.
+
+**Change.**
+- `backend/app/trading_intelligence/state_snapshot.py`: new `SnapshotSerializationError(ValueError)` and `to_json_safe_snapshot()`. `capture_market_state_snapshot` and `capture_context_snapshot` now return a detached, JSON-safe copy. Aware `datetime` becomes UTC ISO with `Z`; `date` becomes `YYYY-MM-DD`; nested structure, nulls and exact JSON scalars are preserved; tuples become lists. Naive datetimes, `Decimal`, sets, bytes, enums, arbitrary objects, non-finite floats, non-string keys and cycles raise with the path and type only (never the value). Nothing is stringified, dropped or defaulted. A symbol with no state still returns `None`.
+- `backend/app/trading_intelligence/outcome_recorder.py`: `_capture` keeps the existing combined call; if it raises, it retries each half separately so one unsupported value costs only its own half. The failing half is stored `NULL` with the existing `snapshot_capture_error` reason; the other half is stored. No new reason code, no schema, migration or accounting change.
+- Shared path: the entry hook, the exit capture and the Backtest Runner all use these two capture functions, so all three are covered by the one boundary. `capture_strategy_outcome_snapshots()` stays strict for the Backtest Runner.
+- Docs: `docs/architecture/execution-engine-design.md` (§6.7.1 table row, C3 row and new **F** with a data-flow diagram and an internal-flow diagram), `docs/architecture/trading-intelligence-architecture.md` (`state_snapshot` paragraph), this file and `TESTING.md`.
+
+**Unchanged on purpose.** The `StrategyOutcome` schema and DB CHECKs, the missing-reason vocabulary and its meaning, ledger accounting, evidence validation, the Governor's strict strategy-evidence contract, `ContextChanged` payloads and the Context Engine's own cache (still raw provider values).
+
+**Historical records.** The failed MSFT entry snapshot is not backfilled: its entry-time context cannot be reconstructed honestly, and current engine state would be a fabrication. The trial's trade, order, fill and open position are untouched, and no database row outside the test fixtures was written by this delivery.
+
+**Limitations.** Only the types the provider and engines produce are supported; a new provider returning `Decimal` or an enum will fail its own half explicitly until the contract is deliberately extended. Naive datetimes are rejected rather than assumed UTC.
+<!-- END DELIVERY SECTION: outcome-snapshot-json-serialization -->
+
 <!-- BEGIN DELIVERY SECTION: late-tick-candle-diagnostics -->
 # CHANGES — `late-tick-candle-diagnostics`
 
