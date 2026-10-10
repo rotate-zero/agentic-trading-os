@@ -1,3 +1,26 @@
+<!-- BEGIN DELIVERY SECTION: decision-selection-audit-contract -->
+# TESTING — `decision-selection-audit-contract`
+
+Base: GitHub `main` `05b6e312d356a248cafe4fd07f27961c50285278`; Alembic head `0017` before this delivery, `0018` after. Python 3.13.16, pytest 8.4.2, pytest-asyncio 0.24, SQLAlchemy 2.0.54, Alembic 1.13.3, PostgreSQL **16.15** (local cluster, role `trading`, database `trading_workspace` migrated to head; disposable databases `d2_mvp_acceptance`, `d2_candle_acceptance` and per-module scratch databases created and dropped by the run). Suites were run serially from `backend/`; the entire backend suite was not run.
+
+**New tests (77 passed):**
+```bash
+python -m pytest -q tests/test_decision_audit_records.py tests/test_decision_audit_postgres.py tests/test_decision_audit_migration.py
+```
+- `test_decision_audit_records.py` (31, pure, real D1 results): shadow-only mapping of a real selected and abstained D1 result, no FeatureSet in evidence, no way to relabel D1 as non-shadow, strict finite JSON/version/type validation, contradictory evidence refusal, caller detachment both ways, UTC normalization and complete equivalence, acceptance-support rules, purity of the new pure modules.
+- `test_decision_audit_postgres.py` (42, real PostgreSQL): real D1 round trip; selected and abstained rows; identical vs conflicting replay; four concurrent same-ID appends; explicit failure (`SelectionJournalError`); no update path (including SQL UPDATE); table CHECKs; claim committed with trade and reservation; invalid associations (missing, shadow, abstained, wrong mode, wrong symbol/direction/version/strategy) leave nothing; malformed contexts refused before locking; rejection cannot carry a claim; identical/conflicting claim replay; second trade for one candidate fails with no approval or reservation; **two concurrent claims commit exactly one trade/reservation/claim**; injected failure after trade and reservation rolls back everything and leaves the candidate unconsumed; database constraints refuse shadow/abstained/cross-mode claims, second claim per trade and claim UPDATE; claims retained after cancellation and closure with a newer candidate independent; legacy approvals commit/replay without claims and are never backfilled; the real `AuthorizerStub` approval path writes no claim or attempt; no entry-path module references the D2 package; lock-order prefix unchanged and the claim lock follows it.
+- `test_decision_audit_migration.py` (4, scratch databases): upgrade from 0017 preserving a legacy trade with no claim, constraint/trigger names, one linear history, constraint behavior at the database, downgrade refusal with evidence then clean downgrade (legacy trades preserved) and re-upgrade, and an empty database upgrading through 0018. The module targets revision 0018 explicitly so later migrations do not break it. `alembic check` reports pre-existing drift on unrelated tables; none involves the new tables.
+
+**Affected regressions (all passed, no skips):**
+- Governor/ledger/D1 group (`test_governor_engine/rules/evidence/evidence_postgres/config/portfolio_state_reader`, `test_authorization_ledger_postgres`, `test_execution_ledger`, `test_reference_price_tracker`, `test_decision_core_purity`, `test_candidate_selection`, `test_candidate_ranking`): **300 passed**.
+- P2 planning plus execution/outcome/acceptance group (`test_trade_planning*`, `test_main_execution_pipeline`, `test_execution_engine`, `test_outcome_recorder*`, `test_outcome_read_path_integration`, `test_execution_trade_detail_route`, `test_execution_authorizations_route`, `test_simulated_mvp_acceptance`, `test_candle_to_simulated_trade_acceptance`, `test_position/fill/exit_ledger_postgres`): **410 passed, 1 warning**.
+- `test_exit_ledger_eod_migration.py`: 3 passed.
+- Existing acceptance commands on fresh databases migrated to 0018, unchanged: `python scripts/simulated_mvp_acceptance.py --database d2_mvp_acceptance` — `RESULT: PASS — 88 milestones`; `python scripts/candle_to_simulated_trade_acceptance.py --database d2_candle_acceptance` — `RESULT: PASS — 43 milestones`.
+- `git diff --check` clean.
+
+**Limits of this evidence:** run on PostgreSQL 16 (earlier deliveries used 18); concurrency is exercised with threads on separate connections, not multiple processes; the tests prove mechanics only and do not prove live-feed freshness, profitability, G1 admission, R1 recovery or any Decision cutover, none of which exists.
+<!-- END DELIVERY SECTION: decision-selection-audit-contract -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-trade-planning-integration -->
 # TESTING — `simulated-trade-planning-integration`
 

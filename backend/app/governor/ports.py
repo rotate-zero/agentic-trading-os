@@ -85,6 +85,24 @@ class PortfolioStateReader(Protocol):
 
 
 @dataclass(frozen=True)
+class CandidateAcceptanceContext:
+    """The explicitly supplied claim a future coordinator attaches to ONE approval (D2).
+
+    The ledger inserts ``candidate_acceptances(execution_mode, candidate_id)`` in
+    the SAME transaction as the approved trade, proposal and reservation, after
+    verifying that ``selection_id`` names a NON-shadow, SELECTED attempt of that
+    mode for exactly this candidate and that the trade describes it. The mode is
+    the record's own ``execution_mode``. Nothing in the existing entry path builds
+    this: ``AuthorizerStub`` never mints candidate or selection identities, so
+    legacy approvals carry no claim. ``selection_id`` is the canonical lowercase
+    UUID text of the journal attempt.
+    """
+
+    candidate_id: str
+    selection_id: str
+
+
+@dataclass(frozen=True)
 class TradeDecisionRecord:
     """Everything the authorizer stub commits for ONE OpportunityCreated
     evaluation, win or lose. Mirrors §6.2's "COMMIT trade row (decision=
@@ -122,6 +140,10 @@ class TradeDecisionRecord:
     # rule-6 risk rejection. Absent on historical records/earlier refusals.
     # Stored in thesis, never in decision_record or authorization fields.
     proposal: dict | None = None
+    # Optional candidate claim, approvals only (D2). None keeps the legacy
+    # behaviour exactly: no claim is written, read or inferred. Never part of
+    # `decision_record`.
+    acceptance: CandidateAcceptanceContext | None = None
 
 
 @dataclass(frozen=True)

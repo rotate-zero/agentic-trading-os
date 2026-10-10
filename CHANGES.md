@@ -1,3 +1,27 @@
+<!-- BEGIN DELIVERY SECTION: decision-selection-audit-contract -->
+# CHANGES — `decision-selection-audit-contract`
+
+Base: GitHub `main` `05b6e312d356a248cafe4fd07f27961c50285278` (`retired-tick-bridge-isolation`), re-read before packaging; Alembic head `0017`. Implements only D2 of `trading-intelligence-architecture.md` §19.7 under existing decision #196. Baseline 05b6e31 already contains the completed P2 Planning integration (its code, proposal validation, exact risk arithmetic and legacy approval replay were inspected and reused unchanged). No commit, push or packaging helper.
+
+**What was added:**
+- `backend/app/models/decision_audit.py` + migration `backend/alembic/versions/0018_decision_selection_audit.py` — `selection_attempts` (UUID PK, UTC `created_at`, `execution_mode`, `shadow`, `policy_version`, `result`, `selected_candidate_id` present iff selected, `schema_version`, JSONB `evidence` object) and `candidate_acceptances` (PK `(execution_mode, candidate_id)`, unique `trade_id` FK to `trades`, composite FK to a non-shadow selected attempt). UPDATE is refused on both by trigger; downgrade refuses while either holds rows. No backfill, legacy trades untouched. The model is registered in `db/base.py`.
+- `backend/app/decision_audit/` — `records.py` (immutable validated `SelectionAttemptRecord`, explicit non-shadow `NonShadowSelectionInput`, acceptance-support checks), `shadow.py` (`shadow_selection_record`: D1 results are journalled shadow-only, never relabelable), `ports.py` (`SelectionJournalPort` with `append`/`get` only; explicit `SelectionJournalError`/`SelectionJournalConflict`), `postgres.py` (`PostgresSelectionJournal`: `INSERT .. ON CONFLICT DO NOTHING`, identical replay no-op, different record conflicts).
+- Governor: `CandidateAcceptanceContext` and the optional `TradeDecisionRecord.acceptance` in `governor/ports.py`; `PostgresTradeLedger.commit_decision` writes the claim in the same transaction as the approved trade, proposal and reservation, verifying mode, selected candidate and trade association, and verifying complete equality on replay.
+- Tests: `test_decision_audit_records.py`, `test_decision_audit_postgres.py`, `test_decision_audit_migration.py` plus builder `decision_audit_support.py` (77 tests; real D1 results from the C1 pipeline).
+
+**Behavior notes:** the attempt journal stores D1's audit plus `ranking_evidence` (attributed/excluded evidence and gaps from the ranking result) and no FeatureSet. A `selection_id` is the D1 `audit_id` and must be canonical UUID text. Legacy callers (including the `AuthorizerStub`) pass no acceptance, so their behavior and `decision_record` are unchanged; a replay that adds, omits or alters a claim conflicts, so no claim is backfilled. Claims survive closure and proven-unsent cancellation; a newer candidate ID is independent. `ledger_transaction` and its `trades -> orders -> trade_reservations` lock prefix are unchanged; `candidate_acceptances` is locked after it only when a claim is supplied, and the journal append takes no table lock.
+
+**Deliberate revisions of the §19.4 proposal (documented there):** a constant-false `selection_shadow` column on the claim completes a composite FK that excludes shadow, abstained, wrong-mode and wrong-candidate attempts at the database; the attempt-to-trade match (symbol, strategy, version, direction) is checked by the adapter.
+
+**Documentation updated:** `docs/architecture/trading-intelligence-architecture.md` (§19 status line, D2 as-built notes with data-flow and internal-flow diagrams in §19.4, D1 cross-references, §19.7 D2 status), `docs/roadmap/phase-roadmap.md`, `docs/architecture/execution-engine-design.md` (§6.14 D2 extension note), this file and `TESTING.md`.
+
+**Decision number:** none assigned or needed; D2 implements the contract already specified by decision #196 (as D1 and P2 did). INDEX.md, the log tail (#196) and the archive agree on the latest number; no decision file changed.
+
+**Not built (unchanged scope):** coordinator, entry cutover (I1), G1 admission/advisory lock, R1 startup recovery, ranking policy (D4), freshness thresholds, new order publisher, API, frontend. The candidate observation API/UI owned by the parallel session was not touched.
+
+**Limitations:** SQL `DELETE` of journal/claim rows is not blocked for an operator; nothing yet produces non-shadow attempts; the journal does not authenticate that a coordinator produced an attempt.
+<!-- END DELIVERY SECTION: decision-selection-audit-contract -->
+
 <!-- BEGIN DELIVERY SECTION: simulated-trade-planning-integration -->
 # CHANGES — `simulated-trade-planning-integration`
 
