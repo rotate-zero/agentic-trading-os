@@ -57,6 +57,7 @@ supported at all."
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Literal
@@ -72,7 +73,14 @@ from app.feature_engine.engine import get_feature_engine
 from app.feature_engine.historical import compute_series
 from app.market_state_engine.engine import get_market_state_engine
 from app.services import candle_aggregator, candle_store
+from app.trading_intelligence.candidate_observation_status import (
+    REASON_READER_NOT_INSTALLED,
+    project_candidate_observation,
+    unavailable_payload,
+)
 from app.trading_intelligence.level_interaction_engine import get_level_interaction_engine
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/intelligence", tags=["intelligence"])
 
@@ -1138,6 +1146,34 @@ async def get_exit_intents_view(request: Request, symbol: str | None = Query(Non
             for intent in sorted(intents, key=lambda item: (item.symbol, item.trigger_ts, str(item.position_id)))
         ],
     }
+
+
+@router.get("/candidate-observation")
+async def get_candidate_observation(request: Request) -> dict[str, Any]:
+    """Read-only view of the C2 candidate observation snapshot (§19.2).
+
+    Uses the lifespan-owned `app.state.candidate_observation_reader` only:
+    exactly one synchronous, I/O-free `snapshot()` per request, serialized by
+    `project_candidate_observation`. No second reader, subscription, strategy
+    evaluation, database read, ranking, selection, Planning/Governor call, event
+    publication or write happens here, and no request parameter exists that could
+    configure the freshness policy or change an eligibility verdict.
+
+    An absent reader, or one that is not running, is an explicit
+    `status: "unavailable"` response (HTTP 200) — never an empty-looking healthy
+    universe. Eligible means "passed C1's freshness and actionability checks",
+    not selected, approved or planned. A failure to read/serialize returns a
+    generic 503; internal exception text is logged, never returned.
+    """
+    reader = getattr(request.app.state, "candidate_observation_reader", None)
+    if reader is None:
+        return unavailable_payload(REASON_READER_NOT_INSTALLED)
+    try:
+        snapshot = reader.snapshot()  # the single capture for this request
+        return project_candidate_observation(snapshot)
+    except Exception:
+        logger.exception("GET /intelligence/candidate-observation failed")
+        raise HTTPException(status_code=503, detail="Candidate observation could not be read.") from None
 
 
 def _fetch_execution_orders(symbol: str | None, limit: int) -> list[dict[str, Any]]:

@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: candidate-observation-status-ui -->
+# CHANGES — `candidate-observation-status-ui`
+
+Base: GitHub `main` `d03f53baee42aa4b7f0c3f11627abbd6680c5e89` (`Decision selection audit contract`, i.e. D2 is already on `main`; its CHANGES/TESTING sections, migration `0018` and §19.4 notes were preserved untouched). The task began from inspected baseline `05b6e31`; `main` advanced once (D2) before packaging, with no file overlap. Makes the existing C2 observation-only candidate state visible through a read-only API and a compact Execution-panel section. No commit, push or packaging helper in the ZIP.
+
+**What was added:**
+- `backend/app/trading_intelligence/candidate_observation_status.py` — pure `project_candidate_observation(snapshot)` and `unavailable_payload(reason)`. Serializes one already-captured C2 `ObservationSnapshot` into detached, strict-JSON-safe dicts (UTC `Z` times, non-finite floats to null), deterministic order (eligible first, then symbol/strategy/version), bounded rows (200 candidates, 50 unavailable-input frames) with full-population counts and explicit `*_truncation` objects. No clock, I/O, logging, bus, database, Governor, Planning, ranking or selection import. Raw evidence and structural levels are never copied.
+- `GET /intelligence/candidate-observation` in `backend/app/api/routes/intelligence.py` (plus a module logger and the import) — reads only `app.state.candidate_observation_reader`, one `snapshot()` per request. Absent/not-started/stopped reader is an explicit `status: "unavailable"` with a reason (HTTP 200, `snapshot: null`), never an empty-looking healthy universe. No query parameters exist, so nothing can configure freshness or make a candidate eligible. A read/serialization failure returns a generic 503; the exception text is only logged.
+- Frontend: `fetchCandidateObservation()` and wire types in `services/api-client.ts`; `hooks/useCandidateObservation.ts` (manual load on mount/expansion and `refresh()`, request-identity counter so only the newest request applies, unmount invalidates in-flight, failed Refresh keeps the last result); `components/execution/candidateObservationView.ts` (pure plain-language helpers); `components/execution/CandidateObservation.tsx` (collapsed-by-default section with loading, error, unavailable, empty and populated states); one import and one mount line in `ExecutionLifecyclePanel.tsx` above Recorded authorizations. The panel's layout, refresh and lifecycle behavior are otherwise untouched. No new dependency.
+- `backend/tests/test_candidate_observation_status.py` — 31 tests over real C1/C2-produced snapshots (see `TESTING.md`).
+
+**Wording and meaning:** the section carries an "Observation only" tag and a dashed border, and states that nothing shown is selected, approved, planned or ordered. Eligible is labelled "Eligible (observation only)". An unconfigured freshness policy reads "Freshness policy is not configured ... a missing setting, not a data-feed outage" (production configures none today, so nothing is currently eligible). Confidence appears only as "descriptive, not a win probability".
+
+**Documentation updated:** `docs/architecture/trading-intelligence-architecture.md` (§19.2 "C2 observation status API and Execution-panel section" with data-flow, internal-flow and hook-lifecycle diagrams; the C2 status paragraph in §19.7), `docs/api/README.md` (pointer to the route contract), `CHANGES.md`, `TESTING.md`. Existing decision content, D1/D2 notes and prior delivery sections were preserved.
+
+**Decision number:** none assigned or needed; this exposes the C2 contract already covered by decision #196. `INDEX.md`, the `confirmed-decisions.md` tail (#196) and the archive agreed on the latest number when checked against `d03f53b`; no decision file is changed.
+
+**Not built / scope:** this exposes C2 observation only. It does not call D1 ranking/selection, persist or read D2 selection attempts, claim candidates, invoke Planning or the Governor, publish events, add trading controls, change lifecycle or freshness policy, or touch D2 files, models, migrations or Governor code. The reader and Scheduler were not modified. D4, G1, R1 and I1 entry cutover remain unbuilt.
+
+**Limitations:** a point-in-time read on expansion/Refresh, not a live feed. Rows beyond the bounds are not listed (counts and truncation flags say so). A stopped reader reports unavailable rather than its retained rows. The reader is not refactored to expose reasons beyond the C1/C2 codes it already produces, which are shown as plain words when unrecognized. The frontend has no test framework, so UI checks were direct execution of the pure helpers plus a rendered inspection (see `TESTING.md`).
+<!-- END DELIVERY SECTION: candidate-observation-status-ui -->
+
 <!-- BEGIN DELIVERY SECTION: decision-selection-audit-contract -->
 # CHANGES — `decision-selection-audit-contract`
 

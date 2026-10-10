@@ -759,6 +759,125 @@ export async function fetchExecutionOutcomeStatus(limit = 50): Promise<Execution
   return (await res.json()) as ExecutionOutcomeStatusWireShape;
 }
 
+// GET /intelligence/candidate-observation (task `candidate-observation-status-ui`).
+// The C2 observation-only candidate snapshot (trading-intelligence-architecture.md
+// §19.2): what the lifespan-owned CandidateObservationReader has observed from
+// completed strategy evaluations. NOT a selection, approval, plan or order:
+// `eligible` means the candidate passed C1's freshness/actionability checks and
+// nothing more. Notes on the wire contract:
+//   - `status: "unavailable"` (reader absent, not started or stopped) carries
+//     `snapshot: null` — it is never an empty-looking healthy universe.
+//   - `freshness.configured === false` means no maximum candidate age is
+//     configured, so nothing can be eligible; it is NOT a feed outage.
+//   - Rows are bounded; `counts` always cover the full population and the
+//     `*_truncation` objects say whether a list is partial. Eligible rows come
+//     first, then (symbol, strategy, version).
+//   - `confidence` is the strategy's own descriptive score, not a win probability.
+//   - All times are ISO-8601 UTC. `age_seconds` is measured from the source
+//     interval's close to `snapshot.as_of` (not from delivery time) and is null
+//     when it cannot be determined.
+//   - Raw evidence and structural levels are deliberately not exposed.
+export type CandidateObservationReaderStatus = "not_started" | "running" | "stopped";
+export type CandidateObservationDisposition = "opportunity" | "no_opportunity" | "gated" | "error";
+
+export interface CandidateObservationRowWireShape {
+  candidate_id: string | null;
+  evaluation_id: string;
+  symbol: string;
+  strategy: string;
+  strategy_version: string;
+  timeframe: string;
+  disposition: CandidateObservationDisposition;
+  disposition_reason: string | null;
+  direction: "long" | "short" | null;
+  eligible: boolean;
+  reasons: string[];
+  invalidation_reason: string | null;
+  opportunity: {
+    status: string;
+    confidence: number | null;
+    expected_horizon_minutes: number | null;
+  } | null;
+  source_candle_ts: string;
+  source_interval_start: string;
+  source_interval_close: string;
+  completed_at: string;
+  received_at: string;
+  age_seconds: number | null;
+  max_age_seconds: number | null;
+}
+
+export interface CandidateObservationUnavailableInputWireShape {
+  symbol: string;
+  timeframe: string;
+  source_candle_ts: string;
+  source_interval_start: string;
+  source_interval_close: string;
+  completed_at: string;
+  received_at: string;
+  prerequisites: { name: string; reason: string }[];
+}
+
+export interface CandidateObservationProblemWireShape {
+  arrival_sequence: number;
+  status: string;
+  reason: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+  source_candle_ts: string | null;
+  received_at: string;
+}
+
+export interface CandidateObservationTruncationWireShape {
+  limit: number;
+  returned: number;
+  total: number;
+  truncated: boolean;
+}
+
+export interface CandidateObservationSnapshotWireShape {
+  as_of: string;
+  arrival_sequence: number;
+  freshness: { status: string; configured: boolean };
+  reset: { boundary: string | null; count: number };
+  counts: {
+    evaluations: number;
+    eligible: number;
+    ineligible: number;
+    by_disposition: Record<string, number>;
+    unavailable_inputs: number;
+  };
+  candidates: CandidateObservationRowWireShape[];
+  candidates_truncation: CandidateObservationTruncationWireShape;
+  unavailable_inputs: CandidateObservationUnavailableInputWireShape[];
+  unavailable_inputs_truncation: CandidateObservationTruncationWireShape;
+  diagnostics: {
+    deliveries: number;
+    by_status: Record<string, number>;
+    by_reason: Record<string, number>;
+    resets: Record<string, number>;
+    recent_problems: CandidateObservationProblemWireShape[];
+  };
+}
+
+export interface CandidateObservationWireShape {
+  status: "available" | "unavailable";
+  reason: string | null;
+  reason_text: string | null;
+  observation_only: boolean;
+  source: string;
+  reader: { status: CandidateObservationReaderStatus | null; execution_mode: string | null };
+  snapshot: CandidateObservationSnapshotWireShape | null;
+}
+
+export async function fetchCandidateObservation(): Promise<CandidateObservationWireShape> {
+  const res = await fetch(`${API_BASE_URL}/intelligence/candidate-observation`);
+  if (!res.ok) {
+    throw new ApiError(await parseErrorDetail(res), res.status);
+  }
+  return (await res.json()) as CandidateObservationWireShape;
+}
+
 // Matches GET /intelligence/strategy-outcomes's response shape (decision
 // #123). Field names/types copied directly from `schemas/performance.py`'s
 // `StrategyOutcome` (re-verified against that file's contents at

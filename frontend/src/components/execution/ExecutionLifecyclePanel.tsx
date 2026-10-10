@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useOrderLifecycle, type LifecycleEvent } from "../../hooks/useOrderLifecycle";
+import { CandidateObservation } from "./CandidateObservation";
 import { RecordedAuthorizations } from "./RecordedAuthorizations";
 import {
   fetchExecutionExitRequests,
@@ -1228,6 +1229,7 @@ export function ExecutionLifecyclePanel() {
 
         {!collapsed && <StartupStatusLine />}
         {!collapsed && <ObservedExitTriggers />}
+        {!collapsed && <CandidateObservation />}
         {!collapsed && <RecordedAuthorizations />}
         {!collapsed && <RecordedExitRequests />}
         {!collapsed && <RecentSimulatedOrders />}

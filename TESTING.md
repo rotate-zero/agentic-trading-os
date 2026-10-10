@@ -1,3 +1,30 @@
+<!-- BEGIN DELIVERY SECTION: candidate-observation-status-ui -->
+# TESTING — `candidate-observation-status-ui`
+
+Base: GitHub `main` `d03f53baee42aa4b7f0c3f11627abbd6680c5e89`. Python 3.13.16, pytest 8.4.2, pytest-asyncio 0.24.0, Node/Vite/TypeScript from `frontend/package-lock.json` (`npm ci`). The new backend tests need no PostgreSQL: the route must not touch a database and the tests make any attempt fail. The entire backend suite was deliberately not run for this feature.
+
+**New tests (31 passed):**
+```bash
+cd backend && python -m pytest -q tests/test_candidate_observation_status.py
+```
+Direct ASGI transport against the real unstarted `app`, with a REAL `CandidateObservationReader` fed REAL `StrategyEvaluationCompleted` envelopes (C1 reducer, shared builders from `test_candidate_observation.py` and `test_opportunity_candidate_contract.py`). Covered: no reader installed, lifespan-shutdown `None`, not-started reader, stopped reader (retained rows not reported); running-but-empty reader; opportunity/no-opportunity/gated/error rows with IDs, reasons and distinct source/completion/receive times; eligible-first deterministic ordering and independence from delivery order; identical repeat reads; unconfigured policy, expired candidate, policy for another timeframe; unavailable prerequisites and the withdrawn earlier candidate; duplicate, conflict, invalid-payload diagnostics and bounded recent problems; restart/session/provider reset boundary and count; pre-reset rejection; execution mode; UTC `Z` timestamp round-trips and strict JSON (no NaN); non-finite floats to null; no raw evidence or structural levels; detached output; candidate-row and unavailable-input bounds with full counts and explicit truncation, eligible rows surviving truncation; exactly one snapshot per request; query parameters cannot change policy or eligibility; non-GET methods return 405; generic 503 without exception text; reads add no evaluation, delivery, subscription, publish, Governor/Execution call, database or socket activity and leave the reader running; static import guard (no governor, execution, planning, ranking, selection, SQLAlchemy, event-bus or broker imports in the projection module). Mutation checks (stopped reader reported as available, ordering removed, truncation flag forced false, evidence exposed) each made tests fail and were reverted.
+
+**Adjacent regressions after rebasing onto `d03f53b` (121 passed):**
+```bash
+cd backend && python -m pytest -q tests/test_candidate_observation_status.py tests/test_candidate_observation.py tests/test_scanner_observation_status.py tests/test_decision_audit_records.py
+```
+
+**Frontend:**
+```bash
+cd frontend && npm ci && npx tsc -b && npx vite build
+```
+`tsc -b` exit 0, no errors; `vite build` succeeded (only the existing chunk-size warning). The tracked `tsconfig.tsbuildinfo` was modified by the build and restored, so it is not in the delivery. There is no frontend test framework, and none was added. The pure helpers in `candidateObservationView.ts` were bundled with esbuild and executed in Node (age/time formatting, reason text, eligibility label without "approved/selected/trade", freshness and confidence wording, truncation and count text, unavailable wording): all assertions passed.
+
+**Rendered inspection:** the real Vite dev server was driven in headless Chromium (Playwright). `GET /intelligence/candidate-observation` was answered with payloads produced by the real backend projection from real reader snapshots (populated with a configured policy, unconfigured policy, running-but-empty, unavailable); other backend routes returned 503. Opening the Execution panel and expanding "Candidate observation" showed the Observation-only tag, the plain freshness explanation, counts, candidate rows with disposition, reason, age and times, the unavailable-inputs list, the diagnostics disclosure and the explicit unavailable message. This used mocked transport, not a live backend, and no live Refresh race or collapse-while-pending interaction was exercised in the browser; the request-identity logic follows the existing `useScannerObservation` pattern and is covered by review and type checks only.
+
+**Hygiene:** `git diff --check` clean; no dependencies, build output or `tsconfig.tsbuildinfo` in the delivery.
+<!-- END DELIVERY SECTION: candidate-observation-status-ui -->
+
 <!-- BEGIN DELIVERY SECTION: decision-selection-audit-contract -->
 # TESTING — `decision-selection-audit-contract`
 
