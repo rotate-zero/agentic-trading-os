@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal
+from typing import Any, Callable
 from uuid import uuid4
 
 from app.core.config import Settings, get_settings
@@ -44,20 +44,13 @@ from app.governor.rules import (
 from app.schemas.events.envelope import EventEnvelope, EventType
 from app.schemas.events.execution import GovernorDecision, OrderApproved, PlanRejected, TradePlanned
 from app.strategy_engine.base_strategy import Opportunity
+from app.trade_planning.planner import plan_entry
+from app.trade_planning.proposal import serialize_proposal
 from app.trading_intelligence.state_snapshot import capture_strategy_outcome_snapshots
 
 logger = logging.getLogger(__name__)
 
 _STOP_SENTINEL = object()
-
-
-def _r_multiple(entry: float, stop: float, target: float | None) -> float | None:
-    if target is None:
-        return None
-    risk = abs(entry - stop)
-    if risk == 0:
-        return None
-    return round(abs(target - entry) / risk, 4)
 
 
 class AuthorizerStub:
@@ -184,7 +177,7 @@ class AuthorizerStub:
         portfolio = await asyncio.to_thread(
             self._portfolio_state.get_snapshot, execution_mode or "unknown", trading_day
         )
-        reference_price = self._reference_price.get(symbol)
+        reference = self._reference_price.get_observation(symbol)
 
         limits = LimitsSnapshot(
             max_concurrent_positions=self._settings.execution_max_concurrent_positions,
@@ -208,7 +201,7 @@ class AuthorizerStub:
             market_state_snapshot_present=snapshots.market_state is not None,
             context_snapshot_present=snapshots.context is not None,
             portfolio=portfolio,
-            reference_price=reference_price,
+            plan=plan_entry(symbol, opportunity, reference, limits.fixed_notional_usd, now),
             now=now,
         )
         result = evaluate_authorization(ctx, limits)
@@ -248,6 +241,7 @@ class AuthorizerStub:
             # a refusal surfaces as LedgerCommitError below: no trade, no
             # reservation, no event. Never replaced with {} here.
             evidence=opportunity.evidence if result.decision == "approved" else None,
+            proposal=serialize_proposal(result.plan) if result.plan is not None else None,
         )
 
         try:
@@ -273,14 +267,18 @@ class AuthorizerStub:
             and result.reference_price is not None
         )
 
-        direction_long_short: Literal["long", "short"] = "long" if opportunity.direction == "BUY" else "short"
+        plan = result.plan
+        assert plan is not None
         trade_planned = TradePlanned(
-            direction=direction_long_short,
-            entry=result.reference_price,
-            stop=opportunity.structural_invalidation,
-            target=opportunity.structural_target,
-            size=result.qty,
-            r_multiple=_r_multiple(result.reference_price, opportunity.structural_invalidation, opportunity.structural_target),
+            direction=plan.direction,
+            entry=plan.entry,
+            stop=plan.stop,
+            target=plan.target,
+            size=plan.size,
+            r_multiple=plan.r_multiple,
+            max_hold_seconds=plan.max_hold_seconds,
+            origin=plan.origin,
+            corroboration=list(plan.corroboration),
         )
         await self._bus.publish(make_envelope(EventType.TRADE_PLANNED, trade_planned, symbol=symbol))
 

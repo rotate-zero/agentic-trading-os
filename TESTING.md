@@ -1,3 +1,66 @@
+<!-- BEGIN DELIVERY SECTION: simulated-trade-planning-integration -->
+# TESTING — `simulated-trade-planning-integration`
+
+Base: clean local `main` `23d87d67a640fd7dfa5f9fa9b540a0d224850fcc`; GitHub main read-back still matches. Python **3.14.4**, pytest **8.4.2**, pytest-asyncio **0.24.0**, installed backend virtualenv; PostgreSQL **18.6** (the locally installed version). Tests ran **serially**, with real PostgreSQL for persistence/replay/rollback and no in-memory substitute. No full backend suite, frontend build, provider connection, broker account or production database was used.
+
+**Database setup and isolation.** A task-owned local cluster was initialized at `/tmp/atos_p2_postgres`, listening only on `127.0.0.1:55432`, using local trust authentication and role `trading`. The sandbox denied socket creation/database connections and stalled asyncio thread wakeups; those commands were rerun outside the sandbox. Relevant commands:
+
+```bash
+/usr/lib/postgresql/18/bin/initdb -D /tmp/atos_p2_postgres -U trading --auth=trust
+/usr/lib/postgresql/18/bin/pg_ctl -D /tmp/atos_p2_postgres -l /tmp/atos_p2_postgres/server.log -o '-h 127.0.0.1 -p 55432 -k /tmp' start
+createdb -h 127.0.0.1 -p 55432 -U trading atos_p2_test
+createdb -h 127.0.0.1 -p 55432 -U trading atos_p2_mvp_acceptance
+createdb -h 127.0.0.1 -p 55432 -U trading atos_p2_candle_acceptance
+```
+
+Each database was migrated from empty to existing head **0017**, with exit 0, using the following commands from `backend/`:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_test .venv/bin/alembic upgrade head
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_mvp_acceptance .venv/bin/alembic upgrade head
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_candle_acceptance .venv/bin/alembic upgrade head
+```
+
+The pytest database is isolated from development data and from both acceptance databases. New persistence tests use the existing strategy-tagged cleanup fixture, preserving unrelated records; older neighboring fixtures run only in this disposable database. The acceptance databases were fresh/migrated/empty at invocation and remain as evidence. Final read-back found zero trades, reservations, orders or outcomes left in the pytest database. The task-owned server was stopped after verification with `/usr/lib/postgresql/18/bin/pg_ctl -D /tmp/atos_p2_postgres stop -m fast`; database files and acceptance logs are retained. No new migration was introduced.
+
+**Final focused run — 424 passed, 0 failed, 0 skipped (8.08 s).** Exact command from `backend/`:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_test .venv/bin/pytest -q --disable-warnings tests/test_trade_planning.py tests/test_trade_planning_proposal.py tests/test_reference_price_tracker.py tests/test_governor_rules.py tests/test_governor_engine.py tests/test_trade_planning_integration_postgres.py tests/test_authorization_ledger_postgres.py tests/test_governor_evidence_postgres.py tests/test_entry_lifecycle_wiring.py
+```
+
+Coverage: long/short and quantity boundaries; existing valid-input float floor/R behavior; invalid reference/stop/target refusal and exact order; rules 0–4 overriding planning refusals; planned risk as the sole candidate-loss input; exact cap equality/just-over, existing-position/in-flight stop risk, unrealized loss and signed realized P&L combinations; unknown exposure; source versus local clocks, missing/invalid source time, late exchange delivery, last-arrival selection and stop clearing. Existing P1/codec tests retain their pure scope.
+
+New real-PostgreSQL integration checks cover approved and every rule-6 rejection's proposal; absent early-refusal proposals; no rejected accepted IDs/authorized terms/reservation; strict invalid/unsupported/non-finite proposal rejection **before opening a session**; detachment before transaction entry and caller mutation; proposal/decision/reservation alignment; identical and decimal-equivalent replay; changed, malformed and unsupported requested/stored replay; historical absent proposals versus present-null/malformed proposals; no backfill; fault injection **after actual trade INSERT but before reservation INSERT** rolling back both; invalid-proposal and database-write failures publishing nothing; a single observed planner invocation and one captured decision time; complete unchanged event payloads/defaults and publish order for fixed fixtures; plan/event/authorization/reservation quantity and reference equality. Existing PostgreSQL tests cover durable order-term authority and duplicate order/venue protection; the busy-symbol integration now also checks absence of proposal/second reservation on redelivery. Portfolio read failure commits/publishes nothing.
+
+**Downstream regression — 194 passed, 0 failed, 0 skipped (6.68 s).** Exact command from `backend/`:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_test .venv/bin/pytest -q --disable-warnings tests/test_main_execution_pipeline.py tests/test_execution_engine.py tests/test_outcome_recorder.py tests/test_outcome_recorder_event_path_integration.py tests/test_outcome_read_path_integration.py tests/test_execution_trade_detail_route.py tests/test_execution_authorizations_route.py tests/test_simulated_mvp_acceptance.py tests/test_candle_to_simulated_trade_acceptance.py tests/test_candidate_selection.py tests/test_strategy_evaluation_batches.py tests/test_strategy_evaluation_batch_integration.py
+```
+
+The main-lifespan outcome test now verifies proposal entry against the reservation, authorized quantity against the entry/order/position quantity, outcome slippage against actual fill minus proposed entry, and the trade/order/position/outcome identity chain. Existing legacy-seeded readers and outcomes remain compatible without fabricated historical plans. C2/D1 regressions passed without connecting those modules to authorization. New timing fixtures capture fixed times and existing lifespan/venue tests explicitly control session gates; success does not depend on current market hours. Both runs emitted existing Python 3.14 dependency deprecation warnings (pytest-asyncio/FastAPI/Starlette); no assertions were weakened.
+
+**Existing acceptance commands, unchanged — both exit 0.** Their documented disposable-name/explicit-selection/migrated-empty database requirements in `backend/README.md` were inspected before running. Exact commands from `backend/`:
+
+```bash
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_mvp_acceptance .venv/bin/python scripts/simulated_mvp_acceptance.py --database atos_p2_mvp_acceptance > /tmp/atos_p2_mvp_acceptance.log 2>&1
+POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=55432 POSTGRES_USER=trading POSTGRES_PASSWORD=trading POSTGRES_DB=atos_p2_candle_acceptance .venv/bin/python scripts/candle_to_simulated_trade_acceptance.py --database atos_p2_candle_acceptance > /tmp/atos_p2_candle_acceptance.log 2>&1
+```
+
+- Simulated MVP: **88 milestones**, 64 API reads across 9 routes, 2.2 s.
+- Candle to simulated trade: **43 milestones**, 19 API reads across 7 routes, 3.1 s.
+- Read-only `psql` verification on the MVP database: 5 approved rows, all 5 with proposals; 1 no-reference rejection without a proposal; **0** proposal/reservation size or reference-price mismatches. Candle database: plan size = reservation qty = entry order qty = outcome entry qty = **10**, proposal entry **100.0**, outcome slippage **0.000000**; the position is closed with current qty 0, as expected.
+
+These commands prove the documented synthetic simulated lifecycle, including attribution and startup behavior already present; they do not prove live-feed freshness, profitability, Decision cutover or R1 orphan recovery. No source-age threshold, new entry coordinator, acceptance claim, selection journal or protective-exit change was introduced.
+
+**Initial attempts and corrections.** The first sandbox-only asyncio run stalled after the pure tests and was interrupted; outside-sandbox rerun passed 258 initial tests. The first expanded run had **411 passed / 7 failed**: five failures exposed omitted existing nullable GovernorDecision fields in the new golden expectation (corrected to include `size_multiplier`/`delay_seconds`), and two existing migration tests required running from `backend/` rather than the repository root. The corrected run passed 418, followed by the final 424 after additional cases. One downstream invocation named a nonexistent batch test file and collected no tests; the corrected command above uses both existing batch test files. None of the required final checks remains unrun.
+
+**Intentional numerical correction.** At entry 1.1/stop 1.09/10 shares, Decimal planned risk is exactly 0.10; the former float expression was 0.10000000000000009. Projected equality now correctly passes a 0.10 cap, while a cap of 0.09999999999999999 rejects. Combined exposure/realized boundaries are checked separately; no risk formula, realized-loss policy or limit changed.
+
+**Handoff checks.** `git diff --check` passes. Branch/status/recent commits were rechecked; only this delivery's local edits/new tests are present, and no commit or push was made. Canonical decision #196 already covers P2; no new number or rewritten decision body. Earlier CHANGES/TESTING delivery sections are preserved.
+<!-- END DELIVERY SECTION: simulated-trade-planning-integration -->
+
 <!-- BEGIN DELIVERY SECTION: decision-selection-shadow-core -->
 # TESTING — `decision-selection-shadow-core`
 

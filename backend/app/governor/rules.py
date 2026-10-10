@@ -12,7 +12,7 @@ Rule order (this task's scope item 1, restated precisely):
   2. opportunity.status == "actionable"
   3. pre-trade snapshot gate — both market_state and context snapshots present
   4. no open position/in-flight entry for the symbol; open + in-flight < max_concurrent_positions
-  5. reference price exists; stop geometry valid; qty = floor(notional / reference_price) >= 1
+  5. surface PlanningRefusal (reference, stop, quantity, target precedence)
   6. daily-loss gate (I15) — realized + unrealized/open-risk + the candidate's own stop-out loss
 
 NOT rule 0-6: reduce-only (exits only — out of scope here), authorization-
@@ -20,12 +20,13 @@ gate replay checks (execution_engine's own concern, not the authorizer's).
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal
 
 from app.governor.ports import PortfolioSnapshot
+from app.trade_planning.plan import PlanningRefusal, TradePlan
 
 # --- inputs ---------------------------------------------------------------
 
@@ -72,7 +73,7 @@ class AuthorizationContext:
     market_state_snapshot_present: bool
     context_snapshot_present: bool
     portfolio: PortfolioSnapshot
-    reference_price: float | None
+    plan: TradePlan | PlanningRefusal
     now: datetime
 
 
@@ -85,29 +86,25 @@ class AuthorizationResult:
     reasons: list[str]
     qty: int | None = None
     reference_price: float | None = None
+    plan: TradePlan | None = None
 
 
-_TERMINAL_EXPOSURE_UNKNOWN = object()  # sentinel: at least one open_exposure_loss term is unknown
-
-
-def _open_exposure_loss(portfolio: PortfolioSnapshot) -> float | None:
+def _open_exposure_loss(portfolio: PortfolioSnapshot) -> Decimal | None:
     """I15's "Σ over open positions AND in-flight entries of
     max(qty × |avg_entry − stop|, −unrealized_pnl)" — None (UNKNOWN) if
     ANY exposure has a missing mark or a missing stop (AC #17's own
     "missing mark"/"missing stop" cases)."""
-    total = 0.0
+    total = Decimal(0)
     for exposure in portfolio.exposures:
         if exposure.stop is None or exposure.avg_entry_price is None or exposure.unrealized_pnl is None:
             return None
-        loss_if_stopped = exposure.qty * abs(exposure.avg_entry_price - exposure.stop)
-        term = max(loss_if_stopped, -exposure.unrealized_pnl)
+        loss_if_stopped = Decimal(exposure.qty) * abs(Decimal(str(exposure.avg_entry_price)) - Decimal(str(exposure.stop)))
+        term = max(loss_if_stopped, -Decimal(str(exposure.unrealized_pnl)))
         total += term
     return total
 
 
 def evaluate_authorization(ctx: AuthorizationContext, limits: LimitsSnapshot) -> AuthorizationResult:
-    reasons: list[str]
-
     # Rule 0 — execution_mode gate (AC #3, #4): only "simulated" proceeds,
     # every other value (paper/live/backtest/unknown/None) rejects with
     # the same reason and never falls back to a different mode.
@@ -138,20 +135,10 @@ def evaluate_authorization(ctx: AuthorizationContext, limits: LimitsSnapshot) ->
     if total_open >= limits.max_concurrent_positions:
         return AuthorizationResult(decision="rejected", reasons=["max_concurrent_positions"])
 
-    # Rule 5 — reference price, stop geometry, fixed-notional sizing.
-    if ctx.reference_price is None:
-        return AuthorizationResult(decision="rejected", reasons=["no_reference_price"])
-    reference_price = ctx.reference_price
-    stop = ctx.opportunity.structural_invalidation
-    if ctx.opportunity.direction == "BUY":
-        valid_geometry = stop < reference_price
-    else:
-        valid_geometry = stop > reference_price
-    if not valid_geometry:
-        return AuthorizationResult(decision="rejected", reasons=["invalid_stop_geometry"])
-    qty = math.floor(limits.fixed_notional_usd / reference_price)
-    if qty < 1:
-        return AuthorizationResult(decision="rejected", reasons=["notional_below_one_share"])
+    # Rule 5 — Planning alone owns geometry, sizing, risk and R.
+    if isinstance(ctx.plan, PlanningRefusal):
+        return AuthorizationResult(decision="rejected", reasons=[ctx.plan.reason])
+    plan = ctx.plan
 
     # Rule 6 — daily-loss gate (I15). Realized loss + open exposure loss
     # (including in-flight entries) + the CANDIDATE trade's own stop-out
@@ -159,14 +146,15 @@ def evaluate_authorization(ctx: AuthorizationContext, limits: LimitsSnapshot) ->
     # existing book makes the whole open_exposure_loss term UNKNOWN,
     # treated as unbounded (reject) — implemented as documented, not
     # silently softened (per this task's own standing instruction).
-    realized_loss_today = max(0.0, -ctx.portfolio.realized_pnl_today)
+    realized_loss_today = max(Decimal(0), -Decimal(str(ctx.portfolio.realized_pnl_today)))
     open_exposure_loss = _open_exposure_loss(ctx.portfolio)
     if open_exposure_loss is None:
-        return AuthorizationResult(decision="rejected", reasons=["loss_exposure_unknown"])
-    candidate_loss = qty * abs(reference_price - stop)
-    if realized_loss_today + open_exposure_loss >= limits.daily_loss_cap_usd:
-        return AuthorizationResult(decision="rejected", reasons=["daily_loss_cap_reached"])
-    if realized_loss_today + open_exposure_loss + candidate_loss > limits.daily_loss_cap_usd:
-        return AuthorizationResult(decision="rejected", reasons=["projected_loss_exceeds_daily_cap"])
+        return AuthorizationResult(decision="rejected", reasons=["loss_exposure_unknown"], plan=plan)
+    cap = Decimal(str(limits.daily_loss_cap_usd))
+    candidate_loss = plan.planned_risk_usd
+    if realized_loss_today + open_exposure_loss >= cap:
+        return AuthorizationResult(decision="rejected", reasons=["daily_loss_cap_reached"], plan=plan)
+    if realized_loss_today + open_exposure_loss + candidate_loss > cap:
+        return AuthorizationResult(decision="rejected", reasons=["projected_loss_exceeds_daily_cap"], plan=plan)
 
-    return AuthorizationResult(decision="approved", reasons=[], qty=qty, reference_price=reference_price)
+    return AuthorizationResult(decision="approved", reasons=[], qty=plan.size, reference_price=plan.entry, plan=plan)

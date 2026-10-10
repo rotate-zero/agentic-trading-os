@@ -16,6 +16,7 @@ import pytest
 
 from app.event_bus.bus import EventBus
 from app.governor.engine import AuthorizerStub
+from app.trade_planning.plan import ReferenceObservation
 from app.governor.ports import (
     LedgerCommitError,
     PortfolioSnapshot,
@@ -53,8 +54,8 @@ class _FakeReferencePriceTracker:
     def stop(self) -> None:
         pass
 
-    def get(self, symbol: str) -> float | None:
-        return self._price
+    def get_observation(self, symbol: str) -> ReferenceObservation | None:
+        return None if self._price is None else ReferenceObservation(self._price, None, None)
 
 
 @dataclass
@@ -173,6 +174,7 @@ async def test_approved_path_publishes_trade_planned_then_governor_decision_then
 
         assert len(ledger.committed) == 1
         assert ledger.committed[0].decision == "approved"
+        assert ledger.committed[0].proposal["size"] == order_approved.payload["qty"]
         assert ledger.committed[0].opportunity_id is not None
         assert ledger.committed[0].client_order_id == order_approved.payload["order_id"]
         assert ledger.committed[0].limits_snapshot == {
@@ -201,6 +203,7 @@ async def test_rejected_path_publishes_only_plan_rejected_and_mints_no_opportuni
 
         assert len(ledger.committed) == 1
         assert ledger.committed[0].decision == "rejected"
+        assert ledger.committed[0].proposal is None
         assert ledger.committed[0].opportunity_id is None
         assert ledger.committed[0].client_order_id is None
     finally:
@@ -275,3 +278,20 @@ def test_governor_package_imports_no_broker_or_venue_module() -> None:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     assert not alias.name.startswith(forbidden_prefixes), f"{py_file.name} imports {alias.name}"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_read_failure_commits_and_publishes_nothing(monkeypatch):
+    class BrokenPortfolio(_FakePortfolioState):
+        def get_snapshot(self, execution_mode, trading_day):
+            raise RuntimeError("portfolio unavailable")
+    bus, authorizer, published, ledger = await _build_and_start(monkeypatch,
+        portfolio_state=BrokenPortfolio(_empty_portfolio()))
+    try:
+        with pytest.raises(RuntimeError, match="portfolio unavailable"):
+            await authorizer._process_one({"symbol": "AAPL", "payload": _opportunity_payload()})
+        assert ledger.committed == []
+        assert published == []
+    finally:
+        await authorizer.stop()
+        await bus.stop()

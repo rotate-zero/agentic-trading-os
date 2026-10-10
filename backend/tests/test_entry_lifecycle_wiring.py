@@ -31,6 +31,7 @@ from app.execution_engine.engine import ExecutionEngine
 from app.execution_engine.fill_ledger import PostgresFillLedger
 from app.execution_engine.postgres import PostgresOrderLedger
 from app.governor.engine import AuthorizerStub
+from app.trade_planning.plan import ReferenceObservation
 from app.governor.portfolio_state_reader import PortfolioStateAdapter
 from app.governor.postgres import PostgresTradeLedger
 from app.models.execution_ledger import (
@@ -93,8 +94,8 @@ class _FakeReferencePriceTracker:
     def stop(self) -> None:
         pass
 
-    def get(self, symbol: str) -> float | None:
-        return self._price
+    def get_observation(self, symbol: str) -> ReferenceObservation | None:
+        return None if self._price is None else ReferenceObservation(self._price, None, None)
 
 
 class _FixedVenueProvider:
@@ -281,3 +282,10 @@ async def test_second_opportunity_for_a_busy_symbol_is_rejected_by_the_read_side
     assert EventType.ORDER_APPROVED not in types
     rejection = next(e for e in published if e.event_type == EventType.PLAN_REJECTED)
     assert "symbol_busy" in rejection.payload["reasons"]
+    with SessionLocal() as s:
+        trades = s.scalars(select(Trade).where(Trade.strategy_name == NAME)).all()
+        assert len(trades) == 2
+        refused = next(t for t in trades if t.decision == "rejected")
+        assert "proposal" not in refused.thesis
+        assert s.get(TradeReservation, refused.trade_id) is None
+        assert all(refused.decision_record[k] is None for k in ("opportunity_id", "client_order_id", "qty", "reference_price"))

@@ -1,21 +1,22 @@
 """PostgreSQL TradeLedgerPort: decision and entry reservation commit together."""
 import json
-from dataclasses import asdict
+from dataclasses import fields
 from datetime import datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 from app.db.ledger_transaction import ledger_transaction
 from app.models.execution_ledger import Trade, TradeReservation
+from app.trade_planning.proposal import ProposalError, validate_proposal, proposals_equal
 from .evidence import EvidenceError, detach_evidence, evidence_equal
 from .ports import LedgerCommitError, TradeDecisionCommitResult
 
 
 def _record_data(record):
-    data = asdict(record)
-    # Evidence lives in trades.thesis["evidence"], not in decision_record, so
-    # the decision_record shape (and its replay comparison) is unchanged.
-    data.pop("evidence")
+    # Snapshot fields live only in thesis. Do not traverse the caller's
+    # originals here: they have already been validated and detached.
+    data = {f.name: getattr(record, f.name) for f in fields(record)
+            if f.name not in {"evidence", "proposal"}}
     for name in ("setup_detected_at", "decided_at"):
         ts = data[name]
         if ts.tzinfo is None or ts.utcoffset() is None:
@@ -47,6 +48,7 @@ class PostgresTradeLedger:
         # no reservation and -- because the engine publishes only after a
         # successful commit -- no approval event.
         evidence = self._validated_evidence(record)
+        proposal = self._validated_proposal(record)
         with ledger_transaction(self._sessions, LedgerCommitError) as session:
             data = _record_data(record)
             if record.decision not in {"approved", "rejected"} or record.direction not in {"BUY", "SELL"}:
@@ -82,6 +84,14 @@ class PostgresTradeLedger:
                         has_stored and not evidence_equal(stored, evidence)
                     ):
                         raise LedgerCommitError("conflicting evidence for committed approval")
+                    has_proposal = isinstance(existing.thesis, dict) and "proposal" in existing.thesis
+                    try:
+                        if has_proposal != (proposal is not None) or (
+                            has_proposal and not proposals_equal(existing.thesis["proposal"], proposal)
+                        ):
+                            raise LedgerCommitError("conflicting proposal for committed approval")
+                    except ProposalError as exc:
+                        raise LedgerCommitError(f"invalid committed proposal: {exc}") from exc
                     return TradeDecisionCommitResult(existing.created_at, str(trade_id))
             else:
                 if any(value is not None for value in (record.opportunity_id, record.client_order_id, record.qty, record.reference_price)):
@@ -97,6 +107,7 @@ class PostgresTradeLedger:
                         "final_stop": record.structural_invalidation, "final_target": record.structural_target,
                         "confidence": record.confidence_at_signal,
                         "setup_detected_at": data["setup_detected_at"],
+                        **({"proposal": proposal} if proposal is not None else {}),
                         **({"evidence": evidence} if evidence is not None else {})},
                 status="open" if record.decision == "approved" else None)
             session.add(trade)
@@ -105,3 +116,30 @@ class PostgresTradeLedger:
                 session.add(TradeReservation(trade_id=trade_id, client_order_id=record.client_order_id,
                                              qty=record.qty, reference_price=price))
         return TradeDecisionCommitResult(datetime.now(timezone.utc), record.opportunity_id)
+
+    @staticmethod
+    def _validated_proposal(record):
+        if record.proposal is None:
+            return None  # Legacy callers/rows retain honest absence.
+        try:
+            proposal = validate_proposal(record.proposal)
+        except ProposalError as exc:
+            raise LedgerCommitError(f"invalid planning proposal: {exc}") from exc
+        if record.decision == "rejected":
+            if record.reasons not in (
+                ["loss_exposure_unknown"], ["daily_loss_cap_reached"],
+                ["projected_loss_exceeds_daily_cap"],
+            ):
+                raise LedgerCommitError("only a rule-6 rejection may carry a proposal")
+        elif record.decision == "approved":
+            if (proposal["size"] != record.qty or record.reference_price is None
+                    or Decimal(proposal["entry"]) != Decimal(str(record.reference_price))):
+                raise LedgerCommitError("proposal differs from authorized reservation terms")
+        else:
+            raise LedgerCommitError("invalid decision for planning proposal")
+        if (proposal["direction"] != ("long" if record.direction == "BUY" else "short")
+                or Decimal(proposal["stop"]) != Decimal(str(record.structural_invalidation))
+                or proposal["target"] is None
+                or Decimal(proposal["target"]) != Decimal(str(record.structural_target))):
+            raise LedgerCommitError("proposal differs from decision geometry")
+        return proposal

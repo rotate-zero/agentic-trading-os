@@ -118,6 +118,10 @@ class TradeDecisionRecord:
     # `decision_record`. None means "not carried" (records written before this
     # field existed) -- never a stand-in for an empty dict.
     evidence: dict | None = None
+    # Immutable planning snapshot, audit only; present on approval or a
+    # rule-6 risk rejection. Absent on historical records/earlier refusals.
+    # Stored in thesis, never in decision_record or authorization fields.
+    proposal: dict | None = None
 
 
 @dataclass(frozen=True)

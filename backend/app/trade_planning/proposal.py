@@ -1,7 +1,7 @@
 """Pure, strict serialization boundary for a TradePlan's persisted proposal.
 
 `serialize_proposal(plan)` turns a landed `TradePlan` into the versioned,
-plain-JSON object that P2 will later store at `trades.thesis["proposal"]`
+plain-JSON object that the simulated authorizer stores at `trades.thesis["proposal"]`
 (execution-engine-design.md §6.14.7, trading-intelligence-architecture.md
 §19.5). `validate_proposal(value)` re-checks a stored or requested object
 against the same schema and returns a detached normalized copy.
@@ -9,8 +9,8 @@ against the same schema and returns a detached normalized copy.
 
 This module only *converts and checks*. It never recalculates quantity,
 planned risk or R (the plan's values are carried), never authorizes, and has
-no clock, I/O, logging, Event Bus or database dependency. It is not wired into
-any production path yet.
+no clock, I/O, logging, Event Bus or database dependency. The Governor ledger
+consumes this boundary for proposal persistence and replay comparison.
 
 Honest state over fabricated state: nothing is repaired. An unsupported
 version, a missing/extra key, a wrong type, a naive timestamp, a non-finite

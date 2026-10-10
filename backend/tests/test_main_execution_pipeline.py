@@ -23,6 +23,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
@@ -596,6 +597,14 @@ def test_position_monitor_places_durable_exit_and_closes_on_later_tick(
             assert float(outcome.realized_pnl) == pytest.approx(realized_pnl)
             assert float(outcome.realized_r) == pytest.approx(ledger_r) == pytest.approx(realized_r)
             assert float(outcome.structural_invalidation) == basis == 90.0
+            # P2 proposal is an immutable reference plan; outcomes still use
+            # actual fills and the established structural-risk attribution.
+            proposal = ledger_trade.thesis["proposal"]
+            reservation = s.get(TradeReservation, trade.trade_id)
+            assert proposal["size"] == order.qty == reservation.qty == position.qty
+            assert Decimal(proposal["entry"]) == reservation.reference_price
+            assert float(outcome.slippage_entry) == pytest.approx(float(entry_fill.price - Decimal(proposal["entry"])))
+            assert order.trade_id == ledger_position.trade_id == outcome.opportunity_id == ledger_trade.trade_id
 
         # The existing strategy-outcomes read route (default is_backtest=false) shows it, exactly once.
         body = client.get("/intelligence/strategy-outcomes", params={"limit": 500}).json()

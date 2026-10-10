@@ -12,6 +12,9 @@ from datetime import date, datetime, timezone
 
 import pytest
 
+from app.trade_planning.plan import ReferenceObservation
+from app.trade_planning.planner import plan_entry
+
 from app.governor.ports import OpenExposure, PortfolioSnapshot
 from app.governor.rules import (
     AuthorizationContext,
@@ -74,6 +77,7 @@ def _ctx(
     context_snapshot_present: bool = True,
     portfolio: PortfolioSnapshot | None = None,
     reference_price: float | None = 100.0,
+    fixed_notional_usd: float = 1000.0,
 ) -> AuthorizationContext:
     return AuthorizationContext(
         symbol=symbol,
@@ -83,7 +87,9 @@ def _ctx(
         market_state_snapshot_present=market_state_snapshot_present,
         context_snapshot_present=context_snapshot_present,
         portfolio=portfolio or _portfolio(),
-        reference_price=reference_price,
+        plan=plan_entry(symbol, opportunity or _opportunity(),
+                        None if reference_price is None else ReferenceObservation(reference_price, _NOW, _NOW),
+                        fixed_notional_usd, _NOW),
         now=_NOW,
     )
 
@@ -316,3 +322,81 @@ def test_daily_loss_gate_candidates_own_stop_out_loss_alone_breaches_cap() -> No
     result = evaluate_authorization(_ctx(opportunity=opp), _limits())
     assert result.decision == "rejected"
     assert result.reasons == ["projected_loss_exceeds_daily_cap"]
+
+
+# P2: plans are inputs; only plans that reach rule 6 become audit proposals.
+@pytest.mark.parametrize("changes,reason", [
+    ({"execution_mode": "paper"}, "execution_mode_not_permitted"),
+    ({"is_regular_session": False}, "outside_regular_session"),
+    ({"opportunity": _opportunity(status="waiting")}, "not_actionable"),
+    ({"market_state_snapshot_present": False}, "snapshot_unavailable:market_state"),
+    ({"context_snapshot_present": False}, "snapshot_unavailable:context"),
+    ({"portfolio": _portfolio(exposures=(OpenExposure("AAPL", "BUY", 1, 100., 99., 100., 0., False),))}, "symbol_busy"),
+    ({"portfolio": _portfolio(exposures=(OpenExposure("MSFT", "BUY", 1, 100., 99., 100., 0., False),))}, "max_concurrent_positions"),
+])
+def test_earlier_rules_win_over_planning_refusal(changes, reason):
+    result = evaluate_authorization(_ctx(reference_price=None, **changes), _limits())
+    assert result.reasons == [reason]
+    assert result.plan is None
+    assert result.qty is result.reference_price is None
+
+
+@pytest.mark.parametrize("price,stop,target,reason", [
+    (0., 99., 110., "no_reference_price"),
+    (float("nan"), 99., 110., "no_reference_price"),
+    (100., 0., 110., "invalid_stop_geometry"),
+    (100., 100., 90., "invalid_stop_geometry"),
+    (1001., 99., 90., "notional_below_one_share"),
+    (100., 99., 100., "invalid_target_geometry"),
+    (100., 99., float("inf"), "invalid_target_geometry"),
+])
+def test_planning_refusal_precedes_risk_and_has_no_plan(price, stop, target, reason):
+    result = evaluate_authorization(_ctx(reference_price=price,
+        opportunity=_opportunity(structural_invalidation=stop, structural_target=target),
+        portfolio=_portfolio(realized_pnl_today=-1000.)), _limits())
+    assert result.reasons == [reason]
+    assert result.plan is None
+
+
+@pytest.mark.parametrize("cap,decision,reason", [
+    (0.1, "approved", []),
+    (0.09999999999999999, "rejected", ["projected_loss_exceeds_daily_cap"]),
+])
+def test_decimal_candidate_exact_cap_and_just_over(cap, decision, reason):
+    # Legacy float risk 10 * (1.1 - 1.09) == 0.10000000000000009
+    # falsely rejected equality. Canonical decimal arithmetic corrects it.
+    ctx = _ctx(reference_price=1.1, fixed_notional_usd=11.,
+               opportunity=_opportunity(structural_invalidation=1.09, structural_target=1.2))
+    result = evaluate_authorization(ctx, _limits(fixed_notional_usd=11., daily_loss_cap_usd=cap))
+    assert result.decision == decision
+    assert result.reasons == reason
+    assert result.plan is ctx.plan
+
+
+@pytest.mark.parametrize("realized,cap,reason", [
+    (-0.1, 0.6, []),
+    (-0.1000000000000001, 0.6, ["projected_loss_exceeds_daily_cap"]),
+    (-0.1, 0.5, ["daily_loss_cap_reached"]),
+    (0.2, 0.5, []),  # realized profit does not offset exposure risk
+])
+def test_decimal_existing_exposure_combines_stop_unrealized_and_realized(realized, cap, reason):
+    exposures = (
+        OpenExposure("MSFT", "BUY", 10, 1.1, 1.09, 1.1, 0., True),  # exact .1
+        OpenExposure("TSLA", "SELL", 1, 1., 1.1, 1.3, -.3, False),  # max(.1,.3)
+    )
+    ctx = _ctx(reference_price=1.1, fixed_notional_usd=11.,
+               opportunity=_opportunity(structural_invalidation=1.09, structural_target=1.2),
+               portfolio=_portfolio(realized_pnl_today=realized, exposures=exposures))
+    result = evaluate_authorization(ctx, _limits(max_concurrent_positions=3, fixed_notional_usd=11., daily_loss_cap_usd=cap))
+    assert result.reasons == reason
+    assert result.plan is ctx.plan
+
+
+def test_risk_gate_consumes_plan_risk_without_recomputing_quantity_or_risk():
+    from dataclasses import replace
+    from decimal import Decimal
+    ctx = _ctx()
+    # An intentionally distinct test value proves delegation. Production
+    # plans are built by plan_entry; rules do not derive another risk value.
+    ctx = replace(ctx, plan=replace(ctx.plan, planned_risk_usd=Decimal("100.00000000000001")))
+    assert evaluate_authorization(ctx, _limits()).reasons == ["projected_loss_exceeds_daily_cap"]

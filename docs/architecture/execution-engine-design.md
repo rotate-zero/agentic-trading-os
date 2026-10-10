@@ -81,7 +81,7 @@
 | Agreement/conflict view over cached opportunities | built (non-scoring, decision #121) | `backend/app/trading_intelligence/opportunity_view.py` |
 | Opportunity Engine (ranking; D4) | **not built** | no module |
 | Decision Engine (arbitration; D1) | **not built** | no module |
-| Trade Planning Engine (`TradeRequest → TradePlan`) | **not built** | no module (as of this inventory; a simulated-slice contract is specified in §6.14 and is still unbuilt) |
+| Trade Planning Engine | **P1/P2 simulated auto path built and connected**; general `TradeRequest → TradePlan` remains unbuilt | `backend/app/trade_planning/` called once by the existing `AuthorizerStub`; proposal persisted with decisions, §6.14 |
 | Governor | **partial** — the widened `GovernorDecision` schema only; no rule engine | `schemas/events/execution.py:GovernorDecision` |
 | Portfolio State Engine | **not built** | no module; `world_view/composite.py` returns `portfolio=None` |
 | Execution Engine | **not built** | no module; nothing calls `place_order` |
@@ -3780,15 +3780,85 @@ Exit codes: `0` PASS, `1` a milestone failed (named), `2` a precondition failed 
 
 **Sensitivity check performed.** With `FeatureEngine._update_gap` temporarily made to return `{}`, the positive scenario fails at milestone C1.10 (calculated gap features absent) with exit code 1; the production change was reverted and is not part of the delivery.
 
-### 6.14 Trade Planning contract for the first simulated slice — P1 core built but not connected
+### 6.14 Trade Planning contract for the first simulated slice — P2 integrated
 
 **Design baseline.** Original design `trade-planning-contract-design` inspected `40df705`; refinement `opportunity-decision-planning-governor-contract-refinement` inspected pushed `main` `f7f5c51`. Neither documentation delivery changed production code, tests, settings or migrations. The first-slice contract below incorporates decision #196; Q1–Q5's dispositions are recorded in §6.14.11. The wider cross-module contract and bounded task sequence are in `trading-intelligence-architecture.md` §19. At that baseline the Trade Planning Engine was unbuilt.
 
-**P1 as-built update (`simulated-trade-planning-core`).** The immutable values in `backend/app/trade_planning/plan.py` and pure `plan_entry` in `planner.py` now implement §6.14.4's auto entry contract and §6.14.6's validation order. They are **built but not connected**: no production caller uses them, and Governor rule 5 still owns current sizing. No event, ledger, tracker, database or startup path was changed. P2 owns the integration described in §6.14.9 steps 2–5, including timestamp capture, proposal persistence, Governor delegation and removal of the old sizing calculation.
+**Historical P1 delivery state (`simulated-trade-planning-core`; connected by P2 below).** The immutable values in `backend/app/trade_planning/plan.py` and pure `plan_entry` in `planner.py` now implement §6.14.4's auto entry contract and §6.14.6's validation order. At that delivery they were **built but not connected**: no production caller used them, and Governor rule 5 still owned sizing. No event, ledger, tracker, database or startup path was changed. P2 owns the integration described in §6.14.9 steps 2–5, including timestamp capture, proposal persistence, Governor delegation and removal of the old sizing calculation.
 
-**Proposal serialization as-built update (`planning-proposal-serialization-core`).** `backend/app/trade_planning/proposal.py` adds the pure, strict conversion boundary for the §6.14.7 snapshot: `serialize_proposal(plan)`, `validate_proposal(value)`, `proposals_equal(stored, requested)` and the `ProposalError`/`UnsupportedProposalVersion` errors. It is **built but not connected** — an unwired persistence boundary. No Governor, reference tracker, ledger, migration, event, backfill or entry-cutover change was made; Governor rule 5 still owns sizing and production behavior is unchanged. P2 will call these helpers instead of duplicating the conversion. See the as-built subsection at the end of §6.14.7.
+**Historical serialization delivery state (`planning-proposal-serialization-core`; connected by P2 below).** `backend/app/trade_planning/proposal.py` adds the pure, strict conversion boundary for the §6.14.7 snapshot: `serialize_proposal(plan)`, `validate_proposal(value)`, `proposals_equal(stored, requested)` and the `ProposalError`/`UnsupportedProposalVersion` errors. At that delivery it was **built but not connected**, an unwired persistence boundary. No Governor, reference tracker, ledger, migration, event, backfill or entry-cutover change was made then. P2 now calls these helpers without duplicating the conversion. See the as-built subsection at the end of §6.14.7.
 
-**Purpose.** Today one component, `AuthorizerStub`, both *plans* a simulated entry (reads a reference price, validates stop geometry, sizes it, derives R, assembles the `TradePlanned` payload) and *authorizes* it (mode, session, snapshots, slots, daily-loss gate, identity minting, commit). This section specifies the smallest separation that gives planning its own contract, preserves the valid-input behavior of the simulated pipeline with explicit invalid-price/stop/target validation corrections, and leaves exactly one sizing authority.
+**P2 as built (`simulated-trade-planning-integration`, 2026-10-10).** The existing simulated `AuthorizerStub` now calls the committed P1 `plan_entry` once with the envelope symbol, validated Opportunity, one `ReferenceObservation`, configured float notional and its single captured decision time. Planning is the sole owner of entry geometry, whole-share quantity, exact Decimal stop-out risk and R. Governor still owns authorization, accepted IDs, commit and publication. C1/C2 observation and D1 selection remain independent of entry authorization; this is not I1 Decision cutover. R1 orphan-approval recovery remains unbuilt.
+
+```text
+ COMPONENT DATA FLOW (P2 active simulated path)
+
+ PriceUpdated ------------------> ReferencePriceTracker
+                                  last delivered price + local envelope time
+                                  + source exchange time (absent stays absent)
+                                              |
+ OpportunityCreated --> one AuthorizerStub queue/worker
+                        captures one now, limits, snapshots, portfolio, reference
+                                              |
+                                              v
+                        plan_entry --> immutable TradePlan | PlanningRefusal
+                                              |
+                        rules 0-4 --> rule 5 refusal --> rule 6 Decimal daily-loss gate
+                                              |
+              rejection                       | approval: mint accepted IDs
+              audit row, proposal only        | trade + proposal + reservation
+              if rule 6 was reached           | in ONE existing transaction
+                         |                    |
+                         +------ COMMIT ------+
+                         |                    |
+                    PlanRejected         TradePlanned (from plan)
+                                              --> GovernorDecision(approved)
+                                              --> OrderApproved
+                                                       |
+                                         Execution: order terms == reservation
+                                         durable order insert --> simulated venue
+```
+
+```text
+ INTERNAL FLOW (authorizer + ledger)
+
+ plan/refusal available --> rules 0-4 first failure? --> reject, no proposal
+                                    |
+                                    v
+                          rule 5 PlanningRefusal? --> reject, no proposal
+                                    |
+                                    v
+                          rule 6 uses ONLY plan.planned_risk_usd
+                                    |
+                       approve or risk-reject with that plan
+                                    |
+                       serialize_proposal --> TradeDecisionRecord.proposal
+                                    |
+                       validate_proposal + detach BEFORE transaction/locks
+                                    |
+                       existing lock order: trades, orders, trade_reservations
+                                    |
+             same accepted ID? -----+----- new approval: INSERT trade + thesis proposal
+             validate same proposal |                     --> INSERT reservation
+             and reservation terms  |                     --> COMMIT together
+             identical: return      |     risk-reject: INSERT audit trade, no reservation
+             conflict: raise        |
+                                    v
+                       only successful commit permits publication
+                       any persistence failure: publish nothing
+```
+
+`AuthorizationContext.plan` carries the planner result; `AuthorizationResult.plan` is present only after a valid plan reaches rule 6 (approval or any daily-loss refusal). Earlier failures discard it for persistence even when Planning could form one. Rejected authorization qty/reference and accepted IDs remain null. `TradePlanned` copies all its proposed values from the plan; its schema/defaults and publication order are unchanged. Quantity and reference are bound to the durable reservation by the ledger; Execution continues to authorize from the reservation, never from the proposal.
+
+`TradeDecisionRecord.proposal` is excluded from `decision_record` and written only at `thesis["proposal"]`. The ledger reuses `validate_proposal` and `proposals_equal`, checks proposal size/entry against approved reservation terms and direction/stop/target against the decision, and rejects malformed/unsupported/non-finite proposals without repair before opening a transaction. Existing rows/callers with no proposal remain valid; same-id legacy replay does not backfill one. Absence differs from a present null, malformed object or unsupported version. A changed proposal conflicts without updating any committed row. A failure after trade INSERT and before reservation INSERT rolls back both.
+
+**I15 arithmetic.** Candidate loss is exactly `plan.planned_risk_usd`. Existing entry/stop/unrealized/realized monetary inputs and the cap are converted through `Decimal(str(value))` before arithmetic. The equation remains `max(0, -realized_pnl_today) + sum(max(qty * abs(avg_entry-stop), -unrealized_pnl)) + candidate_loss`; unknown exposure still rejects, existing loss at cap still rejects, and projected loss equal to cap still passes. Deliberate last-bit correction: 10 shares at 1.1 with stop 1.09 have exact risk 0.10; the old float expression yielded 0.10000000000000009 and incorrectly rejected a 0.10 cap. Float division/floor sizing and float rounded R remain exactly the P1 behavior. No limits or freshness thresholds change.
+
+**Reference clocks.** Arrival order still selects the price, even if a later envelope carries an older exchange timestamp. `get()` remains compatible; `get_observation()` exposes the immutable observation. The local clock is the envelope timestamp; a missing, unparseable or timezone-naive source clock stays absent. The existing codec records independent descriptive local/source ages, including future/negative ages; it does not assert freshness.
+
+**Verification.** Focused PostgreSQL tests cover proposal attribution, strict validation/detachment, identical/conflicting/legacy replay, rollback and plan/event/reservation equality. Outcome-path tests verify proposal entry versus actual fills and unchanged outcome identity/slippage. Both unchanged acceptance commands exit 0 (88 simulated-MVP and 43 candle-to-trade milestones). Exact commands and final counts are in `TESTING.md` under this delivery slug. No event type, migration or setting was added. Decision #196 already covers this implementation; no new architectural decision was allocated.
+
+**Purpose at the design baseline.** `AuthorizerStub` originally both planned and authorized simulated entries. The contract below separates those responsibilities while retaining the existing worker and valid-input event flow. Historical findings and responsibility tables explicitly reference their inspected baseline; the P2 status above supersedes their former planning ownership.
 
 #### 6.14.1 Verified current responsibility and event map
 
@@ -3831,7 +3901,7 @@ Every row was checked against the code at `40df705`. "Planning-type work" marks 
                                                   ExecutionEngine: has_committed_decision ─► insert_order (terms == reservation) ─► venue
 ```
 
-**Verified findings that shape the contract** (none is fixed by this delivery):
+**Historical verified findings that shaped the contract** (at the design baseline; P2 resolves F1–F5 in the supported planning path and preserves F10 as separate recovery work):
 
 - **F1 — A risk rejection keeps no proposal.** `AuthorizationResult` carries `qty`/`reference_price` only when approved, so a rule-6 rejection (`daily_loss_cap_reached`, `projected_loss_exceeds_daily_cap`, `loss_exposure_unknown`) is committed with `qty = None`, `reference_price = None` (and the ledger refuses a rejected record that carries them). The row cannot say what size was refused.
 - **F2 — No reference provenance.** Only the price survives; not when it was observed, and not how old it was at planning time.
@@ -4067,7 +4137,7 @@ It follows the precedent already set for `thesis["evidence"]`: stored in `thesis
 **As-built: the serialization boundary (`planning-proposal-serialization-core`).** The shape above is implemented once, in `backend/app/trade_planning/proposal.py`, as a pure module (standard library plus `plan.py`; no clock, I/O, logging, Event Bus or database). It *carries* the landed `TradePlan` values; it never recalculates size, planned risk, R or authorization, and it adds no freshness threshold.
 
 ```text
- DATA FLOW  (solid = built here; "P2" = future consumer, not wired)
+ DATA FLOW  (serialization core reused; P2 consumers are now wired)
 
    Opportunity ─┐
    notional    ─┼─► plan_entry ─► TradePlan ──► serialize_proposal ──► proposal dict ──► [P2] TradeDecisionRecord.proposal
@@ -4147,7 +4217,7 @@ The migration preserves valid-input behavior and has one call path; Q3/Q5 and in
 
 | Step | File(s) | Change | Verification before moving on |
 |---|---|---|---|
-| 1 | `backend/app/trade_planning/__init__.py`, `plan.py`, `planner.py` (new); `proposal.py` (new, `planning-proposal-serialization-core`) | Pure `TradePlan`, `PlanningRefusal`, `ReferenceObservation`, `plan_entry`; plus the strict `serialize_proposal`/`validate_proposal`/`proposals_equal` boundary P2 step 5 consumes. Not yet called. | Unit tests including a differential test against a **test-local copy of the legacy rule-5 formula** over a price/stop/direction grid (the copy lives only in the test, so it cannot become a second authority). |
+| 1 | `backend/app/trade_planning/__init__.py`, `plan.py`, `planner.py` (new); `proposal.py` (new, `planning-proposal-serialization-core`) | Pure `TradePlan`, `PlanningRefusal`, `ReferenceObservation`, `plan_entry`; plus the strict `serialize_proposal`/`validate_proposal`/`proposals_equal` boundary. Built in earlier deliveries and connected by P2; reused without recalculating plan values. | Unit tests including a differential test against a **test-local copy of the legacy rule-5 formula** over a price/stop/direction grid (the copy lives only in the test, so it cannot become a second authority). |
 | 2 | `backend/app/governor/reference_price.py` | Store price, local observed time and source exchange time; add `get_observation()`; `get()` unchanged. | Tracker tests; existing callers untouched. |
 | 3 | `backend/app/governor/rules.py` | `AuthorizationContext` carries `plan`/`planning_refusal` instead of `reference_price`; rule 5 only surfaces the refusal; rule 6 uses `plan.planned_risk_usd`; the division and geometry code are removed here in the same step. | `test_governor_rules.py` updated; existing reason precedence plus the new target refusal; planned risk follows the same candidate-loss equation, with decimal boundary tests. |
 | 4 | `backend/app/governor/engine.py` | Call `plan_entry` once per decision with the already-gathered inputs; build `TradePlanned` from the plan; keep publish order and identity minting exactly. | `test_governor_engine.py`, `test_entry_lifecycle_wiring.py` pass; golden test: `TradePlanned`/`OrderApproved` payloads equal pre-change values for fixed inputs. |
@@ -4160,7 +4230,7 @@ Rollback restores the pre-integration caller and ledger adapter together with ma
 
 Out of this slice by design: opportunity ranking (D4), Decision Engine arbitration (D1), `TradeRequest`/manual origin, the Approval Queue and `ExecutionMode` gate, Kelly or any other sizing, scaling/trailing rules, hold-time enforcement, paper/live venues, a standalone planning subscriber, and the F10 reservation-without-order recovery (a separate follow-up).
 
-#### 6.14.10 Acceptance criteria for the eventual build
+#### 6.14.10 Acceptance criteria for P1/P2
 
 | # | Criterion |
 |---|---|
