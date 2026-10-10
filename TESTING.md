@@ -1,3 +1,27 @@
+<!-- BEGIN DELIVERY SECTION: decision-selection-shadow-core -->
+# TESTING — `decision-selection-shadow-core`
+
+Base: pushed `main` `9413a242503a704315023a179d10137ed90d0546` (C2 present). Python 3.13.16, pytest 8.4.2, backend requirements installed in a fresh virtualenv. Pure core: no PostgreSQL, frontend build or full backend suite is needed or was run. Suites were run serially.
+
+**Focused tests.** From the repository root: `pytest -q backend/tests/test_decision_evidence.py backend/tests/test_candidate_ranking.py backend/tests/test_candidate_selection.py backend/tests/test_decision_core_purity.py backend/tests/test_decision_observation_compat.py` — **123 passed** (24 evidence, 29 ranking, 60 selection, 5 purity, 5 C2-reader compatibility). Adjacent suites re-run after reconciliation with C2: C1 (`test_opportunity_candidate_contract.py`, `_reducer.py`, `_eligibility.py`), C2 (`test_candidate_observation.py`, `test_strategy_evaluation_batches.py`), `test_portfolio_state.py` — **159 passed, 15 skipped** (the skips are PostgreSQL-dependent `test_portfolio_state.py` tests, not run here; unchanged by this delivery).
+
+**Coverage.** Every snapshot comes from the real C1 pipeline (`apply_batch` then `assess_candidates`), and portfolio inputs include a real `build_snapshot` result.
+- Zero, one and many candidates; same-direction strategies on one symbol, opposite directions, several symbols and mixed conflict groups all abstain; confidence, arrival order, candidate-ID order and evidence never pick a winner, and evidence does not change a unique selection.
+- Existing open-position and in-flight exposure (including both on one symbol), exhausted and over-subscribed slots, slot headroom, invalid or missing slot policy.
+- Missing, unavailable, unsynchronized (a newer `captured_at` proves nothing) and other-mode portfolio inputs, all global reasons reported together, a flat real snapshot versus a missing one, and no invented portfolio-age rule.
+- Unconfigured and expired freshness, gated/error/no-opportunity/waiting exclusions, and a later arrival kept out of the captured set (arrival exactly at the cutoff included).
+- Attempted candidates: a lone attempted candidate is not re-proposed, attempts never force a winner from an ambiguous set, unknown IDs are recorded and ignored, `record_attempt` allows one attempt, a new arrival needs a new capture.
+- Determinism: results and audit records are equal across every input ordering and across repeated calls; inputs are not mutated.
+- Evidence: attribution by strategy and version (plus symbol/direction), unknown/future availability and future sample periods excluded and listed, evidence available exactly at the as-of usable, missing provenance, empty samples, synthetic-only evidence and mixed populations reported as gaps, full backtest provenance retained, naive timestamps rejected, UTC normalization.
+- Detached values: frozen results, JSON-safe audit mappings that are fresh on every call, canonical-JSON copies of context and metrics.
+- C2 compatibility: a real `CandidateObservationReader` fed real batches yields snapshots D1 ranks and selects (one candidate selects, a competing batch abstains, an unconfigured reader policy leaves nothing selectable, a batch delivered after the frozen snapshot stays out of the captured set, a newer no-result removes the candidate from the next capture).
+- Purity: an AST scan finds no import outside the standard library and the C1/D1 siblings and no clock, sleep, randomness, `open` or `print`; a subprocess import loads no application service, SQLAlchemy, pydantic or asyncio module; no numeric policy constant exists besides schema versions and the one-attempt limit.
+
+**Documentation checks.** The four new diagrams are plain-ASCII `text` fences; every reason code, function and field in them was cross-checked against the modules.
+
+**Limits.** These tests prove a pure, unwired contract. They show nothing about live Scheduler batches (C2), a coordinator, durable audit or acceptance, Governor or Planning behavior, or restart/concurrency effects; those belong to later tasks. The D4 ranking policy is not tested because none exists.
+<!-- END DELIVERY SECTION: decision-selection-shadow-core -->
+
 <!-- BEGIN DELIVERY SECTION: strategy-evaluation-batch-observation -->
 # TESTING — `strategy-evaluation-batch-observation`
 

@@ -1,3 +1,27 @@
+<!-- BEGIN DELIVERY SECTION: decision-selection-shadow-core -->
+# CHANGES — `decision-selection-shadow-core`
+
+Base: pushed `main` `9413a242503a704315023a179d10137ed90d0546` (`Strategy evaluation batch observation`, i.e. C2 is already on `main`; its CHANGES/TESTING sections and §19 notes were preserved). Implements only D1 from `trading-intelligence-architecture.md` §19.7, following §§19.3–19.4.
+
+**What was added** (new files under `backend/app/trading_intelligence/`, standard library plus the landed C1 modules; no clock, I/O, logging, Event Bus, database, Governor, Portfolio State or order dependency):
+- `decision_evidence.py` — `EvidenceRecord` (strategy/version attribution, population = execution mode, `calibration` vs `synthetic_mechanics` class, `available_at`, configuration ref, context slice, sample period/count, outcome definition, execution venue, backtest run/sweep/data/feature provenance) and `EvidenceSnapshot` with an explicit as-of. Missing provenance stays `None` and is reported by `missing_fields`; backtest provenance is accepted only on the backtest population; synthetic mechanics can never be live or calibration evidence. No sufficiency rule exists.
+- `candidate_ranking.py` — `rank_candidates(snapshot, evidence, *, cutoff, ranking_policy=None) -> RankingResult` over a C1 `EligibilitySnapshot`. The unranked adapter returns `unranked` (`no_approved_ranking_policy`); naming a policy returns `unavailable`. It records candidate IDs, adapter/policy versions, eligibility/evidence/cutoff times, direction/symbol/timeframe groups, per-candidate attributed evidence with gaps, excluded assessments (C1 reasons or `received_after_cutoff`) and excluded or unattributed evidence (unknown availability, unavailable at the as-of, sample period after the as-of). `ranked_order` is always empty; candidate-ID sorting is reproducibility only.
+- `candidate_selection.py` — `select(...) -> SelectionResult` with `unique_candidate_v1` only (explicit policy name, no default), explicit `PortfolioInput` (availability and ledger synchronization stated separately from `captured_at`; `from_snapshot` copies a real Portfolio State snapshot and requires explicit readiness), explicit `SlotPolicy`, attempted IDs and `audit_id`. It selects only when exactly one candidate survives globally after exposure and slot checks; otherwise it abstains with reasons, exclusions and conflict groups. `record_attempt` limits each candidate to one attempt; an attempt never resolves an ambiguous set and later arrivals never enter the captured set. Results are frozen and expose `to_audit_record()` fresh JSON-safe mappings; `shadow` is always true and `authorizes_trade` always false.
+- Five test files plus one shared builder module, 123 new tests (see `TESTING.md`). `test_decision_observation_compat.py` drives D1 from the landed C2 `CandidateObservationReader` snapshots; no C2 file was modified.
+
+**Documentation updated:** `docs/architecture/trading-intelligence-architecture.md` (§19 status line, D1 as-built notes with data-flow and internal-flow diagrams in §19.3 and §19.4, §19.7 D1 status), `docs/roadmap/phase-roadmap.md` (sequence note), and this file and `TESTING.md`.
+
+**Decision number:** none assigned or needed; the behavior is covered by decision #196 and its choices are implementation details within it. No decision log or index file is changed. Recheck the canonical log tail at finalization.
+
+**Implementation choices for later tasks to confirm:**
+- Slots count open positions plus in-flight entries against an explicit maximum, matching Governor rule 4; the maximum has no default.
+- Ambiguity is judged before attempted IDs are removed, so a rejection cannot force a winner.
+- The capture cutoff is `received_at <= cutoff_at`; a candidate received later is a later arrival.
+- Comparability groups are only labelled `unassessed`; no comparability rule is invented.
+
+**Not done, by design:** D4 ranking policy and evidence sufficiency, evidence queries against Performance Intelligence, D2 journal/acceptance tables and migrations, the coordinator and any retry worker, event publishers or subscribers, API/UI wiring, Governor or Planning calls, freshness values and the entry cutover. Nothing in the Scheduler, C2, lifecycle or event files was touched; D1 does not import the C2 reader.
+<!-- END DELIVERY SECTION: decision-selection-shadow-core -->
+
 <!-- BEGIN DELIVERY SECTION: strategy-evaluation-batch-observation -->
 # CHANGES — `strategy-evaluation-batch-observation`
 

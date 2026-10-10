@@ -1013,7 +1013,7 @@ The one place the suggestion as literally written wasn't taken: unconditional "G
 
 ## 19. Opportunity, Decision, Planning and Governor implementation contract
 
-**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path. **Build status:** the pure P1 planner and the pure C1 candidate core are built; C1 is now connected observation-only by C2 (`strategy-evaluation-batch-observation`, §19.2 as-built notes and §19.7): the Scheduler publishes `StrategyEvaluationCompleted` and an observation-only reader reduces it. No entry path, ranking, selection, planning integration or cutover uses any of it (P1 remains unconnected).
+**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path. **Build status:** the pure P1 planner and the pure C1 candidate core are built; C1 is now connected observation-only by C2 (`strategy-evaluation-batch-observation`, §19.2 as-built notes and §19.7): the Scheduler publishes `StrategyEvaluationCompleted` and an observation-only reader reduces it. The pure D1 ranking/selection core (`decision-selection-shadow-core`, §19.3–§19.4) is built but not connected. No entry path, planning integration or cutover uses any of it (P1 remains unconnected); D4 (ranking policy), D2 (selection persistence) and entry cutover are unbuilt.
 
 ### 19.1 Existing foundations and responsibility boundaries
 
@@ -1248,6 +1248,44 @@ flowchart TD
     T --> A
 ```
 
+**D1 ranking status (`decision-selection-shadow-core`).** The pure ranking boundary and the honest unranked adapter are **built but not connected**. `decision_evidence.py` holds `EvidenceRecord`/`EvidenceSnapshot`; `candidate_ranking.py` holds `rank_candidates(snapshot, evidence, *, cutoff, ranking_policy=None) -> RankingResult`. With no policy the status is `unranked`; naming any policy gives `unavailable` (`ranking_policy_not_implemented:<id>@<version>`) because none is approved or implemented. `ranked_order` is always empty: candidates are listed sorted by `candidate_id` for reproducibility only, and no score, weight, confidence threshold, sample minimum, agreement bonus or Kelly estimate exists in the code.
+
+- **Captured set.** Only C1-eligible assessments become candidates. Eligible candidates received after the explicit `SnapshotCutoff.cutoff_at` are later arrivals and are excluded (`capture_cutoff` / `received_after_cutoff`); the Opportunity Cache is never read and no strategy signal is recalculated.
+- **Evidence attribution.** A record attaches to a candidate only for the same strategy *and* version (and the symbol/direction when the record names them). Each record keeps configuration, context slice, sample period and count, outcome definition, execution mode and venue, and backtest run/sweep/data/feature provenance. Missing provenance, empty samples, synthetic-mechanics evidence and mixed populations are reported as explicit gaps; populations are labelled, never blended. A record whose `available_at` is unknown or after the evidence as-of, or whose sample period ends after it, is excluded from every candidate and listed, so future outcomes cannot influence a result. Backtest provenance is accepted only on the backtest population; synthetic mechanics evidence is never calibration evidence. The core performs no database query.
+- **Descriptive groups.** Direction groups, per-symbol groups (`single`, `same_direction`, `opposite_direction`) and per-timeframe comparability groups (always `unassessed`: no approved policy defines comparability).
+
+```text
+C1 (built)                      D1 RANKING (built, not connected)                       LATER
+----------                      -------------------------------------                   -----
+CandidateState                  decision_evidence.py
+  assess_candidates                EvidenceRecord (provenance, population, class)
+  -> EligibilitySnapshot ----+     EvidenceSnapshot (explicit as_of)  <--- caller-supplied
+                             |                                              evidence (D4 / queries,
+explicit SnapshotCutoff -----+--> candidate_ranking.py                      not built)
+explicit ranking policy ---------   rank_candidates ---> RankingResult ---> D1 select (below)
+  (None today)                       (no clock, no database, no order)       D2 journal (unbuilt)
+```
+
+```text
+rank_candidates(snapshot, evidence, cutoff, policy)
+  |
+  +- per C1 assessment
+  |     +- not eligible ............................ excluded  stage=eligibility (C1 reasons kept)
+  |     +- eligible, received_at > cutoff_at ....... excluded  stage=capture_cutoff
+  |     +- otherwise ............................... captured candidate (sorted by candidate_id)
+  |
+  +- groups: direction / symbol relation / timeframe (unassessed)
+  +- evidence, per candidate
+  |     +- strategy+version (+symbol/direction when named) must match
+  |     +- available_at unknown | after as_of | sample ends after as_of .. excluded, listed
+  |     +- usable records attributed; gaps: none attributed, only synthetic mechanics,
+  |        mixed populations, missing provenance, empty sample
+  |
+  +- policy None ........ status=unranked    (no_approved_ranking_policy)
+     policy named ....... status=unavailable (ranking_policy_not_implemented)
+     ranked_order is always empty
+```
+
 ### 19.4 Decision: provisional selection, abstention and feedback
 
 `select(ranking_result, portfolio_snapshot, attempted_candidate_ids) -> SelectionResult` is pure. Outputs are `selected(candidate_id)` or `abstained(reasons)`, together with the considered IDs, exclusions, conflict groups, ranking/policy versions, captured input times and an audit ID. `OpportunitySelected` is already an enum name but has no built payload/producer contract; the eventual wire schema must follow this result and must not masquerade as authorization.
@@ -1282,6 +1320,47 @@ flowchart TD
     G -->|Ordinary rejection| N["Mark attempted; bounded reconsideration"]
     N --> R
     G -->|Unavailable or persistence failure| A
+```
+
+**D1 selection status (`decision-selection-shadow-core`).** `candidate_selection.py` implements `select(ranking_result, portfolio, attempted_candidate_ids, *, selection_policy, slot_policy, audit_id) -> SelectionResult` with `unique_candidate_v1` as the only policy (**built but not connected**; the policy must be named explicitly, there is no default). It reads no clock and database, publishes no event, mints no trade ID and cannot authorize anything (`shadow` is always true, `authorizes_trade` always false).
+
+- **Policy.** After C1 eligibility and the capture cutoff, symbols with an open position or in-flight entry are excluded, then the slot check applies (open + in-flight entries against the explicit maximum, the Governor rule-4 reading). A candidate is selected only when exactly one remains globally. Same-direction strategies on one symbol, opposite directions, several symbols or several survivors abstain with `multiple_surviving_candidates` plus conflict groups. Confidence, arrival order, `received_at`, candidate-ID order, ranking status and evidence are never read for the decision.
+- **Portfolio inputs are explicit.** `PortfolioInput` states `available` and `ledger_synchronized` separately from `captured_at`, so a freshly stamped `as_of` does not prove synchronization. A missing, unavailable, unsynchronized or other-mode capture, or a missing `SlotPolicy`, abstains. `PortfolioInput.from_snapshot(snapshot, *, ledger_synchronized)` copies the counted exposures of a real Portfolio State `PortfolioSnapshot` and has no default for readiness. No buying-power, correlation, portfolio-age or risk rule is invented, and there is no numeric default for the slot maximum.
+- **Bounded feedback.** Ambiguity is judged on the captured set before attempted IDs are removed, so a rejection can never turn an ambiguous set into a forced winner (`attempted_candidates_do_not_resolve_ambiguity`); an attempted lone survivor is not proposed again (`candidate_already_attempted`). `record_attempt` allows one attempt per candidate. Later arrivals enter only through a new capture. No retry worker exists.
+- **Result.** `SelectionResult` retains considered IDs, exclusions with stage and reasons, conflict groups, the selected ID or abstention reasons, ranking and selection policy versions, eligibility/evidence/portfolio times, the snapshot cutoff, the caller-supplied `audit_id` and attempted IDs, and `to_audit_record()` returns a fresh JSON-safe mapping. D2 persistence (`selection_attempts`, `candidate_acceptances`), the coordinator and entry cutover are unbuilt.
+
+```text
+RankingResult (captured set) ---+
+PortfolioInput (explicit) ------+--> candidate_selection.py
+SlotPolicy (explicit) ----------+      select(..., selection_policy="unique_candidate_v1", audit_id)
+attempted IDs (feedback) -------+        |
+audit_id (explicit) ------------+        v
+                                    SelectionResult (selected | abstained, shadow only)
+                                        |
+                                        +--> D2 selection journal (unbuilt)
+                                        +--> coordinator / Planning / Governor (unbuilt)
+Portfolio State ---> PortfolioInput.from_snapshot(snapshot, ledger_synchronized=...)
+```
+
+```text
+select(ranking, portfolio, attempted, policy, slots, audit_id)
+  |
+  +- portfolio None ................................ abstain portfolio_state_missing
+  +- not available / not ledger_synchronized ........ abstain portfolio_state_unavailable | portfolio_ledger_not_synchronized
+  +- mode differs from the ranking's mode ........... abstain portfolio_mode_mismatch
+  +- slot policy None ............................... abstain slot_policy_unconfigured
+  |    (every failing precondition is reported together)
+  +- captured candidates
+  |     +- symbol has an open position / in-flight entry ... excluded  stage=exposure
+  |     +- survivors exist and open+in-flight >= maximum ... excluded  stage=slots, abstain no_available_slots
+  |
+  +- survivors (before attempted IDs are applied)
+        +- none ........................................... abstain no_eligible_candidates | all_candidates_excluded
+        +- more than one .................................. abstain multiple_surviving_candidates
+        |                                                   (+ opposite_directions, conflict groups;
+        |                                                    attempts never resolve it)
+        +- exactly one, already attempted ................. abstain candidate_already_attempted
+        +- exactly one, not attempted ..................... selected(candidate_id)
 ```
 
 ### 19.5 Planning: first implementation and validation precedence
@@ -1350,7 +1429,9 @@ P1/C1 and later the pure D1 core can be developed independently, but shared docu
 
 **Current C1 status:** built but not connected. `candidate_contract.py`, `candidate_state.py` and `candidate_eligibility.py` implement the C1 row (§19.2 as-built notes and diagrams above); focused pure tests pass, including long/short and timezone-equivalent identities, duplicate/conflict redelivery, newer invalidation, out-of-order batches, reset-boundary delayed delivery, version retirement, source-age boundaries and missing policy. The Scheduler, Event Bus, Opportunity Cache/view, `AuthorizerStub`, database and order path are unchanged. C2 must produce complete batches (including explicit interval start/close and unavailable-prerequisite reporting), call the reducer with explicit receive times and reset events, and resolve the Scheduler input-caching question in §19.2; D1 may consume `EligibilitySnapshot` in shadow only. Entry cutover (I1) remains unbuilt.
 
-**Current C2 status (`strategy-evaluation-batch-observation`):** built observation-only (§19.2 C2 notes and diagrams). The Scheduler publishes `StrategyEvaluationCompleted`; `CandidateObservationReader` reduces it with the C1 core, resets on start, session change and streaming-source change, and serves detached snapshots. Existing `OpportunityCreated` consumers and the `AuthorizerStub` path are unchanged for coherent inputs. D1 (pure ranking/selection modules, separate session) and I1 (entry cutover) remain unbuilt and independent; nothing here ranks, selects, plans, reserves or orders.
+**Current C2 status (`strategy-evaluation-batch-observation`):** built observation-only (§19.2 C2 notes and diagrams). The Scheduler publishes `StrategyEvaluationCompleted`; `CandidateObservationReader` reduces it with the C1 core, resets on start, session change and streaming-source change, and serves detached snapshots. Existing `OpportunityCreated` consumers and the `AuthorizerStub` path are unchanged for coherent inputs. D1 (pure ranking/selection modules, `decision-selection-shadow-core`) is a separate, unconnected delivery and I1 (entry cutover) remains unbuilt; nothing here ranks, selects, plans, reserves or orders.
+
+**Current D1 status:** built but not connected. `decision_evidence.py`, `candidate_ranking.py` and `candidate_selection.py` implement the D1 row (§19.3 and §19.4 as-built notes and diagrams above); focused pure tests pass on real C1-produced snapshots and a real Portfolio State snapshot, covering zero/one/many candidates, same- and opposite-direction competition, existing position and in-flight exposure, exhausted slots, unavailable/unsynchronized/mismatched portfolio inputs, unconfigured freshness, attempted candidates, captured-set determinism, no confidence/arrival/ID winner, evidence provenance and as-of handling, detached values and purity. The `ObservationSnapshot.eligibility` served by the C2 reader is the same `EligibilitySnapshot` D1 consumes and its `arrival_sequence` maps onto `SnapshotCutoff`; a compatibility test drives D1 from a real reader, but nothing connects them in production. The Scheduler, Event Bus, Governor, ledger, database and order path are unchanged. D4 (ranking policy and evidence sufficiency), D2 (selection persistence), G1 and I1 remain unbuilt.
 
 **Reusable task instruction:** “Implement only `<ID and slug>` from trading-intelligence-architecture.md §19.7 against fresh main. Inspect AGENTS.md and the listed contracts first; reuse landed prerequisites. Complete code, focused tests, relevant PostgreSQL checks and canonical docs together. Do not activate later phases, invent D4 weights/freshness values, or implement reserved Governor branches. Report an actual unresolved product choice rather than guessing. Use the delivery slug during work and assign a decision number only if needed at final integration. Deliver complete changed files at project-root-relative paths in a ZIP; exclude packaging helpers and patches.”
 
