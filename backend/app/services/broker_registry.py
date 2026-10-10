@@ -33,12 +33,15 @@ A third, separately-typed role was added for the Execution Engine
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from app.broker_adapters.base import MarketDataProvider
 from app.broker_adapters.order_venue import OrderVenue
 from app.core.config import get_settings
 from app.services.tick_ingest import BridgeState, TickBridgeDiagnostics, TickIngestBridge
+
+logger = logging.getLogger(__name__)
 
 _streaming_provider: MarketDataProvider | None = None
 _streaming_bridge: TickIngestBridge | None = None
@@ -48,6 +51,34 @@ _streaming_bridge: TickIngestBridge | None = None
 _retired_bridges: list[TickIngestBridge] = []
 _historical_provider: MarketDataProvider | None = None
 _protected_feed_wake: Callable[[], None] | None = None
+
+
+# Synchronous, nonblocking observers told when the streaming SOURCE changes
+# (provider or bridge identity replaced, or cleared). Added by C2
+# (strategy-evaluation-batch-observation) for the candidate observation
+# reader's reset boundary; there was no multi-listener hook before — the
+# protected-feed wake below is a single-owner signal and is not reused.
+_streaming_ownership_listeners: list[Callable[[str], None]] = []
+
+
+def register_streaming_ownership_listener(callback: Callable[[str], None]) -> None:
+    if callback not in _streaming_ownership_listeners:
+        _streaming_ownership_listeners.append(callback)
+
+
+def unregister_streaming_ownership_listener(callback: Callable[[str], None]) -> None:
+    try:
+        _streaming_ownership_listeners.remove(callback)
+    except ValueError:
+        pass
+
+
+def _notify_streaming_ownership_changed(kind: str) -> None:
+    for callback in list(_streaming_ownership_listeners):
+        try:
+            callback(kind)
+        except Exception:  # noqa: BLE001 — an observer must never break provider switching
+            logger.exception("streaming ownership listener failed (%s)", kind)
 
 
 def register_protected_feed_wake(callback: Callable[[], None]) -> None:
@@ -141,8 +172,11 @@ async def take_over_streaming(
         if _streaming_bridge is not None and _streaming_bridge is not bridge:
             _retire_bridge(_streaming_bridge)
         await settle_retired_bridges()
+        source_changed = _streaming_provider is not new_provider or _streaming_bridge is not bridge
         _streaming_provider = new_provider
         _streaming_bridge = bridge
+        if source_changed:
+            _notify_streaming_ownership_changed("take_over")
         request_protected_feed_reconcile()
     except BaseException:
         # The caller may have constructed an admitting bridge before this
@@ -158,10 +192,13 @@ def clear_streaming_provider() -> None:
     bridge is shut off immediately; its task cleanup is awaited at the next
     lifecycle boundary (settle_retired_bridges())."""
     global _streaming_provider, _streaming_bridge
+    had_source = _streaming_provider is not None or _streaming_bridge is not None
     if _streaming_bridge is not None:
         _retire_bridge(_streaming_bridge)
     _streaming_provider = None
     _streaming_bridge = None
+    if had_source:
+        _notify_streaming_ownership_changed("cleared")
     request_protected_feed_reconcile()
 
 
@@ -239,3 +276,4 @@ def clear_all() -> None:
     clear_execution_venue()
     global _protected_feed_wake
     _protected_feed_wake = None
+    _streaming_ownership_listeners.clear()

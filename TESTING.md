@@ -1,3 +1,25 @@
+<!-- BEGIN DELIVERY SECTION: strategy-evaluation-batch-observation -->
+# TESTING — `strategy-evaluation-batch-observation`
+
+Base: GitHub `main` `e7c5e55abaff58845426ca74bf2b488f106af908`. Local PostgreSQL 16 `trading_workspace` (`alembic upgrade head`, revision 0017); focused suites run serially, no full backend suite. No real provider connection.
+
+Commands (from `backend/`) and results:
+- `pytest -q tests/test_opportunity_candidate_contract.py tests/test_opportunity_candidate_eligibility.py tests/test_opportunity_candidate_reducer.py` — 95 passed (C1 unchanged).
+- `pytest -q tests/test_strategy_scheduler.py tests/test_strategy_evaluation_batches.py` — 60 passed (30 existing, 30 new).
+- `pytest -q tests/test_event_bus.py tests/test_execution_event_schemas.py tests/test_gate_conditions.py` — 29 passed.
+- `pytest -q tests/test_candidate_observation.py tests/test_strategy_evaluation_batch_integration.py` — 38 passed (34 reader/lifecycle, 4 real-engine/real-lifespan).
+- `pytest -q tests/test_broker_registry.py tests/test_tick_bridge_retirement.py tests/test_protected_feed_event_wake.py tests/test_finnhub_reconnect.py tests/test_provider_subscription_status.py tests/test_tick_bridge_diagnostics.py` — 109 passed.
+- `pytest -q tests/test_main_execution_pipeline.py` — 8 passed; `tests/test_scanner_observation_lifespan.py tests/test_outcome_recorder_lifespan_recovery.py` — 29 passed; `tests/test_opportunity_cache.py tests/test_websocket_channels.py` — 18 passed; `tests/test_backtest_runner.py tests/test_backtest_runner_regression.py tests/test_backtest_routes.py` — 39 passed.
+- `pytest -q tests/test_candle_to_simulated_trade_acceptance.py tests/test_simulated_mvp_acceptance.py` — 35 passed.
+- Existing acceptance commands on fresh migrated disposable databases: `python scripts/candle_to_simulated_trade_acceptance.py --database <db>` — `RESULT: PASS — 43 milestones`; `python scripts/simulated_mvp_acceptance.py --database <db>` — `RESULT: PASS — 88 milestones`. Both run the real Scheduler → AuthorizerStub → execution path with the reader code present in the tree (the acceptance harness does not start the lifespan reader; the lifespan-started reader is covered by the integration tests).
+
+**Coverage:** every disposition (opportunity, no_opportunity, gated, error incl. gate-check and evaluate failures, invalid opportunity contents); untriggered strategies absent; missing features/context and feature/state candle or timeframe mismatch (unit and real engines); source intervals for 1m/5m/1h, session-trailing hour, half day, pre-market/after-hours and unavailable reasons; distinct timestamps; identical vs changed re-evaluation; publish failure isolation; complete-batch visibility (no `await` in the handler, conflict withholds the whole batch, concurrent snapshot subscriber sees 0 or all members); duplicate, conflicting (incl. completion-time-only), stale and out-of-order delivery; newer none/gate/error and unavailable invalidation; invalid envelope/payload; mode isolation and separate replay reader; restart, session-change (incl. late last candle and lunch/power-hour non-change) and provider-takeover/clear reset boundaries with delayed/straddling batches; detached immutable snapshots and arrival sequence; no publish call or authorization/order/portfolio/planning import (AST and clean-interpreter check); real lifespan start/expose/stop and listener cleanup; unchanged `OpportunityCache` consumer and no order/selection events on the bus.
+
+**Sensitivity (temporary mutations, restored, not delivered):** removing the `candle_ts` coherence check failed `test_features_for_a_newer_candle_are_never_mixed_with_an_older_market_state`; removing the original-batch reuse failed `test_identical_reevaluation_republishes_the_original_batch_completion_time`.
+
+**Not run:** the full backend suite; frontend (untouched); any real-provider or live-feed check.
+<!-- END DELIVERY SECTION: strategy-evaluation-batch-observation -->
+
 <!-- BEGIN DELIVERY SECTION: planning-proposal-serialization-core -->
 # TESTING — `planning-proposal-serialization-core`
 

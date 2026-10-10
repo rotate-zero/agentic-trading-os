@@ -162,15 +162,53 @@ exists for either yet.** No v1 strategy declares one (all 7 use
 the registry but logged as a loud warning at construction time — it will
 never actually be called — rather than silently pretending support that
 isn't there.
+
+**Completed-evaluation batches (C2, `strategy-evaluation-batch-observation`,
+trading-intelligence-architecture.md §19.2).** After the whole strategy pass
+for one MarketStateChanged trigger finishes, this module publishes ONE
+`StrategyEvaluationCompleted` (normal lane, this Scheduler its sole producer):
+every strategy version the candle triggered with a terminal disposition —
+`opportunity` (complete contents carried), `no_opportunity`, `gated` or
+`error`. A strategy whose `evaluate()` or gate check raised is recorded as
+`error` (machine code only, never exception text) and the remaining strategies
+still run. A strategy this trigger did not call never appears as evaluated.
+`OpportunityCreated` is still published inline, exactly as before, for the
+existing consumers; the batch is additive and is published last.
+
+Coherence, found by reading the cache and the bus ordering rather than assumed:
+`_latest_features` keeps only the LATEST FeatureSet per `(symbol, timeframe)`,
+and MarketStateEngine publishes `MarketStateChanged` from a debounced worker
+that can run after a newer `FeaturesUpdated`. Before this change the Scheduler
+would then hand `evaluate()` a MarketState for candle N with a FeatureSet for
+candle N+1. Now the FeatureSet's `timeframe` and `candle_ts` must equal the
+MarketState's; otherwise NO strategy is evaluated, nothing is published as
+`OpportunityCreated`, and an unavailable batch (prerequisite `features`) is
+published instead. Missing features or context are reported the same way
+(prerequisites `features` / `context`) where they were previously a silent
+skip. ContextChanged carries no candle timestamp, so context is checked for
+availability only — a known limit, not a coherence guarantee.
+
+The batch needs an explicit source interval, derived with the producer and
+MarketClock conventions (`candidate_batch_wire.derive_source_interval`). When
+it cannot be derived (unverified calendar year, no session, unsupported
+timeframe) no batch is published, a warning is logged, and the existing
+OpportunityCreated behavior is left exactly as it was — C2 is observation-only
+and never withholds a legacy opportunity because of its own bookkeeping.
+Re-evaluating an already-published candle with identical dispositions republishes
+the ORIGINAL batch (original `completed_at`) so a consumer sees an identical
+redelivery; different contents publish a new batch and the consumer reports the
+conflict. Completion time is never recomputed to make a repeat look new.
 """
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
 from app.context_engine.engine import get_context_engine
+from app.core.market_clock import MarketClock, get_market_clock
 from app.event_bus.bus import EventBus, get_event_bus
 from app.event_bus.events import make_envelope
 from app.schemas.events.context import ContextChanged
@@ -187,7 +225,22 @@ from app.strategy_engine import (
     vwap_strategy,
 )
 from app.strategy_engine.base_strategy import Strategy
+from app.schemas.events.strategy_evaluation import StrategyEvaluationCompleted
 from app.strategy_engine.gate_conditions import gate_conditions_satisfied, validate_gate_conditions
+from app.trading_intelligence.candidate_batch_wire import (
+    SourceIntervalUnavailable,
+    as_utc,
+    batch_to_payload,
+    derive_source_interval,
+    opportunity_content_from,
+)
+from app.trading_intelligence.candidate_contract import (
+    CandidateContractError,
+    EvaluationBatch,
+    ExecutionMode,
+    StrategyDisposition,
+    UnavailablePrerequisite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,8 +283,19 @@ class StrategyScheduler:
     below is what `main.py` actually calls, building the real 7-strategy
     registry."""
 
-    def __init__(self, bus: EventBus, strategies: list[Strategy] | None = None) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        strategies: list[Strategy] | None = None,
+        *,
+        mode: ExecutionMode = "simulated",
+        now: Callable[[], datetime] | None = None,
+        market_clock: MarketClock | None = None,
+    ) -> None:
         self._bus = bus
+        self._mode: ExecutionMode = mode
+        self._now = now if now is not None else (lambda: datetime.now(timezone.utc))
+        self._market_clock = market_clock if market_clock is not None else get_market_clock()
         self._strategies = (
             strategies if strategies is not None else default_registry(datetime.now(timezone.utc))
         )
@@ -267,6 +331,9 @@ class StrategyScheduler:
         # actually watches. See module docstring for why this is cached
         # rather than reconstructed from FeatureEngine.get_snapshot().
         self._latest_features: dict[tuple[str, str], FeatureSet] = {}
+        # (symbol, timeframe) -> last published batch payload, so an identical
+        # re-evaluation of the same candle republishes the ORIGINAL batch.
+        self._last_batch: dict[tuple[str, str], StrategyEvaluationCompleted] = {}
 
     def start(self) -> None:
         self._bus.subscribe(EventType.FEATURES_UPDATED, self._on_features_updated)
@@ -311,25 +378,49 @@ class StrategyScheduler:
 
         features = self._latest_features.get((symbol, timeframe))
         context = self._read_context(symbol)
-        if features is None or context is None:
-            # Honest absence, not a fabricated call. `features` absent
-            # means no FeaturesUpdated for this exact (symbol, timeframe)
-            # has been seen yet (shouldn't happen in steady state, since
-            # MarketStateChanged is itself derived from one — but a
-            # process that starts mid-session with a warm MarketState
-            # cache and a cold FeatureSet cache is a real, if narrow,
-            # startup-ordering case). `context` absent means
-            # ContextEngine hasn't evaluated this symbol yet — see
-            # `_read_context`'s own docstring.
-            logger.debug(
-                "StrategyScheduler skipping %s @ %s — %s not available",
+
+        # Prerequisites: honest absence or incoherence is reported, never
+        # papered over. See module docstring (coherence).
+        unavailable: list[UnavailablePrerequisite] = []
+        if features is None:
+            unavailable.append(UnavailablePrerequisite("features", "features_unavailable"))
+        elif features.timeframe != market_state.timeframe:
+            unavailable.append(UnavailablePrerequisite("features", "timeframe_mismatch"))
+        elif as_utc(features.candle_ts) != as_utc(market_state.candle_ts):
+            unavailable.append(UnavailablePrerequisite("features", "candle_ts_mismatch"))
+        if context is None:
+            # `context` absent means ContextEngine hasn't evaluated this symbol
+            # yet — see `_read_context`'s own docstring.
+            unavailable.append(UnavailablePrerequisite("context", "context_unavailable"))
+
+        try:
+            interval = derive_source_interval(timeframe, market_state.candle_ts, self._market_clock)
+        except SourceIntervalUnavailable as exc:
+            interval = None
+            logger.warning(
+                "StrategyScheduler: no source interval for %s @ %s candle_ts=%s (%s) — "
+                "no evaluation batch published; OpportunityCreated behavior unchanged",
                 symbol,
                 timeframe,
-                "features" if features is None else "context",
+                market_state.candle_ts,
+                exc.reason,
             )
-            return
 
+        if unavailable:
+            logger.debug(
+                "StrategyScheduler skipping %s @ %s — unavailable: %s",
+                symbol,
+                timeframe,
+                ", ".join(f"{p.name}:{p.reason}" for p in unavailable),
+            )
+            if interval is not None:
+                await self._publish_batch(symbol, market_state, interval, (), tuple(unavailable))
+            return
+        assert features is not None and context is not None
+
+        dispositions: list[StrategyDisposition] = []
         for strategy in strategies:
+            version = strategy.config.version
             # gate_conditions (§2b, decision #117) — evaluated centrally,
             # BEFORE evaluate() is even called, per §2b's own text. Own
             # try/except, isolated from evaluate()'s below, so a bug in
@@ -347,6 +438,9 @@ class StrategyScheduler:
                         strategy.config.gate_conditions,
                         market_state.candle_ts,
                     )
+                    dispositions.append(
+                        StrategyDisposition(strategy.name, version, "gated", reason="gate_conditions_not_satisfied")
+                    )
                     continue
             except Exception:  # noqa: BLE001 — a gate-check bug must not stop the rest either
                 logger.exception(
@@ -355,6 +449,7 @@ class StrategyScheduler:
                     strategy.name,
                     symbol,
                 )
+                dispositions.append(StrategyDisposition(strategy.name, version, "error", reason="gate_check_failed"))
                 continue
 
             try:
@@ -366,19 +461,76 @@ class StrategyScheduler:
                     strategy.name,
                     symbol,
                 )
+                dispositions.append(StrategyDisposition(strategy.name, version, "error", reason="evaluate_failed"))
                 continue
 
-            if opportunity is not None:
-                await self._bus.publish(
-                    make_envelope(EventType.OPPORTUNITY_CREATED, opportunity, symbol=symbol)
-                )
-                logger.info(
-                    "OpportunityCreated: %s %s %s confidence=%.2f",
+            if opportunity is None:
+                dispositions.append(StrategyDisposition(strategy.name, version, "no_opportunity"))
+                continue
+
+            await self._bus.publish(
+                make_envelope(EventType.OPPORTUNITY_CREATED, opportunity, symbol=symbol)
+            )
+            logger.info(
+                "OpportunityCreated: %s %s %s confidence=%.2f",
+                strategy.name,
+                symbol,
+                opportunity.direction,
+                opportunity.confidence,
+            )
+            try:
+                content = opportunity_content_from(opportunity, strategy.name, version)
+            except CandidateContractError:
+                logger.warning(
+                    "StrategyScheduler: %s's opportunity for %s is not a valid candidate content — "
+                    "recorded as an error disposition (the OpportunityCreated above is unchanged)",
                     strategy.name,
                     symbol,
-                    opportunity.direction,
-                    opportunity.confidence,
                 )
+                dispositions.append(StrategyDisposition(strategy.name, version, "error", reason="opportunity_content_invalid"))
+                continue
+            dispositions.append(StrategyDisposition(strategy.name, version, "opportunity", opportunity=content))
+
+        if interval is not None:
+            await self._publish_batch(symbol, market_state, interval, tuple(dispositions), ())
+
+    async def _publish_batch(
+        self,
+        symbol: str,
+        market_state: MarketState,
+        interval: tuple[datetime, datetime],
+        dispositions: tuple[StrategyDisposition, ...],
+        unavailable: tuple[UnavailablePrerequisite, ...],
+    ) -> None:
+        """Publish one completed batch. Never raises: C2 observation must not
+        be able to disturb the legacy OpportunityCreated path or other triggers."""
+        try:
+            batch = EvaluationBatch(
+                symbol=symbol,
+                trigger_timeframe=market_state.timeframe,
+                mode=self._mode,
+                source_candle_ts=as_utc(market_state.candle_ts),
+                source_interval_start=interval[0],
+                source_interval_close=interval[1],
+                completed_at=self._now(),
+                dispositions=dispositions,
+                unavailable_prerequisites=unavailable,
+            )
+            payload = batch_to_payload(batch)
+            key = (symbol, market_state.timeframe)
+            previous = self._last_batch.get(key)
+            if previous is not None and previous.model_copy(update={"completed_at": payload.completed_at}) == payload:
+                payload = previous  # identical re-evaluation: original completed_at, not a fresh one
+            await self._bus.publish(
+                make_envelope(EventType.STRATEGY_EVALUATION_COMPLETED, payload, symbol=symbol)
+            )
+            self._last_batch[key] = payload
+        except Exception:  # noqa: BLE001 — observation bookkeeping must not break evaluation
+            logger.exception(
+                "StrategyScheduler: failed to publish StrategyEvaluationCompleted for %s @ %s",
+                symbol,
+                market_state.timeframe,
+            )
 
     # --- ContextChanged reconstruction (see module docstring) -----------
 
@@ -404,5 +556,9 @@ _strategy_scheduler: StrategyScheduler | None = None
 def get_strategy_scheduler(bus: EventBus | None = None) -> StrategyScheduler:
     global _strategy_scheduler
     if _strategy_scheduler is None:
-        _strategy_scheduler = StrategyScheduler(bus if bus is not None else get_event_bus())
+        from app.core.config import get_settings
+
+        _strategy_scheduler = StrategyScheduler(
+            bus if bus is not None else get_event_bus(), mode=get_settings().execution_mode  # type: ignore[arg-type]
+        )
     return _strategy_scheduler

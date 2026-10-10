@@ -186,6 +186,13 @@ class _FakeBus:
     async def publish(self, envelope: EventEnvelope) -> None:
         self.published.append(envelope)
 
+    @property
+    def opportunity_events(self) -> list[EventEnvelope]:
+        """The legacy OpportunityCreated stream only. C2 adds one
+        StrategyEvaluationCompleted per pass on top of it (additive); every
+        pre-C2 assertion below is about the unchanged legacy stream."""
+        return [e for e in self.published if e.event_type == EventType.OPPORTUNITY_CREATED]
+
 
 # --- registry / trigger-grouping (pure) --------------------------------------
 
@@ -294,7 +301,7 @@ async def test_features_updated_never_calls_evaluate_or_publishes(monkeypatch: p
     scheduler = StrategyScheduler(fake_bus, strategies=[stub])
     await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
     assert stub.calls == []
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 # --- _on_market_state_changed: the real trigger (pure) -----------------------
@@ -317,7 +324,7 @@ async def test_market_state_changed_ignores_cross_symbol_sentinel(monkeypatch: p
     await scheduler._on_features_updated(_features_updated_envelope(_CROSS_SYMBOL_SENTINEL))
     await scheduler._on_market_state_changed(_market_state_changed_envelope(_CROSS_SYMBOL_SENTINEL))
     assert stub.calls == []
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 async def test_market_state_changed_ignores_unwatched_timeframe():
@@ -334,7 +341,7 @@ async def test_market_state_changed_skips_when_features_not_yet_cached(monkeypat
     scheduler = StrategyScheduler(fake_bus, strategies=[stub])
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
     assert stub.calls == []
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 async def test_market_state_changed_skips_when_context_absent(monkeypatch: pytest.MonkeyPatch):
@@ -345,7 +352,7 @@ async def test_market_state_changed_skips_when_context_absent(monkeypatch: pytes
     await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
     assert stub.calls == []
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 # --- gate_conditions enforcement, per-candle (decision #117) ----------------
@@ -366,7 +373,7 @@ async def test_gated_strategy_skipped_when_candle_outside_regular_session(monkey
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL", candle_ts=_PRE_MARKET_TS))
 
     assert gated.calls == []  # evaluate() never reached — gated out before it
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 async def test_gated_strategy_fires_when_candle_inside_regular_session(monkeypatch: pytest.MonkeyPatch):
@@ -380,7 +387,7 @@ async def test_gated_strategy_fires_when_candle_inside_regular_session(monkeypat
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
 
     assert len(gated.calls) == 1
-    assert len(fake_bus.published) == 1
+    assert len(fake_bus.opportunity_events) == 1
 
 
 async def test_strategy_with_no_gate_conditions_never_blocked_by_this_mechanism(
@@ -401,7 +408,7 @@ async def test_strategy_with_no_gate_conditions_never_blocked_by_this_mechanism(
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL", candle_ts=_AFTER_HOURS_TS))
 
     assert len(ungated.calls) == 1
-    assert len(fake_bus.published) == 1
+    assert len(fake_bus.opportunity_events) == 1
 
 
 async def test_gate_check_is_per_strategy_not_a_blanket_skip(monkeypatch: pytest.MonkeyPatch):
@@ -418,7 +425,7 @@ async def test_gate_check_is_per_strategy_not_a_blanket_skip(monkeypatch: pytest
 
     assert gated.calls == []
     assert len(ungated.calls) == 1
-    assert {env.payload["strategy"] for env in fake_bus.published} == {"Ungated"}
+    assert {env.payload["strategy"] for env in fake_bus.opportunity_events} == {"Ungated"}
 
 
 def _raising_gate_check(gate_conditions: dict, _candle_ts) -> bool:
@@ -457,7 +464,7 @@ async def test_gate_check_exception_does_not_block_other_strategies(
 
     assert broken_gate.calls == []  # gate check raised — evaluate() never reached
     assert len(healthy.calls) == 1  # NOT blocked by broken_gate's gate-check exception
-    assert {env.payload["strategy"] for env in fake_bus.published} == {"Healthy"}
+    assert {env.payload["strategy"] for env in fake_bus.opportunity_events} == {"Healthy"}
     assert "gate_conditions check raised" in caplog.text
     assert "BrokenGate" in caplog.text
 
@@ -478,8 +485,8 @@ async def test_matching_strategy_gets_called_and_publishes(monkeypatch: pytest.M
     assert isinstance(features, FeatureSet) and features.close == 101.5
     assert isinstance(context, ContextChanged) and context.providers == _CONTEXT_DICT["providers"]
 
-    assert len(fake_bus.published) == 1
-    published = fake_bus.published[0]
+    assert len(fake_bus.opportunity_events) == 1
+    published = fake_bus.opportunity_events[0]
     assert published.event_type == EventType.OPPORTUNITY_CREATED
     assert published.symbol == "AAPL"
     assert published.payload["strategy"] == "A"
@@ -493,7 +500,7 @@ async def test_non_matching_strategy_returns_none_and_publishes_nothing(monkeypa
     await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
     assert len(stub.calls) == 1
-    assert fake_bus.published == []
+    assert fake_bus.opportunity_events == []
 
 
 async def test_one_strategy_raising_does_not_block_the_others(
@@ -511,8 +518,8 @@ async def test_one_strategy_raising_does_not_block_the_others(
 
     assert len(broken.calls) == 1
     assert len(healthy.calls) == 1  # NOT skipped despite broken's exception
-    assert len(fake_bus.published) == 1
-    assert fake_bus.published[0].payload["strategy"] == "Healthy"
+    assert len(fake_bus.opportunity_events) == 1
+    assert fake_bus.opportunity_events[0].payload["strategy"] == "Healthy"
     assert "Broken" in caplog.text
 
 
@@ -526,7 +533,7 @@ async def test_two_matching_strategies_both_publish_independently(monkeypatch: p
     scheduler = StrategyScheduler(fake_bus, strategies=[a, b])
     await scheduler._on_features_updated(_features_updated_envelope("AAPL"))
     await scheduler._on_market_state_changed(_market_state_changed_envelope("AAPL"))
-    assert {env.payload["strategy"] for env in fake_bus.published} == {"A", "B"}
+    assert {env.payload["strategy"] for env in fake_bus.opportunity_events} == {"A", "B"}
 
 
 # --- ContextChanged reconstruction, directly (pure) --------------------------

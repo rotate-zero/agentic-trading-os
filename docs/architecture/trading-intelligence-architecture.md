@@ -1013,7 +1013,7 @@ The one place the suggestion as literally written wasn't taken: unconditional "G
 
 ## 19. Opportunity, Decision, Planning and Governor implementation contract
 
-**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path. **Build status:** the pure P1 planner and the pure C1 candidate core are built but not connected (§19.7); no entry path, subscriber or publication uses them.
+**Status — design only, 2026-10-09.** Delivery `opportunity-decision-planning-governor-contract-refinement`, decision #196. Saqib authorized refinement against the current modules and requested bounded implementation tasks suitable for Sol Medium/High and Sonnet 5.5 Medium. Inspected base: `f7f5c515f914f8cd515ca0ba2343052b95c260fc`. This section is the canonical cross-module contract; `execution-engine-design.md` §6.14 owns the narrow Planning extraction. Implementation tasks below require their own assignment under AGENTS.md; approving this documentation does not turn on a new entry path. **Build status:** the pure P1 planner and the pure C1 candidate core are built; C1 is now connected observation-only by C2 (`strategy-evaluation-batch-observation`, §19.2 as-built notes and §19.7): the Scheduler publishes `StrategyEvaluationCompleted` and an observation-only reader reduces it. No entry path, ranking, selection, planning integration or cutover uses any of it (P1 remains unconnected).
 
 ### 19.1 Existing foundations and responsibility boundaries
 
@@ -1083,7 +1083,7 @@ flowchart TD
 | `candidate_state.py` | Immutable `CandidateState` and pure `apply_batch`, `apply_reset`, `retire_strategy_versions`; deterministic `ReductionResult` statuses and reason codes. |
 | `candidate_eligibility.py` | Explicit `CandidateFreshnessPolicy` and `assess_candidates(state, as_of, policy)` returning a detached, ordered `EligibilitySnapshot` with reasons and separate source/completion/receive times. |
 
-Nothing subscribes to the Event Bus, the Scheduler publishes no `StrategyEvaluationCompleted`, `OpportunityCache`/view and `AuthorizerStub` are unchanged, and no table, migration, ranking score or order event exists. **C2 (live observation) and I1 (entry cutover) remain unbuilt.**
+As delivered by C1 the core was unconnected; **C2 (below) now connects it observation-only.** I1 (entry cutover) remains unbuilt.
 
 ```text
 PRODUCER (C2, not built)            C1 CORE (built, not connected)                       LATER CONSUMERS
@@ -1163,6 +1163,71 @@ C1 implementation choices, all within decision #196 (no new decision was needed)
 - **Atomic conflicts.** A content conflict anywhere in a batch applies nothing from it. A strategy absent from a batch keeps its earlier record. A slot `(symbol, strategy, version)` is bound to its first trigger timeframe.
 - **Resets.** All three reset kinds clear eligibility and apply the same admission rule: a candle whose interval begins before the boundary is rejected, so a candle straddling the boundary waits for the next fully post-boundary candle. This does not claim queued old-source events were retracted (§19.2). Applying it to session changes as well as provider changes/restarts is the stricter reading. After a process restart, build a fresh state and call `apply_reset("restart", boundary)`.
 - **Scope of state.** A state is bound to one execution mode, so backtest/replay uses its own instance. Opportunities whose status is not `actionable` are recorded but never eligible. `expected_horizon_minutes` is kept as descriptive data; `wait_expires_at` is not carried and never used as expiry. Session membership comes from reset events plus the age policy; detecting a session change through `MarketClock` belongs to C2.
+
+**C2 implementation status (`strategy-evaluation-batch-observation`): built, observation-only.** The Scheduler now publishes the completed batch and a reader reduces it with the C1 core. Decision #196 already covers this contract, so no new decision number was needed.
+
+| Piece | Responsibility |
+|---|---|
+| `schemas/events/strategy_evaluation.py`, `EventType.STRATEGY_EVALUATION_COMPLETED` | Typed `StrategyEvaluationCompleted` wire payload (symbol on the envelope, as for `FeatureSet`). Normal lane; not in `CRITICAL_EVENT_TYPES`; no WebSocket channel mapping. |
+| `strategy_engine/scheduler.py` | Sole producer. One batch per `MarketStateChanged` trigger, published after the whole pass. |
+| `trading_intelligence/candidate_batch_wire.py` | Payload/C1-batch conversion, `Opportunity`→candidate content, and source-interval derivation. |
+| `trading_intelligence/candidate_observation.py` | `CandidateObservationReader`: subscribes, reduces through the C1 reducer, serves detached `ObservationSnapshot`s. |
+| `services/broker_registry.py` | New multi-listener streaming-ownership hook (the existing protected-feed wake is single-owner and was not reused). |
+| `main.py` | Starts the reader after `OpportunityCache`, exposes `app.state.candidate_observation_reader`, stops it with the other subscribers. |
+
+```text
+MarketStateChanged --+
+                     +--> StrategyScheduler._on_market_state_changed
+FeaturesUpdated -----+      (latest-FeatureSet cache per symbol/timeframe)
+ContextEngine snapshot -----^
+        |
+        |  prerequisites: features present AND features.timeframe/candle_ts == state's; context present
+        |     any miss --> NO evaluate(), NO OpportunityCreated --> unavailable batch
+        |  source interval: MarketClock.session_bounds + candle convention (cannot derive --> no batch,
+        |     legacy behavior untouched)
+        v
+  per strategy this trigger covers (untriggered ones never listed):
+     gate unmet -> gated | gate raised -> error | evaluate raised -> error
+     None -> no_opportunity | Opportunity -> OpportunityCreated (unchanged, inline) + opportunity
+        |
+        v  after the whole pass
+  StrategyEvaluationCompleted (normal lane) ---------------> CandidateObservationReader
+  OpportunityCreated (unchanged) --> OpportunityCache, AuthorizerStub (unchanged)
+```
+
+```text
+CandidateObservationReader._on_batch   (no await: parse -> session roll -> reduce -> assign, atomic)
+  not running ............................. counted not_running
+  envelope symbol missing / "__MARKET__" ... counted invalid
+  payload fails schema or C1 contract ...... counted invalid (reader keeps running)
+  else apply_batch(state, batch, received_at = reader clock)
+        applied | duplicate | stale | conflict | rejected(mode_mismatch, pre_reset_boundary, ...)
+        conflict: nothing applied, WARNING, kept in recent_problems (never last-write-wins)
+
+snapshot(as_of) -> ObservationSnapshot(status, mode, arrival_sequence, freshness_status,
+                                       EligibilitySnapshot, unavailable_frames, diagnostics)
+
+resets (all call apply_reset; admission needs source interval START >= boundary)
+  start()           restart,          boundary = start time
+  session change    session_change,   boundary = new session start (now when closed); checked on
+                                      every delivery and snapshot; open/lunch/power-hour = one session
+  provider change   provider_change,  boundary = now, via broker_registry listener (take_over with a
+                                      changed provider/bridge, or clear)
+  stop()            unsubscribe + unregister; later deliveries ignored
+```
+
+C2 implementation choices, all within decision #196:
+
+- **Latest-only FeatureSet cache and ordering (resolves the §19.2 inspection).** The cache keeps one FeatureSet per `(symbol, timeframe)`, and `MarketStateChanged` comes from a debounced worker, so it can arrive after a newer `FeaturesUpdated`. Before C2 `evaluate()` could then receive a MarketState for candle N with a FeatureSet for N+1. Now a `timeframe`/`candle_ts` mismatch evaluates nothing and publishes an unavailable batch (`features: candle_ts_mismatch`/`timeframe_mismatch`). This is the one place legacy behavior changes, and only for incoherent inputs; missing features/context were already skipped and are now also reported (`features_unavailable`, `context_unavailable`). `ContextChanged` carries no candle timestamp, so context is checked for availability only, not coherence.
+- **Source interval.** `[candle_ts, min(candle_ts + width, session_end))` using the producer convention (candle_ts is the interval open; aggregated buckets via `bucket_start_for` from `session_bounds`). A session-trailing 1h bucket closes at the session close (e.g. 15:30-16:00 ET); a half-day ends at 13:00 ET. An unsupported timeframe, no session, an unverified calendar year or a non-aligned aggregated candle gives no batch (logged), and OpportunityCreated is still published as before. The three timestamps stay distinct: `source_candle_ts`, interval close, and `completed_at` (Scheduler clock) vs the reader's receive time.
+- **Redelivery.** Re-evaluating a candle with identical dispositions republishes the ORIGINAL batch (original `completed_at`); changed dispositions publish a new batch and the reader reports a conflict. The C1 reducer compares `completed_at`, so a batch that differs only in completion time is a reported conflict, never silently a duplicate. Completion time is never recomputed to make a repeat look new.
+- **Error isolation.** Error dispositions carry machine codes only (`gate_check_failed`, `evaluate_failed`, `opportunity_content_invalid`), never exception text. An opportunity the contract refuses (identity mismatch, non-JSON evidence, non-finite numbers) is recorded as `error` while the legacy OpportunityCreated is still published unchanged. A failure to publish the batch is logged and never disturbs evaluation.
+- **Atomicity and cutoff.** The handler has no `await`, so a reader sees all or none of a batch. Each delivery gets an arrival number; a snapshot records the highest fully processed one as `arrival_sequence`.
+- **Freshness.** The reader takes an optional `CandidateFreshnessPolicy`; none is configured in production, so every opportunity reports `freshness_policy_unconfigured` and nothing is eligible. No age is invented.
+- **Mode isolation.** The reader is bound to one mode (`settings.execution_mode`, simulated) and rejects others (`mode_mismatch`). Backtest replay runs on a private `EventBus` and never uses the Scheduler, and the reader is deliberately not a module singleton.
+- **Observation only.** The reader imports no Governor, Execution, Portfolio State, Trade Planning or Position Monitor module and has no `publish` call; it does not read `OpportunityCreated`. `OpportunityCache`/view and `AuthorizerStub` are unchanged.
+
+Known limits: the strict reset rule also rejects the last candle of a session if it is delivered after the session boundary; a calendar-unverified year or underivable interval yields no batch; no candidate-age policy, route, UI or retirement wiring exists (`retire_strategy_versions` is not connected, no strategy-disable mechanism exists); the reader is process-local with no persistence.
 
 ### 19.3 Ranking: honest evidence and deliberate non-ranking
 
@@ -1284,6 +1349,8 @@ P1/C1 and later the pure D1 core can be developed independently, but shared docu
 **Current P1 serialization-boundary status (`planning-proposal-serialization-core`):** built but not connected — an unwired persistence boundary. `backend/app/trade_planning/proposal.py` converts a landed `TradePlan` into the versioned `thesis["proposal"]` object (`serialize_proposal`), strictly re-validates a stored or requested one (`validate_proposal`) and answers identical-versus-conflicting replay (`proposals_equal`). It carries plan values (no recalculation), records both reference clocks and their descriptive ages including negative ones, normalizes aware timestamps to UTC, keeps missing clocks null, and refuses unsupported versions, malformed or non-finite values without repair. Diagrams and the encoding table are in `execution-engine-design.md` §6.14.7. Governor sizing, the reference tracker, the ledger, events and production behavior are unchanged; P2 consumes these helpers for `TradeDecisionRecord.proposal`, same-id replay comparison and persistence, and still owns timestamp capture, transaction wiring and entry cutover.
 
 **Current C1 status:** built but not connected. `candidate_contract.py`, `candidate_state.py` and `candidate_eligibility.py` implement the C1 row (§19.2 as-built notes and diagrams above); focused pure tests pass, including long/short and timezone-equivalent identities, duplicate/conflict redelivery, newer invalidation, out-of-order batches, reset-boundary delayed delivery, version retirement, source-age boundaries and missing policy. The Scheduler, Event Bus, Opportunity Cache/view, `AuthorizerStub`, database and order path are unchanged. C2 must produce complete batches (including explicit interval start/close and unavailable-prerequisite reporting), call the reducer with explicit receive times and reset events, and resolve the Scheduler input-caching question in §19.2; D1 may consume `EligibilitySnapshot` in shadow only. Entry cutover (I1) remains unbuilt.
+
+**Current C2 status (`strategy-evaluation-batch-observation`):** built observation-only (§19.2 C2 notes and diagrams). The Scheduler publishes `StrategyEvaluationCompleted`; `CandidateObservationReader` reduces it with the C1 core, resets on start, session change and streaming-source change, and serves detached snapshots. Existing `OpportunityCreated` consumers and the `AuthorizerStub` path are unchanged for coherent inputs. D1 (pure ranking/selection modules, separate session) and I1 (entry cutover) remain unbuilt and independent; nothing here ranks, selects, plans, reserves or orders.
 
 **Reusable task instruction:** “Implement only `<ID and slug>` from trading-intelligence-architecture.md §19.7 against fresh main. Inspect AGENTS.md and the listed contracts first; reuse landed prerequisites. Complete code, focused tests, relevant PostgreSQL checks and canonical docs together. Do not activate later phases, invent D4 weights/freshness values, or implement reserved Governor branches. Report an actual unresolved product choice rather than guessing. Use the delivery slug during work and assign a decision number only if needed at final integration. Deliver complete changed files at project-root-relative paths in a ZIP; exclude packaging helpers and patches.”
 

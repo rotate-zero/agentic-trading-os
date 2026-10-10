@@ -1,3 +1,26 @@
+<!-- BEGIN DELIVERY SECTION: strategy-evaluation-batch-observation -->
+# CHANGES — `strategy-evaluation-batch-observation`
+
+Base: pushed `main` `e7c5e55abaff58845426ca74bf2b488f106af908` (`Planning proposal serialization core`); re-checked against `origin/main` immediately before packaging. Task C2 of `trading-intelligence-architecture.md` §19.7. Observation only: no ranking, selection, planning integration, Governor call, reservation, order event or entry cutover (D1 and I1 remain separate and unbuilt).
+
+**What was added / changed**
+- `backend/app/schemas/events/strategy_evaluation.py` (new) and `EventType.STRATEGY_EVALUATION_COMPLETED` in `schemas/events/envelope.py`: typed `StrategyEvaluationCompleted` payload (timeframe, mode, source candle/interval start/close, `completed_at`, per-strategy dispositions with complete opportunity contents, or unavailable prerequisites). Normal lane; Scheduler is the sole producer.
+- `backend/app/strategy_engine/scheduler.py`: publishes one batch per trigger after the whole strategy pass. Dispositions `opportunity`/`no_opportunity`/`gated`/`error` with machine reason codes; strategy/gate errors are isolated; untriggered strategies are never listed. FeatureSet/MarketState `timeframe`+`candle_ts` coherence is now verified; a mismatch, or missing features/context, evaluates nothing and publishes an unavailable batch. Identical re-evaluation republishes the original batch (original `completed_at`). `OpportunityCreated` is unchanged and still published inline. New optional constructor args `mode`, `now`, `market_clock`.
+- `backend/app/trading_intelligence/candidate_batch_wire.py` (new): payload/C1-batch conversion, `Opportunity`→candidate content, and source-interval derivation from MarketClock and the producers' candle convention (session-trailing buckets, half days).
+- `backend/app/trading_intelligence/candidate_observation.py` (new): `CandidateObservationReader` over the unchanged C1 contract/reducer/eligibility modules — atomic delivery, arrival-sequence cutoff, detached snapshots, diagnostics, `freshness_policy_unconfigured` without a configured policy, resets on start/session change/streaming-source change/stop.
+- `backend/app/services/broker_registry.py`: additive `register/unregister_streaming_ownership_listener`, notified by `take_over_streaming` (changed provider or bridge) and `clear_streaming_provider`; `clear_all()` also clears listeners. No existing hook was multi-listener.
+- `backend/app/main.py`: starts the reader after `OpportunityCache`, sets/clears `app.state.candidate_observation_reader`, stops it after the bus.
+- Tests: `test_strategy_evaluation_batches.py` (30), `test_candidate_observation.py` (34), `test_strategy_evaluation_batch_integration.py` (4, DB-gated); `test_strategy_scheduler.py` only gained a fake-bus `opportunity_events` view and its legacy assertions now read the OpportunityCreated stream (no assertion weakened).
+
+**Documentation updated:** `docs/architecture/trading-intelligence-architecture.md` (§19 status, §19.2 C2 as-built block with component and internal-flow diagrams and implementation choices, §19.7 current C2 status), `system-design.md` (event vocabulary), `strategy-engine-design.md` (Scheduler note), this file and `TESTING.md`.
+
+**Decision number:** none assigned or needed; the behavior implements decision #196's §19.2 contract. `confirmed-decisions.md`/`INDEX.md` untouched (latest #196).
+
+**Behavior change to be aware of:** the only legacy change is for incoherent inputs — a FeatureSet for a different candle than the MarketState is no longer passed to `evaluate()`. Coherent inputs behave as before.
+
+**Known limitations:** no candidate-age policy is configured, so nothing is eligible yet (by design); the strict reset rule also rejects a session's last candle if delivered after the boundary; an underivable source interval (unverified calendar year, no session) yields no batch while legacy opportunities still publish; context is checked for availability only (no candle timestamp); strategy-version retirement is not wired (no disable mechanism exists); the reader has no route, UI or persistence.
+<!-- END DELIVERY SECTION: strategy-evaluation-batch-observation -->
+
 <!-- BEGIN DELIVERY SECTION: planning-proposal-serialization-core -->
 # CHANGES — `planning-proposal-serialization-core`
 

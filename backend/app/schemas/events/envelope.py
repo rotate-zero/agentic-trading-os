@@ -29,6 +29,9 @@ class EventType(StrEnum):
 
     # Decision intelligence
     OPPORTUNITY_CREATED = "OpportunityCreated"
+    # C2 (strategy-evaluation-batch-observation): one completed strategy pass for one
+    # symbol/timeframe/source candle. Normal lane; Scheduler is the sole producer.
+    STRATEGY_EVALUATION_COMPLETED = "StrategyEvaluationCompleted"
     OPPORTUNITY_SELECTED = "OpportunitySelected"
     TRADE_PLANNED = "TradePlanned"
     GOVERNOR_DECISION = "GovernorDecision"

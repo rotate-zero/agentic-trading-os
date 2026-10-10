@@ -156,6 +156,20 @@ async def lifespan(app: FastAPI):
     opportunity_cache = get_opportunity_cache(bus)
     opportunity_cache.start()
 
+    # CandidateObservationReader (C2, strategy-evaluation-batch-observation) —
+    # an OBSERVATION-ONLY subscriber to StrategyEvaluationCompleted (the
+    # Scheduler's complete batches). Reduces them through the C1 pure reducer;
+    # no ranking, selection, planning, Governor call, reservation or order
+    # event, and AuthorizerStub's OpportunityCreated path is untouched. Same
+    # unconditional-start, stop-after-bus posture as OpportunityCache. It
+    # resets itself on start, session change and streaming-source change.
+    # Deliberately not a module singleton: backtest replay (private EventBus)
+    # can never share it.
+    from app.trading_intelligence.candidate_observation import CandidateObservationReader
+
+    candidate_observation_reader = CandidateObservationReader(bus, mode=settings.execution_mode)  # type: ignore[arg-type]
+    candidate_observation_reader.start()
+
     # FundamentalsRefreshJobs — the only writer to symbol_fundamentals
     # (decision #96). Soft-fails its own start() (logs + no-ops) when no
     # Finnhub key is configured, same posture as the broker
@@ -487,10 +501,12 @@ async def lifespan(app: FastAPI):
     # universe route; cleared first thing at shutdown (below) so a late
     # addition cannot reach an engine that is stopping.
     app.state.context_engine = context_engine
+    app.state.candidate_observation_reader = candidate_observation_reader
     try:
         yield
     finally:
         app.state.context_engine = None
+        app.state.candidate_observation_reader = None
         app.state.world_view_portfolio_reader = None
         app.state.position_monitor = None
         app.state.protected_feed_status_reader = None
@@ -576,6 +592,9 @@ async def lifespan(app: FastAPI):
         # trivial in practice (opportunity_cache.py's own docstring: no
         # queue, nothing to drain).
         await opportunity_cache.stop()
+        # C2 observation reader — subscriber, no queue; unsubscribes and
+        # unregisters its streaming-ownership listener.
+        await candidate_observation_reader.stop()
 
     # Execution pipeline — same "stops after
         # the bus" posture as everything else in this block: each engine's
